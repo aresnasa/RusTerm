@@ -1,0 +1,27 @@
+[package]
+name = "rusterm-ui"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+dioxus.workspace = true
+dioxus-router.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+parking_lot.workspace = true
+vte = { workspace = true, features = ["ansi"] }
+
+rusterm-core.workspace = true
+rusterm-ssh.workspace = true
+rusterm-crypto.workspace = true
+rusterm-db.workspace = true
+rusterm-ai.workspace = true
+rusterm-plugins.workspace = true
+rusterm-proto.workspace = true
+rusterm-history.workspace = true

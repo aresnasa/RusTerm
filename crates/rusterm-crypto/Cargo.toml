@@ -1,0 +1,16 @@
+[package]
+name = "rusterm-crypto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aes-gcm.workspace = true
+argon2.workspace = true
+keyring.workspace = true
+zeroize.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+rand = "0.9"

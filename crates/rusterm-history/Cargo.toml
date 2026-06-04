@@ -1,0 +1,15 @@
+[package]
+name = "rusterm-history"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+rusqlite.workspace = true
+rusterm-db.workspace = true

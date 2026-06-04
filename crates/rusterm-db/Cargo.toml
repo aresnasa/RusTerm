@@ -1,0 +1,22 @@
+[package]
+name = "rusterm-db"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+rusqlite.workspace = true
+tokio-rusqlite.workspace = true
+tokio.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+dirs.workspace = true
+
+rusterm-core.workspace = true
+
+[dev-dependencies]
+tempfile = "3"

@@ -1,0 +1,25 @@
+# Build
+/target/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+
+# Screenshots
+*.png
+!assets/**/*.png
+
+# Outputs
+/outputs/
+
+# Environment
+.env

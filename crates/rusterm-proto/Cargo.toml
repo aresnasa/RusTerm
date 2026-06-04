@@ -1,0 +1,20 @@
+[package]
+name = "rusterm-proto"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+serialport.workspace = true
+portable-pty.workspace = true
+tokio.workspace = true
+tokio-util.workspace = true
+serde.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+uuid.workspace = true
+bytes.workspace = true
+futures.workspace = true
+
+rusterm-core.workspace = true

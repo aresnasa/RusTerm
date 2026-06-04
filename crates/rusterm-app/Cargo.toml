@@ -1,0 +1,26 @@
+[package]
+name = "rusterm-app"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "rusterm"
+path = "src/main.rs"
+
+[dependencies]
+rusterm-core.workspace = true
+rusterm-ssh.workspace = true
+rusterm-crypto.workspace = true
+rusterm-db.workspace = true
+rusterm-ai.workspace = true
+rusterm-plugins.workspace = true
+rusterm-proto.workspace = true
+rusterm-ui.workspace = true
+
+dioxus.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+anyhow.workspace = true
+dirs.workspace = true

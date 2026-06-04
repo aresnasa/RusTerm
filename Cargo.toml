@@ -1,0 +1,99 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/rusterm-app",
+    "crates/rusterm-core",
+    "crates/rusterm-ssh",
+    "crates/rusterm-crypto",
+    "crates/rusterm-db",
+    "crates/rusterm-ai",
+    "crates/rusterm-plugins",
+    "crates/rusterm-proto",
+    "crates/rusterm-ui",
+    "crates/rusterm-history",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/rusterm/rusterm"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Terminal
+vte = "0.15"
+portable-pty = "0.9"
+
+# SSH
+russh = { version = "0.61", features = ["aws-lc-rs"] }
+russh-config = "0.58"
+russh-keys = "0.49"
+
+# Crypto & Security
+aes-gcm = "0.10"
+argon2 = "0.5"
+keyring = "3"
+zeroize = { version = "1", features = ["derive"] }
+secrecy = { version = "0.10", features = ["serde"] }
+
+# Database
+rusqlite = { version = "0.37", features = ["bundled", "vtab"] }
+tokio-rusqlite = "0.7"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+bincode = "1"
+
+# AI
+async-openai = "0.40"
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+
+# Protocols
+serialport = "4.9"
+tokio-util = { version = "0.7", features = ["compat"] }
+bytes = "1"
+
+# Plugin system
+wasmtime = { version = "45", default-features = false, features = ["cranelift", "pooling-allocator"] }
+wasmtime-wasi = "45"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-appender = "0.2"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Utility
+uuid = { version = "1", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+dirs = "6"
+once_cell = "1"
+parking_lot = "0.12"
+futures = "0.3"
+async-trait = "0.1"
+base64 = "0.22"
+bitflags = "2"
+unicode-width = "0.2"
+
+# Dioxus UI
+dioxus = { version = "0.7", features = ["desktop"] }
+dioxus-router = "0.7"
+
+# Cross-crate deps
+rusterm-core = { path = "crates/rusterm-core" }
+rusterm-ssh = { path = "crates/rusterm-ssh" }
+rusterm-crypto = { path = "crates/rusterm-crypto" }
+rusterm-db = { path = "crates/rusterm-db" }
+rusterm-ai = { path = "crates/rusterm-ai" }
+rusterm-plugins = { path = "crates/rusterm-plugins" }
+rusterm-proto = { path = "crates/rusterm-proto" }
+rusterm-ui = { path = "crates/rusterm-ui" }
+rusterm-history = { path = "crates/rusterm-history" }
