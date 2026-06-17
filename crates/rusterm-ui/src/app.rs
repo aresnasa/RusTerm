@@ -51,7 +51,7 @@ fn start_ssh_connection(
             let delay = if attempt < 3 { 50 } else { 100 };
             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             if let Ok(result) = dioxus::document::eval(&format!(
-                "(function() {{ const el = document.getElementById('{measure_cid}'); if (!el) return ''; const rect = el.getBoundingClientRect(); if (rect.width <= 0 || rect.height <= 0) return ''; const cs = getComputedStyle(el); const padH = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight); const padV = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom); const bw = parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth); const bh = parseFloat(cs.borderTopWidth) + parseFloat(cs.borderBottomWidth); const w = rect.width - padH - bw; const h = rect.height - padV - bh; if (w <= 0 || h <= 0) return ''; const test = document.createElement('span'); test.textContent = 'M'; test.style.cssText = 'font-family:JetBrains Mono,Fira Code,Cascadia Code,monospace;font-size:13px;line-height:1.5;position:absolute;visibility:hidden;white-space:pre;'; document.body.appendChild(test); const tr = test.getBoundingClientRect(); document.body.removeChild(test); const cw = Math.max(1, tr.width); const ch = Math.max(1, tr.height); const cols = Math.max(1, Math.floor(w / cw)); const rows = Math.max(1, Math.floor(h / ch)); if (cols > 1 && rows > 1) return cols + ',' + rows; return ''; }})()"
+                "(function() {{ const el = document.getElementById('{measure_cid}'); if (!el) return ''; const rect = el.getBoundingClientRect(); if (rect.width <= 0 || rect.height <= 0) return ''; const cs = getComputedStyle(el); const padH = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight); const padV = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom); const bw = parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth); const bh = parseFloat(cs.borderTopWidth) + parseFloat(cs.borderBottomWidth); const w = rect.width - padH - bw; const h = rect.height - padV - bh; if (w <= 0 || h <= 0) return ''; const test = document.createElement('span'); test.textContent = 'M'; test.style.cssText = 'font-family:JetBrains Mono,Fira Code,Cascadia Code,monospace;font-size:13px;line-height:1.5;position:absolute;visibility:hidden;white-space:pre;'; document.body.appendChild(test); const tr = test.getBoundingClientRect(); document.body.removeChild(test); const cw = Math.max(1, tr.width); const ch = Math.max(1, tr.height); const cols = Math.max(1, Math.floor(w / cw)); const rows = Math.max(1, Math.floor((h - 1) / ch)); if (cols > 1 && rows > 1) return cols + ',' + rows; return ''; }})()"
             )).await {
                 if let Some(s) = result.as_str() {
                     if !s.is_empty() {
@@ -80,13 +80,13 @@ fn start_ssh_connection(
 
         let (event_tx, mut event_rx) =
             tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
-        let client = rusterm_ssh::SshClient::new(ssh_config, event_tx);
+        let client = rusterm_ssh::SshClient::new(ssh_config, event_tx.clone());
 
         match client
             .connect(tab_id.clone(), measured_size)
             .await
         {
-            Ok((session, _ssh_session)) => {
+            Ok((session, ssh_session)) => {
                 input_senders
                     .write()
                     .insert(tab_id.clone(), session.input_tx.clone());
@@ -117,7 +117,23 @@ fn start_ssh_connection(
                 }
 
                 let _session_guard = session;
-                let _conn_guard = _ssh_session;
+
+                // Pre-seed session history from local shell history
+                {
+                    let provider = rusterm_history::HybridHistoryProvider::new();
+                    let initial_history: Vec<String> = provider.search("", 3000)
+                        .into_iter()
+                        .map(|m| m.command)
+                        .collect();
+                    if !initial_history.is_empty() {
+                        let mut s = state.write();
+                        if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == tab_id) {
+                            tab.command_history = initial_history;
+                        }
+                    }
+                }
+
+                let _conn_guard = ssh_session;
 
                 while let Some(event) = event_rx.recv().await {
                     match event {
@@ -150,6 +166,13 @@ fn start_ssh_connection(
                                     tab.render_output = render_result;
                                     tab.version += 1;
                                 }
+                            }
+                        }
+                        SessionEvent::RemoteHistory(id, commands) => {
+                            tracing::info!("[SSH] received remote history: {} commands for {}", commands.len(), &id[..id.len().min(8)]);
+                            let mut s = state.write();
+                            if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
+                                tab.command_history = commands;
                             }
                         }
                         _ => {}
@@ -211,6 +234,21 @@ fn start_shell_connection(
                 entry.terminal.set_input_sender(session.input_tx.clone());
             }
 
+            // Pre-populate local shell history from native history files
+            {
+                let provider = rusterm_history::HybridHistoryProvider::new();
+                let local_history: Vec<String> = provider.search("", 2000)
+                    .into_iter()
+                    .map(|m| m.command)
+                    .collect();
+                if !local_history.is_empty() {
+                    let mut s = state.write();
+                    if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == tab_id) {
+                        tab.command_history = local_history;
+                    }
+                }
+            }
+
             let _session_guard = session;
 
             spawn(async move {
@@ -244,6 +282,12 @@ fn start_shell_connection(
                                     tab.render_output = render_result;
                                     tab.version += 1;
                                 }
+                            }
+                        }
+                        SessionEvent::RemoteHistory(id, commands) => {
+                            let mut s = state.write();
+                            if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
+                                tab.command_history = commands;
                             }
                         }
                         _ => {}
@@ -354,6 +398,32 @@ pub fn App() -> Element {
                 background: #1a1b26;
                 font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
             ",
+            tabindex: "0",
+            onkeydown: move |e: KeyboardEvent| {
+                // Cmd+1..9 (macOS) or Ctrl+1..9 (Linux/Windows) to switch tabs
+                let mods = e.modifiers();
+                if (mods.meta() || mods.ctrl()) && !mods.alt() && !mods.shift() {
+                    if let Key::Character(ref s) = e.key() {
+                        if let Ok(idx) = s.parse::<usize>() {
+                            if idx >= 1 && idx <= 9 {
+                                e.prevent_default();
+                                let tabs = state.read().sessions.clone();
+                                if let Some(tab) = tabs.get(idx - 1) {
+                                    let tab_id = tab.id.clone();
+                                    state.write().active_session = Some(tab_id.clone());
+                                    let focus_id = format!("terminal-input-{tab_id}");
+                                    spawn(async move {
+                                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                        let _ = dioxus::document::eval(&format!(
+                                            "document.getElementById('{focus_id}')?.focus()"
+                                        )).await;
+                                    });
+                                }
+                            }
+                        }
+                    }
+                }
+            },
 
             // Sidebar
             {rsx! {
@@ -374,6 +444,10 @@ pub fn App() -> Element {
                                         render_output: Default::default(),
                                         version: 0,
                                         suggestion: None,
+                                        suggestions: Vec::new(),
+                                        suggestion_selected: 0,
+                                        suggestion_visible: false,
+                                        command_history: Vec::new(),
                                     });
                                     state.write().active_session = Some(tab_id.clone());
                                     start_ssh_connection(state, input_senders, tab_id, ssh_config.clone());
@@ -395,6 +469,10 @@ pub fn App() -> Element {
                                         render_output,
                                         version: 1,
                                         suggestion: None,
+                                        suggestions: Vec::new(),
+                                        suggestion_selected: 0,
+                                        suggestion_visible: false,
+                                        command_history: Vec::new(),
                                     });
                                     state.write().active_session = Some(tab_id.clone());
                                     start_shell_connection(state, input_senders, tab_id, shell_config.clone());
@@ -411,6 +489,10 @@ pub fn App() -> Element {
                                             render_output: render_result,
                                             version: 1,
                                             suggestion: None,
+                                            suggestions: Vec::new(),
+                                            suggestion_selected: 0,
+                                            suggestion_visible: false,
+                                            command_history: Vec::new(),
                                         });
                                         state.write().active_session = Some(tab_id.clone());
                                     }
@@ -546,64 +628,115 @@ pub fn App() -> Element {
                                                 }
                                                 // Query history for suggestion (on non-Enter input)
                                                 if !is_enter {
-                                                    let terminals = state_for_cmd.read().terminals.clone();
-                                                    if let Some(handle) = terminals.get(&sid_clone) {
-                                                        let line = handle.lock().terminal.extract_current_line();
+                                                    let sid_sug = sid_clone.clone();
+                                                    let epoch = {
+                                                        let mut s = state_for_cmd.write();
+                                                        s.suggestion_epoch += 1;
+                                                        s.suggestion_epoch
+                                                    };
+                                                    spawn(async move {
+                                                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+                                                        if state_for_cmd.read().suggestion_epoch != epoch {
+                                                            return;
+                                                        }
+
+                                                        // Extract the current line AFTER debounce
+                                                        let line = {
+                                                            let terminals = state_for_cmd.read().terminals.clone();
+                                                            if let Some(handle) = terminals.get(&sid_sug) {
+                                                                handle.lock().terminal.extract_current_line()
+                                                            } else {
+                                                                return;
+                                                            }
+                                                        };
                                                         let line = line.trim().to_string();
-                                                        let sid_sug = sid_clone.clone();
-                                                        if !line.is_empty() {
-                                                            spawn(async move {
-                                                                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-                                                                // Try atuin first, then rusterm-db
-                                                                let mut suggestion: Option<String> = None;
 
-                                                                // Try atuin DB
-                                                                let atuin_provider = rusterm_history::AtuinDbProvider::new();
-                                                                if let Some(ref atuin) = atuin_provider {
-                                                                    if let Ok(results) = atuin.search(&line, 1) {
-                                                                        if let Some(entry) = results.first() {
-                                                                            if entry.command.starts_with(&line) {
-                                                                                suggestion = Some(entry.command[line.len()..].to_string());
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
-
-                                                                // Fall back to rusterm-db
-                                                                if suggestion.is_none() {
-                                                                    let db_path = dirs::data_dir()
-                                                                        .unwrap_or_default()
-                                                                        .join("rusterm")
-                                                                        .join("rusterm.db");
-                                                                    if let Ok(db) = rusterm_db::Database::open(Some(db_path)).await {
-                                                                        if let Ok(results) = db.search_history(&line, 1).await {
-                                                                            if let Some(entry) = results.first() {
-                                                                                if entry.command.starts_with(&line) {
-                                                                                    suggestion = Some(entry.command[line.len()..].to_string());
-                                                                                }
-                                                                            }
-                                                                        }
-                                                                    }
-                                                                }
-
-                                                                // Update suggestion in state
-                                                                if let Some(suffix) = suggestion {
-                                                                    state_for_cmd.write().sessions.iter_mut()
-                                                                        .find(|t| t.id == sid_sug)
-                                                                        .map(|tab| tab.suggestion = Some(suffix));
-                                                                } else {
-                                                                    state_for_cmd.write().sessions.iter_mut()
-                                                                        .find(|t| t.id == sid_sug)
-                                                                        .map(|tab| tab.suggestion = None);
-                                                                }
-                                                            });
-                                                        } else {
-                                                            // Clear suggestion if line is empty
+                                                        if line.is_empty() {
                                                             state_for_cmd.write().sessions.iter_mut()
-                                                                .find(|t| t.id == sid_clone)
+                                                                .find(|t| t.id == sid_sug)
+                                                                .map(|tab| tab.suggestion = None);
+                                                            return;
+                                                        }
+
+                                                        // Strip prompt prefix to get the command part
+                                                        let cmd_part = strip_prompt(&line);
+
+                                                        if cmd_part.is_empty() {
+                                                            state_for_cmd.write().sessions.iter_mut()
+                                                                .find(|t| t.id == sid_sug)
+                                                                .map(|tab| tab.suggestion = None);
+                                                            return;
+                                                        }
+
+                                                        let cmd_lower = cmd_part.to_lowercase();
+                                                        let mut suggestion: Option<String> = None;
+
+                                                        // 1. Search session command history (most relevant)
+                                                        let session_hist = state_for_cmd.read().sessions
+                                                            .iter().find(|t| t.id == sid_sug)
+                                                            .map(|t| t.command_history.clone())
+                                                            .unwrap_or_default();
+
+                                                        if !session_hist.is_empty() {
+                                                            // Search in reverse (most recent first), pick shortest non-trivial match
+                                                            let mut best: Option<&String> = None;
+                                                            let mut best_len = usize::MAX;
+                                                            for cmd in session_hist.iter().rev() {
+                                                                if cmd.to_lowercase().starts_with(&cmd_lower)
+                                                                    && cmd.len() > cmd_part.len()
+                                                                    && cmd.len() < best_len
+                                                                {
+                                                                    best = Some(cmd);
+                                                                    best_len = cmd.len();
+                                                                }
+                                                            }
+                                                            if let Some(cmd) = best {
+                                                                suggestion = Some(cmd[cmd_part.len()..].to_string());
+                                                            }
+                                                        }
+
+                                                        // 2. Search local shell history (atuin/zsh/bash/fish)
+                                                        if suggestion.is_none() {
+                                                            let provider = rusterm_history::HybridHistoryProvider::new();
+                                                            if let Some(entry) = provider.search(&cmd_part, 5).first() {
+                                                                if entry.command.starts_with(&cmd_part) {
+                                                                    suggestion = Some(entry.command[cmd_part.len()..].to_string());
+                                                                }
+                                                            }
+                                                        }
+
+                                                        // 3. Fall back to rusterm-db
+                                                        if suggestion.is_none() {
+                                                            let db_path = dirs::data_dir()
+                                                                .unwrap_or_default()
+                                                                .join("rusterm")
+                                                                .join("rusterm.db");
+                                                            if let Ok(db) = rusterm_db::Database::open(Some(db_path)).await {
+                                                                if let Ok(results) = db.search_history(&cmd_part, 5).await {
+                                                                    if let Some(entry) = results.first() {
+                                                                        if entry.command.starts_with(&cmd_part) {
+                                                                            suggestion = Some(entry.command[cmd_part.len()..].to_string());
+                                                                        }
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+
+                                                        if state_for_cmd.read().suggestion_epoch != epoch {
+                                                            return;
+                                                        }
+
+                                                        if let Some(suffix) = suggestion {
+                                                            state_for_cmd.write().sessions.iter_mut()
+                                                                .find(|t| t.id == sid_sug)
+                                                                .map(|tab| tab.suggestion = Some(suffix));
+                                                        } else {
+                                                            state_for_cmd.write().sessions.iter_mut()
+                                                                .find(|t| t.id == sid_sug)
                                                                 .map(|tab| tab.suggestion = None);
                                                         }
-                                                    }
+                                                    });
                                                 }
                                             },
                                             on_command: move |_: String| {
@@ -614,9 +747,20 @@ pub fn App() -> Element {
 
                                                 let terminals = state_for_cmd.read().terminals.clone();
                                                 if let Some(handle) = terminals.get(&sid_for_cmd) {
-                                                    let cmd = handle.lock().terminal.extract_current_line();
-                                                    let cmd = cmd.trim().to_string();
+                                                    let raw_line = handle.lock().terminal.extract_current_line();
+                                                    let cmd = strip_prompt(raw_line.trim());
                                                     if !cmd.is_empty() {
+                                                        // Add to session command history (for inline suggestions)
+                                                        state_for_cmd.write().sessions.iter_mut()
+                                                            .find(|t| t.id == sid_for_cmd)
+                                                            .map(|tab| {
+                                                                // Avoid duplicates at the end
+                                                                if tab.command_history.last() != Some(&cmd) {
+                                                                    tab.command_history.push(cmd.clone());
+                                                                }
+                                                            });
+
+                                                        // Also persist to DB
                                                         let sid = sid_for_cmd.clone();
                                                         spawn(async move {
                                                             let db_path = dirs::data_dir()
@@ -832,6 +976,10 @@ pub fn App() -> Element {
                         render_output,
                         version: 1,
                         suggestion: None,
+                        suggestions: Vec::new(),
+                        suggestion_selected: 0,
+                        suggestion_visible: false,
+                        command_history: Vec::new(),
                     });
                     s.active_session = Some(config.id.clone());
                 }
@@ -842,4 +990,61 @@ pub fn App() -> Element {
             },
         }
     }
+}
+
+/// Strip shell prompt from a terminal line, returning just the command part.
+/// Handles common prompt patterns like "user@host:~$ cmd", "[user@host]$ cmd",
+/// "❯ cmd", etc. Falls back to trying word-boundary suffixes.
+fn strip_prompt(line: &str) -> String {
+    if line.is_empty() { return String::new(); }
+
+    // Try common prompt-ending markers (dollar+space, hash+space, etc.)
+    let prompt_markers = ["$ ", "# ", "% ", "> ", "\u{276f} ", "\u{279c} "];
+    for marker in prompt_markers {
+        if let Some(idx) = line.rfind(marker) {
+            let cmd = line[idx + marker.len()..].trim();
+            if !cmd.is_empty() {
+                return cmd.to_string();
+            }
+        }
+    }
+
+    // Fallback: try stripping words from the left.
+    // A prompt typically has 2-5 words before the command.
+    // Check if any suffix looks like a command (starts with a common pattern).
+    let words: Vec<&str> = line.split_whitespace().collect();
+    if words.len() > 2 {
+        // Try from word index 1 onwards — skip at least the first prompt word
+        for start in 1..words.len().min(5) {
+            let suffix = words[start..].join(" ");
+            // Heuristic: if this suffix starts with a common command prefix, use it
+            if looks_like_command(&suffix) {
+                return suffix;
+            }
+        }
+    }
+
+    line.to_string()
+}
+
+/// Quick heuristic: does this text look like the start of a shell command?
+fn looks_like_command(s: &str) -> bool {
+    let first = s.split_whitespace().next().unwrap_or("");
+    if first.is_empty() { return false; }
+    // Common command starters — if the first word matches, it's likely a command
+    let common = [
+        "ls", "cd", "cat", "grep", "find", "awk", "sed", "make", "git", "docker",
+        "npm", "cargo", "python", "python3", "node", "go", "rustup", "vim", "nvim",
+        "emacs", "ssh", "scp", "rsync", "curl", "wget", "tar", "zip", "unzip",
+        "sudo", "apt", "yum", "brew", "pip", "pip3", "echo", "mkdir", "rm", "cp",
+        "mv", "chmod", "chown", "ps", "top", "htop", "kill", "df", "du", "free",
+        "export", "source", "alias", "which", "type", "man", "less", "more",
+        "head", "tail", "sort", "uniq", "wc", "diff", "patch", "xargs", "tee",
+        "jq", "yq", "terraform", "ansible", "kubectl", "helm", "aws", "gcloud",
+        "az", "open", "pbcopy", "pbpaste", "launchctl", "systemctl", "service",
+        "ping", "traceroute", "netstat", "ss", "ip", "ifconfig", "env", "printenv",
+        "date", "cal", "whoami", "id", "uname", "hostname", "uptime", "w", "who",
+        "history", "clear", "reset", "exit", "logout", "reboot", "shutdown",
+    ];
+    common.contains(&first) || first.contains('/') || first.contains('.') || first.starts_with('-')
 }

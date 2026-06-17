@@ -86,6 +86,11 @@ pub struct AppState {
     pub unlock_state: UnlockState,
     #[serde(skip)]
     pub master_password_error: Option<String>,
+    /// Monotonically increasing counter for debouncing suggestion queries.
+    /// Each keystroke increments this; stale async queries check if their
+    /// snapshot is still current before writing results.
+    #[serde(skip)]
+    pub suggestion_epoch: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -96,7 +101,21 @@ pub struct SessionTab {
     #[serde(skip)]
     pub render_output: RenderOutput,
     pub version: u64,
+    /// Inline fish-style suggestion (top match suffix)
+    #[serde(skip)]
     pub suggestion: Option<String>,
+    /// Multiple suggestion candidates for the dropdown
+    #[serde(skip)]
+    pub suggestions: Vec<String>,
+    /// Dropdown selected index
+    #[serde(skip)]
+    pub suggestion_selected: usize,
+    /// Dropdown visibility
+    #[serde(skip)]
+    pub suggestion_visible: bool,
+    /// Local command history for this session. Stored locally only, never transmitted.
+    #[serde(skip)]
+    pub command_history: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -125,6 +144,7 @@ impl Default for AppState {
             session_logs: HashMap::new(),
             unlock_state,
             master_password_error: None,
+            suggestion_epoch: 0,
         }
     }
 }
