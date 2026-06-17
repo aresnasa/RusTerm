@@ -1,46 +1,106 @@
-use anyhow::Result;
-
 use crate::atuin_db::AtuinDbProvider;
+use crate::bash_history::BashHistoryProvider;
+use crate::fish_history::FishHistoryProvider;
+use crate::zsh_history::ZshHistoryProvider;
 use crate::HistoryMatch;
 
+/// Unified history provider that queries multiple sources:
+/// 1. atuin DB (if installed)
+/// 2. zsh history file
+/// 3. bash history file
+/// 4. fish history file
+///
+/// Results are merged, deduplicated, and re-ranked by score.
 pub struct HybridHistoryProvider {
     atuin: Option<AtuinDbProvider>,
+    zsh: Option<ZshHistoryProvider>,
+    bash: Option<BashHistoryProvider>,
+    fish: Option<FishHistoryProvider>,
 }
 
 impl HybridHistoryProvider {
     pub fn new() -> Self {
         Self {
             atuin: AtuinDbProvider::new(),
+            zsh: ZshHistoryProvider::new(),
+            bash: BashHistoryProvider::new(),
+            fish: FishHistoryProvider::new(),
         }
     }
 
-    pub fn search(&self, query: &str, limit: usize) -> Result<Vec<HistoryMatch>> {
-        // Try atuin first
+    /// Search across all history sources. Merges results, deduplicates by
+    /// command text (keeping the highest score), and returns ranked results.
+    pub fn search(&self, query: &str, limit: usize) -> Vec<HistoryMatch> {
+        let mut all: Vec<HistoryMatch> = Vec::new();
+
+        // 1. atuin (most metadata, highest quality)
         if let Some(ref atuin) = self.atuin {
             if let Ok(results) = atuin.search(query, limit) {
-                if !results.is_empty() {
-                    return Ok(results);
-                }
+                all.extend(results);
             }
         }
 
-        // Fall back to rusterm-db (caller handles this)
-        Ok(Vec::new())
-    }
+        // 2. zsh history
+        if let Some(ref zsh) = self.zsh {
+            all.extend(zsh.search(query, limit));
+        }
 
-    pub fn recent(&self, limit: usize) -> Result<Vec<HistoryMatch>> {
-        if let Some(ref atuin) = self.atuin {
-            if let Ok(results) = atuin.recent(limit) {
-                if !results.is_empty() {
-                    return Ok(results);
-                }
+        // 3. bash history
+        if let Some(ref bash) = self.bash {
+            all.extend(bash.search(query, limit));
+        }
+
+        // 4. fish history
+        if let Some(ref fish) = self.fish {
+            all.extend(fish.search(query, limit));
+        }
+
+        if all.is_empty() {
+            return Vec::new();
+        }
+
+        // Deduplicate by command, keeping the best score
+        let mut best: std::collections::HashMap<String, HistoryMatch> =
+            std::collections::HashMap::new();
+
+        for m in all {
+            let entry = best.entry(m.command.clone()).or_insert_with(|| HistoryMatch::new(
+                m.command.clone(),
+                m.cwd.clone(),
+                m.hostname.clone(),
+                m.timestamp,
+                m.score,
+            ));
+            // Keep the highest score; prefer entries with metadata
+            if m.score > entry.score
+                || (m.score == entry.score && (m.cwd.is_some() || m.hostname.is_some()))
+            {
+                entry.score = m.score;
+                if m.cwd.is_some() { entry.cwd = m.cwd; }
+                if m.hostname.is_some() { entry.hostname = m.hostname; }
+                if m.timestamp.is_some() { entry.timestamp = m.timestamp; }
             }
         }
 
-        Ok(Vec::new())
+        let mut results: Vec<HistoryMatch> = best.into_values().collect();
+        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.truncate(limit);
+        results
     }
 
     pub fn has_atuin(&self) -> bool {
         self.atuin.is_some()
+    }
+
+    pub fn has_zsh(&self) -> bool {
+        self.zsh.is_some()
+    }
+
+    pub fn has_bash(&self) -> bool {
+        self.bash.is_some()
+    }
+
+    pub fn has_fish(&self) -> bool {
+        self.fish.is_some()
     }
 }

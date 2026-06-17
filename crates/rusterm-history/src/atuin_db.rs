@@ -60,13 +60,13 @@ impl AtuinDbProvider {
                 let age_hours = (Utc::now() - timestamp).num_hours().max(1) as f32;
                 let recency_score = 1.0 / (1.0 + age_hours / 24.0);
                 let frequency_score = (count as f32).ln() * 20.0;
-                HistoryMatch {
+                HistoryMatch::new(
                     command,
                     cwd,
                     hostname,
-                    timestamp: Some(timestamp),
-                    score: recency_score + frequency_score,
-                }
+                    Some(timestamp),
+                    recency_score + frequency_score,
+                )
             })
             .collect();
 
@@ -96,13 +96,13 @@ impl AtuinDbProvider {
             .filter_map(|r| r.ok())
             .map(|(command, cwd, hostname, ts_ns)| {
                 let timestamp = DateTime::from_timestamp_nanos(ts_ns);
-                HistoryMatch {
+                HistoryMatch::new(
                     command,
                     cwd,
                     hostname,
-                    timestamp: Some(timestamp),
-                    score: 1.0,
-                }
+                    Some(timestamp),
+                    1.0,
+                )
             })
             .collect();
 

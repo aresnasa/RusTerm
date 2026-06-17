@@ -13,3 +13,10 @@ chrono.workspace = true
 dirs.workspace = true
 rusqlite.workspace = true
 rusterm-db.workspace = true
+
+[features]
+default = []
+## Enables network sync for history (NOT recommended — violates local-only policy).
+## This feature exists only so that any future network code can be gated behind it.
+## When disabled (the default), no history data can leave the local machine.
+network = []
