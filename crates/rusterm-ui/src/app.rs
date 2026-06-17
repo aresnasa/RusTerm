@@ -691,30 +691,36 @@ pub fn App() -> Element {
                                                         let mut all_suggestions: Vec<String> = Vec::new();
                                                         let mut seen = std::collections::HashSet::new();
 
-                                                        // 1. Session command history (most recent, prefix match, top 3)
+                                                        // 1. Session command history — count frequency, sort by it
                                                         let session_hist = state_for_cmd.read().sessions
                                                             .iter().find(|t| t.id == sid_sug)
                                                             .map(|t| t.command_history.clone())
                                                             .unwrap_or_default();
 
-                                                        for cmd in session_hist.iter().rev() {
+                                                        // Count occurrences and sort by frequency descending
+                                                        let mut freq: std::collections::HashMap<&String, usize> = std::collections::HashMap::new();
+                                                        for cmd in session_hist.iter() {
                                                             if cmd.to_lowercase().starts_with(&cmd_lower)
-                                                                && cmd.len() > cmd_part.len()
+                                                                && cmd != &cmd_part
                                                                 && !seen.contains(cmd.to_lowercase().as_str())
                                                             {
-                                                                seen.insert(cmd.to_lowercase().clone());
-                                                                all_suggestions.push(cmd.clone());
-                                                                if all_suggestions.len() >= 3 { break; }
+                                                                *freq.entry(cmd).or_insert(0) += 1;
                                                             }
                                                         }
+                                                        let mut freq_vec: Vec<(&String, usize)> = freq.into_iter().collect();
+                                                        freq_vec.sort_by(|a, b| b.1.cmp(&a.1));
+                                                        for (cmd, _count) in freq_vec.iter().take(8) {
+                                                            seen.insert(cmd.to_lowercase().clone());
+                                                            all_suggestions.push((*cmd).clone());
+                                                        }
 
-                                                        // 2. Local shell history files (atuin/zsh/bash/fish, top 5)
+                                                        // 2. Local shell history files (atuin/zsh/bash/fish, frecency scored)
                                                         {
                                                             let provider = rusterm_history::HybridHistoryProvider::new();
-                                                            let results = provider.search(&cmd_part, 5);
+                                                            let results = provider.search(&cmd_part, 10);
                                                             for m in results {
                                                                 if m.command.to_lowercase().starts_with(&cmd_lower)
-                                                                    && m.command.len() > cmd_part.len()
+                                                                    && m.command != cmd_part
                                                                     && !seen.contains(m.command.to_lowercase().as_str())
                                                                 {
                                                                     seen.insert(m.command.to_lowercase().clone());
@@ -723,17 +729,17 @@ pub fn App() -> Element {
                                                             }
                                                         }
 
-                                                        // 3. SQLite FTS5 (cross-session global, top 5)
+                                                        // 3. SQLite FTS5 (cross-session global, frecency scored)
                                                         {
                                                             let db_path = dirs::data_dir()
                                                                 .unwrap_or_default()
                                                                 .join("rusterm")
                                                                 .join("rusterm.db");
                                                             if let Ok(db) = rusterm_db::Database::open(Some(db_path)).await {
-                                                                if let Ok(results) = db.search_history(&cmd_part, 5).await {
+                                                                if let Ok(results) = db.search_history(&cmd_part, 10).await {
                                                                     for entry in results {
                                                                         if entry.command.to_lowercase().starts_with(&cmd_lower)
-                                                                            && entry.command.len() > cmd_part.len()
+                                                                            && entry.command != cmd_part
                                                                             && !seen.contains(entry.command.to_lowercase().as_str())
                                                                         {
                                                                             seen.insert(entry.command.to_lowercase().clone());
@@ -763,14 +769,18 @@ pub fn App() -> Element {
                                                                 });
                                                         } else {
                                                             // First suggestion suffix is the inline ghost text
-                                                            let suffix = all_suggestions[0][cmd_part.len()..].to_string();
-                                                            let show_dropdown = all_suggestions.len() > 1;
+                                                            let first = &all_suggestions[0];
+                                                            let suffix = if first.len() > cmd_part.len() {
+                                                                first[cmd_part.len()..].to_string()
+                                                            } else {
+                                                                String::new()
+                                                            };
                                                             state_for_cmd.write().sessions.iter_mut()
                                                                 .find(|t| t.id == sid_sug)
                                                                 .map(|tab| {
-                                                                    tab.suggestion = Some(suffix);
+                                                                    tab.suggestion = if suffix.is_empty() { None } else { Some(suffix) };
                                                                     tab.suggestions = all_suggestions;
-                                                                    tab.suggestion_visible = show_dropdown;
+                                                                    tab.suggestion_visible = true;
                                                                     tab.suggestion_selected = 0;
                                                                 });
                                                         }

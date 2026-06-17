@@ -364,7 +364,7 @@ pub fn TerminalView(
             return;
         }
 
-        // ── Suggestion dropdown navigation ──
+        // ── Suggestion panel navigation ──
         if current_suggestion_visible && !closure_suggestions.is_empty() {
             match &key {
                 Key::ArrowDown => {
@@ -385,7 +385,8 @@ pub fn TerminalView(
                     on_suggestion_navigate.call(Some(prev));
                     return;
                 }
-                Key::Tab | Key::Enter => {
+                Key::Tab => {
+                    // Tab accepts the selected suggestion
                     if let Some(cmd) = closure_suggestions.get(current_suggestion_selected) {
                         on_suggestion_accept.call(cmd.clone());
                     }
@@ -395,15 +396,21 @@ pub fn TerminalView(
                     on_suggestion_dismiss.call(());
                     return;
                 }
+                // Enter falls through to PTY normally (also dismisses panel)
+                Key::Enter => {
+                    on_suggestion_dismiss.call(());
+                    // Don't return — let Enter continue to PTY
+                }
                 _ => {}
             }
         }
 
-        // ── Auto-completion: accept inline suggestion with Right/End/Ctrl+E ──
-        if current_suggestion.is_some() && !current_suggestion_visible {
+        // ── Auto-completion: accept inline suggestion with Right/End/Ctrl+E/Tab ──
+        if current_suggestion.is_some() {
             let is_accept = match &key {
                 Key::ArrowRight => true,
                 Key::End => true,
+                Key::Tab => true,
                 Key::Character(s) if ctrl && !alt && !shift && s.eq_ignore_ascii_case("e") => true,
                 _ => false,
             };
@@ -843,13 +850,11 @@ pub fn TerminalView(
                 }
             }
 
-            // Suggestion dropdown
+            // Suggestion panel (Atuin-style bottom panel)
             if current_suggestion_visible && !current_suggestions.is_empty() {
                 SuggestionPopup {
                     suggestions: current_suggestions.clone(),
                     selected_index: current_suggestion_selected,
-                    cursor_row: render_output.cursor_row,
-                    cursor_col: render_output.cursor_col,
                     on_select: move |cmd: String| {
                         on_suggestion_accept.call(cmd);
                     },
