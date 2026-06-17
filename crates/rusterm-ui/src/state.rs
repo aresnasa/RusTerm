@@ -91,6 +91,12 @@ pub struct AppState {
     /// snapshot is still current before writing results.
     #[serde(skip)]
     pub suggestion_epoch: u64,
+    /// Whether the Atuin-style history search panel is visible
+    #[serde(skip)]
+    pub history_panel_visible: bool,
+    /// Full history entries loaded for the search panel
+    #[serde(skip)]
+    pub history_panel_entries: Vec<HistoryPanelEntry>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -145,8 +151,22 @@ impl Default for AppState {
             unlock_state,
             master_password_error: None,
             suggestion_epoch: 0,
+            history_panel_visible: false,
+            history_panel_entries: Vec::new(),
         }
     }
+}
+
+/// A history entry for display in the Atuin-style search panel.
+/// All data is local-only, never transmitted.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct HistoryPanelEntry {
+    pub command: String,
+    pub cwd: Option<String>,
+    pub hostname: Option<String>,
+    pub duration_ms: Option<i64>,
+    pub exit_code: Option<i32>,
+    pub timestamp: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

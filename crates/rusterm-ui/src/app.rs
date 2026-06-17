@@ -18,8 +18,9 @@ use crate::components::TerminalView;
 use crate::components::ConnectionDialog;
 use crate::components::AiPanel;
 use crate::components::MasterPasswordDialog;
+use crate::components::HistoryPanel;
 use crate::components::connection_dialog::NewConnectionForm;
-use crate::state::{AppState, Modal, SessionTab, TerminalEntry, UnlockState};
+use crate::state::{AppState, HistoryPanelEntry, Modal, SessionTab, TerminalEntry, UnlockState};
 
 fn save_config(state: &Signal<AppState>) {
     let s = state.read();
@@ -590,6 +591,7 @@ pub fn App() -> Element {
                                     let sid_for_sug_nav = tab.id.clone();
                                     let sid_for_sug_accept = tab.id.clone();
                                     let sid_for_sug_dismiss = tab.id.clone();
+                                    let sid_for_history = tab.id.clone();
                                     let senders = input_senders;
                                     let mut state_for_cmd = state;
                                     rsx! {
@@ -903,6 +905,73 @@ pub fn App() -> Element {
                                                     .find(|t| t.id == sid_for_sug_dismiss)
                                                     .map(|tab| tab.suggestion_visible = false);
                                             },
+                                            on_history_search: move |_: ()| {
+                                                // Load full history and show the panel
+                                                let mut entries: Vec<HistoryPanelEntry> = Vec::new();
+
+                                                // 1. Session command history
+                                                {
+                                                    let s = state_for_cmd.read();
+                                                    if let Some(tab) = s.sessions.iter().find(|t| t.id == sid_for_history) {
+                                                        for cmd in tab.command_history.iter().rev() {
+                                                            entries.push(HistoryPanelEntry {
+                                                                command: cmd.clone(),
+                                                                cwd: None,
+                                                                hostname: None,
+                                                                duration_ms: None,
+                                                                exit_code: None,
+                                                                timestamp: None,
+                                                            });
+                                                        }
+                                                    }
+                                                }
+
+                                                // 2. Shell history files via HybridHistoryProvider
+                                                let provider = rusterm_history::HybridHistoryProvider::new();
+                                                for m in provider.search("", 200) {
+                                                    if !entries.iter().any(|e| e.command == m.command) {
+                                                        entries.push(HistoryPanelEntry {
+                                                            command: m.command,
+                                                            cwd: m.cwd,
+                                                            hostname: m.hostname,
+                                                            duration_ms: None,
+                                                            exit_code: None,
+                                                            timestamp: m.timestamp.map(|t| t.to_rfc3339()),
+                                                        });
+                                                    }
+                                                }
+
+                                                // Show panel with what we have so far
+                                                state_for_cmd.write().history_panel_visible = true;
+                                                state_for_cmd.write().history_panel_entries = entries;
+
+                                                // 3. SQLite FTS5 (async — enrich after showing)
+                                                let mut state_async = state_for_cmd;
+                                                spawn(async move {
+                                                    let db_path = dirs::data_dir()
+                                                        .unwrap_or_default()
+                                                        .join("rusterm")
+                                                        .join("rusterm.db");
+                                                    if let Ok(db) = rusterm_db::Database::open(Some(db_path)).await {
+                                                        if let Ok(results) = db.search_history("", 200).await {
+                                                            let mut existing = state_async.write().history_panel_entries.clone();
+                                                            for entry in results {
+                                                                if !existing.iter().any(|e| e.command == entry.command) {
+                                                                    existing.push(HistoryPanelEntry {
+                                                                        command: entry.command,
+                                                                        cwd: entry.cwd,
+                                                                        hostname: entry.hostname,
+                                                                        duration_ms: entry.duration_ms,
+                                                                        exit_code: entry.exit_code,
+                                                                        timestamp: Some(entry.created_at),
+                                                                    });
+                                                                }
+                                                            }
+                                                            state_async.write().history_panel_entries = existing;
+                                                        }
+                                                    }
+                                                });
+                                            },
                                         }
                                     }
                                 }
@@ -924,6 +993,25 @@ pub fn App() -> Element {
                                 }
                             }
                             modal.set(Modal::None);
+                        },
+                    }
+                }
+
+                // History search panel overlay
+                if state.read().history_panel_visible {
+                    HistoryPanel {
+                        entries: state.read().history_panel_entries.clone(),
+                        on_accept: move |cmd: String| {
+                            let active = state.read().active_session.clone();
+                            if let Some(sid) = active {
+                                if let Some(sender) = input_senders.read().get(&sid) {
+                                    let _ = sender.send(format!("{}\n", cmd).into_bytes());
+                                }
+                            }
+                            state.write().history_panel_visible = false;
+                        },
+                        on_close: move |_: ()| {
+                            state.write().history_panel_visible = false;
                         },
                     }
                 }

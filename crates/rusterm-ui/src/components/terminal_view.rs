@@ -265,6 +265,7 @@ pub fn TerminalView(
     on_suggestion_navigate: EventHandler<Option<usize>>,
     on_suggestion_accept: EventHandler<String>,
     on_suggestion_dismiss: EventHandler<()>,
+    on_history_search: EventHandler<()>,
 ) -> Element {
     let mut focused = use_signal(|| false);
     let mut search_visible = use_signal(|| false);
@@ -289,6 +290,12 @@ pub fn TerminalView(
 
         if meta { return; }
         e.prevent_default();
+
+        // Ctrl+R: open history search panel
+        if ctrl && !shift && !alt && matches!(key, Key::Character(ref s) if s.eq_ignore_ascii_case("r")) {
+            on_history_search.call(());
+            return;
+        }
 
         // Ctrl+Shift+F: toggle search bar
         if ctrl && shift && matches!(key, Key::Character(ref s) if s == "f" || s == "F") {
