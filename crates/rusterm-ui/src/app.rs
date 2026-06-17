@@ -991,6 +991,10 @@ pub fn App() -> Element {
                             "Sessions: {state.read().sessions.len()}"
                         }
                         span {
+                            style: "color: #9ece6a; font-size: 10px; letter-spacing: 0.5px; border: 1px solid #9ece6a; border-radius: 3px; padding: 0 4px; cursor: default;",
+                            "LOCAL ONLY"
+                        }
+                        span {
                             style: "cursor: pointer; color: #7aa2f7;",
                             onclick: move |_| modal.set(Modal::AiSuggest),
                             "AI"
