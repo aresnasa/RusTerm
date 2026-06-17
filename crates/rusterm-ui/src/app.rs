@@ -587,6 +587,9 @@ pub fn App() -> Element {
                                     let sid_for_scroll_up = tab.id.clone();
                                     let sid_for_scroll_down = tab.id.clone();
                                     let sid_for_scroll_bottom = tab.id.clone();
+                                    let sid_for_sug_nav = tab.id.clone();
+                                    let sid_for_sug_accept = tab.id.clone();
+                                    let sid_for_sug_dismiss = tab.id.clone();
                                     let senders = input_senders;
                                     let mut state_for_cmd = state;
                                     rsx! {
@@ -595,6 +598,9 @@ pub fn App() -> Element {
                                             render_output: tab.render_output.clone(),
                                             version: tab.version,
                                             suggestion: tab.suggestion.clone(),
+                                            suggestions: tab.suggestions.clone(),
+                                            suggestion_selected: tab.suggestion_selected,
+                                            suggestion_visible: tab.suggestion_visible,
                                             on_resize: move |(cols, rows, pw, ph): (u16, u16, u32, u32)| {
                                                 let terminals = state.read().terminals.clone();
                                                 if let Some(handle) = terminals.get(&sid_for_resize) {
@@ -818,6 +824,49 @@ pub fn App() -> Element {
                                                         tab.version += 1;
                                                     }
                                                 }
+                                            },
+                                            on_suggestion_navigate: move |idx: Option<usize>| {
+                                                if let Some(i) = idx {
+                                                    state_for_cmd.write().sessions.iter_mut()
+                                                        .find(|t| t.id == sid_for_sug_nav)
+                                                        .map(|tab| tab.suggestion_selected = i);
+                                                }
+                                            },
+                                            on_suggestion_accept: move |cmd: String| {
+                                                // Accept: compute the suffix and send it
+                                                let suffix = {
+                                                    let terminals = state_for_cmd.read().terminals.clone();
+                                                    if let Some(handle) = terminals.get(&sid_for_sug_accept) {
+                                                        let line = handle.lock().terminal.extract_current_line();
+                                                        let cmd_part = strip_prompt(line.trim());
+                                                        if cmd.starts_with(&cmd_part) && cmd_part.len() < cmd.len() {
+                                                            cmd[cmd_part.len()..].to_string()
+                                                        } else {
+                                                            String::new()
+                                                        }
+                                                    } else {
+                                                        String::new()
+                                                    }
+                                                };
+                                                if !suffix.is_empty() {
+                                                    if let Some(sender) = senders.read().get(&sid_for_sug_accept) {
+                                                        let _ = sender.send(suffix.as_bytes().to_vec());
+                                                    }
+                                                }
+                                                // Dismiss dropdown and clear suggestion
+                                                state_for_cmd.write().sessions.iter_mut()
+                                                    .find(|t| t.id == sid_for_sug_accept)
+                                                    .map(|tab| {
+                                                        tab.suggestion_visible = false;
+                                                        tab.suggestion = None;
+                                                        tab.suggestions = Vec::new();
+                                                        tab.suggestion_selected = 0;
+                                                    });
+                                            },
+                                            on_suggestion_dismiss: move |_: ()| {
+                                                state_for_cmd.write().sessions.iter_mut()
+                                                    .find(|t| t.id == sid_for_sug_dismiss)
+                                                    .map(|tab| tab.suggestion_visible = false);
                                             },
                                         }
                                     }

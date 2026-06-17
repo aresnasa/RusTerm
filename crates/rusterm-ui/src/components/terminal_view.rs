@@ -2,11 +2,12 @@ use dioxus::prelude::*;
 
 use rusterm_core::terminal::{CellColor, CellFlags, RenderOutput, RenderRow};
 
+use crate::components::SuggestionPopup;
+
 // ── Terminal key encoding helpers ──────────────────────────────────
 
-/// Build a CSI sequence: ESC [ <param> (; <modifier>)? <final_byte>
 fn csi_seq(param: u8, modifier: Option<u8>, final_byte: u8) -> Vec<u8> {
-    let mut buf = vec![0x1b, 0x5b]; // ESC [
+    let mut buf = vec![0x1b, 0x5b];
     buf.extend_from_slice(param.to_string().as_bytes());
     if let Some(m) = modifier {
         buf.push(b';');
@@ -16,23 +17,16 @@ fn csi_seq(param: u8, modifier: Option<u8>, final_byte: u8) -> Vec<u8> {
     buf
 }
 
-/// Build a cursor key sequence with DECCKM support.
-/// In normal mode: ESC [ <param> <final>  (or with modifier: ESC [ <param> ;<mod> <final>)
-/// In application mode (DECCKM, no modifier): ESC O <final>
 fn cursor_key_seq(param: u8, final_byte: u8, app_cursor: bool, modifier: Option<u8>) -> Vec<u8> {
     if modifier.is_some() {
-        // When modifiers are present, always use CSI form with modifier
         csi_seq(param, modifier, final_byte)
     } else if app_cursor {
-        // DECCKM: ESC O <final>
         vec![0x1b, 0x4f, final_byte]
     } else {
-        // Normal: ESC [ <param> <final>
         csi_seq(param, None, final_byte)
     }
 }
 
-/// Map a character to its Ctrl control character (0x00-0x1F)
 fn ctrl_char(s: &str) -> Vec<u8> {
     match s.to_lowercase().as_str() {
         "a" => vec![0x01], "b" => vec![0x02], "c" => vec![0x03],
@@ -44,25 +38,15 @@ fn ctrl_char(s: &str) -> Vec<u8> {
         "s" => vec![0x13], "t" => vec![0x14], "u" => vec![0x15],
         "v" => vec![0x16], "w" => vec![0x17], "x" => vec![0x18],
         "y" => vec![0x19], "z" => vec![0x1a],
-        "[" => vec![0x1b],   // ESC
-        "\\" => vec![0x1c],  // FS
-        "]" => vec![0x1d],   // GS
-        "^" => vec![0x1e],   // RS
-        "_" => vec![0x1f],   // US
-        "2" | "@" => vec![0x00],  // NUL
-        "3" => vec![0x1b],        // ESC
-        "4" => vec![0x1c],        // FS
-        "5" => vec![0x1d],        // GS
-        "6" => vec![0x1e],        // RS
-        "7" | "/" => vec![0x1f],  // US
-        "8" => vec![0x7f],        // DEL
-        " " => vec![0x00],        // Ctrl+Space = NUL
+        "[" => vec![0x1b], "\\" => vec![0x1c], "]" => vec![0x1d],
+        "^" => vec![0x1e], "_" => vec![0x1f],
+        "2" | "@" => vec![0x00], "3" => vec![0x1b], "4" => vec![0x1c],
+        "5" => vec![0x1d], "6" => vec![0x1e], "7" | "/" => vec![0x1f],
+        "8" => vec![0x7f], " " => vec![0x00],
         _ => vec![],
     }
 }
 
-/// Map a physical key Code to a base character for CSI sequences.
-/// Used when the logical Key value is affected by Shift (e.g., Shift+1 = "!")
 fn code_to_char(code: &Code) -> u8 {
     match code {
         Code::Digit0 => b'0', Code::Digit1 => b'1', Code::Digit2 => b'2',
@@ -78,7 +62,8 @@ fn code_to_char(code: &Code) -> u8 {
     }
 }
 
-// Named color → CSS hex mapping (Tokyo Night theme)
+// ── Color mapping (Tokyo Night theme) ──────────────────────────────
+
 fn color_to_css(color: &CellColor) -> String {
     match color {
         CellColor::Default => String::new(),
@@ -115,26 +100,13 @@ fn named_color_hex(nc: vte::ansi::NamedColor) -> &'static str {
 
 fn indexed_color_hex(idx: u8) -> String {
     if idx < 16 {
-        // First 16 colors match the named colors
         match idx {
-            0 => "#414868".to_string(),
-            1 => "#f7768e".to_string(),
-            2 => "#9ece6a".to_string(),
-            3 => "#e0af68".to_string(),
-            4 => "#7aa2f7".to_string(),
-            5 => "#bb9af7".to_string(),
-            6 => "#7dcfff".to_string(),
-            7 => "#c0caf5".to_string(),
-            8 => "#565f89".to_string(),
-            9 => "#f7768e".to_string(),
-            10 => "#9ece6a".to_string(),
-            11 => "#e0af68".to_string(),
-            12 => "#7aa2f7".to_string(),
-            13 => "#bb9af7".to_string(),
-            14 => "#7dcfff".to_string(),
-            15 => "#c0caf5".to_string(),
-            _ => "#c0caf5".to_string(),
-        }
+            0 => "#414868", 1 => "#f7768e", 2 => "#9ece6a", 3 => "#e0af68",
+            4 => "#7aa2f7", 5 => "#bb9af7", 6 => "#7dcfff", 7 => "#c0caf5",
+            8 => "#565f89", 9 => "#f7768e", 10 => "#9ece6a", 11 => "#e0af68",
+            12 => "#7aa2f7", 13 => "#bb9af7", 14 => "#7dcfff", 15 => "#c0caf5",
+            _ => "#c0caf5",
+        }.to_string()
     } else if idx < 232 {
         let i = (idx - 16) as u32;
         let r_val = if i / 36 > 0 { 55 + (i / 36) * 40 } else { 0 };
@@ -148,87 +120,132 @@ fn indexed_color_hex(idx: u8) -> String {
     }
 }
 
-fn flags_to_style(flags: CellFlags) -> String {
+// ── HTML escape ────────────────────────────────────────────────────
+
+fn html_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+// ── Optimized row → HTML ───────────────────────────────────────────
+
+/// Build CSS style string from cell attributes.
+fn cell_style(fg: &CellColor, bg: &CellColor, flags: CellFlags) -> String {
     let mut parts = Vec::new();
-    if flags.contains(CellFlags::BOLD) {
-        parts.push("font-weight:700");
-    }
-    if flags.contains(CellFlags::ITALIC) {
-        parts.push("font-style:italic");
-    }
-    if flags.contains(CellFlags::UNDERLINE) {
-        parts.push("text-decoration:underline");
-    }
-    if flags.contains(CellFlags::STRIKETHROUGH) {
-        parts.push("text-decoration:line-through");
-    }
+    let fg_css = color_to_css(fg);
+    if !fg_css.is_empty() { parts.push(fg_css); }
+    let bg_css = color_to_css(bg);
+    if !bg_css.is_empty() { parts.push(format!("background:{}", bg_css)); }
+    if flags.contains(CellFlags::BOLD) { parts.push("font-weight:700".to_string()); }
+    if flags.contains(CellFlags::ITALIC) { parts.push("font-style:italic".to_string()); }
+    if flags.contains(CellFlags::UNDERLINE) { parts.push("text-decoration:underline".to_string()); }
+    if flags.contains(CellFlags::STRIKETHROUGH) { parts.push("text-decoration:line-through".to_string()); }
     parts.join(";")
 }
 
-struct StyledRun {
-    text: String,
-    fg_css: String,
-    bg_css: String,
-    flag_style: String,
-    is_cursor: bool,
-}
+/// Render a terminal row to an HTML string. Uses `dangerous_inner_html`
+/// for fast DOM updates — avoids Dioxus per-span VDOM diffing overhead.
+///
+/// When a suggestion is shown, we only render cells up to the cursor position,
+/// then append the suggestion right after it. Cells after the cursor are
+/// typically empty spaces and would push the suggestion to the end of the row.
+fn row_to_html(row: &RenderRow, cursor_col: Option<usize>, suggestion: Option<&str>) -> String {
+    let mut html = String::with_capacity(row.cells.len() * 4);
 
-fn row_to_runs(row: &RenderRow, cursor_col: Option<usize>) -> Vec<StyledRun> {
-    let mut runs = Vec::new();
-    let mut current = StyledRun {
-        text: String::new(),
-        fg_css: String::new(),
-        bg_css: String::new(),
-        flag_style: String::new(),
-        is_cursor: false,
+    let mut cur_fg = CellColor::Default;
+    let mut cur_bg = CellColor::Default;
+    let mut cur_flags = CellFlags::empty();
+    let mut cur_text = String::new();
+
+    let flush = |html: &mut String, text: &str, fg: &CellColor, bg: &CellColor, flags: CellFlags| {
+        if text.is_empty() { return; }
+        let style = cell_style(fg, bg, flags);
+        let escaped = html_escape(text);
+        if style.is_empty() {
+            html.push_str(&escaped);
+        } else {
+            html.push_str("<span style=\"");
+            html.push_str(&style);
+            html.push_str("\">");
+            html.push_str(&escaped);
+            html.push_str("</span>");
+        }
+    };
+
+    // If we have a suggestion, stop rendering after the cursor position
+    // so the suggestion appears immediately after the typed text.
+    let stop_at = if suggestion.is_some() {
+        cursor_col.map(|c| c + 1)
+    } else {
+        None
     };
 
     for (i, cell) in row.cells.iter().enumerate() {
-        if cell.wide_next {
-            continue; // Skip continuation cells of wide chars
+        if let Some(stop) = stop_at {
+            if i >= stop { break; }
         }
 
-        let fg = color_to_css(&cell.fg);
-        let bg = color_to_css(&cell.bg);
-        let fs = flags_to_style(cell.flags);
+        if cell.wide_next { continue; }
+
         let is_cursor = cursor_col == Some(i);
+        if is_cursor {
+            flush(&mut html, &cur_text, &cur_fg, &cur_bg, cur_flags);
+            cur_text.clear();
 
-        let same_style = fg == current.fg_css
-            && bg == current.bg_css
-            && fs == current.flag_style
-            && is_cursor == current.is_cursor;
+            let ch = if cell.character == ' ' { "&nbsp;" } else { &html_escape(&cell.character.to_string()) };
+            let base_style = cell_style(&cell.fg, &cell.bg, cell.flags);
+            let cursor_style = if base_style.is_empty() {
+                "border-left:2px solid #c0caf5;margin-left:-1px".to_string()
+            } else {
+                format!("{};border-left:2px solid #c0caf5;margin-left:-1px", base_style)
+            };
+            html.push_str("<span style=\"");
+            html.push_str(&cursor_style);
+            html.push_str("\">");
+            html.push_str(ch);
+            html.push_str("</span>");
 
-        if !current.text.is_empty() && !same_style {
-            runs.push(std::mem::replace(
-                &mut current,
-                StyledRun {
-                    text: String::new(),
-                    fg_css: String::new(),
-                    bg_css: String::new(),
-                    flag_style: String::new(),
-                    is_cursor: false,
-                },
-            ));
+            cur_fg = CellColor::Default;
+            cur_bg = CellColor::Default;
+            cur_flags = CellFlags::empty();
+            continue;
         }
 
-        current.fg_css = fg;
-        current.bg_css = bg;
-        current.flag_style = fs;
-        current.is_cursor = is_cursor;
-        current.text.push(cell.character);
-
-        // For wide chars, also push a space for visual width
-        if cell.wide {
-            current.text.push(' ');
+        let same_style = cell.fg == cur_fg && cell.bg == cur_bg && cell.flags == cur_flags;
+        if !cur_text.is_empty() && !same_style {
+            flush(&mut html, &cur_text, &cur_fg, &cur_bg, cur_flags);
+            cur_text.clear();
         }
+
+        cur_fg = cell.fg.clone();
+        cur_bg = cell.bg.clone();
+        cur_flags = cell.flags;
+        cur_text.push(cell.character);
     }
 
-    if !current.text.is_empty() {
-        runs.push(current);
+    flush(&mut html, &cur_text, &cur_fg, &cur_bg, cur_flags);
+
+    // Insert suggestion right after the cursor content
+    if let Some(sug) = suggestion {
+        html.push_str("<span style=\"color:#565f89;opacity:0.55\">");
+        html.push_str(&html_escape(sug));
+        html.push_str("</span>");
     }
 
-    runs
+    html
 }
+
+// ── TerminalView component ─────────────────────────────────────────
 
 #[component]
 pub fn TerminalView(
@@ -236,19 +253,31 @@ pub fn TerminalView(
     render_output: RenderOutput,
     version: u64,
     suggestion: Option<String>,
+    suggestions: Vec<String>,
+    suggestion_selected: usize,
+    suggestion_visible: bool,
     on_input: EventHandler<Vec<u8>>,
     on_command: EventHandler<String>,
     on_resize: EventHandler<(u16, u16, u32, u32)>,
     on_scroll_up: EventHandler<usize>,
     on_scroll_down: EventHandler<usize>,
     on_scroll_to_bottom: EventHandler<()>,
+    on_suggestion_navigate: EventHandler<Option<usize>>,
+    on_suggestion_accept: EventHandler<String>,
+    on_suggestion_dismiss: EventHandler<()>,
 ) -> Element {
     let mut focused = use_signal(|| false);
     let mut search_visible = use_signal(|| false);
     let mut search_query = use_signal(String::new);
     let mut search_match_index = use_signal(|| 0usize);
-    let mut search_matches: Signal<Vec<(usize, usize)>> = use_signal(Vec::new); // (row, col) pairs
+    let mut search_matches: Signal<Vec<(usize, usize)>> = use_signal(Vec::new);
 
+    let current_suggestion = suggestion.clone();
+    let current_suggestions = suggestions.clone();
+    let current_suggestion_visible = suggestion_visible;
+    let current_suggestion_selected = suggestion_selected;
+
+    let closure_suggestions = current_suggestions.clone();
     let handle_keydown = move |e: KeyboardEvent| {
         let key = e.key();
         let code = e.code();
@@ -258,12 +287,7 @@ pub fn TerminalView(
         let meta = mods.meta();
         let shift = mods.shift();
 
-        // Don't consume OS shortcuts (Cmd on macOS, Win on Windows, Super on Linux)
-        if meta {
-            return;
-        }
-
-        // Always prevent default to stop WebView from intercepting shortcuts
+        if meta { return; }
         e.prevent_default();
 
         // Ctrl+Shift+F: toggle search bar
@@ -277,14 +301,11 @@ pub fn TerminalView(
             return;
         }
 
-        // If search bar is visible, handle search navigation
         if search_visible() {
             if matches!(key, Key::Enter) {
-                // Enter in search: go to next match
                 let matches = search_matches();
                 if !matches.is_empty() {
-                    let idx = search_match_index();
-                    let next = (idx + 1) % matches.len();
+                    let next = (search_match_index() + 1) % matches.len();
                     search_match_index.set(next);
                 }
                 return;
@@ -296,11 +317,10 @@ pub fn TerminalView(
                 search_match_index.set(0);
                 return;
             }
-            // Don't process other keys when search is focused (let the input handle them)
             return;
         }
 
-        // Ctrl+Shift+C: copy selection to clipboard
+        // Ctrl+Shift+C: copy selection
         if ctrl && shift && matches!(key, Key::Character(ref s) if s == "c" || s == "C") {
             spawn(async move {
                 let _ = dioxus::document::eval(
@@ -310,8 +330,10 @@ pub fn TerminalView(
             return;
         }
 
-        // Ctrl+Shift+V: paste from clipboard (with bracketed paste support)
-        if ctrl && shift && matches!(key, Key::Character(ref s) if s == "v" || s == "V") {
+        // Ctrl+Shift+V / Shift+Insert: paste from clipboard
+        if (ctrl && shift && matches!(key, Key::Character(ref s) if s == "v" || s == "V"))
+            || (shift && matches!(key, Key::Insert))
+        {
             let input_cb = on_input;
             let bracketed = render_output.mode_bracketed_paste;
             spawn(async move {
@@ -335,79 +357,88 @@ pub fn TerminalView(
             return;
         }
 
-        // Shift+Insert: paste from clipboard
-        if shift && matches!(key, Key::Insert) {
-            let input_cb = on_input;
-            let bracketed = render_output.mode_bracketed_paste;
-            spawn(async move {
-                if let Ok(result) = dioxus::document::eval("navigator.clipboard.readText()").await {
-                    if let Some(text) = result.as_str() {
-                        if !text.is_empty() {
-                            let data = if bracketed {
-                                let mut buf = Vec::with_capacity(text.len() + 12);
-                                buf.extend_from_slice(b"\x1b[200~");
-                                buf.extend_from_slice(text.as_bytes());
-                                buf.extend_from_slice(b"\x1b[201~");
-                                buf
-                            } else {
-                                text.as_bytes().to_vec()
-                            };
-                            input_cb.call(data);
-                        }
+        // ── Suggestion dropdown navigation ──
+        if current_suggestion_visible && !closure_suggestions.is_empty() {
+            match &key {
+                Key::ArrowDown => {
+                    let next = if current_suggestion_selected + 1 >= closure_suggestions.len() {
+                        0
+                    } else {
+                        current_suggestion_selected + 1
+                    };
+                    on_suggestion_navigate.call(Some(next));
+                    return;
+                }
+                Key::ArrowUp => {
+                    let prev = if current_suggestion_selected == 0 {
+                        closure_suggestions.len().saturating_sub(1)
+                    } else {
+                        current_suggestion_selected - 1
+                    };
+                    on_suggestion_navigate.call(Some(prev));
+                    return;
+                }
+                Key::Tab | Key::Enter => {
+                    if let Some(cmd) = closure_suggestions.get(current_suggestion_selected) {
+                        on_suggestion_accept.call(cmd.clone());
                     }
-                }
-            });
-            return;
-        }
-
-        // Shift+PageUp/PageDown/Home/End: scroll local scrollback
-        if shift && !ctrl && !alt {
-            match key {
-                Key::PageUp => {
-                    on_scroll_up.call(10);
                     return;
                 }
-                Key::PageDown => {
-                    on_scroll_down.call(10);
-                    return;
-                }
-                Key::Home => {
-                    on_scroll_up.call(render_output.scrollback_total);
-                    return;
-                }
-                Key::End => {
-                    on_scroll_to_bottom.call(());
+                Key::Escape => {
+                    on_suggestion_dismiss.call(());
                     return;
                 }
                 _ => {}
             }
         }
 
-        // Detect Enter key to capture command
-        let is_enter = !ctrl && !alt && matches!(key, Key::Enter);
+        // ── Auto-completion: accept inline suggestion with Right/End/Ctrl+E ──
+        if current_suggestion.is_some() && !current_suggestion_visible {
+            let is_accept = match &key {
+                Key::ArrowRight => true,
+                Key::End => true,
+                Key::Character(s) if ctrl && !alt && !shift && s.eq_ignore_ascii_case("e") => true,
+                _ => false,
+            };
+            if is_accept {
+                if let Some(ref sug) = current_suggestion {
+                    on_input.call(sug.as_bytes().to_vec());
+                    return;
+                }
+            }
+        }
 
+        // Shift+PageUp/PageDown/Home/End: scroll local scrollback
+        if shift && !ctrl && !alt {
+            match key {
+                Key::PageUp => { on_scroll_up.call(10); return; }
+                Key::PageDown => { on_scroll_down.call(10); return; }
+                Key::Home => { on_scroll_up.call(render_output.scrollback_total); return; }
+                Key::End => { on_scroll_to_bottom.call(()); return; }
+                _ => {}
+            }
+        }
+
+        let is_enter = !ctrl && !alt && matches!(key, Key::Enter);
         let app_cursor = render_output.mode_cursor_keys;
 
-        // Compute xterm CSI modifier number from modifier key state
         let modifier: Option<u8> = match (ctrl, alt, shift) {
             (false, false, false) => None,
-            (false, false, true)  => Some(2),  // Shift
-            (false, true,  false) => Some(3),  // Alt
-            (false, true,  true)  => Some(4),  // Alt+Shift
-            (true,  false, false) => Some(5),  // Ctrl
-            (true,  false, true)  => Some(6),  // Ctrl+Shift
-            (true,  true,  false) => Some(7),  // Ctrl+Alt
-            (true,  true,  true)  => Some(8),  // Ctrl+Alt+Shift
+            (false, false, true)  => Some(2),
+            (false, true,  false) => Some(3),
+            (false, true,  true)  => Some(4),
+            (true,  false, false) => Some(5),
+            (true,  false, true)  => Some(6),
+            (true,  true,  false) => Some(7),
+            (true,  true,  true)  => Some(8),
         };
 
         let data: Vec<u8> = match key {
-            // ── Arrow keys (with DECCKM and modifier support) ──
             Key::ArrowUp    => cursor_key_seq(1, b'A', app_cursor, modifier),
             Key::ArrowDown  => cursor_key_seq(1, b'B', app_cursor, modifier),
             Key::ArrowRight => cursor_key_seq(1, b'C', app_cursor, modifier),
             Key::ArrowLeft  => cursor_key_seq(1, b'D', app_cursor, modifier),
 
-            // ── Navigation keys (with modifier support) ──
             Key::Home     => csi_seq(1, modifier, b'H'),
             Key::End      => csi_seq(1, modifier, b'F'),
             Key::Insert   => csi_seq(2, modifier, b'~'),
@@ -415,13 +446,11 @@ pub fn TerminalView(
             Key::PageUp   => csi_seq(5, modifier, b'~'),
             Key::PageDown => csi_seq(6, modifier, b'~'),
 
-            // ── Function keys F1-F4 (with DECCKM and modifier support) ──
             Key::F1 => cursor_key_seq(1, b'P', app_cursor, modifier),
             Key::F2 => cursor_key_seq(1, b'Q', app_cursor, modifier),
             Key::F3 => cursor_key_seq(1, b'R', app_cursor, modifier),
             Key::F4 => cursor_key_seq(1, b'S', app_cursor, modifier),
 
-            // ── Function keys F5-F12 (CSI form with modifier support) ──
             Key::F5  => csi_seq(15, modifier, b'~'),
             Key::F6  => csi_seq(17, modifier, b'~'),
             Key::F7  => csi_seq(18, modifier, b'~'),
@@ -431,31 +460,21 @@ pub fn TerminalView(
             Key::F11 => csi_seq(23, modifier, b'~'),
             Key::F12 => csi_seq(24, modifier, b'~'),
 
-            // ── Ctrl-only + character keys: generate control characters ──
-            Key::Character(ref s) if ctrl && !alt && !shift => {
-                ctrl_char(s)
-            }
-
-            // ── Alt+character: ESC prefix ──
+            Key::Character(ref s) if ctrl && !alt && !shift => ctrl_char(s),
             Key::Character(ref s) if alt && !ctrl => {
                 let mut buf = vec![0x1b];
                 buf.extend_from_slice(s.as_bytes());
                 buf
             }
-
-            // ── Ctrl+Shift+character: CSI 1;6 form ──
             Key::Character(ref s) if ctrl && shift && !alt => {
                 let c = s.chars().next().unwrap_or('A');
                 if c.is_ascii_alphabetic() {
                     csi_seq(1, Some(6), c as u8)
                 } else {
-                    // Use physical key code for numbers/symbols
                     let base = code_to_char(&code);
                     csi_seq(1, Some(6), base)
                 }
             }
-
-            // ── Ctrl+Alt+character: ESC + control character ──
             Key::Character(ref s) if ctrl && alt && !shift => {
                 let ctrl_ch = ctrl_char(s);
                 if !ctrl_ch.is_empty() && ctrl_ch[0] != 0x1b {
@@ -467,22 +486,17 @@ pub fn TerminalView(
                 }
             }
 
-            // ── Special keys with modifier support ──
             Key::Enter     => if alt { vec![0x1b, 0x0d] } else { vec![0x0d] },
             Key::Backspace => if alt { vec![0x1b, 0x7f] } else { vec![0x7f] },
             Key::Tab       => vec![0x09],
             Key::Escape    => vec![0x1b],
 
-            // ── Plain character input ──
             Key::Character(ref s) => s.as_bytes().to_vec(),
-
             _ => vec![],
         };
 
         if !data.is_empty() {
-            if is_enter {
-                on_command.call(version.to_string());
-            }
+            if is_enter { on_command.call(version.to_string()); }
             on_input.call(data);
         }
     };
@@ -490,7 +504,6 @@ pub fn TerminalView(
     let container_id = format!("terminal-input-{session_id}");
     let scroll_id = format!("terminal-scroll-{session_id}");
 
-    // Auto-focus when session changes
     let sid_for_focus = session_id.clone();
     use_effect(move || {
         let focus_sid = sid_for_focus.clone();
@@ -503,8 +516,6 @@ pub fn TerminalView(
         });
     });
 
-    // Window focus/blur handler: re-focus terminal only when no other
-    // interactive element (input, button, dialog) has focus
     let sid_for_window_focus = session_id.clone();
     use_effect(move || {
         let cid = format!("terminal-input-{sid_for_window_focus}");
@@ -519,20 +530,14 @@ pub fn TerminalView(
                 el._windowFocusHandler = function() {{
                     const active = document.activeElement;
                     const isInteractive = active && (
-                        active.tagName === 'INPUT' ||
-                        active.tagName === 'BUTTON' ||
-                        active.tagName === 'SELECT' ||
-                        active.tagName === 'TEXTAREA' ||
+                        active.tagName === 'INPUT' || active.tagName === 'BUTTON' ||
+                        active.tagName === 'SELECT' || active.tagName === 'TEXTAREA' ||
                         active.closest('[role="dialog"]')
                     );
-                    if (!isInteractive) {{
-                        el.focus();
-                    }}
+                    if (!isInteractive) el.focus();
                 }};
                 el._windowBlurHandler = function() {{
-                    if (document.activeElement === el) {{
-                        el.blur();
-                    }}
+                    if (document.activeElement === el) el.blur();
                 }};
                 window.addEventListener('focus', el._windowFocusHandler);
                 window.addEventListener('blur', el._windowBlurHandler);
@@ -543,7 +548,6 @@ pub fn TerminalView(
         });
     });
 
-    // Resize: poll DOM for container size and call on_resize directly
     let resize_sid = session_id.clone();
     let resize_on_resize = on_resize;
     let _resize_future = use_future(move || {
@@ -555,16 +559,13 @@ pub fn TerminalView(
             let cid = format!("terminal-input-{sid}");
             loop {
                 tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-
                 let measure_cid = cid.clone();
                 let result = dioxus::document::eval(&format!(
-                    "return (function() {{ const el = document.getElementById('{measure_cid}'); if (!el) return 'no-el'; const rect = el.getBoundingClientRect(); if (rect.width <= 0 || rect.height <= 0) return 'zero'; const cs = getComputedStyle(el); const padH = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight); const padV = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom); const bw = parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth); const bh = parseFloat(cs.borderTopWidth) + parseFloat(cs.borderBottomWidth); const w = rect.width - padH - bw; const h = rect.height - padV - bh; if (w <= 0 || h <= 0) return 'small'; const test = document.createElement('span'); test.textContent = 'M'; test.style.cssText = 'font-family:JetBrains Mono,Fira Code,Cascadia Code,monospace;font-size:13px;line-height:1.5;position:absolute;visibility:hidden;white-space:pre;'; document.body.appendChild(test); const tr = test.getBoundingClientRect(); document.body.removeChild(test); const cw = Math.max(1, tr.width); const ch = Math.max(1, tr.height); const cols = Math.max(1, Math.floor(w / cw)); const rows = Math.max(1, Math.floor(h / ch)); return cols + ',' + rows + ',' + cw.toFixed(2) + ',' + ch.toFixed(2); }})()"
+                    "return (function() {{ const el = document.getElementById('{measure_cid}'); if (!el) return 'no-el'; const rect = el.getBoundingClientRect(); if (rect.width <= 0 || rect.height <= 0) return 'zero'; const cs = getComputedStyle(el); const padH = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight); const padV = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom); const bw = parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth); const bh = parseFloat(cs.borderTopWidth) + parseFloat(cs.borderBottomWidth); const w = rect.width - padH - bw; const h = rect.height - padV - bh; if (w <= 0 || h <= 0) return 'small'; const test = document.createElement('span'); test.textContent = 'M'; test.style.cssText = 'font-family:JetBrains Mono,Fira Code,Cascadia Code,monospace;font-size:13px;line-height:1.5;position:absolute;visibility:hidden;white-space:pre;'; document.body.appendChild(test); const tr = test.getBoundingClientRect(); document.body.removeChild(test); const cw = Math.max(1, tr.width); const ch = Math.max(1, tr.height); const cols = Math.max(1, Math.floor(w / cw)); const rows = Math.max(1, Math.floor((h - 1) / ch)); return cols + ',' + rows + ',' + cw.toFixed(2) + ',' + ch.toFixed(2); }})()"
                 )).await;
                 if let Ok(value) = result {
                     if let Some(s) = value.as_str() {
-                        if s == "no-el" || s == "zero" || s == "small" || s.is_empty() {
-                            continue;
-                        }
+                        if s == "no-el" || s == "zero" || s == "small" || s.is_empty() { continue; }
                         let parts: Vec<&str> = s.split(',').collect();
                         if parts.len() >= 2 {
                             if let (Ok(cols), Ok(rows)) = (parts[0].parse::<u16>(), parts[1].parse::<u16>()) {
@@ -585,33 +586,16 @@ pub fn TerminalView(
         }
     });
 
-    // Auto-scroll to cursor only when at bottom (scroll_offset == 0) and new output arrives
-    let sid_for_scroll = session_id.clone();
-    let current_scroll_offset = render_output.scrollback_offset;
-    use_effect(move || {
-        let _ = version;
-        // Only auto-scroll when user is at the bottom (not scrolled up)
-        if current_scroll_offset > 0 {
-            return;
-        }
-        let sid = sid_for_scroll.clone();
-        let cid = format!("terminal-input-{sid}");
-        spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(16)).await;
-            let _ = dioxus::document::eval(&format!(
-                "document.getElementById('{cid}')?.scrollTo({{ top: 999999, behavior: 'smooth' }})"
-            )).await;
-        });
-    });
-
     let cursor_row = render_output.cursor_row;
     let cursor_col = render_output.cursor_col;
     let cursor_visible = render_output.cursor_visible;
+    let line_number_start = render_output.line_number_start;
+    let total_rows = render_output.rows.len();
 
-    // Recompute search matches when query or render output changes
+    // Recompute search matches
     {
         let query = search_query();
-        let _ = version; // depend on render output changes
+        let _ = version;
         if !query.is_empty() {
             let q = query.to_lowercase();
             let mut found = Vec::new();
@@ -640,6 +624,50 @@ pub fn TerminalView(
         });
     };
 
+    // Gutter width in ch units based on max line number digit count
+    let max_line_num = line_number_start + total_rows;
+    let gutter_width = if max_line_num < 10 { 3 }
+        else if max_line_num < 100 { 4 }
+        else if max_line_num < 1000 { 5 }
+        else if max_line_num < 10000 { 6 }
+        else { 7 };
+
+    // Pre-render line numbers as a single HTML block (gutter column)
+    let gutter_html = render_output.rows.iter().enumerate().map(|(row_idx, _)| {
+        let line_num = line_number_start + row_idx;
+        format!("<div style=\"height:1.5em;line-height:1.5\">{}</div>", line_num)
+    }).collect::<Vec<_>>().join("");
+
+    // Pre-render content rows to HTML (no line numbers, no flex per-row)
+    let row_htmls: Vec<String> = render_output.rows.iter().enumerate().map(|(row_idx, row)| {
+        let is_cursor_row = row_idx == cursor_row && cursor_visible;
+        let cur_col = if is_cursor_row { Some(cursor_col) } else { None };
+        let sug = if is_cursor_row { suggestion.as_deref() } else { None };
+
+        let sm = search_matches();
+        let sidx = search_match_index();
+        let is_current_match = sm.get(sidx).map(|(r, _)| *r == row_idx).unwrap_or(false);
+        let is_search_match = sm.iter().any(|(r, _)| *r == row_idx);
+
+        let row_bg = if is_current_match {
+            "background:rgba(122,162,247,0.2);"
+        } else if is_search_match {
+            "background:rgba(122,162,247,0.08);"
+        } else {
+            ""
+        };
+
+        let content_html = row_to_html(row, cur_col, sug);
+
+        let mut html = String::with_capacity(content_html.len() + 60);
+        html.push_str("<div style=\"white-space:pre;line-height:1.5;");
+        html.push_str(row_bg);
+        html.push_str("\">");
+        html.push_str(&content_html);
+        html.push_str("</div>");
+        html
+    }).collect();
+
     rsx! {
         div {
             id: "{container_id}",
@@ -647,8 +675,8 @@ pub fn TerminalView(
                 position: absolute;
                 left: 0; right: 0; top: 0; bottom: 0;
                 background: #1a1b26;
-                padding: 8px 12px;
-                overflow-y: auto;
+                padding: 8px 12px 4px 4px;
+                overflow-y: hidden;
                 font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
                 font-size: 13px;
                 line-height: 1.5;
@@ -658,8 +686,9 @@ pub fn TerminalView(
                 box-sizing: border-box;
                 -webkit-appearance: none;
                 appearance: none;
+                scrollbar-width: none;
+                -ms-overflow-style: none;
             ",
-            // Force-remove macOS focus ring via inline JS after mount
             onmounted: move |_| {
                 let cid = container_id.clone();
                 spawn(async move {
@@ -699,8 +728,8 @@ pub fn TerminalView(
                     rsx! {
                         div {
                             style: "
-                                position: sticky;
-                                top: 0;
+                                position: absolute;
+                                top: 0; left: 0; right: 0;
                                 z-index: 10;
                                 display: flex;
                                 align-items: center;
@@ -747,14 +776,7 @@ pub fn TerminalView(
                             }
                             span { style: "color: #565f89; font-size: 11px; white-space: nowrap; min-width: 60px; text-align: right;", "{match_info}" }
                             button {
-                                style: "
-                                    background: none;
-                                    border: none;
-                                    color: #565f89;
-                                    cursor: pointer;
-                                    font-size: 14px;
-                                    padding: 0 4px;
-                                ",
+                                style: "background:none;border:none;color:#565f89;cursor:pointer;font-size:14px;padding:0 4px;",
                                 onclick: move |_| {
                                     let matches = search_matches();
                                     if !matches.is_empty() {
@@ -762,17 +784,10 @@ pub fn TerminalView(
                                         search_match_index.set(next);
                                     }
                                 },
-                                "\u{25BC}" // ▼
+                                "\u{25BC}"
                             }
                             button {
-                                style: "
-                                    background: none;
-                                    border: none;
-                                    color: #565f89;
-                                    cursor: pointer;
-                                    font-size: 14px;
-                                    padding: 0 4px;
-                                ",
+                                style: "background:none;border:none;color:#565f89;cursor:pointer;font-size:14px;padding:0 4px;",
                                 onclick: move |_| {
                                     let matches = search_matches();
                                     if !matches.is_empty() {
@@ -780,99 +795,60 @@ pub fn TerminalView(
                                         search_match_index.set(prev);
                                     }
                                 },
-                                "\u{25B2}" // ▲
+                                "\u{25B2}"
                             }
                             button {
-                                style: "
-                                    background: none;
-                                    border: none;
-                                    color: #565f89;
-                                    cursor: pointer;
-                                    font-size: 14px;
-                                    padding: 0 4px;
-                                ",
+                                style: "background:none;border:none;color:#565f89;cursor:pointer;font-size:14px;padding:0 4px;",
                                 onclick: move |_| {
                                     search_visible.set(false);
                                     search_query.set(String::new());
                                     search_matches.set(Vec::new());
                                     search_match_index.set(0);
                                 },
-                                "\u{2715}" // ✕
+                                "\u{2715}"
                             }
                         }
                     }
                 }
             }
 
+            // Two-column layout: line number gutter + terminal content
             div {
                 id: "{scroll_id}",
-                style: "",
+                style: "display:flex;",
 
-                for (row_idx, row) in render_output.rows.iter().enumerate() {
-                    {
-                        let is_cursor_row = row_idx == cursor_row && cursor_visible;
-                        let cur_col = if is_cursor_row { Some(cursor_col) } else { None };
-                        let runs = row_to_runs(row, cur_col);
-                        let row_key = format!("{session_id}-{row_idx}");
-                        let inline_suggestion = if is_cursor_row { suggestion.clone() } else { None };
+                // Line number gutter
+                div {
+                    style: "flex-shrink:0;width:{gutter_width}ch;padding-right:8px;text-align:right;color:#3b4261;user-select:none;line-height:1.5;",
+                    dangerous_inner_html: "{gutter_html}",
+                }
 
-                        // Check if this row has a search match
-                        let sm = search_matches();
-                        let sidx = search_match_index();
-                        let is_search_match = sm.iter().any(|(r, _)| *r == row_idx);
-                        let is_current_match = sm.get(sidx).map(|(r, _)| *r == row_idx).unwrap_or(false);
-                        let row_bg = if is_current_match {
-                            "background:rgba(122,162,247,0.2);"
-                        } else if is_search_match {
-                            "background:rgba(122,162,247,0.08);"
-                        } else {
-                            ""
-                        };
+                // Terminal content
+                div {
+                    style: "flex:1;min-width:0;overflow:hidden;",
 
-                        rsx! {
-                            div {
-                                key: "{row_key}",
-                                style: "white-space: pre; line-height: 1.5; width: 100%;{row_bg}",
-
-                                for (run_idx, run) in runs.iter().enumerate() {
-                                    {
-                                        let mut style_parts = vec![];
-                                        if !run.fg_css.is_empty() {
-                                            style_parts.push(format!("color:{}", run.fg_css));
-                                        }
-                                        if !run.bg_css.is_empty() {
-                                            style_parts.push(format!("background:{}", run.bg_css));
-                                        }
-                                        if !run.flag_style.is_empty() {
-                                            style_parts.push(run.flag_style.clone());
-                                        }
-                                        if run.is_cursor {
-                                            style_parts.push("border-left:2px solid #c0caf5;margin-left:-1px".to_string());
-                                        }
-                                        let style = style_parts.join(";");
-                                        let text = run.text.clone();
-                                        let run_key = format!("{row_key}-{run_idx}");
-
-                                        rsx! {
-                                            span {
-                                                key: "{run_key}",
-                                                style: "{style}",
-                                                "{text}"
-                                            }
-                                        }
-                                    }
-                                }
-
-                                // Inline suggestion (Fish-shell style)
-                                if let Some(ref sug) = inline_suggestion {
-                                    span {
-                                        style: "color:#565f89;opacity:0.6;",
-                                        "{sug}"
-                                    }
-                                }
-                            }
+                    for (row_idx, row_html) in row_htmls.iter().enumerate() {
+                        div {
+                            key: "{session_id}-{row_idx}",
+                            dangerous_inner_html: "{row_html}",
                         }
                     }
+                }
+            }
+
+            // Suggestion dropdown
+            if current_suggestion_visible && !current_suggestions.is_empty() {
+                SuggestionPopup {
+                    suggestions: current_suggestions.clone(),
+                    selected_index: current_suggestion_selected,
+                    cursor_row: render_output.cursor_row,
+                    cursor_col: render_output.cursor_col,
+                    on_select: move |cmd: String| {
+                        on_suggestion_accept.call(cmd);
+                    },
+                    on_dismiss: move |_: ()| {
+                        on_suggestion_dismiss.call(());
+                    },
                 }
             }
         }
