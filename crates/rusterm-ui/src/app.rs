@@ -661,7 +661,12 @@ pub fn App() -> Element {
                                                         if line.is_empty() {
                                                             state_for_cmd.write().sessions.iter_mut()
                                                                 .find(|t| t.id == sid_sug)
-                                                                .map(|tab| tab.suggestion = None);
+                                                                .map(|tab| {
+                                                                    tab.suggestion = None;
+                                                                    tab.suggestions = Vec::new();
+                                                                    tab.suggestion_visible = false;
+                                                                    tab.suggestion_selected = 0;
+                                                                });
                                                             return;
                                                         }
 
@@ -671,76 +676,101 @@ pub fn App() -> Element {
                                                         if cmd_part.is_empty() {
                                                             state_for_cmd.write().sessions.iter_mut()
                                                                 .find(|t| t.id == sid_sug)
-                                                                .map(|tab| tab.suggestion = None);
+                                                                .map(|tab| {
+                                                                    tab.suggestion = None;
+                                                                    tab.suggestions = Vec::new();
+                                                                    tab.suggestion_visible = false;
+                                                                    tab.suggestion_selected = 0;
+                                                                });
                                                             return;
                                                         }
 
                                                         let cmd_lower = cmd_part.to_lowercase();
-                                                        let mut suggestion: Option<String> = None;
+                                                        let mut all_suggestions: Vec<String> = Vec::new();
+                                                        let mut seen = std::collections::HashSet::new();
 
-                                                        // 1. Search session command history (most relevant)
+                                                        // 1. Session command history (most recent, prefix match, top 3)
                                                         let session_hist = state_for_cmd.read().sessions
                                                             .iter().find(|t| t.id == sid_sug)
                                                             .map(|t| t.command_history.clone())
                                                             .unwrap_or_default();
 
-                                                        if !session_hist.is_empty() {
-                                                            // Search in reverse (most recent first), pick shortest non-trivial match
-                                                            let mut best: Option<&String> = None;
-                                                            let mut best_len = usize::MAX;
-                                                            for cmd in session_hist.iter().rev() {
-                                                                if cmd.to_lowercase().starts_with(&cmd_lower)
-                                                                    && cmd.len() > cmd_part.len()
-                                                                    && cmd.len() < best_len
-                                                                {
-                                                                    best = Some(cmd);
-                                                                    best_len = cmd.len();
-                                                                }
-                                                            }
-                                                            if let Some(cmd) = best {
-                                                                suggestion = Some(cmd[cmd_part.len()..].to_string());
+                                                        for cmd in session_hist.iter().rev() {
+                                                            if cmd.to_lowercase().starts_with(&cmd_lower)
+                                                                && cmd.len() > cmd_part.len()
+                                                                && !seen.contains(cmd.to_lowercase().as_str())
+                                                            {
+                                                                seen.insert(cmd.to_lowercase().clone());
+                                                                all_suggestions.push(cmd.clone());
+                                                                if all_suggestions.len() >= 3 { break; }
                                                             }
                                                         }
 
-                                                        // 2. Search local shell history (atuin/zsh/bash/fish)
-                                                        if suggestion.is_none() {
+                                                        // 2. Local shell history files (atuin/zsh/bash/fish, top 5)
+                                                        {
                                                             let provider = rusterm_history::HybridHistoryProvider::new();
-                                                            if let Some(entry) = provider.search(&cmd_part, 5).first() {
-                                                                if entry.command.starts_with(&cmd_part) {
-                                                                    suggestion = Some(entry.command[cmd_part.len()..].to_string());
+                                                            let results = provider.search(&cmd_part, 5);
+                                                            for m in results {
+                                                                if m.command.to_lowercase().starts_with(&cmd_lower)
+                                                                    && m.command.len() > cmd_part.len()
+                                                                    && !seen.contains(m.command.to_lowercase().as_str())
+                                                                {
+                                                                    seen.insert(m.command.to_lowercase().clone());
+                                                                    all_suggestions.push(m.command);
                                                                 }
                                                             }
                                                         }
 
-                                                        // 3. Fall back to rusterm-db
-                                                        if suggestion.is_none() {
+                                                        // 3. SQLite FTS5 (cross-session global, top 5)
+                                                        {
                                                             let db_path = dirs::data_dir()
                                                                 .unwrap_or_default()
                                                                 .join("rusterm")
                                                                 .join("rusterm.db");
                                                             if let Ok(db) = rusterm_db::Database::open(Some(db_path)).await {
                                                                 if let Ok(results) = db.search_history(&cmd_part, 5).await {
-                                                                    if let Some(entry) = results.first() {
-                                                                        if entry.command.starts_with(&cmd_part) {
-                                                                            suggestion = Some(entry.command[cmd_part.len()..].to_string());
+                                                                    for entry in results {
+                                                                        if entry.command.to_lowercase().starts_with(&cmd_lower)
+                                                                            && entry.command.len() > cmd_part.len()
+                                                                            && !seen.contains(entry.command.to_lowercase().as_str())
+                                                                        {
+                                                                            seen.insert(entry.command.to_lowercase().clone());
+                                                                            all_suggestions.push(entry.command);
                                                                         }
                                                                     }
                                                                 }
                                                             }
                                                         }
 
+                                                        // Check epoch again before writing results
                                                         if state_for_cmd.read().suggestion_epoch != epoch {
                                                             return;
                                                         }
 
-                                                        if let Some(suffix) = suggestion {
+                                                        // Truncate to 8 suggestions max
+                                                        all_suggestions.truncate(8);
+
+                                                        if all_suggestions.is_empty() {
                                                             state_for_cmd.write().sessions.iter_mut()
                                                                 .find(|t| t.id == sid_sug)
-                                                                .map(|tab| tab.suggestion = Some(suffix));
+                                                                .map(|tab| {
+                                                                    tab.suggestion = None;
+                                                                    tab.suggestions = Vec::new();
+                                                                    tab.suggestion_visible = false;
+                                                                    tab.suggestion_selected = 0;
+                                                                });
                                                         } else {
+                                                            // First suggestion suffix is the inline ghost text
+                                                            let suffix = all_suggestions[0][cmd_part.len()..].to_string();
+                                                            let show_dropdown = all_suggestions.len() > 1;
                                                             state_for_cmd.write().sessions.iter_mut()
                                                                 .find(|t| t.id == sid_sug)
-                                                                .map(|tab| tab.suggestion = None);
+                                                                .map(|tab| {
+                                                                    tab.suggestion = Some(suffix);
+                                                                    tab.suggestions = all_suggestions;
+                                                                    tab.suggestion_visible = show_dropdown;
+                                                                    tab.suggestion_selected = 0;
+                                                                });
                                                         }
                                                     });
                                                 }
@@ -749,7 +779,12 @@ pub fn App() -> Element {
                                                 // Clear suggestion on Enter
                                                 state_for_cmd.write().sessions.iter_mut()
                                                     .find(|t| t.id == sid_for_cmd)
-                                                    .map(|tab| tab.suggestion = None);
+                                                    .map(|tab| {
+                                                        tab.suggestion = None;
+                                                        tab.suggestions = Vec::new();
+                                                        tab.suggestion_visible = false;
+                                                        tab.suggestion_selected = 0;
+                                                    });
 
                                                 let terminals = state_for_cmd.read().terminals.clone();
                                                 if let Some(handle) = terminals.get(&sid_for_cmd) {
