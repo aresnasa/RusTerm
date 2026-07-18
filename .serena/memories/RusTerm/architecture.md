@@ -48,8 +48,14 @@
 
 ## Tests
 
-- 115 tests pass (workspace, no features): 23 in rusterm-db, 3 in rusterm-history (NEW), 9 in rusterm-ui state.rs, 14 in rusterm-analytics (NEW), rest in other crates.
-- 115 tests also pass with `--features rusterm-ui/analytics`.
+- 116 tests pass (workspace, no features): 23 in rusterm-db, 3 in rusterm-history, 10 in rusterm-ui state.rs (NEW: `suggestion_popup_reappears_after_delete_when_history_has_matches`), 14 in rusterm-analytics, rest in other crates.
+- 116 tests also pass with `--features rusterm-ui/analytics`.
+
+## Suggestion-query tracing (added 2026-07-18)
+
+- `[SUGGESTION-QUERY] STALE — spawn epoch=N but current=M (skipped)` — logged in the `on_input` spawn when the epoch check fails (a newer keystroke or the delete handler bumped the epoch).
+- `[SUGGESTION-QUERY] session=… line empty — hiding popup` / `cmd_part empty (line=…) — hiding popup` — early-return paths.
+- `[SUGGESTION-QUERY] session=… cmd_part=… epoch=… current_epoch=… results=… recent_failed=…` — the main outcome log, emitted right before the popup is shown/hidden. Use this to diagnose "popup doesn't appear after delete": if `results=[]`, the history sources legitimately had no match (after filtering); if `results` is non-empty but the popup still doesn't show, there's a render/Signal issue.
 
 ## Icon Assets
 

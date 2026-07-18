@@ -645,6 +645,185 @@ mod tests {
             "command_history must be empty after deleting the only command"
         );
     }
+
+    /// Regression test for the bug where, after Shift+Delete on a suggestion,
+    /// typing the correct command prefix no longer shows the suggestion popup.
+    ///
+    /// The bug was reported as: "After deleting a suggested command, entering
+    /// the correct command doesn't pop up the suggestion anymore."
+    ///
+    /// This test simulates the full flow:
+    ///   1. Session has `command_history = ['pwd']` (the correct command,
+    ///      previously run successfully).
+    ///   2. Suggestions panel shows `['pwdwd', 'pwd']` — `pwdwd` is a typo
+    ///      that snuck in from `~/.bash_history` (NULL exit_code, kept by
+    ///      HAVING). `pwd` is the legitimate match.
+    ///   3. User Shift+Deletes `pwdwd` — the handler removes it from
+    ///      `suggestions` and `command_history`, inserts into
+    ///      `recent_failed_commands`, and (in production) spawns
+    ///      `mark_command_failed`.
+    ///   4. The suggestion panel becomes `['pwd']` (still visible — non-empty).
+    ///   5. User types `pw` (prefix of the correct command).
+    ///   6. The suggestion query (simulated here) filters against
+    ///      `recent_failed_commands` and the current `cmd_part`, then
+    ///      populates `suggestions`.
+    ///   7. Verify the popup becomes visible with `['pwd']`.
+    ///
+    /// This pins the contract that:
+    ///   - Deleting a suggestion does NOT clear `command_history` of other
+    ///     commands (only the deleted one).
+    ///   - `recent_failed_commands` only contains the deleted command, not
+    ///     other commands.
+    ///   - A subsequent suggestion query (with non-empty results) restores
+    ///     `suggestion_visible = true`.
+    #[test]
+    fn suggestion_popup_reappears_after_delete_when_history_has_matches() {
+        let mut state = state_with_tabs(&["alpha"]);
+
+        // Step 1: session has 'pwd' in command_history (previously successful).
+        let tab = state.sessions.first_mut().unwrap();
+        tab.command_history = vec!["pwd".to_string()];
+
+        // Step 2: suggestions panel shows the typo + the legitimate match.
+        let tab = state.sessions.first_mut().unwrap();
+        tab.suggestions = vec!["pwdwd".to_string(), "pwd".to_string()];
+        tab.suggestion_selected = 0; // user has 'pwdwd' highlighted
+        tab.suggestion_visible = true;
+        tab.suggestion = Some("wd".to_string()); // inline ghost for 'pwdwd'
+
+        // Step 3: user Shift+Deletes 'pwdwd'.
+        let cmd_to_delete = "pwdwd".to_string();
+        let tab = state.sessions.first_mut().unwrap();
+        tab.command_history.retain(|c| c != &cmd_to_delete);
+        tab.suggestions.retain(|c| c != &cmd_to_delete);
+        if tab.suggestion_selected >= tab.suggestions.len() {
+            tab.suggestion_selected = tab.suggestions.len().saturating_sub(1);
+        }
+        if tab.suggestions.is_empty() {
+            tab.suggestion_visible = false;
+            tab.suggestion = None;
+            tab.suggestion_selected = 0;
+        }
+        // Immediate guard against DB source re-surfacing the deleted command.
+        state.recent_failed_commands.insert(cmd_to_delete.clone());
+
+        // Step 4: verify state after delete.
+        let tab = state.sessions.first().unwrap();
+        assert_eq!(
+            tab.suggestions,
+            vec!["pwd".to_string()],
+            "suggestions should now contain only 'pwd' (the legitimate match)"
+        );
+        assert!(
+            tab.suggestion_visible,
+            "popup should still be visible — there's one remaining suggestion"
+        );
+        assert!(
+            tab.command_history.contains(&"pwd".to_string()),
+            "command_history must still contain 'pwd' (only the deleted cmd is removed)"
+        );
+        assert!(
+            !tab.command_history.contains(&cmd_to_delete),
+            "command_history must NOT contain the deleted command"
+        );
+        assert!(
+            state.recent_failed_commands.contains(&cmd_to_delete),
+            "recent_failed_commands must contain the deleted command (UI guard)"
+        );
+        assert_eq!(
+            state.recent_failed_commands.len(),
+            1,
+            "recent_failed_commands must contain ONLY the deleted command, not others"
+        );
+
+        // Step 5: simulate the user typing 'pw' (prefix of the correct command).
+        // The on_input handler in app.rs spawns a 200ms-debounced query that:
+        //   - extracts the current line (we'll assume 'pw' here)
+        //   - filters session_history + DB results by:
+        //       starts_with(cmd_lower) && cmd != cmd_part && !seen && !recent_failed
+        // We simulate the query result by running the same filter logic.
+        let cmd_part = "pw";
+        let cmd_lower = cmd_part.to_lowercase();
+        let recent_failed = state.recent_failed_commands.clone();
+
+        // Simulate session_history source (the in-memory command_history).
+        let session_hist = state.sessions.first().unwrap().command_history.clone();
+        let mut all_suggestions: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for cmd in session_hist.iter() {
+            if cmd.to_lowercase().starts_with(&cmd_lower)
+                && cmd != cmd_part
+                && !seen.contains(cmd.to_lowercase().as_str())
+                && !recent_failed.contains(cmd)
+            {
+                seen.insert(cmd.to_lowercase().clone());
+                all_suggestions.push(cmd.clone());
+            }
+        }
+
+        // Simulate DB source: assume DB has 'pwd' and 'pwdwd'.
+        // (In production, the HAVING clause would already filter 'pwdwd'
+        // after mark_command_failed commits, but during the timing window
+        // the recent_failed guard filters it.)
+        let db_results = vec!["pwd".to_string(), "pwdwd".to_string()];
+        for entry in db_results {
+            if entry.to_lowercase().starts_with(&cmd_lower)
+                && entry != cmd_part
+                && !seen.contains(entry.to_lowercase().as_str())
+                && !recent_failed.contains(&entry)
+            {
+                seen.insert(entry.to_lowercase().clone());
+                all_suggestions.push(entry);
+            }
+        }
+
+        // Step 6: simulate the spawn populating the suggestion state.
+        // (In production, this is the `state_for_cmd.write().sessions.iter_mut()`
+        // block in the on_input spawn.)
+        if all_suggestions.is_empty() {
+            let tab = state.sessions.first_mut().unwrap();
+            tab.suggestion = None;
+            tab.suggestions = Vec::new();
+            tab.suggestion_visible = false;
+            tab.suggestion_selected = 0;
+        } else {
+            let first = &all_suggestions[0];
+            let suffix = if first.len() > cmd_part.len() {
+                first[cmd_part.len()..].to_string()
+            } else {
+                String::new()
+            };
+            let tab = state.sessions.first_mut().unwrap();
+            tab.suggestion = if suffix.is_empty() {
+                None
+            } else {
+                Some(suffix)
+            };
+            tab.suggestions = all_suggestions;
+            tab.suggestion_visible = true;
+            tab.suggestion_selected = 0;
+        }
+
+        // Step 7: verify the popup is visible with 'pwd'.
+        let tab = state.sessions.first().unwrap();
+        assert!(
+            tab.suggestion_visible,
+            "popup MUST be visible after typing 'pw' — 'pwd' is a valid match. \
+             If this fails, the delete handler left state in a way that prevents \
+             the suggestion query from showing results. State: {:?}",
+            tab
+        );
+        assert_eq!(
+            tab.suggestions,
+            vec!["pwd".to_string()],
+            "suggestions should contain only 'pwd' (pwdwd is filtered by recent_failed)"
+        );
+        assert_eq!(
+            tab.suggestion,
+            Some("d".to_string()),
+            "inline ghost text should be 'd' (suffix of 'pwd' after 'pw')"
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

@@ -1054,31 +1054,38 @@ fn start_ssh_connection(
                                     // Spawned separately so a slow DuckDB insert doesn't
                                     // block the output loop. Errors are logged but
                                     // non-fatal — analytics is best-effort.
+                                    // Reuse the AppState's lazily-initialized
+                                    // AnalyticsHandle instead of opening a fresh DuckDB
+                                    // connection per command. The handle holds a single
+                                    // Arc<Mutex<Option<AnalyticsDB>>> so the connection
+                                    // persists across calls — we don't pay the
+                                    // ~5-50ms `open + init_schema` cost on every
+                                    // keystroke-level command execution, and we don't
+                                    // risk file-lock contention with the startup mirror
+                                    // task below. The .clone() here is cheap (just an
+                                    // Arc bump) and lets us move the handle into the
+                                    // spawned task without holding the state read lock.
                                     #[cfg(feature = "analytics")]
-                                    spawn(async move {
-                                        match rusterm_analytics::AnalyticsDB::open(None::<&str>) {
-                                            Ok(db) => {
-                                                let analytics_entry = rusterm_analytics::AnalyticsCommand {
+                                    {
+                                        let analytics_handle = state.read().analytics.clone();
+                                        spawn(async move {
+                                            let analytics_entry =
+                                                rusterm_analytics::AnalyticsCommand {
                                                     command: _analytics_cmd,
                                                     hostname: _analytics_host,
                                                     exit_code: Some(0),
                                                     created_at: analytics_created,
                                                 };
-                                                if let Err(e) = db.record_command(&analytics_entry) {
-                                                    tracing::warn!(
-                                                        "[ANALYTICS] failed to record command: {}",
-                                                        e
-                                                    );
-                                                }
-                                            }
-                                            Err(e) => {
+                                            if let Err(e) =
+                                                analytics_handle.record_command(&analytics_entry)
+                                            {
                                                 tracing::warn!(
-                                                    "[ANALYTICS] failed to open db for record: {}",
+                                                    "[ANALYTICS] failed to record command: {}",
                                                     e
                                                 );
                                             }
-                                        }
-                                    });
+                                        });
+                                    }
                                 }
                             }
                             check_onekey_match(state, &id, &data);
@@ -1462,31 +1469,38 @@ fn start_shell_connection(
                                     // Spawned separately so a slow DuckDB insert doesn't
                                     // block the output loop. Errors are logged but
                                     // non-fatal — analytics is best-effort.
+                                    // Reuse the AppState's lazily-initialized
+                                    // AnalyticsHandle instead of opening a fresh DuckDB
+                                    // connection per command. The handle holds a single
+                                    // Arc<Mutex<Option<AnalyticsDB>>> so the connection
+                                    // persists across calls — we don't pay the
+                                    // ~5-50ms `open + init_schema` cost on every
+                                    // keystroke-level command execution, and we don't
+                                    // risk file-lock contention with the startup mirror
+                                    // task below. The .clone() here is cheap (just an
+                                    // Arc bump) and lets us move the handle into the
+                                    // spawned task without holding the state read lock.
                                     #[cfg(feature = "analytics")]
-                                    spawn(async move {
-                                        match rusterm_analytics::AnalyticsDB::open(None::<&str>) {
-                                            Ok(db) => {
-                                                let analytics_entry = rusterm_analytics::AnalyticsCommand {
+                                    {
+                                        let analytics_handle = state.read().analytics.clone();
+                                        spawn(async move {
+                                            let analytics_entry =
+                                                rusterm_analytics::AnalyticsCommand {
                                                     command: _analytics_cmd,
                                                     hostname: _analytics_host,
                                                     exit_code: Some(0),
                                                     created_at: analytics_created,
                                                 };
-                                                if let Err(e) = db.record_command(&analytics_entry) {
-                                                    tracing::warn!(
-                                                        "[ANALYTICS] failed to record command: {}",
-                                                        e
-                                                    );
-                                                }
-                                            }
-                                            Err(e) => {
+                                            if let Err(e) =
+                                                analytics_handle.record_command(&analytics_entry)
+                                            {
                                                 tracing::warn!(
-                                                    "[ANALYTICS] failed to open db for record: {}",
+                                                    "[ANALYTICS] failed to record command: {}",
                                                     e
                                                 );
                                             }
-                                        }
-                                    });
+                                        });
+                                    }
                                 }
                             }
                             check_onekey_match(state, &id, &data);
@@ -1748,7 +1762,7 @@ pub fn App() -> Element {
     // from atuin land with a non-zero exit code and are filtered by HAVING.
     // bash/zsh/fish flat-file sources have no exit code → None → still NULL
     // → filtered here by `known_failed_commands`.
-    let _history_import = use_future(|| async move {
+    let _history_import = use_future(move || async move {
         let db_path = dirs::data_dir()
             .unwrap_or_default()
             .join("rusterm")
@@ -1820,35 +1834,25 @@ pub fn App() -> Element {
         // open), analytics queries will return empty results, but the app
         // continues to function normally. Only runs when the `analytics`
         // feature is enabled; otherwise the cfg-gated block is empty.
+        // Reuse the AppState's lazily-initialized AnalyticsHandle for the
+        // startup mirror — same reasoning as the per-command spawn above:
+        // avoid opening a fresh DuckDB connection just for this call, so the
+        // connection opened here is the same one reused by later per-command
+        // record_command spawns. The handle's mirror_from_sqlite lazy-opens
+        // the DB on first call (which is here, on startup) and reuses it
+        // thereafter.
         #[cfg(feature = "analytics")]
         {
-            let sqlite_db_ref = &db;
-            // We can't easily clone the Database handle (it's behind a
-            // tokio-rusqlite connection), so we run the mirror inline in
-            // this same task. The mirror is a full table scan — typically
-            // <100ms for 10k rows — so blocking briefly here is acceptable.
-            match rusterm_analytics::AnalyticsDB::open(None::<&str>) {
-                Ok(analytics_db) => {
-                    match rusterm_analytics::mirror_from_sqlite(&analytics_db, sqlite_db_ref).await {
-                        Ok(count) => {
-                            tracing::info!(
-                                "[ANALYTICS] mirrored {} commands from sqlite to duckdb on startup",
-                                count
-                            );
-                        }
-                        Err(e) => {
-                            tracing::warn!(
-                                "[ANALYTICS] startup mirror failed: {}",
-                                e
-                            );
-                        }
-                    }
+            let analytics_handle = state.read().analytics.clone();
+            match analytics_handle.mirror_from_sqlite(&db).await {
+                Ok(count) => {
+                    tracing::info!(
+                        "[ANALYTICS] mirrored {} commands from sqlite to duckdb on startup",
+                        count
+                    );
                 }
                 Err(e) => {
-                    tracing::warn!(
-                        "[ANALYTICS] failed to open duckdb for startup mirror: {}",
-                        e
-                    );
+                    tracing::warn!("[ANALYTICS] startup mirror failed: {}", e);
                 }
             }
         }
@@ -2273,7 +2277,13 @@ pub fn App() -> Element {
                                                     spawn(async move {
                                                         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
 
-                                                        if state_for_cmd.read().suggestion_epoch != epoch {
+                                                        let current_epoch = state_for_cmd.read().suggestion_epoch;
+                                                        if current_epoch != epoch {
+                                                            tracing::info!(
+                                                                "[SUGGESTION-QUERY] STALE — spawn epoch={} but current={} (skipped)",
+                                                                epoch,
+                                                                current_epoch
+                                                            );
                                                             return;
                                                         }
 
@@ -2289,6 +2299,10 @@ pub fn App() -> Element {
                                                         let line = line.trim().to_string();
 
                                                         if line.is_empty() {
+                                                            tracing::info!(
+                                                                "[SUGGESTION-QUERY] session={} line empty — hiding popup",
+                                                                &sid_sug[..sid_sug.len().min(8)]
+                                                            );
                                                             state_for_cmd.write().sessions.iter_mut()
                                                                 .find(|t| t.id == sid_sug)
                                                                 .map(|tab| {
@@ -2304,6 +2318,11 @@ pub fn App() -> Element {
                                                         let cmd_part = strip_prompt(&line);
 
                                                         if cmd_part.is_empty() {
+                                                            tracing::info!(
+                                                                "[SUGGESTION-QUERY] session={} cmd_part empty (line={:?}) — hiding popup",
+                                                                &sid_sug[..sid_sug.len().min(8)],
+                                                                line
+                                                            );
                                                             state_for_cmd.write().sessions.iter_mut()
                                                                 .find(|t| t.id == sid_sug)
                                                                 .map(|tab| {
@@ -2394,6 +2413,16 @@ pub fn App() -> Element {
 
                                                         // Truncate to 8 suggestions max
                                                         all_suggestions.truncate(15);
+
+                                                        tracing::info!(
+                                                            "[SUGGESTION-QUERY] session={} cmd_part={:?} epoch={} current_epoch={} results={:?} recent_failed={:?}",
+                                                            &sid_sug[..sid_sug.len().min(8)],
+                                                            cmd_part,
+                                                            epoch,
+                                                            state_for_cmd.read().suggestion_epoch,
+                                                            all_suggestions,
+                                                            recent_failed
+                                                        );
 
                                                         if all_suggestions.is_empty() {
                                                             state_for_cmd.write().sessions.iter_mut()
