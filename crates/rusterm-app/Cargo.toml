@@ -2,6 +2,7 @@
 name = "rusterm-app"
 version.workspace = true
 edition.workspace = true
+build = "build.rs"
 
 [[bin]]
 name = "rusterm"
@@ -21,3 +22,10 @@ dioxus.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+
+[build-dependencies]
+# SVG -> PNG rasterizer at build time. The triplet must be version-aligned:
+# resvg uses usvg uses tiny-skia. Keep them on the same major.minor.
+resvg = { version = "0.42", default-features = false }
+usvg = { version = "0.42", default-features = false }
+tiny-skia = "0.11"

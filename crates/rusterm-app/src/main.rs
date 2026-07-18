@@ -95,13 +95,15 @@ html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#
         .with_background_color((26, 27, 38, 255))
         .with_custom_head(head_html.to_string());
 
-    // Window icon. The ICO at `assets/icon.ico` ships with 16..256px frames;
-    // `image::load_from_memory` (called transitively by dioxus's
-    // `icon_from_memory`) picks the largest frame and decodes it to RGBA.
+    // Window icon. The PNG embedded below is rasterized at build time
+    // from `assets/gemini-svg.svg` by `build.rs` (using resvg/usvg/tiny-skia).
+    // We embed the generated PNG via `include_bytes!` so the icon ships
+    // inside the `rusterm` binary — no external file at runtime.
+    //
     // Failure here is non-fatal — the app still launches, just with the
     // platform-default window icon — so we log and continue instead of
     // panicking.
-    let icon_bytes = include_bytes!("../../../assets/icon.ico");
+    let icon_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/icon.png"));
     match dioxus::desktop::icon_from_memory::<dioxus::desktop::tao::window::Icon>(icon_bytes) {
         Ok(icon) => {
             cfg = cfg.with_icon(icon);
