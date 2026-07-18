@@ -1017,6 +1017,14 @@ fn start_ssh_connection(
                                 }
                                 if let Some((cmd, db_id, hostname)) = committed {
                                     let sid = id.clone();
+                                    // Clone for the analytics record (the original `cmd` is
+                                    // moved into the DB entry below). When the `analytics`
+                                    // feature is off, the spawned analytics task below is
+                                    // cfg-gated out entirely.
+                                    let _analytics_cmd = cmd.clone();
+                                    let _analytics_host = hostname.clone();
+                                    let analytics_created = chrono::Utc::now().to_rfc3339();
+                                    let analytics_created_for_db = analytics_created.clone();
                                     spawn(async move {
                                         let db_path = dirs::data_dir()
                                             .unwrap_or_default()
@@ -1033,10 +1041,41 @@ fn start_ssh_connection(
                                                 hostname,
                                                 exit_code: Some(0),
                                                 duration_ms: None,
-                                                created_at: chrono::Utc::now().to_rfc3339(),
+                                                created_at: analytics_created_for_db,
                                             };
                                             if let Err(e) = db.save_history(entry).await {
                                                 tracing::warn!("Failed to save history: {}", e);
+                                            }
+                                        }
+                                    });
+                                    // Incremental analytics mirror: record the successful
+                                    // command into DuckDB so the analytics DB stays
+                                    // current without a full re-mirror on every command.
+                                    // Spawned separately so a slow DuckDB insert doesn't
+                                    // block the output loop. Errors are logged but
+                                    // non-fatal — analytics is best-effort.
+                                    #[cfg(feature = "analytics")]
+                                    spawn(async move {
+                                        match rusterm_analytics::AnalyticsDB::open(None::<&str>) {
+                                            Ok(db) => {
+                                                let analytics_entry = rusterm_analytics::AnalyticsCommand {
+                                                    command: _analytics_cmd,
+                                                    hostname: _analytics_host,
+                                                    exit_code: Some(0),
+                                                    created_at: analytics_created,
+                                                };
+                                                if let Err(e) = db.record_command(&analytics_entry) {
+                                                    tracing::warn!(
+                                                        "[ANALYTICS] failed to record command: {}",
+                                                        e
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "[ANALYTICS] failed to open db for record: {}",
+                                                    e
+                                                );
                                             }
                                         }
                                     });
@@ -1386,6 +1425,14 @@ fn start_shell_connection(
                                 }
                                 if let Some((cmd, db_id, hostname)) = committed {
                                     let sid = id.clone();
+                                    // Clone for the analytics record (the original `cmd` is
+                                    // moved into the DB entry below). When the `analytics`
+                                    // feature is off, the spawned analytics task below is
+                                    // cfg-gated out entirely.
+                                    let _analytics_cmd = cmd.clone();
+                                    let _analytics_host = hostname.clone();
+                                    let analytics_created = chrono::Utc::now().to_rfc3339();
+                                    let analytics_created_for_db = analytics_created.clone();
                                     spawn(async move {
                                         let db_path = dirs::data_dir()
                                             .unwrap_or_default()
@@ -1402,10 +1449,41 @@ fn start_shell_connection(
                                                 hostname,
                                                 exit_code: Some(0),
                                                 duration_ms: None,
-                                                created_at: chrono::Utc::now().to_rfc3339(),
+                                                created_at: analytics_created_for_db,
                                             };
                                             if let Err(e) = db.save_history(entry).await {
                                                 tracing::warn!("Failed to save history: {}", e);
+                                            }
+                                        }
+                                    });
+                                    // Incremental analytics mirror: record the successful
+                                    // command into DuckDB so the analytics DB stays
+                                    // current without a full re-mirror on every command.
+                                    // Spawned separately so a slow DuckDB insert doesn't
+                                    // block the output loop. Errors are logged but
+                                    // non-fatal — analytics is best-effort.
+                                    #[cfg(feature = "analytics")]
+                                    spawn(async move {
+                                        match rusterm_analytics::AnalyticsDB::open(None::<&str>) {
+                                            Ok(db) => {
+                                                let analytics_entry = rusterm_analytics::AnalyticsCommand {
+                                                    command: _analytics_cmd,
+                                                    hostname: _analytics_host,
+                                                    exit_code: Some(0),
+                                                    created_at: analytics_created,
+                                                };
+                                                if let Err(e) = db.record_command(&analytics_entry) {
+                                                    tracing::warn!(
+                                                        "[ANALYTICS] failed to record command: {}",
+                                                        e
+                                                    );
+                                                }
+                                            }
+                                            Err(e) => {
+                                                tracing::warn!(
+                                                    "[ANALYTICS] failed to open db for record: {}",
+                                                    e
+                                                );
                                             }
                                         }
                                     });
@@ -1735,6 +1813,44 @@ pub fn App() -> Element {
         tracing::info!("Importing {} local history commands into DB", entries.len());
         if let Err(e) = db.save_history_batch(entries).await {
             tracing::warn!("Failed to save local history batch: {}", e);
+        }
+
+        // Mirror the SQLite history into DuckDB for analytics. This is a
+        // best-effort, fire-and-forget task — if it fails (e.g. DuckDB can't
+        // open), analytics queries will return empty results, but the app
+        // continues to function normally. Only runs when the `analytics`
+        // feature is enabled; otherwise the cfg-gated block is empty.
+        #[cfg(feature = "analytics")]
+        {
+            let sqlite_db_ref = &db;
+            // We can't easily clone the Database handle (it's behind a
+            // tokio-rusqlite connection), so we run the mirror inline in
+            // this same task. The mirror is a full table scan — typically
+            // <100ms for 10k rows — so blocking briefly here is acceptable.
+            match rusterm_analytics::AnalyticsDB::open(None::<&str>) {
+                Ok(analytics_db) => {
+                    match rusterm_analytics::mirror_from_sqlite(&analytics_db, sqlite_db_ref).await {
+                        Ok(count) => {
+                            tracing::info!(
+                                "[ANALYTICS] mirrored {} commands from sqlite to duckdb on startup",
+                                count
+                            );
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                "[ANALYTICS] startup mirror failed: {}",
+                                e
+                            );
+                        }
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[ANALYTICS] failed to open duckdb for startup mirror: {}",
+                        e
+                    );
+                }
+            }
         }
     });
 

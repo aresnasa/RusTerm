@@ -7016,6 +7016,7 @@ dependencies = [
  "parking_lot",
  "regex",
  "rusterm-ai",
+ "rusterm-analytics",
  "rusterm-core",
  "rusterm-crypto",
  "rusterm-db",

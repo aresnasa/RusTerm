@@ -124,14 +124,10 @@ pub fn SuggestionPopup(
                 "Shift+Del or click × to remove"
             }
             // Hover rule for the × button on non-selected rows. Selected rows
-            // always show the × (handled inline above). We emit this once per
-            // popup instance; it's idempotent if multiple popups render.
-            style {
-                dangerous_inner_html: "
-                    .sug-row:hover .sug-del { color: #9ece6a !important; }
-                    .sug-row .sug-del:hover { color: #f7768e !important; }
-                "
-            }
+            // always show the × (handled inline above). The actual CSS rules
+            // live in the global `<style>` block in `main.rs` (`with_custom_head`)
+            // alongside the other Tokyo Night hover rules — keeps all theme
+            // CSS in one place and avoids `<style>`-inside-`<div>` quirks.
             // Hidden dismiss anchor — kept for symmetry with OneKeyPopup so
             // future callers can wire an explicit dismiss target if needed.
             div { style: "display:none;", onclick: move |_| on_dismiss.call(()), "" }

@@ -56,7 +56,7 @@ use serde::{Deserialize, Serialize};
 pub mod classify;
 pub mod mirror;
 
-pub use classify::{classify_commands, CommandCategory};
+pub use classify::{CommandCategory, classify_commands};
 pub use mirror::mirror_from_sqlite;
 
 /// One row in the analytics-optimized `commands` table.
@@ -290,16 +290,21 @@ impl AnalyticsDB {
     /// rows (one per hour) — hours with no executions have count 0. Useful
     /// for visualizing when the user is most active.
     ///
-    /// The query uses DuckDB's `EXTRACT(HOUR FROM created_at::TIMESTAMPTZ)`
-    /// to parse the RFC3339 timestamps we store. We coerce to `TIMESTAMPTZ`
-    /// first so the hour reflects UTC, not local time (DuckDB's default
-    /// timestamp parsing is timezone-naive).
+    /// The query uses DuckDB's `strftime(..., '%H')` to extract the UTC hour
+    /// from each command's RFC3339 timestamp. We cast to `TIMESTAMPTZ` first
+    /// (so DuckDB recognizes the `Z` suffix as UTC) and then format with
+    /// `%H` — `strftime` on a `TIMESTAMPTZ` returns the hour in UTC, not in
+    /// the host's local timezone (verified empirically against DuckDB 1.10504).
+    ///
+    /// Earlier attempts used `EXTRACT(HOUR FROM <ts> AT TIME ZONE 'UTC')`
+    /// but DuckDB's binder rejects that syntax. `strftime` is the canonical
+    /// way to extract a UTC hour from a TIMESTAMPTZ in DuckDB.
     pub fn usage_patterns_by_time_of_day(&self) -> Result<Vec<HourlyUsage>> {
         let conn = self.conn.lock();
         let mut stmt = conn.prepare(
             "WITH hours AS (
                 SELECT
-                    EXTRACT(HOUR FROM TRY_CAST(created_at AS TIMESTAMPTZ)) AS hour,
+                    CAST(strftime(TRY_CAST(created_at AS TIMESTAMPTZ), '%H') AS INTEGER) AS hour,
                     COUNT(*) AS cnt
                 FROM commands
                 WHERE TRY_CAST(created_at AS TIMESTAMPTZ) IS NOT NULL
@@ -376,10 +381,10 @@ impl AnalyticsDB {
             )
             .context("behavior_summary: distinct hosts")?;
 
-        // busiest hour of day (UTC) — reuses the bucketing logic
+        // busiest hour of day (UTC) — reuses the strftime bucketing logic.
         let mut stmt = conn.prepare(
             "SELECT
-                EXTRACT(HOUR FROM TRY_CAST(created_at AS TIMESTAMPTZ)) AS hour,
+                CAST(strftime(TRY_CAST(created_at AS TIMESTAMPTZ), '%H') AS INTEGER) AS hour,
                 COUNT(*) AS cnt
              FROM commands
              WHERE TRY_CAST(created_at AS TIMESTAMPTZ) IS NOT NULL
@@ -474,11 +479,13 @@ mod tests {
             db.record_command(&c).unwrap();
         }
         let counts = db.classify().unwrap();
-        // Should be sorted descending by count
+        // Should be sorted descending by count; ties broken by label alpha.
+        // Git and Docker both have count 2 → Docker (alpha < Git) comes first.
         assert!(counts[0].count >= counts[counts.len() - 1].count);
-        // git should be the most-used category (2 commands)
-        assert_eq!(counts[0].category, CommandCategory::Git);
+        assert_eq!(counts[0].category, CommandCategory::Docker);
         assert_eq!(counts[0].count, 2);
+        assert_eq!(counts[1].category, CommandCategory::Git);
+        assert_eq!(counts[1].count, 2);
     }
 
     /// `success_rate_by_prefix` must exclude NULL exit codes from the
@@ -564,9 +571,9 @@ mod tests {
             summary.success_rate
         );
         assert_eq!(summary.distinct_hosts, 1);
-        // busiest hour is 10 (two commands: git status + git log)
+        // busiest hour is 10 UTC (two commands: git status + git log)
         assert_eq!(summary.busiest_hour, Some(10));
-        // most-used category is Git (2 commands)
+        // most-used category is Git (2 commands) — beats Docker (1) on count
         assert_eq!(summary.most_used_category, Some(CommandCategory::Git));
         // most-used command — all commands appear once, so it's whatever
         // GROUP BY ... ORDER BY COUNT(*) DESC picks first. We can't assert

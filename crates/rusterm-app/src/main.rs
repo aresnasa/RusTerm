@@ -86,6 +86,8 @@ html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#
 ::selection{background:rgba(122,162,247,0.3);color:#c0caf5;}
 ::-moz-selection{background:rgba(122,162,247,0.3);color:#c0caf5;}
 *[id^="terminal-input-"]::-webkit-scrollbar{display:none;}
+.sug-row:hover .sug-del{color:#9ece6a !important;}
+.sug-row .sug-del:hover{color:#f7768e !important;}
 </style>"#;
 
     let cfg = dioxus::desktop::Config::new()

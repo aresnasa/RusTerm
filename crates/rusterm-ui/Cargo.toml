@@ -26,3 +26,16 @@ rusterm-ai.workspace = true
 rusterm-plugins.workspace = true
 rusterm-proto.workspace = true
 rusterm-history.workspace = true
+# Analytics (DuckDB-backed OLAP layer). Optional because the bundled DuckDB
+# C++ library adds ~50MB to the binary — users who don't want the analytics
+# panel can build without this feature and pay no cost. When disabled, the
+# `rusterm_ui::analytics` module is stubbed out (returns empty results).
+rusterm-analytics = { workspace = true, optional = true }
+
+[features]
+default = []
+## Enable the DuckDB-backed analytics layer (crates/rusterm-analytics).
+## Adds ~50MB to the binary due to the bundled libduckdb C++ library.
+## When disabled, analytics queries return empty results and no DuckDB
+## connection is opened.
+analytics = ["dep:rusterm-analytics"]

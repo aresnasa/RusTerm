@@ -9,11 +9,11 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{AnalyticsCommand, CategoryCount};
+use crate::CategoryCount;
 
 /// Coarse-grained command category. Ordered roughly by what a developer
 /// typically does most: version control, containers, orchestration, builds,
-//! file ops, networking, etc.
+/// file ops, networking, etc.
 ///
 /// Variants are intentionally limited (~15) so the UI chart is legible.
 /// Commands that don't match any prefix land in `Other`.
@@ -144,12 +144,12 @@ fn classify_basename(basename: &str) -> CommandCategory {
         | "sort" | "uniq" | "wc" | "jq" | "yq" | "xargs" | "tr" | "tee" => {
             CommandCategory::TextProcessing
         }
-        "ssh" | "scp" | "rsync" | "curl" | "wget" | "nc" | "netcat" | "telnet" | "ftp"
-        | "sftp" | "dig" | "nslookup" | "host" | "ping" | "traceroute" | "mtr" => {
+        "ssh" | "scp" | "rsync" | "curl" | "wget" | "nc" | "netcat" | "telnet" | "ftp" | "sftp"
+        | "dig" | "nslookup" | "host" | "ping" | "traceroute" | "mtr" => {
             CommandCategory::Networking
         }
-        "ps" | "top" | "htop" | "btop" | "kill" | "killall" | "pkill" | "systemctl"
-        | "service" | "journalctl" | "dmesg" | "lsof" | "fuser" => CommandCategory::Process,
+        "ps" | "top" | "htop" | "btop" | "kill" | "killall" | "pkill" | "systemctl" | "service"
+        | "journalctl" | "dmesg" | "lsof" | "fuser" => CommandCategory::Process,
         "vim" | "vi" | "nano" | "emacs" | "code" | "hx" | "helix" | "nvim" => {
             CommandCategory::Editor
         }
@@ -196,7 +196,10 @@ mod tests {
         assert_eq!(classify_command("npm install"), CommandCategory::NodeJs);
         assert_eq!(classify_command("ls -la"), CommandCategory::FileOps);
         assert_eq!(classify_command("cd /tmp"), CommandCategory::Navigation);
-        assert_eq!(classify_command("grep foo bar"), CommandCategory::TextProcessing);
+        assert_eq!(
+            classify_command("grep foo bar"),
+            CommandCategory::TextProcessing
+        );
         assert_eq!(classify_command("ssh host"), CommandCategory::Networking);
         assert_eq!(classify_command("vim file.txt"), CommandCategory::Editor);
         assert_eq!(classify_command("make"), CommandCategory::Build);
@@ -209,20 +212,11 @@ mod tests {
             classify_command("sudo apt update"),
             CommandCategory::Other // `apt` isn't in any bucket
         );
-        assert_eq!(
-            classify_command("sudo docker ps"),
-            CommandCategory::Docker
-        );
+        assert_eq!(classify_command("sudo docker ps"), CommandCategory::Docker);
         // time
-        assert_eq!(
-            classify_command("time cargo build"),
-            CommandCategory::Rust
-        );
+        assert_eq!(classify_command("time cargo build"), CommandCategory::Rust);
         // nohup
-        assert_eq!(
-            classify_command("nohup git pull &"),
-            CommandCategory::Git
-        );
+        assert_eq!(classify_command("nohup git pull &"), CommandCategory::Git);
         // path prefix
         assert_eq!(
             classify_command("/usr/bin/git status"),
@@ -238,10 +232,7 @@ mod tests {
     fn classifies_piped_commands_by_first_token() {
         // `git log | grep foo` is classified as Git, not TextProcessing —
         // the user thinks of it as a git command.
-        assert_eq!(
-            classify_command("git log | grep foo"),
-            CommandCategory::Git
-        );
+        assert_eq!(classify_command("git log | grep foo"), CommandCategory::Git);
     }
 
     #[test]

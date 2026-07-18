@@ -143,6 +143,12 @@ pub struct AppState {
     /// (dead) PTY.
     #[serde(skip)]
     pub disconnected_sessions: HashSet<String>,
+    /// DuckDB-backed analytics handle. Lazily opened on first use (so the
+    /// ~50MB bundled libduckdb doesn't initialize on app startup unless
+    /// the user actually queries analytics). When the `analytics` feature
+    /// is off, this is a no-op stub.
+    #[serde(skip)]
+    pub analytics: crate::analytics::AnalyticsHandle,
 }
 
 /// State of the OneKey autofill popup for a single session.
@@ -227,6 +233,7 @@ impl Default for AppState {
             onekey_popups: HashMap::new(),
             session_configs: HashMap::new(),
             disconnected_sessions: HashSet::new(),
+            analytics: crate::analytics::AnalyticsHandle::default(),
         }
     }
 }
