@@ -2,16 +2,17 @@ use std::fs;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
-use argon2::{Algorithm, Argon2, Params, Version};
 use argon2::password_hash::{PasswordHasher, SaltString};
+use argon2::{Algorithm, Argon2, Params, Version};
 use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rand::RngCore;
 
 use crate::config::{
-    ConnectionConfig, ConnectionKind, EncryptedValue, PersistedConfig, PersistedConnection,
-    PersistedConnectionKind, PersistedSshAuth, PersistedSshConfig, SshAuth, SshConfig,
+    ConnectionConfig, ConnectionKind, EncryptedValue, OneKey, OneKeyStep, PersistedConfig,
+    PersistedConnection, PersistedConnectionKind, PersistedOneKey, PersistedOneKeyStep,
+    PersistedSshAuth, PersistedSshConfig, SshAuth, SshConfig,
 };
-use rusterm_crypto::{decrypt_data, encrypt_data, KeyringStore};
+use rusterm_crypto::{KeyringStore, decrypt_data, encrypt_data};
 
 const CONFIG_FILE_NAME: &str = "settings.json";
 const CONFIG_VERSION: u32 = 1;
@@ -126,7 +127,9 @@ impl ConfigManager {
                 if let Err(e) =
                     KeyringStore::save_credential("rusterm-master-key", &BASE64.encode(key))
                 {
-                    tracing::warn!("OS keyring unavailable, deriving master key from machine ID: {e}");
+                    tracing::warn!(
+                        "OS keyring unavailable, deriving master key from machine ID: {e}"
+                    );
                     let machine_id = Self::get_machine_id();
                     key = rusterm_crypto::derive_key(&machine_id, KEY_DERIVATION_SALT)?;
                 }
@@ -139,11 +142,11 @@ impl ConfigManager {
         if !config_path.exists() {
             return Ok(None);
         }
-        let content = fs::read_to_string(config_path)
-            .context("Failed to read settings.json")?;
-        let persisted: serde_json::Value = serde_json::from_str(&content)
-            .context("Failed to parse settings.json")?;
-        Ok(persisted.get("master_password_hash")
+        let content = fs::read_to_string(config_path).context("Failed to read settings.json")?;
+        let persisted: serde_json::Value =
+            serde_json::from_str(&content).context("Failed to parse settings.json")?;
+        Ok(persisted
+            .get("master_password_hash")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string()))
     }
@@ -235,12 +238,96 @@ impl ConfigManager {
             .collect()
     }
 
+    /// Expose the master key for use by other components that need to encrypt
+    /// sensitive user data at rest (e.g. `SessionLog`). The key itself is
+    /// never written to logs — see `Debug for ConfigManager` above, which
+    /// redacts it.
+    ///
+    /// Returns a `Zeroizing` wrapper so callers don't accidentally leave the
+    /// key material in unzeroed memory.
+    pub fn master_key(&self) -> zeroize::Zeroizing<[u8; 32]> {
+        zeroize::Zeroizing::new(self.master_key)
+    }
+
+    /// Derive a per-session subkey from the master key + session ID. This is
+    /// used by `SessionLog` to encrypt that session's I/O with a key that's
+    /// scoped to the session — compromising one session's log file does not
+    /// reveal data from other sessions.
+    ///
+    /// Derivation is Argon2id with the session ID as salt, which is sufficient
+    /// because the master key is already high-entropy.
+    pub fn derive_session_key(&self, session_id: &str) -> Result<[u8; 32]> {
+        let salt = session_id.as_bytes();
+        // Pad salt to Argon2's minimum 8 bytes if the session ID is unusually
+        // short (UUIDs are 36 chars, so this is defensive only).
+        let salt_padded: Vec<u8> = if salt.len() < 8 {
+            let mut v = salt.to_vec();
+            v.resize(8, 0);
+            v
+        } else {
+            salt.to_vec()
+        };
+        // Convert master key to a hex string for use as the Argon2 "password"
+        // input. (Argon2 takes bytes; we just need a deterministic high-entropy
+        // preimage.)
+        let master_hex = base64::engine::general_purpose::STANDARD.encode(self.master_key);
+        rusterm_crypto::derive_key(&master_hex, &salt_padded)
+    }
+
     pub fn save_connections(&self, connections: &[ConnectionConfig]) -> Result<()> {
+        // Preserve existing OneKeys (read-modify-write) so saving connections
+        // doesn't clobber the OneKey library.
+        let existing_onekeys = self.read_persisted().onekeys;
         let persisted = PersistedConfig {
             version: CONFIG_VERSION,
             connections: connections
                 .iter()
                 .map(|c| self.encrypt_connection(c))
+                .collect::<Result<Vec<_>>>()?,
+            onekeys: existing_onekeys,
+            master_password_hash: self.master_password_hash.clone(),
+        };
+
+        let json =
+            serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
+
+        let temp_path = self.config_path.with_extension("json.tmp");
+        fs::write(&temp_path, &json).context("Failed to write config file")?;
+        fs::rename(&temp_path, &self.config_path).context("Failed to rename temp config file")?;
+
+        Ok(())
+    }
+
+    /// Read the on-disk PersistedConfig (or an empty default if missing/unparseable).
+    fn read_persisted(&self) -> PersistedConfig {
+        if !self.config_path.exists() {
+            return PersistedConfig {
+                version: CONFIG_VERSION,
+                connections: vec![],
+                onekeys: vec![],
+                master_password_hash: None,
+            };
+        }
+        fs::read_to_string(&self.config_path)
+            .ok()
+            .and_then(|c| serde_json::from_str(&c).ok())
+            .unwrap_or(PersistedConfig {
+                version: CONFIG_VERSION,
+                connections: vec![],
+                onekeys: vec![],
+                master_password_hash: None,
+            })
+    }
+
+    /// Save the OneKey library. Preserves existing connections (read-modify-write).
+    pub fn save_onekeys(&self, onekeys: &[OneKey]) -> Result<()> {
+        let existing_connections = self.read_persisted().connections;
+        let persisted = PersistedConfig {
+            version: CONFIG_VERSION,
+            connections: existing_connections,
+            onekeys: onekeys
+                .iter()
+                .map(|ok| self.encrypt_onekey(ok))
                 .collect::<Result<Vec<_>>>()?,
             master_password_hash: self.master_password_hash.clone(),
         };
@@ -253,6 +340,78 @@ impl ConfigManager {
         fs::rename(&temp_path, &self.config_path).context("Failed to rename temp config file")?;
 
         Ok(())
+    }
+
+    pub fn load_onekeys(&self) -> Result<Vec<OneKey>> {
+        self.read_persisted()
+            .onekeys
+            .into_iter()
+            .map(|pok| self.decrypt_onekey(pok))
+            .collect()
+    }
+
+    fn encrypt_onekey(&self, ok: &OneKey) -> Result<PersistedOneKey> {
+        let steps = ok
+            .steps
+            .iter()
+            .map(|s| self.encrypt_step(s))
+            .collect::<Result<Vec<_>>>()?;
+        Ok(PersistedOneKey {
+            id: ok.id.clone(),
+            name: ok.name.clone(),
+            steps,
+        })
+    }
+
+    fn encrypt_step(&self, s: &OneKeyStep) -> Result<PersistedOneKeyStep> {
+        Ok(PersistedOneKeyStep {
+            label: s.label.clone(),
+            expect: s.expect.clone(),
+            send: self.encrypt_string(&s.send)?,
+        })
+    }
+
+    fn decrypt_onekey(&self, pok: PersistedOneKey) -> Result<OneKey> {
+        let steps = pok
+            .steps
+            .into_iter()
+            .map(|s| self.decrypt_step(s))
+            .collect::<Result<Vec<_>>>()?;
+        // Migration: if this OneKey has a `Username for \S+:` step (git HTTPS
+        // pattern) AND a password step with a bare `password:` expect, the
+        // password expect won't match git's actual `Password for 'host': `
+        // prompt (the `for 'host'` sits between "Password" and ":"). Upgrade
+        // it to `password for \S+:` so the popup fires for the password step.
+        // Without this, the username popup fires but the password popup never
+        // does, forcing the user to type the password manually — exactly the
+        // scenario OneKeys exists to prevent.
+        let has_username_step = steps.iter().any(|s| s.expect.starts_with("Username for"));
+        let steps = steps
+            .into_iter()
+            .map(|mut s| {
+                if has_username_step && s.expect.trim() == "password:" {
+                    tracing::info!(
+                        "Migrating OneKey '{}': upgrading password step expect 'password:' -> 'password for \\S+:' (git HTTPS pattern)",
+                        &pok.name
+                    );
+                    s.expect = r"password for \S+:".to_string();
+                }
+                s
+            })
+            .collect::<Vec<_>>();
+        Ok(OneKey {
+            id: pok.id,
+            name: pok.name,
+            steps,
+        })
+    }
+
+    fn decrypt_step(&self, s: PersistedOneKeyStep) -> Result<OneKeyStep> {
+        Ok(OneKeyStep {
+            label: s.label,
+            expect: s.expect,
+            send: self.decrypt_value(&s.send)?,
+        })
     }
 
     fn encrypt_connection(&self, conn: &ConnectionConfig) -> Result<PersistedConnection> {
@@ -368,7 +527,8 @@ impl ConfigManager {
 mod tests {
     use super::*;
     use crate::config::{
-        ConnectionKind, SerialConfig, SshAuth, SshConfig, TcpConfig, TelnetConfig,
+        ConnectionKind, OneKey, OneKeyStep, SerialConfig, SshAuth, SshConfig, TcpConfig,
+        TelnetConfig,
     };
 
     fn test_config_manager() -> (ConfigManager, tempfile::TempDir) {
@@ -390,6 +550,126 @@ mod tests {
         cm.save_connections(&[]).unwrap();
         let loaded = cm.load_connections().unwrap();
         assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn test_onekey_save_load_roundtrip() {
+        let (cm, _dir) = test_config_manager();
+        let onekeys = vec![OneKey {
+            id: "ok1".to_string(),
+            name: "git-inesa".to_string(),
+            steps: vec![
+                OneKeyStep {
+                    label: "Username".to_string(),
+                    expect: r"Username for \S+:".to_string(),
+                    send: "my-user".to_string(),
+                },
+                OneKeyStep {
+                    label: "Password".to_string(),
+                    // Use the git-HTTPS-shaped expect here so the migration
+                    // in `decrypt_onekey` (which upgrades a bare `password:`
+                    // to `password for \S+:` when a Username step is present)
+                    // doesn't rewrite it on load — keeping this a pure round-trip.
+                    expect: r"password for \S+:".to_string(),
+                    send: "secret-token-123".to_string(),
+                },
+            ],
+        }];
+        cm.save_onekeys(&onekeys).unwrap();
+        let loaded = cm.load_onekeys().unwrap();
+        assert_eq!(loaded, onekeys);
+
+        // Each step's `send` must be encrypted at rest — not plaintext in the file.
+        let raw = std::fs::read_to_string(&cm.config_path).unwrap();
+        assert!(!raw.contains("secret-token-123"));
+        assert!(!raw.contains("my-user"));
+    }
+
+    #[test]
+    fn test_onekey_password_expect_migrated_for_git_https() {
+        // The bug this guards: a user saves a git-HTTPS OneKey with a Username
+        // step (`Username for \S+:`) and a Password step whose expect is a bare
+        // `password:`. Git's actual prompt is `Password for 'host': ` — the
+        // `for 'host'` sits between "Password" and ":", so `password:` does
+        // NOT match, the popup never fires for the password step, and the user
+        // has to type the password manually. The migration upgrades the expect
+        // to `password for \S+:` on load so the popup fires correctly.
+        let (cm, _dir) = test_config_manager();
+        let onekeys = vec![OneKey {
+            id: "ok-migrate".to_string(),
+            name: "gitlab".to_string(),
+            steps: vec![
+                OneKeyStep {
+                    label: "Username".to_string(),
+                    expect: r"Username for \S+:".to_string(),
+                    send: "user".to_string(),
+                },
+                OneKeyStep {
+                    label: "".to_string(),
+                    expect: r"password:".to_string(),
+                    send: "pass".to_string(),
+                },
+            ],
+        }];
+        cm.save_onekeys(&onekeys).unwrap();
+        let loaded = cm.load_onekeys().unwrap();
+        assert_eq!(loaded.len(), 1);
+        let steps = &loaded[0].steps;
+        assert_eq!(steps.len(), 2);
+        // Username step is untouched.
+        assert_eq!(steps[0].expect, r"Username for \S+:");
+        // Password step's expect was migrated.
+        assert_eq!(
+            steps[1].expect, r"password for \S+:",
+            "bare 'password:' expect must be migrated to 'password for \\S+:' when a Username step is present"
+        );
+        // The send value survives the migration (decrypted correctly).
+        assert_eq!(steps[1].send, "pass");
+    }
+
+    #[test]
+    fn test_onekey_password_expect_not_migrated_without_username_step() {
+        // A bare `password:` expect is correct for SSH password prompts (which
+        // are literally `password:`). The migration must NOT touch OneKeys that
+        // don't have a `Username for \S+:` step, otherwise SSH password autofill
+        // would break.
+        let (cm, _dir) = test_config_manager();
+        let onekeys = vec![OneKey {
+            id: "ok-ssh".to_string(),
+            name: "ssh-host".to_string(),
+            steps: vec![OneKeyStep {
+                label: "Password".to_string(),
+                expect: r"password:".to_string(),
+                send: "ssh-pass".to_string(),
+            }],
+        }];
+        cm.save_onekeys(&onekeys).unwrap();
+        let loaded = cm.load_onekeys().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(
+            loaded[0].steps[0].expect, r"password:",
+            "bare 'password:' expect must be preserved when no Username step is present (SSH password prompt)"
+        );
+    }
+
+    #[test]
+    fn test_onekeys_preserved_when_saving_connections() {
+        let (cm, _dir) = test_config_manager();
+        cm.save_onekeys(&[OneKey {
+            id: "ok1".to_string(),
+            name: "n".to_string(),
+            steps: vec![OneKeyStep {
+                label: "l".to_string(),
+                expect: "e".to_string(),
+                send: "s".to_string(),
+            }],
+        }])
+        .unwrap();
+        // Saving connections must not clobber the OneKey library.
+        cm.save_connections(&[]).unwrap();
+        let loaded = cm.load_onekeys().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].steps[0].send, "s");
     }
 
     #[test]
@@ -568,7 +848,10 @@ mod tests {
         assert_eq!(parsed["version"], 1);
         assert!(parsed["connections"].is_array());
         assert_eq!(parsed["connections"][0]["name"], "Check Format");
-        assert!(parsed["connections"][0]["kind"]["Ssh"]["auth"]["Password"]["password"]["_encrypted"].is_string());
+        assert!(
+            parsed["connections"][0]["kind"]["Ssh"]["auth"]["Password"]["password"]["_encrypted"]
+                .is_string()
+        );
     }
 
     #[test]
@@ -616,7 +899,9 @@ mod tests {
         let cm2 = ConfigManager {
             config_path: config_path.clone(),
             master_key: key2,
-            master_password_hash: parsed["master_password_hash"].as_str().map(|s| s.to_string()),
+            master_password_hash: parsed["master_password_hash"]
+                .as_str()
+                .map(|s| s.to_string()),
         };
         let loaded = cm2.load_connections().unwrap();
         assert_eq!(loaded.len(), 1);

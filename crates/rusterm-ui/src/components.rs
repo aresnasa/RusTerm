@@ -5,7 +5,8 @@ pub mod connection_dialog;
 pub mod ai_panel;
 pub mod master_password_dialog;
 pub mod suggestion_popup;
-pub mod history_panel;
+pub mod onekey_manager;
+pub mod onekey_popup;
 
 pub use sidebar::Sidebar;
 pub use tab_bar::TabBar;
@@ -14,4 +15,5 @@ pub use connection_dialog::ConnectionDialog;
 pub use ai_panel::AiPanel;
 pub use master_password_dialog::MasterPasswordDialog;
 pub use suggestion_popup::SuggestionPopup;
-pub use history_panel::HistoryPanel;
+pub use onekey_manager::OneKeyManager;
+pub use onekey_popup::OneKeyPopup;

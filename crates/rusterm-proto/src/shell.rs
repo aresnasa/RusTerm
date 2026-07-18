@@ -1,4 +1,5 @@
 use std::io::{Read, Write};
+use std::sync::Arc;
 
 use portable_pty::{native_pty_system, CommandBuilder, PtySize};
 use tokio::sync::mpsc;
@@ -60,8 +61,12 @@ impl ShellConnection {
             close_tx,
         );
 
+        // Shared guard: only one thread may send Disconnected
+        let disconnected = Arc::new(std::sync::atomic::AtomicBool::new(false));
+
         let sid_read = session_id.clone();
         let evt_read = event_tx.clone();
+        let disconnected_read = disconnected.clone();
         std::thread::spawn(move || {
             let mut buf = [0u8; 4096];
             let mut reader = reader;
@@ -69,45 +74,76 @@ impl ShellConnection {
                 match reader.read(&mut buf) {
                     Ok(0) => break,
                     Ok(n) => {
-                        let _ = evt_read.send(SessionEvent::Output(sid_read.clone(), buf[..n].to_vec()));
+                        let bytes = buf[..n].to_vec();
+                        let _ = evt_read.send(SessionEvent::Output(sid_read.clone(), bytes));
                     }
                     Err(_) => break,
                 }
             }
-            let _ = evt_read.send(SessionEvent::Disconnected(
-                sid_read,
-                "Shell exited".to_string(),
-            ));
+            if disconnected_read
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                let _ = evt_read.send(SessionEvent::Disconnected(
+                    sid_read,
+                    "Shell exited".to_string(),
+                ));
+            }
         });
 
         let sid_write = session_id.clone();
         let evt_write = event_tx.clone();
+        let disconnected_write = disconnected.clone();
         std::thread::spawn(move || {
+            // The writer thread needs a Tokio runtime to poll the input
+            // channel, but a std::thread has no runtime context — calling
+            // Handle::current() here panics ("no reactor running"). Build a
+            // dedicated current-thread runtime for this thread instead.
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(_) => return,
+            };
             loop {
-                let cont = tokio::task::block_in_place(|| {
-                    tokio::runtime::Handle::current().block_on(async {
-                        tokio::select! {
-                            Some(data) = input_rx.recv() => {
-                                if writer.write_all(&data).is_err() {
-                                    false
-                                } else {
-                                    let _ = writer.flush();
-                                    true
-                                }
+                let cont = rt.block_on(async {
+                    tokio::select! {
+                        Some(data) = input_rx.recv() => {
+                            if writer.write_all(&data).is_err() {
+                                false
+                            } else {
+                                let _ = writer.flush();
+                                true
                             }
-                            Some(_) = close_rx.recv() => false,
-                            else => false,
                         }
-                    })
+                        Some(_) = close_rx.recv() => false,
+                        else => false,
+                    }
                 });
                 if !cont {
                     break;
                 }
             }
-            let _ = evt_write.send(SessionEvent::Disconnected(
-                sid_write,
-                "Shell closed".to_string(),
-            ));
+            if disconnected_write
+                .compare_exchange(
+                    false,
+                    true,
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                )
+                .is_ok()
+            {
+                let _ = evt_write.send(SessionEvent::Disconnected(
+                    sid_write,
+                    "Shell closed".to_string(),
+                ));
+            }
         });
 
         let _sid_resize = session_id.clone();

@@ -16,9 +16,13 @@ fn html_escape(s: &str) -> String {
     out
 }
 
-/// Large Atuin-style suggestion panel rendered at the bottom of the terminal.
+/// Atuin-style suggestion panel rendered ABOVE the current cursor line.
 /// Shows matching history commands sorted by frequency, with the selected
 /// item highlighted. Appears automatically as the user types.
+///
+/// The vertical position is set via a CSS variable `--suggestion-bottom`
+/// on the parent terminal container, measured by JavaScript to sit exactly
+/// above the cursor row. Falls back to `2em` if unset.
 #[component]
 pub fn SuggestionPopup(
     suggestions: Vec<String>,
@@ -33,27 +37,39 @@ pub fn SuggestionPopup(
     let current_selected = selected_index;
 
     // Build rows HTML
-    let items_html = suggestions.iter().enumerate().map(|(i, cmd)| {
-        let is_selected = i == current_selected;
-        let bg = if is_selected { "#283457" } else { "transparent" };
-        let fg = if is_selected { "#c0caf5" } else { "#a9b1d6" };
-        let left_border = if is_selected { "border-left:2px solid #7aa2f7;" } else { "border-left:2px solid transparent;" };
-        let escaped = html_escape(cmd);
+    let items_html = suggestions
+        .iter()
+        .enumerate()
+        .map(|(i, cmd)| {
+            let is_selected = i == current_selected;
+            let bg = if is_selected { "#283457" } else { "transparent" };
+            let fg = if is_selected { "#c0caf5" } else { "#a9b1d6" };
+            let left_border = if is_selected {
+                "border-left:2px solid #7aa2f7;"
+            } else {
+                "border-left:2px solid transparent;"
+            };
+            let escaped = html_escape(cmd);
 
-        format!(
-            "<div style=\"display:flex;align-items:center;padding:3px 12px;{left_border}background:{bg};color:{fg};cursor:pointer;white-space:pre;overflow:hidden;text-overflow:ellipsis;\">{escaped}</div>"
-        )
-    }).collect::<Vec<_>>().join("");
+            format!(
+                "<div style=\"display:flex;align-items:center;padding:3px 12px;{left_border}background:{bg};color:{fg};cursor:pointer;white-space:pre;overflow:hidden;text-overflow:ellipsis;\">{escaped}</div>"
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("");
 
     rsx! {
         div {
             style: "
                 position: absolute;
-                left: 0; right: 0; bottom: 0;
-                max-height: 40%;
+                left: 0; right: 0;
+                bottom: var(--suggestion-bottom, 2em);
+                max-height: 50%;
                 overflow-y: auto;
                 background: #16161e;
-                border-top: 1px solid #2a2b3d;
+                border: 1px solid #2a2b3d;
+                border-bottom: none;
+                box-shadow: 0 -4px 16px rgba(0,0,0,0.4);
                 font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
                 font-size: 13px;
                 line-height: 1.5;

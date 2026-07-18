@@ -1,0 +1,183 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  RusTerm desktop app icon.
+
+  Design intent:
+    - Squircle base in Rust orange gradient  -> Rust / performance / speed
+    - A ">" terminal cursor streaking like a comet (upper-right) -> speed / fast
+    - Four riveted corner bolts + an inner shield outline -> local security / safe
+    - Single dominant symbol (cursor) + security accents, legible at 16x16.
+
+  Pure SVG, no external deps. Square viewBox 0 0 512 512.
+-->
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="0 0 512 512"
+     role="img"
+     aria-label="RusTerm app icon">
+  <title>RusTerm</title>
+  <desc>Rust-powered terminal with local security.</desc>
+
+  <defs>
+    <!-- Squircle clip: rounded-square app-tile shape -->
+    <clipPath id="squircle" clipPathUnits="userSpaceOnUse">
+      <path d="
+        M 96 32
+        H 416
+        A 64 64 0 0 1 480 96
+        V 416
+        A 64 64 0 0 1 416 480
+        H 96
+        A 64 64 0 0 1 32 416
+        V 96
+        A 64 64 0 0 1 96 32
+        Z" />
+    </clipPath>
+
+    <!-- Rust orange radial gradient for depth -->
+    <radialGradient id="rustGrad" cx="38%" cy="30%" r="85%">
+      <stop offset="0%"  stop-color="#F26A4F"/>
+      <stop offset="55%" stop-color="#CE422B"/>
+      <stop offset="100%" stop-color="#7A1F0F"/>
+    </radialGradient>
+
+    <!-- Subtle top-gloss for app-tile feel -->
+    <linearGradient id="gloss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"  stop-color="#FFFFFF" stop-opacity="0.22"/>
+      <stop offset="45%" stop-color="#FFFFFF" stop-opacity="0.00"/>
+    </linearGradient>
+
+    <!-- Cursor / comet gradient: bright core -> warm tail -->
+    <linearGradient id="cursorGrad" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0%"  stop-color="#FFD37A"/>
+      <stop offset="55%" stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#FFE9B0"/>
+    </linearGradient>
+
+    <!-- Soft shadow under the cursor -->
+    <filter id="cursorGlow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="6"/>
+      <feOffset dx="0" dy="2" result="off"/>
+      <feComponentTransfer in="off" result="shadow">
+        <feFuncA type="linear" slope="0.55"/>
+      </feComponentTransfer>
+      <feMerge>
+        <feMergeNode in="shadow"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <!-- ============== BASE ============== -->
+  <g clip-path="url(#squircle)">
+    <rect x="0" y="0" width="512" height="512" fill="url(#rustGrad)"/>
+    <rect x="0" y="0" width="512" height="512" fill="url(#gloss)"/>
+
+    <!-- Faint concentric rings: subtle "shield / vault" feel -->
+    <g fill="none" stroke="#FFFFFF" stroke-opacity="0.06" stroke-width="2">
+      <circle cx="256" cy="256" r="210"/>
+      <circle cx="256" cy="256" r="170"/>
+    </g>
+  </g>
+
+  <!-- ============== INNER SHIELD OUTLINE (security accent) ============== -->
+  <!-- Drawn as an open path so the cursor can break out of it (speed) -->
+  <path d="
+    M 256 96
+    L 384 144
+    L 384 264
+    C 384 348  328 408  256 432
+    C 184 408  128 348  128 264
+    L 128 144
+    Z"
+    fill="none"
+    stroke="#1B1B1F"
+    stroke-opacity="0.78"
+    stroke-width="10"
+    stroke-linejoin="round"/>
+
+  <!-- Shield inner highlight -->
+  <path d="
+    M 256 108
+    L 372 151
+    L 372 264
+    C 372 340  322 396  256 418
+    C 190 396  140 340  140 264
+    L 140 151
+    Z"
+    fill="none"
+    stroke="#FFFFFF"
+    stroke-opacity="0.18"
+    stroke-width="3"
+    stroke-linejoin="round"/>
+
+  <!-- ============== TERMINAL PROMPT "$_" ============== -->
+  <!-- The "$" sits left-of-center; the cursor ">" is the streaking comet. -->
+  <g font-family="ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace"
+     text-rendering="geometricPrecision">
+    <!-- $ symbol -->
+    <text x="168" y="298"
+          font-size="120"
+          font-weight="700"
+          fill="#1B1B1F"
+          fill-opacity="0.85"
+          text-anchor="middle"
+          dominant-baseline="alphabetic">$</text>
+  </g>
+
+  <!-- ============== COMET CURSOR ">" (speed) ============== -->
+  <!-- The cursor body: a chevron, bright, with a motion tail. -->
+  <g filter="url(#cursorGlow)">
+    <!-- Motion tail: 3 fading chevrons trailing behind -->
+    <g fill="none" stroke="#FFE9B0" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M 232 232 L 272 256 L 232 280"
+            stroke-width="10" stroke-opacity="0.30"/>
+      <path d="M 250 228 L 296 256 L 250 284"
+            stroke-width="12" stroke-opacity="0.55"/>
+    </g>
+    <!-- Main cursor chevron -->
+    <path d="M 272 222 L 332 256 L 272 290"
+          fill="none"
+          stroke="url(#cursorGrad)"
+          stroke-width="20"
+          stroke-linecap="round"
+          stroke-linejoin="round"/>
+    <!-- Bright core dot at the chevron tip -->
+    <circle cx="338" cy="256" r="9" fill="#FFFFFF"/>
+  </g>
+
+  <!-- ============== FOUR CORNER BOLTS (lock / rivets = security) ============== -->
+  <g fill="#1B1B1F" fill-opacity="0.80">
+    <!-- positions chosen to sit inside the squircle corners -->
+    <g>
+      <!-- top-left -->
+      <circle cx="96"  cy="96"  r="11"/>
+      <circle cx="96"  cy="96"  r="4"  fill="#FFD37A"/>
+      <!-- top-right -->
+      <circle cx="416" cy="96"  r="11"/>
+      <circle cx="416" cy="96"  r="4"  fill="#FFD37A"/>
+      <!-- bottom-left -->
+      <circle cx="96"  cy="416" r="11"/>
+      <circle cx="96"  cy="416" r="4"  fill="#FFD37A"/>
+      <!-- bottom-right -->
+      <circle cx="416" cy="416" r="11"/>
+      <circle cx="416" cy="416" r="4"  fill="#FFD37A"/>
+    </g>
+  </g>
+
+  <!-- ============== BASE STROKE (crisp app-tile edge) ============== -->
+  <path d="
+    M 96 32
+    H 416
+    A 64 64 0 0 1 480 96
+    V 416
+    A 64 64 0 0 1 416 480
+    H 96
+    A 64 64 0 0 1 32 416
+    V 96
+    A 64 64 0 0 1 96 32
+    Z"
+    fill="none"
+    stroke="#1B1B1F"
+    stroke-opacity="0.35"
+    stroke-width="2"/>
+</svg>

@@ -12,6 +12,9 @@ tokio.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
+tracing-appender.workspace = true
+regex.workspace = true
 anyhow.workspace = true
 thiserror.workspace = true
 uuid.workspace = true
@@ -23,8 +26,17 @@ base64.workspace = true
 rand = "0.9"
 dirs.workspace = true
 argon2.workspace = true
+zeroize.workspace = true
 rusterm-crypto.workspace = true
 
 [dev-dependencies]
 toml.workspace = true
 tempfile = "3"
+criterion = { version = "0.5", default-features = false, features = ["cargo_bench_support"] }
+tracing-subscriber.workspace = true
+tracing.workspace = true
+
+# Benchmarks use the public Terminal API through the `terminal` module.
+[[bench]]
+name = "terminal_throughput"
+harness = false

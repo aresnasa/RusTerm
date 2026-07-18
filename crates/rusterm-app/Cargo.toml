@@ -20,7 +20,4 @@ rusterm-ui.workspace = true
 dioxus.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-tracing-subscriber.workspace = true
-tracing-appender.workspace = true
 anyhow.workspace = true
-dirs.workspace = true

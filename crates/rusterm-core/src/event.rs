@@ -19,4 +19,7 @@ pub enum SessionEvent {
     Error(SessionId, String),
     Resized(SessionId, u16, u16),
     Closed(SessionId),
+    /// Remote shell history fetched via exec channel.
+    /// Contains (session_id, parsed_commands).
+    RemoteHistory(SessionId, Vec<String>),
 }

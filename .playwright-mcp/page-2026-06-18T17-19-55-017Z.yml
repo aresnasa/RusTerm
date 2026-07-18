@@ -1,0 +1,7 @@
+- generic [active] [ref=e1]:
+  - generic [ref=e3]:
+    - generic [ref=e4]: "1"
+    - generic [ref=e5]:
+      - generic [ref=e6]: user@host:~$ ls -la
+      - generic [ref=e7]: user@host:~$
+  - generic [ref=e8]: "container rect.height = 1112.00 h (height - padV) = 1100.00 padV (top+bottom) = 12.00 --- char metrics --- span getBoundingClientRect.height (ch used NOW) = 19.50 span getBoundingClientRect.width (cw used NOW) = 7.83 computed lineHeight (row) parseFloat = 19.50 computed lineHeight (container) = 19.50 actual row div rect.height = 19.50 --- rows calc comparison --- rows with spanH (CURRENT): floor(1100.00 / 19.50) = 56 rows with lineHeight (FIX): floor(1100.00 / 19.50) = 56 rows with actual row height: floor(1100.00 / 19.50) = 56 --- width metrics --- content div rect.width (lastElementChild, NEW) = 1144.70 cols with content width = 146"

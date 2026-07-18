@@ -37,6 +37,16 @@ CREATE TABLE IF NOT EXISTS session_log (
     created_at TEXT NOT NULL
 );
 
+-- Hosts that have already been "auto-configured to the left side" after a
+-- successful SSH login. Recording the final success here lets subsequent
+-- SSH logins to the same host skip the configuration step entirely
+-- (idempotency: avoid duplicate configuration). Intermediate debug
+-- steps are NOT recorded — only the final success is.
+CREATE TABLE IF NOT EXISTS configured_hosts (
+    host TEXT PRIMARY KEY,
+    configured_at TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_history_session ON history(session_id);
 CREATE INDEX IF NOT EXISTS idx_history_created ON history(created_at);
 CREATE INDEX IF NOT EXISTS idx_history_command_created ON history(command, created_at);

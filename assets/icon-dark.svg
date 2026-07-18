@@ -1,0 +1,64 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512">
+  <defs>
+    <!-- Squircle clip -->
+    <clipPath id="sqD">
+      <path d="M96 32 H416 A64 64 0 0 1 480 96 V416 A64 64 0 0 1 416 480 H96 A64 64 0 0 1 32 416 V96 A64 64 0 0 1 96 32 Z"/>
+    </clipPath>
+
+    <!-- Near-black base with subtle warmth -->
+    <radialGradient id="bgD" cx="50%" cy="50%" r="70%">
+      <stop offset="0%" stop-color="#1B1B1F"/>
+      <stop offset="100%" stop-color="#0E0E12"/>
+    </radialGradient>
+
+    <!-- Orange cursor gradient (bright to deep) -->
+    <linearGradient id="cursorD" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FFE9B0"/>
+      <stop offset="40%" stop-color="#FFD37A"/>
+      <stop offset="70%" stop-color="#F26A4F"/>
+      <stop offset="100%" stop-color="#CE422B"/>
+    </linearGradient>
+
+    <!-- Wide glow filter -->
+    <filter id="glowD" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="10"/>
+    </filter>
+  </defs>
+
+  <!-- Dark squircle -->
+  <g clip-path="url(#sqD)">
+    <rect width="512" height="512" fill="url(#bgD)"/>
+  </g>
+
+  <!-- Faint shield outline (security hint, very subtle) -->
+  <path d="M256 96 L376 144 V256 Q376 360 256 416 Q136 360 136 256 V144 Z"
+        fill="none" stroke="#F26A4F" stroke-width="2" opacity="0.12"/>
+
+  <!-- Motion trail (speed hint) — three short streaks behind cursor -->
+  <g stroke-linecap="round" fill="none">
+    <line x1="120" y1="200" x2="172" y2="232" stroke="#F26A4F" stroke-width="2" opacity="0.20"/>
+    <line x1="140" y1="180" x2="194" y2="212" stroke="#F26A4F" stroke-width="3" opacity="0.28"/>
+    <line x1="162" y1="160" x2="216" y2="192" stroke="#FFD37A" stroke-width="4" opacity="0.40"/>
+  </g>
+
+  <!-- Cursor glow halo (wide blurred stroke) -->
+  <g filter="url(#glowD)" opacity="0.65">
+    <path d="M200 160 L320 256 L200 352"
+          fill="none" stroke="#F26A4F" stroke-width="42"
+          stroke-linecap="round" stroke-linejoin="round"/>
+    <line x1="200" y1="368" x2="262" y2="368"
+          stroke="#F26A4F" stroke-width="28" stroke-linecap="round"/>
+  </g>
+
+  <!-- Main > cursor (sharp, on top of glow) -->
+  <path d="M200 160 L320 256 L200 352"
+        fill="none" stroke="url(#cursorD)" stroke-width="24"
+        stroke-linecap="round" stroke-linejoin="round"/>
+
+  <!-- Cursor underline (prompt block) -->
+  <line x1="200" y1="368" x2="262" y2="368"
+        stroke="url(#cursorD)" stroke-width="16" stroke-linecap="round"/>
+
+  <!-- Spark highlight on cursor tip -->
+  <circle cx="318" cy="254" r="4" fill="#FFFFFF" opacity="0.9"/>
+</svg>

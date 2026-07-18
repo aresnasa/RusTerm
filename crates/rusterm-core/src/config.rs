@@ -30,11 +30,39 @@ pub struct SshConfig {
     pub keepalive_interval: Option<u64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+// NOTE: `Debug` for `SshAuth` is implemented manually below to ensure passwords
+// and key passphrases are never accidentally leaked through `{:?}` formatting
+// (e.g. via `tracing::error!(?auth)`). This is part of RusTerm's privacy
+// guarantee: secrets never appear in logs.
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub enum SshAuth {
-    Password { password: String },
-    Key { private_key_path: String, passphrase: Option<String> },
+    Password {
+        password: String,
+    },
+    Key {
+        private_key_path: String,
+        passphrase: Option<String>,
+    },
     Agent,
+}
+
+impl std::fmt::Debug for SshAuth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            SshAuth::Password { .. } => f
+                .debug_struct("SshAuth::Password")
+                .field("password", &"<redacted>")
+                .finish(),
+            SshAuth::Key {
+                private_key_path, ..
+            } => f
+                .debug_struct("SshAuth::Key")
+                .field("private_key_path", private_key_path)
+                .field("passphrase", &"<redacted>")
+                .finish(),
+            SshAuth::Agent => f.write_str("SshAuth::Agent"),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -53,12 +81,32 @@ pub struct TelnetConfig {
     pub port: u16,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+// `ShellConfig::env` can carry secrets (e.g. `AWS_SECRET_ACCESS_KEY=...`),
+// so its `Debug` impl redacts all env *values* while preserving keys for
+// diagnosability (knowing which env vars are set is operationally useful;
+// knowing their values is not, and is a classic leak vector).
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct ShellConfig {
     pub command: Option<String>,
     pub args: Vec<String>,
     pub env: Vec<(String, String)>,
     pub working_dir: Option<String>,
+}
+
+impl std::fmt::Debug for ShellConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let redacted_env: Vec<(String, &str)> = self
+            .env
+            .iter()
+            .map(|(k, _)| (k.clone(), "<redacted>"))
+            .collect();
+        f.debug_struct("ShellConfig")
+            .field("command", &self.command)
+            .field("args", &self.args)
+            .field("env", &redacted_env)
+            .field("working_dir", &self.working_dir)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -74,9 +122,21 @@ pub struct HostConfig {
 
 // --- Persistence types (encrypted JSON on disk) ---
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+// `EncryptedValue` stores AEAD ciphertext (nonce + AES-256-GCM output) as
+// base64. The ciphertext itself is not secret, but we redact it in `Debug`
+// to keep logs compact and avoid creating the impression that any
+// cryptographic material is being written to disk in the clear.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct EncryptedValue {
     pub _encrypted: String,
+}
+
+impl std::fmt::Debug for EncryptedValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptedValue")
+            .field("_encrypted", &"<redacted>")
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,7 +144,62 @@ pub struct PersistedConfig {
     pub version: u32,
     pub connections: Vec<PersistedConnection>,
     #[serde(default)]
+    pub onekeys: Vec<PersistedOneKey>,
+    #[serde(default)]
     pub master_password_hash: Option<String>,
+}
+
+// --- OneKeys (ZOC-style Expect/Send auto-fill) ---
+
+/// In-memory OneKey entry: a named sequence of Expect/Send steps.
+/// When terminal output matches a step's `expect`, that step's `send` is offered.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OneKey {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub steps: Vec<OneKeyStep>,
+}
+
+// `OneKeyStep` holds the `send` value in memory as plaintext (so it can be sent
+// to the terminal when the step matches). Its `Debug` impl redacts `send` so
+// accidental `tracing::debug!(?step)` calls don't leak credentials into logs.
+#[derive(Clone, Serialize, Deserialize, PartialEq)]
+pub struct OneKeyStep {
+    /// Display label, e.g. "Username" / "Password".
+    #[serde(default)]
+    pub label: String,
+    /// Regex matched against terminal output.
+    pub expect: String,
+    /// Value to send when this step matches (plaintext in memory).
+    pub send: String,
+}
+
+impl std::fmt::Debug for OneKeyStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OneKeyStep")
+            .field("label", &self.label)
+            .field("expect", &self.expect)
+            .field("send", &"<redacted>")
+            .finish()
+    }
+}
+
+/// Persisted OneKey entry. Each step's `send` is encrypted at rest.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedOneKey {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub steps: Vec<PersistedOneKeyStep>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedOneKeyStep {
+    #[serde(default)]
+    pub label: String,
+    pub expect: String,
+    pub send: EncryptedValue,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,8 +234,13 @@ pub struct PersistedSshConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PersistedSshAuth {
-    Password { password: EncryptedValue },
-    Key { private_key_path: String, passphrase: Option<EncryptedValue> },
+    Password {
+        password: EncryptedValue,
+    },
+    Key {
+        private_key_path: String,
+        passphrase: Option<EncryptedValue>,
+    },
     Agent,
 }
 
@@ -137,7 +257,9 @@ mod tests {
                 host: "192.168.1.1".to_string(),
                 port: 22,
                 username: "root".to_string(),
-                auth: SshAuth::Password { password: "secret".to_string() },
+                auth: SshAuth::Password {
+                    password: "secret".to_string(),
+                },
                 terminal_type: "xterm-256color".to_string(),
                 proxy_jump: None,
                 keepalive_interval: Some(30),
@@ -179,20 +301,36 @@ mod tests {
     fn test_all_connection_kinds() {
         let configs = vec![
             ConnectionKind::Ssh(SshConfig {
-                host: "host".to_string(), port: 22, username: "user".to_string(),
-                auth: SshAuth::Agent, terminal_type: "xterm-256color".to_string(),
-                proxy_jump: None, keepalive_interval: None,
+                host: "host".to_string(),
+                port: 22,
+                username: "user".to_string(),
+                auth: SshAuth::Agent,
+                terminal_type: "xterm-256color".to_string(),
+                proxy_jump: None,
+                keepalive_interval: None,
             }),
             ConnectionKind::Serial(SerialConfig {
-                port: "/dev/ttyS0".to_string(), baud_rate: 9600, data_bits: 8,
-                parity: "none".to_string(), stop_bits: 1, flow_control: "none".to_string(),
+                port: "/dev/ttyS0".to_string(),
+                baud_rate: 9600,
+                data_bits: 8,
+                parity: "none".to_string(),
+                stop_bits: 1,
+                flow_control: "none".to_string(),
             }),
-            ConnectionKind::Telnet(TelnetConfig { host: "host".to_string(), port: 23 }),
+            ConnectionKind::Telnet(TelnetConfig {
+                host: "host".to_string(),
+                port: 23,
+            }),
             ConnectionKind::Shell(ShellConfig {
-                command: Some("/bin/bash".to_string()), args: vec![],
-                env: vec![], working_dir: None,
+                command: Some("/bin/bash".to_string()),
+                args: vec![],
+                env: vec![],
+                working_dir: None,
             }),
-            ConnectionKind::Tcp(TcpConfig { host: "host".to_string(), port: 8080 }),
+            ConnectionKind::Tcp(TcpConfig {
+                host: "host".to_string(),
+                port: 8080,
+            }),
         ];
 
         for kind in configs {
@@ -205,8 +343,13 @@ mod tests {
     #[test]
     fn test_ssh_auth_variants() {
         let auths = vec![
-            SshAuth::Password { password: "pass".to_string() },
-            SshAuth::Key { private_key_path: "/path/to/key".to_string(), passphrase: Some("secret".to_string()) },
+            SshAuth::Password {
+                password: "pass".to_string(),
+            },
+            SshAuth::Key {
+                private_key_path: "/path/to/key".to_string(),
+                passphrase: Some("secret".to_string()),
+            },
             SshAuth::Agent,
         ];
 

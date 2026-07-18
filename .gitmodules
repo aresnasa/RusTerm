@@ -1,0 +1,3 @@
+[submodule "ansible/kubeasz"]
+	path = ansible/kubeasz
+	url = https://github.com/easzlab/kubeasz.git

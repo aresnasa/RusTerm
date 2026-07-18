@@ -28,6 +28,7 @@ pub fn Sidebar(
     on_connect: EventHandler<String>,
     on_new: EventHandler<()>,
     on_copy: EventHandler<String>,
+    on_onekey: EventHandler<()>,
 ) -> Element {
     let mut search = use_signal(String::new);
     let mut expanded_ssh = use_signal(|| true);
@@ -69,11 +70,21 @@ pub fn Sidebar(
             div {
                 style: "padding: 12px; display: flex; justify-content: space-between; align-items: center;",
                 span { style: "font-weight: 600; font-size: 14px; letter-spacing: 0.3px;", "Connections" }
-                button {
-                    class: "conn-btn",
-                    style: "background: #7aa2f7; border: none; color: #1a1b26; border-radius: 4px; padding: 4px 10px; cursor: pointer; font-size: 12px; font-weight: 600;",
-                    onclick: move |_| on_new.call(()),
-                    "+ New"
+                div {
+                    style: "display: flex; gap: 6px;",
+                    button {
+                        class: "conn-btn",
+                        style: "background: transparent; border: 1px solid #2a2b3d; color: #c0caf5; border-radius: 4px; padding: 4px 10px; cursor: pointer; font-size: 12px;",
+                        title: "Configure OneKeys (Expect/Send auto-fill)",
+                        onclick: move |_| on_onekey.call(()),
+                        "OneKeys"
+                    }
+                    button {
+                        class: "conn-btn",
+                        style: "background: #7aa2f7; border: none; color: #1a1b26; border-radius: 4px; padding: 4px 10px; cursor: pointer; font-size: 12px; font-weight: 600;",
+                        onclick: move |_| on_new.call(()),
+                        "+ New"
+                    }
                 }
             }
 

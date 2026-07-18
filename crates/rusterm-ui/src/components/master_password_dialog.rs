@@ -7,10 +7,12 @@ pub fn MasterPasswordDialog(
     mode: UnlockState,
     error: Option<String>,
     on_unlock: EventHandler<String>,
+    on_clear_error: EventHandler<()>,
 ) -> Element {
     let mut password = use_signal(String::new);
     let mut confirm = use_signal(String::new);
     let mut loading = use_signal(|| false);
+    let mut show_password = use_signal(|| false);
 
     let is_first_run = mode == UnlockState::FirstRun;
     let title = if is_first_run {
@@ -24,8 +26,17 @@ pub fn MasterPasswordDialog(
         "Enter your master password to decrypt your connections."
     };
 
+    // If an error appears, clear the loading state so the user can retry
+    if error.is_some() && loading() {
+        loading.set(false);
+    }
+    let has_error = error.is_some();
+    let error_text = error.clone();
+
     let passwords_match = !is_first_run || password() == confirm();
     let can_submit = !password().is_empty() && passwords_match && !loading();
+    let pw_input_type = if show_password() { "text" } else { "password" };
+    let toggle_label = if show_password() { "Hide" } else { "Show" };
 
     rsx! {
         div {
@@ -48,7 +59,6 @@ pub fn MasterPasswordDialog(
                     color: #c0caf5;
                 ",
 
-                // Logo / title area
                 div {
                     style: "text-align: center; margin-bottom: 24px;",
                     h2 {
@@ -64,72 +74,103 @@ pub fn MasterPasswordDialog(
                 div {
                     style: "display: flex; flex-direction: column; gap: 14px;",
 
-                    label {
-                        style: "font-size: 12px; color: #565f89; font-weight: 500;",
-                        "Master Password"
-                    }
-                    input {
-                        style: "
-                            background: #1a1b26;
-                            border: 1px solid #2a2b3d;
-                            border-radius: 4px;
-                            padding: 10px 12px;
-                            color: #c0caf5;
-                            font-size: 14px;
-                            outline: none;
-                            width: 100%;
-                            box-sizing: border-box;
-                        ",
-                        r#type: "password",
-                        placeholder: "Enter password",
-                        autofocus: true,
-                        value: "{password}",
-                        oninput: move |e| password.set(e.value()),
-                        onkeydown: move |e| {
-                            if e.key() == Key::Enter && can_submit {
-                                loading.set(true);
-                                on_unlock.call(password());
+                    div {
+                        style: "display: flex; flex-direction: column; gap: 4px;",
+                        label {
+                            style: "font-size: 12px; color: #565f89; font-weight: 500;",
+                            "Master Password"
+                        }
+                        div {
+                            style: "display: flex; gap: 6px;",
+                            input {
+                                style: "
+                                    flex: 1;
+                                    background: #1a1b26;
+                                    border: 1px solid #2a2b3d;
+                                    border-radius: 4px;
+                                    padding: 10px 12px;
+                                    color: #c0caf5;
+                                    font-size: 14px;
+                                    outline: none;
+                                    box-sizing: border-box;
+                                ",
+                                r#type: "{pw_input_type}",
+                                placeholder: "Enter password",
+                                autofocus: true,
+                                value: "{password}",
+                                oninput: move |e| {
+                                    password.set(e.value());
+                                    if has_error { on_clear_error.call(()); }
+                                },
+                                onkeydown: move |e| {
+                                    if e.key() == Key::Enter && can_submit {
+                                        loading.set(true);
+                                        on_unlock.call(password());
+                                    }
+                                },
                             }
-                        },
+                            button {
+                                style: "
+                                    background: #1a1b26;
+                                    border: 1px solid #2a2b3d;
+                                    border-radius: 4px;
+                                    padding: 0 12px;
+                                    color: #565f89;
+                                    cursor: pointer;
+                                    font-size: 12px;
+                                    min-width: 56px;
+                                ",
+                                r#type: "button",
+                                title: "Show / hide password",
+                                onclick: move |_| show_password.set(!show_password()),
+                                "{toggle_label}"
+                            }
+                        }
                     }
 
                     if is_first_run {
-                        label {
-                            style: "font-size: 12px; color: #565f89; font-weight: 500;",
-                            "Confirm Password"
-                        }
-                        input {
-                            style: "
-                                background: #1a1b26;
-                                border: 1px solid #2a2b3d;
-                                border-radius: 4px;
-                                padding: 10px 12px;
-                                color: #c0caf5;
-                                font-size: 14px;
-                                outline: none;
-                                width: 100%;
-                                box-sizing: border-box;
-                            ",
-                            r#type: "password",
-                            placeholder: "Confirm password",
-                            value: "{confirm}",
-                            oninput: move |e| confirm.set(e.value()),
-                            onkeydown: move |e| {
-                                if e.key() == Key::Enter && can_submit {
-                                    loading.set(true);
-                                    on_unlock.call(password());
+                        div {
+                            style: "display: flex; flex-direction: column; gap: 4px;",
+                            label {
+                                style: "font-size: 12px; color: #565f89; font-weight: 500;",
+                                "Confirm Password"
+                            }
+                            input {
+                                style: "
+                                    background: #1a1b26;
+                                    border: 1px solid #2a2b3d;
+                                    border-radius: 4px;
+                                    padding: 10px 12px;
+                                    color: #c0caf5;
+                                    font-size: 14px;
+                                    outline: none;
+                                    width: 100%;
+                                    box-sizing: border-box;
+                                ",
+                                r#type: "{pw_input_type}",
+                                placeholder: "Confirm password",
+                                value: "{confirm}",
+                                oninput: move |e| {
+                                    confirm.set(e.value());
+                                    if has_error { on_clear_error.call(()); }
+                                },
+                                onkeydown: move |e| {
+                                    if e.key() == Key::Enter && can_submit {
+                                        loading.set(true);
+                                        on_unlock.call(password());
+                                    }
+                                },
+                            }
+                            if !passwords_match && !confirm().is_empty() {
+                                p {
+                                    style: "color: #f7768e; font-size: 12px; margin: 0;",
+                                    "Passwords do not match"
                                 }
-                            },
-                        }
-                        if !passwords_match && !confirm().is_empty() {
-                            p {
-                                style: "color: #f7768e; font-size: 12px; margin: 0;",
-                                "Passwords do not match"
                             }
                         }
                     }
 
-                    if let Some(ref err) = error {
+                    if let Some(ref err) = error_text {
                         p {
                             style: "color: #f7768e; font-size: 12px; margin: 0; text-align: center;",
                             "{err}"
