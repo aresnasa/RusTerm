@@ -845,12 +845,30 @@ pub fn TerminalView(
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
                 let measure_cid = cid.clone();
                 let scroll_cid = format!("terminal-scroll-{sid}");
+                // Measurement strategy: compute the terminal content width as
+                // (scroll_div_width - gutter_width) where gutter_width is read
+                // directly from the gutter element (terminal-scroll's
+                // firstElementChild). This is stable from first mount onward,
+                // unlike the previous approach which measured
+                // `lastElementChild` (the content div) — that returned an
+                // over-wide value on the first poll because the gutter hadn't
+                // been laid out yet (render_output was Default::default() with
+                // scrollback_capacity=0, producing a 2ch gutter instead of the
+                // stable 6ch). The result was a transient wrong-cols resize
+                // (e.g. 207 → 203 within 100ms) that visibly re-wrapped remote
+                // output. Reading both children's bounding rects explicitly
+                // avoids that race.
                 let result = dioxus::document::eval(&format!(
-                    "return (function() {{ const el = document.getElementById('{measure_cid}'); if (!el) return 'no-el'; const rect = el.getBoundingClientRect(); if (rect.width <= 0 || rect.height <= 0) return 'zero'; const cs = getComputedStyle(el); const padH = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight); const padV = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom); const bw = parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth); const bh = parseFloat(cs.borderTopWidth) + parseFloat(cs.borderBottomWidth); const h = rect.height - padV - bh; if (h <= 0) return 'small'; let w; const sd = document.getElementById('{scroll_cid}'); if (sd && sd.lastElementChild) {{ w = sd.lastElementChild.getBoundingClientRect().width; }} else {{ w = rect.width - padH - bw; }} if (w <= 0) return 'small'; const test = document.createElement('span'); test.textContent = 'M'; test.style.cssText = 'font-family:JetBrains Mono,Fira Code,Cascadia Code,monospace;font-size:13px;line-height:1.5;position:absolute;visibility:hidden;white-space:pre;'; document.body.appendChild(test); const tr = test.getBoundingClientRect(); document.body.removeChild(test); const cw = Math.max(1, tr.width); const ch = Math.max(1, tr.height); const cols = Math.max(1, Math.floor(w / cw)); const rows = Math.max(1, Math.floor(h / ch)); const cr_sug = el.querySelector('[data-cursor-row=\"1\"]'); if (cr_sug) {{ const tr_sug = el.getBoundingClientRect(); const cr_r_sug = cr_sug.getBoundingClientRect(); el.style.setProperty('--suggestion-bottom', (tr_sug.bottom - cr_r_sug.top) + 'px'); el.style.setProperty('--suggestion-top', (cr_r_sug.bottom - tr_sug.top) + 'px'); }} return cols + ',' + rows + ',' + cw.toFixed(2) + ',' + ch.toFixed(2); }})()"
+                    "return (function() {{ const el = document.getElementById('{measure_cid}'); if (!el) return 'no-el'; const rect = el.getBoundingClientRect(); if (rect.width <= 0 || rect.height <= 0) return 'zero'; const cs = getComputedStyle(el); const padH = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight); const padV = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom); const bw = parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth); const bh = parseFloat(cs.borderTopWidth) + parseFloat(cs.borderBottomWidth); const h = rect.height - padV - bh; if (h <= 0) return 'small'; const sd = document.getElementById('{scroll_cid}'); if (!sd) return 'no-scroll'; const sdRect = sd.getBoundingClientRect(); if (sdRect.width <= 0) return 'small'; let w = sdRect.width; if (sd.firstElementChild) {{ const gutterW = sd.firstElementChild.getBoundingClientRect().width; w = Math.max(0, sdRect.width - gutterW); }} if (w <= 0) return 'small'; const test = document.createElement('span'); test.textContent = 'M'; test.style.cssText = 'font-family:JetBrains Mono,Fira Code,Cascadia Code,monospace;font-size:13px;line-height:1.5;position:absolute;visibility:hidden;white-space:pre;'; document.body.appendChild(test); const tr = test.getBoundingClientRect(); document.body.removeChild(test); const cw = Math.max(1, tr.width); const ch = Math.max(1, tr.height); const cols = Math.max(1, Math.floor(w / cw)); const rows = Math.max(1, Math.floor(h / ch)); const cr_sug = el.querySelector('[data-cursor-row=\"1\"]'); if (cr_sug) {{ const tr_sug = el.getBoundingClientRect(); const cr_r_sug = cr_sug.getBoundingClientRect(); el.style.setProperty('--suggestion-bottom', (tr_sug.bottom - cr_r_sug.top) + 'px'); el.style.setProperty('--suggestion-top', (cr_r_sug.bottom - tr_sug.top) + 'px'); }} return cols + ',' + rows + ',' + cw.toFixed(2) + ',' + ch.toFixed(2); }})()"
                 )).await;
                 if let Ok(value) = result {
                     if let Some(s) = value.as_str() {
-                        if s == "no-el" || s == "zero" || s == "small" || s.is_empty() {
+                        if s == "no-el"
+                            || s == "no-scroll"
+                            || s == "zero"
+                            || s == "small"
+                            || s.is_empty()
+                        {
                             continue;
                         }
                         let parts: Vec<&str> = s.split(',').collect();
@@ -942,7 +960,15 @@ pub fn TerminalView(
     // capacity + visible rows), not the current line count — otherwise the
     // gutter widens at 10/100/1000/10000-line thresholds as scrollback fills,
     // shifting all content horizontally (a display anomaly).
-    let max_line_num = (render_output.scrollback_capacity + total_rows).max(1);
+    //
+    // We floor `scrollback_capacity` at 10_000 (the Terminal's default capacity)
+    // so the initial render — where `render_output` is `Default::default()`
+    // (scrollback_capacity=0) — still sizes the gutter at 6ch. Without this
+    // floor the first poll of the resize future measures a 2ch gutter, computes
+    // an over-wide `cols`, and fires an `on_resize` that the next poll (after
+    // the real render lands with capacity=10_000 → 6ch gutter) immediately
+    // contradicts — remote output briefly re-wraps at the wrong column count.
+    let max_line_num = (render_output.scrollback_capacity.max(10_000) + total_rows).max(1);
     let gutter_width = (max_line_num.ilog10() as usize + 1) + 1; // digits + 1 padding
 
     // Pre-render line numbers as a single HTML block (gutter column)

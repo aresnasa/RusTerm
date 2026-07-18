@@ -29,6 +29,11 @@ pub fn Sidebar(
     on_new: EventHandler<()>,
     on_copy: EventHandler<String>,
     on_onekey: EventHandler<()>,
+    /// Open the connection dialog in edit mode for the connection with this id.
+    on_edit: EventHandler<String>,
+    /// Request deletion of the connection with this id (the App component
+    /// owns the confirm dialog — the sidebar only triggers it).
+    on_delete: EventHandler<String>,
 ) -> Element {
     let mut search = use_signal(String::new);
     let mut expanded_ssh = use_signal(|| true);
@@ -49,11 +54,35 @@ pub fn Sidebar(
         })
         .collect();
 
-    let ssh_conns: Vec<&ConnectionConfig> = filtered.iter().filter(|c| matches!(c.kind, ConnectionKind::Ssh(_))).collect();
-    let shell_conns: Vec<&ConnectionConfig> = filtered.iter().filter(|c| matches!(c.kind, ConnectionKind::Shell(_))).collect();
-    let other_conns: Vec<&ConnectionConfig> = filtered.iter().filter(|c| !matches!(c.kind, ConnectionKind::Ssh(_) | ConnectionKind::Shell(_))).collect();
+    let ssh_conns: Vec<&ConnectionConfig> = filtered
+        .iter()
+        .filter(|c| matches!(c.kind, ConnectionKind::Ssh(_)))
+        .collect();
+    let shell_conns: Vec<&ConnectionConfig> = filtered
+        .iter()
+        .filter(|c| matches!(c.kind, ConnectionKind::Shell(_)))
+        .collect();
+    let other_conns: Vec<&ConnectionConfig> = filtered
+        .iter()
+        .filter(|c| !matches!(c.kind, ConnectionKind::Ssh(_) | ConnectionKind::Shell(_)))
+        .collect();
 
     rsx! {
+        // Scoped CSS for the hover-revealed row action icons. Rendered inline
+        // (not in main.rs's head) so the sidebar is self-contained; class names
+        // are namespaced with `conn-` to avoid collisions.
+        style { "
+            .conn-icons{{opacity:0;transition:opacity 0.12s;display:flex;gap:2px;align-items:center;}}
+            .conn-item:hover .conn-icons{{opacity:1;}}
+            .conn-edit{{color:#9ece6a;cursor:pointer;font-size:13px;padding:0 4px;line-height:1;user-select:none;}}
+            .conn-edit:hover{{color:#7aa2f7;}}
+            .conn-del{{color:#f7768e;cursor:pointer;font-size:13px;padding:0 4px;line-height:1;user-select:none;}}
+            .conn-del:hover{{color:#ff5e8f;}}
+            .ctx-item{{padding:6px 12px;font-size:12px;cursor:pointer;color:#c0caf5;}}
+            .ctx-item:hover{{background:#2a2b3d;}}
+            .ctx-danger:hover{{background:#2a2b3d;color:#f7768e;}}
+        " }
+
         div {
             style: "
                 width: 260px;
@@ -122,6 +151,8 @@ pub fn Sidebar(
                                         conn: conn.clone(),
                                         on_connect: on_connect,
                                         on_copy: on_copy,
+                                        on_edit: on_edit,
+                                        on_delete: on_delete,
                                         context_menu: context_menu,
                                     }
                                 }}
@@ -148,6 +179,8 @@ pub fn Sidebar(
                                         conn: conn.clone(),
                                         on_connect: on_connect,
                                         on_copy: on_copy,
+                                        on_edit: on_edit,
+                                        on_delete: on_delete,
                                         context_menu: context_menu,
                                     }
                                 }}
@@ -174,6 +207,8 @@ pub fn Sidebar(
                                         conn: conn.clone(),
                                         on_connect: on_connect,
                                         on_copy: on_copy,
+                                        on_edit: on_edit,
+                                        on_delete: on_delete,
                                         context_menu: context_menu,
                                     }
                                 }}
@@ -205,7 +240,7 @@ pub fn Sidebar(
                 style: "position: fixed; top: {y}px; left: {x}px; z-index: 3000; background: #24283b; border: 1px solid #2a2b3d; border-radius: 4px; padding: 4px 0; min-width: 140px; box-shadow: 0 4px 12px rgba(0,0,0,0.4);",
 
                 div {
-                    style: "padding: 6px 12px; font-size: 12px; cursor: pointer; color: #c0caf5; hover:background: #2a2b3d;",
+                    class: "ctx-item",
                     onclick: move |_| {
                         if let Some((id, _, _)) = context_menu() {
                             on_connect.call(id);
@@ -215,7 +250,7 @@ pub fn Sidebar(
                     "Connect"
                 }
                 div {
-                    style: "padding: 6px 12px; font-size: 12px; cursor: pointer; color: #c0caf5;",
+                    class: "ctx-item",
                     onclick: move |_| {
                         if let Some((id, _, _)) = context_menu() {
                             on_copy.call(id);
@@ -223,6 +258,26 @@ pub fn Sidebar(
                         context_menu.set(None);
                     },
                     "Copy Session"
+                }
+                div {
+                    class: "ctx-item",
+                    onclick: move |_| {
+                        if let Some((id, _, _)) = context_menu() {
+                            on_edit.call(id);
+                        }
+                        context_menu.set(None);
+                    },
+                    "Edit…"
+                }
+                div {
+                    class: "ctx-item ctx-danger",
+                    onclick: move |_| {
+                        if let Some((id, _, _)) = context_menu() {
+                            on_delete.call(id);
+                        }
+                        context_menu.set(None);
+                    },
+                    "Delete"
                 }
             }
         }
@@ -236,11 +291,15 @@ fn ConnItem(
     conn: ConnectionConfig,
     on_connect: EventHandler<String>,
     on_copy: EventHandler<String>,
+    on_edit: EventHandler<String>,
+    on_delete: EventHandler<String>,
     mut context_menu: Signal<Option<(String, f64, f64)>>,
 ) -> Element {
     let color = kind_color(&conn.kind);
     let id = conn.id.clone();
     let id_for_ctx = conn.id.clone();
+    let id_for_edit = conn.id.clone();
+    let id_for_del = conn.id.clone();
     let mut hovered = use_signal(|| false);
     let bg = if hovered() { "#24283b" } else { "transparent" };
 
@@ -280,6 +339,32 @@ fn ConnItem(
                 span {
                     style: "font-size: 9px; background: #9ece6a; color: #1a1b26; padding: 1px 5px; border-radius: 3px; font-weight: 600; flex-shrink: 0;",
                     "1-KEY"
+                }
+            }
+
+            // Hover-revealed inline action icons. `stop_propagation` on their
+            // clicks prevents the row's `onclick` (Connect) from also firing.
+            // The icons are always in the DOM (so CSS :hover on the row can
+            // drive their opacity) but invisible until the row is hovered.
+            span {
+                class: "conn-icons",
+                span {
+                    class: "conn-edit",
+                    title: "Edit connection",
+                    onclick: move |e: MouseEvent| {
+                        e.stop_propagation();
+                        on_edit.call(id_for_edit.clone());
+                    },
+                    "✎"
+                }
+                span {
+                    class: "conn-del",
+                    title: "Delete connection",
+                    onclick: move |e: MouseEvent| {
+                        e.stop_propagation();
+                        on_delete.call(id_for_del.clone());
+                    },
+                    "✕"
                 }
             }
         }

@@ -2,7 +2,10 @@ use std::collections::{HashSet, VecDeque};
 
 use bitflags::bitflags;
 use unicode_width::UnicodeWidthChar;
-use vte::ansi::{self, Attr, CharsetIndex, ClearMode, Color, Handler, LineClearMode, PrivateMode, StandardCharset};
+use vte::ansi::{
+    self, Attr, CharsetIndex, ClearMode, Color, Handler, LineClearMode, PrivateMode,
+    StandardCharset,
+};
 
 // ── Cell & Row ──────────────────────────────────────────────────────
 
@@ -12,7 +15,7 @@ pub struct Cell {
     pub fg: CellColor,
     pub bg: CellColor,
     pub flags: CellFlags,
-    pub wide: bool,     // true for the first cell of a wide char
+    pub wide: bool,      // true for the first cell of a wide char
     pub wide_next: bool, // true for the continuation cell of a wide char
 }
 
@@ -290,7 +293,8 @@ impl Terminal {
         while i < data_len {
             if data[i] == 0x1b {
                 // Need at least ESC + suffix bytes after this position.
-                if i + 1 + SUFFIX.len() <= data_len && data[i + 1..i + 1 + SUFFIX.len()] == *SUFFIX {
+                if i + 1 + SUFFIX.len() <= data_len && data[i + 1..i + 1 + SUFFIX.len()] == *SUFFIX
+                {
                     let mut j = i + 1 + SUFFIX.len();
                     // Optional ';' separator before the numeric exit code.
                     if j < data_len && data[j] == b';' {
@@ -322,13 +326,17 @@ impl Terminal {
         }
     }
 
-    pub fn resize(&mut self, cols: u16, rows: u16) {
+    pub fn resize(&mut self, cols: u16, rows: u16, pixel_width: u32, pixel_height: u32) {
         let old_cols = self.size.cols as usize;
         let old_rows = self.size.rows as usize;
         let new_cols = cols as usize;
         let new_rows = rows as usize;
 
-        if new_cols == old_cols && new_rows == old_rows {
+        if new_cols == old_cols
+            && new_rows == old_rows
+            && pixel_width == self.size.pixel_width
+            && pixel_height == self.size.pixel_height
+        {
             return;
         }
 
@@ -346,7 +354,10 @@ impl Terminal {
                 for chunk in chars.chunks(new_cols) {
                     if row_idx >= new_rows {
                         // Push excess into scrollback
-                        self.scrollback.push_back(Row { cells: chunk.to_vec(), wrapped: true });
+                        self.scrollback.push_back(Row {
+                            cells: chunk.to_vec(),
+                            wrapped: true,
+                        });
                         row_idx += 1;
                         continue;
                     }
@@ -356,7 +367,8 @@ impl Terminal {
                             row.cells[i] = cell.clone();
                         }
                     }
-                    row.wrapped = chunk.len() > new_cols || (chunk.len() == new_cols && line_iter.peek().is_some());
+                    row.wrapped = chunk.len() > new_cols
+                        || (chunk.len() == new_cols && line_iter.peek().is_some());
                     self.grid.push(row);
                     row_idx += 1;
                 }
@@ -371,7 +383,12 @@ impl Terminal {
             self.grid.push(Row::new(new_cols));
         }
 
-        self.size = TerminalSize { cols, rows, pixel_width: 0, pixel_height: 0 };
+        self.size = TerminalSize {
+            cols,
+            rows,
+            pixel_width,
+            pixel_height,
+        };
         self.scroll_top = 0;
         self.scroll_bottom = new_rows.saturating_sub(1);
 
@@ -407,14 +424,18 @@ impl Terminal {
         let scrollback_len = self.scrollback.len();
 
         let render_row = |row: &Row| RenderRow {
-            cells: row.cells.iter().map(|c| RenderCell {
-                character: c.character,
-                fg: c.fg,
-                bg: c.bg,
-                flags: c.flags,
-                wide: c.wide,
-                wide_next: c.wide_next,
-            }).collect(),
+            cells: row
+                .cells
+                .iter()
+                .map(|c| RenderCell {
+                    character: c.character,
+                    fg: c.fg,
+                    bg: c.bg,
+                    flags: c.flags,
+                    wide: c.wide,
+                    wide_next: c.wide_next,
+                })
+                .collect(),
             wrapped: row.wrapped,
         };
 
@@ -428,7 +449,11 @@ impl Terminal {
             let from_scrollback_start = scrollback_len.saturating_sub(offset);
 
             let mut out: Vec<RenderRow> = Vec::with_capacity(visible_rows);
-            out.extend(self.scrollback.range(from_scrollback_start..from_scrollback_start + scrollback_avail).map(render_row));
+            out.extend(
+                self.scrollback
+                    .range(from_scrollback_start..from_scrollback_start + scrollback_avail)
+                    .map(render_row),
+            );
             let remaining = visible_rows - out.len();
             out.extend(self.grid.iter().take(remaining).map(render_row));
             out
@@ -739,7 +764,8 @@ impl Handler for Terminal {
         let row = row.min(self.rows().saturating_sub(1));
         let col = col.min(self.cols().saturating_sub(1));
         // If cursor lands on the continuation cell of a wide char, move to the start
-        let col = if row < self.grid.len() && col < self.grid[row].cells.len()
+        let col = if row < self.grid.len()
+            && col < self.grid[row].cells.len()
             && self.grid[row].cells[col].wide_next
         {
             col.saturating_sub(1)
@@ -874,7 +900,8 @@ impl Handler for Terminal {
             for _ in 0..count {
                 if self.scroll_bottom > 0 {
                     self.grid.remove(self.scroll_bottom);
-                    self.grid.insert(self.cursor_row, Self::make_row_with_bg(cols, bg));
+                    self.grid
+                        .insert(self.cursor_row, Self::make_row_with_bg(cols, bg));
                 }
             }
             for i in self.cursor_row..=self.scroll_bottom {
@@ -890,7 +917,8 @@ impl Handler for Terminal {
             for _ in 0..count {
                 if self.cursor_row < self.grid.len() && self.scroll_bottom < self.grid.len() {
                     self.grid.remove(self.cursor_row);
-                    self.grid.insert(self.scroll_bottom, Self::make_row_with_bg(cols, bg));
+                    self.grid
+                        .insert(self.scroll_bottom, Self::make_row_with_bg(cols, bg));
                 }
             }
             for i in self.cursor_row..=self.scroll_bottom {
@@ -929,7 +957,8 @@ impl Handler for Terminal {
 
     fn move_backward_tabs(&mut self, count: u16) {
         for _ in 0..count {
-            let prev_tab = (0..self.cursor_col).rev()
+            let prev_tab = (0..self.cursor_col)
+                .rev()
                 .find(|&c| self.tab_stops.get(c).copied().unwrap_or(false));
             self.cursor_col = prev_tab.unwrap_or(0);
         }
@@ -1114,7 +1143,8 @@ impl Handler for Terminal {
             }
             Attr::CancelItalic => self.attrs_flags.remove(CellFlags::ITALIC),
             Attr::CancelUnderline => {
-                self.attrs_flags.remove(CellFlags::UNDERLINE | CellFlags::DOUBLE_UNDERLINE);
+                self.attrs_flags
+                    .remove(CellFlags::UNDERLINE | CellFlags::DOUBLE_UNDERLINE);
             }
             Attr::CancelBlink => {}
             Attr::CancelReverse => self.attrs_flags.remove(CellFlags::INVERSE),
@@ -1158,10 +1188,16 @@ impl Handler for Terminal {
             PrivateMode::Named(ansi::NamedPrivateMode::LineWrap) => self.mode_line_wrap = true,
             PrivateMode::Named(ansi::NamedPrivateMode::Origin) => self.mode_origin = true,
             PrivateMode::Named(ansi::NamedPrivateMode::ShowCursor) => self.mode_show_cursor = true,
-            PrivateMode::Named(ansi::NamedPrivateMode::BracketedPaste) => self.mode_bracketed_paste = true,
+            PrivateMode::Named(ansi::NamedPrivateMode::BracketedPaste) => {
+                self.mode_bracketed_paste = true
+            }
             PrivateMode::Named(ansi::NamedPrivateMode::SwapScreenAndSetRestoreCursor) => {
                 if !self.using_alt_screen {
-                    tracing::debug!("[TERM] ESC[?1049h — switching to alternate screen, cursor=({}, {})", self.cursor_row, self.cursor_col);
+                    tracing::debug!(
+                        "[TERM] ESC[?1049h — switching to alternate screen, cursor=({}, {})",
+                        self.cursor_row,
+                        self.cursor_col
+                    );
                     self.screen_switch_cursor = Some(ScreenSwitchState {
                         cursor: CursorState {
                             row: self.cursor_row,
@@ -1205,7 +1241,9 @@ impl Handler for Terminal {
             PrivateMode::Named(ansi::NamedPrivateMode::LineWrap) => self.mode_line_wrap = false,
             PrivateMode::Named(ansi::NamedPrivateMode::Origin) => self.mode_origin = false,
             PrivateMode::Named(ansi::NamedPrivateMode::ShowCursor) => self.mode_show_cursor = false,
-            PrivateMode::Named(ansi::NamedPrivateMode::BracketedPaste) => self.mode_bracketed_paste = false,
+            PrivateMode::Named(ansi::NamedPrivateMode::BracketedPaste) => {
+                self.mode_bracketed_paste = false
+            }
             PrivateMode::Named(ansi::NamedPrivateMode::SwapScreenAndSetRestoreCursor) => {
                 if self.using_alt_screen {
                     tracing::debug!("[TERM] ESC[?1049l — switching back to primary screen");
@@ -1214,7 +1252,12 @@ impl Handler for Terminal {
                     }
                     self.using_alt_screen = false;
                     if let Some(saved) = self.screen_switch_cursor.take() {
-                        tracing::debug!("[TERM] restoring cursor to ({}, {}), show_cursor={}", saved.cursor.row, saved.cursor.col, saved.mode_show_cursor);
+                        tracing::debug!(
+                            "[TERM] restoring cursor to ({}, {}), show_cursor={}",
+                            saved.cursor.row,
+                            saved.cursor.col,
+                            saved.mode_show_cursor
+                        );
                         self.cursor_row = saved.cursor.row;
                         self.cursor_col = saved.cursor.col;
                         self.attrs_fg = saved.cursor.fg;
@@ -1278,7 +1321,7 @@ impl Handler for Terminal {
 
     fn device_status(&mut self, arg: usize) {
         match arg {
-            5 => self.send_response(b"\x1b[0n"),  // OK
+            5 => self.send_response(b"\x1b[0n"), // OK
             6 => {
                 // Cursor position report
                 let row = self.cursor_row + 1;
@@ -1405,7 +1448,11 @@ mod tests {
     /// and the surviving scrollback must remain renderable.
     #[test]
     fn scrollback_evicts_oldest_when_full() {
-        let mut term = Terminal::new(TerminalSize { cols: 10, rows: 2, ..Default::default() });
+        let mut term = Terminal::new(TerminalSize {
+            cols: 10,
+            rows: 2,
+            ..Default::default()
+        });
         term.scrollback_capacity = 3;
         let mut parser = vte::ansi::Processor::new();
 
@@ -1417,29 +1464,50 @@ mod tests {
         term.process(b"ddd\r\n", &mut parser);
         term.process(b"eee\r\n", &mut parser);
 
-        assert_eq!(term.scrollback_len(), 3, "scrollback must be capped at capacity");
+        assert_eq!(
+            term.scrollback_len(),
+            3,
+            "scrollback must be capped at capacity"
+        );
 
         // Render the entire scrollback by scrolling past the grid. The surviving
         // lines are bbb, ccc, ddd — aaa must have been evicted (FIFO), and the
         // newest line eee lives in the grid, not the scrollback.
         let out = term.render_with_scroll(3);
         assert_eq!(out.rows.len(), 2);
-        let all_text: String = out.rows.iter()
+        let all_text: String = out
+            .rows
+            .iter()
             .flat_map(|r| r.cells.iter().map(|c| c.character))
             .collect();
-        assert!(!all_text.contains('a'), "evicted line 'aaa' must not appear, got {all_text:?}");
-        assert!(all_text.contains('b') && all_text.contains('c'), "oldest survivors bbb/ccc expected, got {all_text:?}");
+        assert!(
+            !all_text.contains('a'),
+            "evicted line 'aaa' must not appear, got {all_text:?}"
+        );
+        assert!(
+            all_text.contains('b') && all_text.contains('c'),
+            "oldest survivors bbb/ccc expected, got {all_text:?}"
+        );
 
         // Eviction must keep memory bounded — capacity is the hard ceiling.
         term.process(b"fff\r\n", &mut parser);
         term.process(b"ggg\r\n", &mut parser);
-        assert_eq!(term.scrollback_len(), 3, "scrollback stays capped under sustained output");
+        assert_eq!(
+            term.scrollback_len(),
+            3,
+            "scrollback stays capped under sustained output"
+        );
         // After two more lines, even bbb should now be evicted.
         let out2 = term.render_with_scroll(3);
-        let text2: String = out2.rows.iter()
+        let text2: String = out2
+            .rows
+            .iter()
             .flat_map(|r| r.cells.iter().map(|c| c.character))
             .collect();
-        assert!(!text2.contains('b'), "bbb should be evicted after fff/ggg, got {text2:?}");
+        assert!(
+            !text2.contains('b'),
+            "bbb should be evicted after fff/ggg, got {text2:?}"
+        );
     }
 
     /// Multi-line scroll (count > 1) must blank the correct number of bottom
@@ -1447,7 +1515,11 @@ mod tests {
     /// the scrolled-away content into the bottom row on the alt screen.
     #[test]
     fn scroll_up_blanks_bottom_rows() {
-        let mut term = Terminal::new(TerminalSize { cols: 4, rows: 4, ..Default::default() });
+        let mut term = Terminal::new(TerminalSize {
+            cols: 4,
+            rows: 4,
+            ..Default::default()
+        });
         let mut parser = vte::ansi::Processor::new();
         // Fill 4 distinct rows: AAAA, BBBB, CCCC, DDDD
         term.process(b"AAAA\r\nBBBB\r\nCCCC\r\nDDDD", &mut parser);
@@ -1458,7 +1530,10 @@ mod tests {
         // The two bottom rows must be blank (all spaces), not leftover content.
         let out = term.render();
         for cell in &out.rows[2].cells {
-            assert_eq!(cell.character, ' ', "bottom-1 row must be blank after scroll");
+            assert_eq!(
+                cell.character, ' ',
+                "bottom-1 row must be blank after scroll"
+            );
         }
         assert!(term.scrollback_len() >= 2);
     }

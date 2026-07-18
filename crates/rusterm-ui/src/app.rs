@@ -238,19 +238,27 @@ fn start_ssh_connection(
                     entry.terminal.set_input_sender(session.input_tx.clone());
                 }
 
-                // Send initial resize to sync PTY with actual terminal size
-                {
-                    let terminals = state.read().terminals.clone();
-                    if let Some(handle) = terminals.get(&tab_id) {
-                        let size = handle.lock().terminal.size();
-                        let _ = session.resize_tx.send((
-                            size.cols,
-                            size.rows,
-                            size.pixel_width,
-                            size.pixel_height,
-                        ));
-                    }
-                }
+                // Send initial resize to sync PTY with the measured container
+                // size. We use `measured_size` (not `terminal.size()`) because the
+                // local terminal model is still at its 80x24 default — the
+                // TerminalView resize future hasn't fired yet (it needs ~100ms
+                // to poll the DOM). Sending `terminal.size()` here would briefly
+                // shrink the remote PTY back to 80x24, causing remote output to
+                // re-wrap incorrectly until the resize future corrects it. The
+                // TerminalView's on_resize handler will keep both the local model
+                // and the remote PTY in sync after the first measurement lands.
+                //
+                // Pixel dims: measured_size.pixel_width is 0 (the connect-time
+                // measurement only computes cols/rows, not pixels). That's OK —
+                // xterm-pty spec treats pixel dims as advisory; the cols/rows are
+                // what matter for line wrapping. The subsequent resize from
+                // TerminalView carries the real pixel dims.
+                let _ = session.resize_tx.send((
+                    measured_size.cols,
+                    measured_size.rows,
+                    measured_size.pixel_width,
+                    measured_size.pixel_height,
+                ));
 
                 // Feature #7: SSH login auto-configure terminal to the left side.
                 //
@@ -1586,6 +1594,48 @@ fn build_ssh_auth(form: &NewConnectionForm) -> SshAuth {
     }
 }
 
+/// Rebuild a `ConnectionConfig` from an edit-dialog form, preserving the
+/// original id and any fields the dialog doesn't expose (group, tags, and for
+/// SSH: proxy_jump / keepalive_interval). For non-SSH kinds the whole `kind`
+/// is preserved as-is — the dialog only edits SSH-specific fields, so a Shell /
+/// Serial / Telnet / TCP connection keeps its config and just gets its name /
+/// onekey updated.
+fn rebuild_connection(original: &ConnectionConfig, form: &NewConnectionForm) -> ConnectionConfig {
+    let kind = match &original.kind {
+        ConnectionKind::Ssh(ssh) => {
+            let port: u16 = form.port.parse().unwrap_or(22);
+            let auth = build_ssh_auth(form);
+            let terminal_type = if form.terminal_type.is_empty() {
+                "xterm-256color".to_string()
+            } else {
+                form.terminal_type.clone()
+            };
+            ConnectionKind::Ssh(SshConfig {
+                host: form.host.clone(),
+                port,
+                username: form.username.clone(),
+                auth,
+                terminal_type,
+                proxy_jump: ssh.proxy_jump.clone(),
+                keepalive_interval: ssh.keepalive_interval,
+            })
+        }
+        other => other.clone(),
+    };
+    ConnectionConfig {
+        id: original.id.clone(),
+        name: if form.name.is_empty() {
+            format!("{}@{}", form.username, form.host)
+        } else {
+            form.name.clone()
+        },
+        kind,
+        group: original.group.clone(),
+        tags: original.tags.clone(),
+        onekey: form.onekey,
+    }
+}
+
 fn create_terminal(id: String, state: &mut Signal<AppState>) {
     let terminal = Terminal::new(TerminalSize::default());
     let handle = Arc::new(Mutex::new(TerminalEntry {
@@ -1745,6 +1795,14 @@ pub fn App() -> Element {
     let ai_suggestions = use_signal(Vec::<rusterm_ai::suggestion::AiSuggestion>::new);
     let mut input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>> =
         use_signal(HashMap::new);
+    // Connection currently being edited in the ConnectionDialog. `None` means
+    // the dialog is in create mode. We reuse `Modal::NewConnection` for both
+    // modes so `Modal` can stay `Copy`; the actual connection lives here.
+    let mut editing_conn: Signal<Option<ConnectionConfig>> = use_signal(|| None);
+    // Connection pending a delete confirmation. When `Some`, a small confirm
+    // modal is rendered; the sidebar only triggers the request, the confirm
+    // happens here so destructive actions can't be fired by a stray click.
+    let mut delete_target: Signal<Option<ConnectionConfig>> = use_signal(|| None);
 
     // One-time startup: import local shell history (zsh/bash/fish/atuin) into
     // the SQLite DB so suggestions can draw from a single unified source.
@@ -2106,6 +2164,7 @@ pub fn App() -> Element {
                         }
                     },
                     on_new: move |_| {
+                        editing_conn.set(None);
                         modal.set(Modal::NewConnection);
                     },
                     on_onekey: move |_| {
@@ -2126,6 +2185,19 @@ pub fn App() -> Element {
                             };
                             state.write().connections.push(copied);
                             save_config(&state);
+                        }
+                    },
+                    on_edit: move |id: String| {
+                        let conn = state.read().connections.iter().find(|c| c.id == id).cloned();
+                        if let Some(conn) = conn {
+                            editing_conn.set(Some(conn));
+                            modal.set(Modal::NewConnection);
+                        }
+                    },
+                    on_delete: move |id: String| {
+                        let conn = state.read().connections.iter().find(|c| c.id == id).cloned();
+                        if let Some(conn) = conn {
+                            delete_target.set(Some(conn));
                         }
                     },
                 }
@@ -2226,7 +2298,7 @@ pub fn App() -> Element {
                                                 let terminals = state.read().terminals.clone();
                                                 if let Some(handle) = terminals.get(&sid_for_resize) {
                                                     let mut entry = handle.lock();
-                                                    entry.terminal.resize(cols, rows);
+                                                    entry.terminal.resize(cols, rows, pw, ph);
                                                     entry.scroll_offset = 0; // Reset scroll on resize
                                                     // Re-render after resize so the UI updates immediately
                                                     let render_result = entry.render_current();
@@ -2958,7 +3030,11 @@ pub fn App() -> Element {
         // Connection dialog modal
         ConnectionDialog {
             visible: matches!(modal(), Modal::NewConnection),
-            on_close: move |_| modal.set(Modal::None),
+            editing: editing_conn.read().clone(),
+            on_close: move |_| {
+                editing_conn.set(None);
+                modal.set(Modal::None);
+            },
             on_create: move |form: NewConnectionForm| {
                 let port: u16 = form.port.parse().unwrap_or(22);
                 let auth = build_ssh_auth(&form);
@@ -3031,6 +3107,82 @@ pub fn App() -> Element {
 
                 start_ssh_connection(state, input_senders, config.id, ssh_config);
             },
+            on_edit: move |(id, form): (String, NewConnectionForm)| {
+                // Edit mode: find the original connection, rebuild it from the
+                // form (preserving id + non-form fields), replace it in place,
+                // and persist. We deliberately do NOT start a new session —
+                // editing a saved connection is not the same as connecting to
+                // it. Any live session tab for this connection keeps running
+                // with the old config; its reconnect path reads from
+                // `session_configs`, which is also stale, but that's
+                // acceptable — the user can close the tab and reconnect to
+                // pick up the new config.
+                let original = state.read().connections.iter().find(|c| c.id == id).cloned();
+                if let Some(original) = original {
+                    let updated = rebuild_connection(&original, &form);
+                    if let Some(slot) = state.write().connections.iter_mut().find(|c| c.id == id) {
+                        *slot = updated;
+                    }
+                    save_config(&state);
+                }
+                editing_conn.set(None);
+                modal.set(Modal::None);
+            },
+        }
+
+        // Delete-connection confirm modal. The sidebar requests a delete by
+        // setting `delete_target`; we render a small confirm dialog here so a
+        // stray click on the trash icon can't silently destroy a saved
+        // connection (which may carry an encrypted password). Dioxus's rsx!
+        // bodies don't allow bare `let` statements, so we bind the target via
+        // the `if let` pattern and reference its fields directly.
+        if let Some(target) = delete_target.read().clone() {
+            div {
+                style: "
+                    position: fixed;
+                    top: 0; left: 0; right: 0; bottom: 0;
+                    background: rgba(0,0,0,0.6);
+                    display: flex;
+                    justify-content: center;
+                    align-items: center;
+                    z-index: 1100;
+                ",
+                div {
+                    style: "
+                        background: #24283b;
+                        border-radius: 8px;
+                        padding: 24px;
+                        width: 380px;
+                        color: #c0caf5;
+                    ",
+                    h3 { style: "margin: 0 0 8px; font-size: 15px;", "Delete connection?" }
+                    p {
+                        style: "margin: 0 0 20px; font-size: 13px; color: #c0caf5; line-height: 1.5;",
+                        "This will remove \"{target.name}\" from your saved connections. The encrypted config (including any stored password) will be erased from disk. This cannot be undone."
+                    }
+                    div {
+                        style: "display: flex; justify-content: flex-end; gap: 8px;",
+                        button {
+                            style: "background: transparent; border: 1px solid #2a2b3d; color: #c0caf5; border-radius: 4px; padding: 8px 16px; cursor: pointer; font-size: 13px;",
+                            onclick: move |_| delete_target.set(None),
+                            "Cancel"
+                        }
+                        button {
+                            style: "background: #f7768e; border: none; color: #1a1b26; border-radius: 4px; padding: 8px 16px; cursor: pointer; font-size: 13px; font-weight: 600;",
+                            onclick: move |_| {
+                                let target_id = target.id.clone();
+                                {
+                                    let mut s = state.write();
+                                    s.connections.retain(|c| c.id != target_id);
+                                }
+                                save_config(&state);
+                                delete_target.set(None);
+                            },
+                            "Delete"
+                        }
+                    }
+                }
+            }
         }
 
         // OneKey manager modal (configure the Expect/Send library; encrypted at rest)

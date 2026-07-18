@@ -249,6 +249,14 @@ impl ConfigManager {
         zeroize::Zeroizing::new(self.master_key)
     }
 
+    /// Expose the resolved path to `settings.json` so other components
+    /// (notably `rusterm-sync`, which needs to read/write the file to push
+    /// it to a cloud backend) can locate it without duplicating the
+    /// resolution logic in [`Self::resolve_config_path`].
+    pub fn config_path(&self) -> &std::path::Path {
+        &self.config_path
+    }
+
     /// Derive a per-session subkey from the master key + session ID. This is
     /// used by `SessionLog` to encrypt that session's I/O with a key that's
     /// scoped to the session — compromising one session's log file does not

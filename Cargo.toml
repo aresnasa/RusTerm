@@ -12,6 +12,7 @@ members = [
     "crates/rusterm-proto",
     "crates/rusterm-ui",
     "crates/rusterm-history",
+    "crates/rusterm-sync",
 ]
 
 [workspace.package]
@@ -104,3 +105,4 @@ rusterm-plugins = { path = "crates/rusterm-plugins" }
 rusterm-proto = { path = "crates/rusterm-proto" }
 rusterm-ui = { path = "crates/rusterm-ui" }
 rusterm-history = { path = "crates/rusterm-history" }
+rusterm-sync = { path = "crates/rusterm-sync" }

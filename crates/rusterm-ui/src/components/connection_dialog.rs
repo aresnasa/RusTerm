@@ -1,5 +1,7 @@
 use dioxus::prelude::*;
 
+use rusterm_core::config::{ConnectionConfig, ConnectionKind, SshAuth};
+
 #[derive(Debug, Clone, Default)]
 pub struct NewConnectionForm {
     pub name: String,
@@ -26,27 +28,112 @@ const TERMINAL_TYPES: &[&str] = &[
     "screen",
 ];
 
+fn default_form() -> NewConnectionForm {
+    NewConnectionForm {
+        auth_type: "password".to_string(),
+        terminal_type: "xterm-256color".to_string(),
+        port: "22".to_string(),
+        ..Default::default()
+    }
+}
+
+/// Build a form pre-filled from an existing connection so the edit dialog
+/// shows the saved values. Only SSH connections populate the host/port/auth
+/// fields; non-SSH kinds only carry name + onekey (the SSH-specific inputs are
+/// left at defaults and, on save, the original `kind` is preserved unchanged
+/// — see `app::rebuild_connection`).
+fn form_from_connection(c: &ConnectionConfig) -> NewConnectionForm {
+    match &c.kind {
+        ConnectionKind::Ssh(ssh) => {
+            let (auth_type, password, key_path, passphrase) = match &ssh.auth {
+                SshAuth::Password { password } => {
+                    ("password", password.clone(), String::new(), String::new())
+                }
+                SshAuth::Key {
+                    private_key_path,
+                    passphrase,
+                } => (
+                    "key",
+                    String::new(),
+                    private_key_path.clone(),
+                    passphrase.clone().unwrap_or_default(),
+                ),
+                SshAuth::Agent => ("agent", String::new(), String::new(), String::new()),
+            };
+            NewConnectionForm {
+                name: c.name.clone(),
+                host: ssh.host.clone(),
+                port: ssh.port.to_string(),
+                username: ssh.username.clone(),
+                auth_type: auth_type.to_string(),
+                password,
+                key_path,
+                passphrase,
+                terminal_type: ssh.terminal_type.clone(),
+                onekey: c.onekey,
+            }
+        }
+        // Non-SSH connections can still be renamed / onekey-toggled; the SSH
+        // fields are irrelevant and ignored on save (kind is preserved).
+        _ => NewConnectionForm {
+            name: c.name.clone(),
+            onekey: c.onekey,
+            ..default_form()
+        },
+    }
+}
+
 #[component]
 pub fn ConnectionDialog(
     visible: bool,
     on_close: EventHandler<()>,
     on_create: EventHandler<NewConnectionForm>,
+    /// When `Some`, the dialog operates in edit mode: fields are pre-filled
+    /// from this connection and the submit button routes to `on_edit`
+    /// (carrying the connection id) instead of `on_create`. The connection id
+    /// is preserved so the existing entry is replaced in place rather than
+    /// duplicated.
+    editing: Option<ConnectionConfig>,
+    on_edit: EventHandler<(String, NewConnectionForm)>,
 ) -> Element {
-    let mut form = use_signal(|| NewConnectionForm {
-        auth_type: "password".to_string(),
-        terminal_type: "xterm-256color".to_string(),
-        port: "22".to_string(),
-        ..Default::default()
-    });
+    let mut form = use_signal(default_form);
+    // Tracks the id of the connection currently reflected in `form`. When the
+    // `editing` prop changes (e.g. user clicks Edit on a different row, or
+    // switches back to New), we re-seed the form. Setting a signal during
+    // render is safe here because the guard makes the write idempotent — no
+    // re-render loop.
+    let mut seeded_id = use_signal(String::new);
 
     if !visible {
         return rsx! {};
     }
 
+    let editing_id = editing.as_ref().map(|c| c.id.clone()).unwrap_or_default();
+    if seeded_id() != editing_id {
+        match &editing {
+            Some(c) => form.set(form_from_connection(c)),
+            None => form.set(default_form()),
+        }
+        seeded_id.set(editing_id);
+    }
+
+    let is_editing = editing.is_some();
+    let title = if is_editing {
+        "Edit SSH Connection"
+    } else {
+        "New SSH Connection"
+    };
+    let submit_label = if is_editing { "Save" } else { "Connect" };
+
     let auth_type = form().auth_type.clone();
     let is_password = auth_type == "password";
     let is_key = auth_type == "key";
     let is_agent = auth_type == "agent";
+
+    // In edit mode, the password field is shown empty (we never echo the
+    // stored password back into the DOM for security). A small hint tells the
+    // user that leaving it blank keeps the existing password.
+    let password_hint = is_editing && is_password;
 
     rsx! {
         div {
@@ -71,7 +158,7 @@ pub fn ConnectionDialog(
                     color: #c0caf5;
                 ",
 
-                h3 { style: "margin: 0 0 16px; font-size: 16px;", "New SSH Connection" }
+                h3 { style: "margin: 0 0 16px; font-size: 16px;", "{title}" }
 
                 div {
                     style: "display: flex; flex-direction: column; gap: 12px;",
@@ -174,7 +261,7 @@ pub fn ConnectionDialog(
                             input {
                                 style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                                 r#type: "password",
-                                placeholder: "Enter password",
+                                placeholder: if password_hint { "Leave blank to keep current password" } else { "Enter password" },
                                 value: "{form().password}",
                                 oninput: move |e| form.write().password = e.value(),
                             }
@@ -260,15 +347,19 @@ pub fn ConnectionDialog(
                     button {
                         style: "background: #7aa2f7; border: none; color: #1a1b26; border-radius: 4px; padding: 8px 16px; cursor: pointer; font-size: 13px; font-weight: 600;",
                         onclick: move |_| {
-                            on_create.call(form());
-                            form.set(NewConnectionForm {
-                                auth_type: "password".to_string(),
-                                terminal_type: "xterm-256color".to_string(),
-                                port: "22".to_string(),
-                                ..Default::default()
-                            });
+                            if let Some(ref c) = editing {
+                                // Edit mode: preserve the id so the existing
+                                // entry is replaced. Non-form fields (group,
+                                // tags, proxy_jump, keepalive_interval, and the
+                                // whole kind for non-SSH) are preserved by
+                                // `rebuild_connection` in app.rs.
+                                on_edit.call((c.id.clone(), form()));
+                            } else {
+                                on_create.call(form());
+                                form.set(default_form());
+                            }
                         },
-                        "Connect"
+                        "{submit_label}"
                     }
                 }
             }
