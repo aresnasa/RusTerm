@@ -7,6 +7,7 @@ members = [
     "crates/rusterm-crypto",
     "crates/rusterm-db",
     "crates/rusterm-ai",
+    "crates/rusterm-analytics",
     "crates/rusterm-plugins",
     "crates/rusterm-proto",
     "crates/rusterm-ui",
@@ -43,6 +44,10 @@ secrecy = { version = "0.10", features = ["serde"] }
 # Database
 rusqlite = { version = "0.37", features = ["bundled", "vtab", "functions"] }
 tokio-rusqlite = "0.7"
+# Embedded OLAP engine for analytics (rusterm-analytics crate).
+# `bundled` builds the bundled libduckdb (~50MB compiled) so we don't depend
+# on a system install. See crates/rusterm-analytics/.
+duckdb = { version = "1.4.5", features = ["bundled"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
@@ -94,6 +99,7 @@ rusterm-ssh = { path = "crates/rusterm-ssh" }
 rusterm-crypto = { path = "crates/rusterm-crypto" }
 rusterm-db = { path = "crates/rusterm-db" }
 rusterm-ai = { path = "crates/rusterm-ai" }
+rusterm-analytics = { path = "crates/rusterm-analytics" }
 rusterm-plugins = { path = "crates/rusterm-plugins" }
 rusterm-proto = { path = "crates/rusterm-proto" }
 rusterm-ui = { path = "crates/rusterm-ui" }

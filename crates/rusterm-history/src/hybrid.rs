@@ -1,8 +1,8 @@
+use crate::HistoryMatch;
 use crate::atuin_db::AtuinDbProvider;
 use crate::bash_history::BashHistoryProvider;
 use crate::fish_history::FishHistoryProvider;
 use crate::zsh_history::ZshHistoryProvider;
-use crate::HistoryMatch;
 
 /// Unified history provider that queries multiple sources:
 /// 1. atuin DB (if installed)
@@ -64,26 +64,50 @@ impl HybridHistoryProvider {
             std::collections::HashMap::new();
 
         for m in all {
-            let entry = best.entry(m.command.clone()).or_insert_with(|| HistoryMatch::new(
-                m.command.clone(),
-                m.cwd.clone(),
-                m.hostname.clone(),
-                m.timestamp,
-                m.score,
-            ));
+            let entry = best.entry(m.command.clone()).or_insert_with(|| {
+                HistoryMatch::new(
+                    m.command.clone(),
+                    m.cwd.clone(),
+                    m.hostname.clone(),
+                    m.timestamp,
+                    m.score,
+                    m.exit_code,
+                )
+            });
             // Keep the highest score; prefer entries with metadata
             if m.score > entry.score
                 || (m.score == entry.score && (m.cwd.is_some() || m.hostname.is_some()))
             {
                 entry.score = m.score;
-                if m.cwd.is_some() { entry.cwd = m.cwd; }
-                if m.hostname.is_some() { entry.hostname = m.hostname; }
-                if m.timestamp.is_some() { entry.timestamp = m.timestamp; }
+                if m.cwd.is_some() {
+                    entry.cwd = m.cwd;
+                }
+                if m.hostname.is_some() {
+                    entry.hostname = m.hostname;
+                }
+                if m.timestamp.is_some() {
+                    entry.timestamp = m.timestamp;
+                }
+                // Preserve exit_code: prefer a known non-None value. If both
+                // are Some, prefer a non-zero one (bias toward "don't suggest"
+                // — a command that ever failed in atuin should be treated as
+                // failed until proven successful in RusTerm).
+                if m.exit_code.is_some() {
+                    match entry.exit_code {
+                        None => entry.exit_code = m.exit_code,
+                        Some(0) => entry.exit_code = m.exit_code,
+                        Some(_) => {} // keep existing non-zero
+                    }
+                }
             }
         }
 
         let mut results: Vec<HistoryMatch> = best.into_values().collect();
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(limit);
         results
     }

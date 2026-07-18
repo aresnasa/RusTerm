@@ -1,0 +1,228 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  RusTerm desktop app icon — "rust-speed + local-security" edition.
+
+  Design pillars (per project brief):
+    1. Rust / speed         — Rust-orange gradient + a streaking ">" comet
+                              cursor with motion tail = "fast like Rust".
+    2. Local security       — A vault shield silhouette wraps the prompt;
+                              a closed padlock sits at the shield base =
+                              "data never leaves your machine".
+    3. Terminal identity    — The `> _` prompt glyph inside the shield
+                              makes the icon read as "terminal" even at
+                              16×16 (filled shapes, no thin strokes).
+
+  Rendering targets:
+    - macOS app-tile (512, 256, 128, 64, 32, 16) — full-color
+    - Linux .desktop / Windows .ico — full-color
+    - Documented separately: assets/icon-template.svg is the pure-black
+      menu-bar template variant (Apple HIG). This file is the full-color
+      app-tile.
+
+  Pure SVG, no external resources. Square viewBox 0 0 512 512.
+-->
+<svg xmlns="http://www.w3.org/2000/svg"
+     viewBox="0 0 512 512"
+     role="img"
+     aria-label="RusTerm app icon: Rust-speed terminal with local security">
+  <title>RusTerm</title>
+  <desc>Rust-powered terminal — fast like Rust, secure by staying local.</desc>
+
+  <defs>
+    <!-- Squircle clip: macOS-style app-tile shape -->
+    <clipPath id="squircle" clipPathUnits="userSpaceOnUse">
+      <path d="
+        M 96 32
+        H 416
+        A 64 64 0 0 1 480 96
+        V 416
+        A 64 64 0 0 1 416 480
+        H 96
+        A 64 64 0 0 1 32 416
+        V 96
+        A 64 64 0 0 1 96 32
+        Z" />
+    </clipPath>
+
+    <!-- Rust orange radial gradient — depth, warmth, signature Rust hue -->
+    <radialGradient id="rustGrad" cx="38%" cy="28%" r="88%">
+      <stop offset="0%"  stop-color="#F87456"/>
+      <stop offset="50%" stop-color="#CE422B"/>
+      <stop offset="100%" stop-color="#5A1408"/>
+    </radialGradient>
+
+    <!-- Top gloss for an app-tile feel -->
+    <linearGradient id="gloss" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"  stop-color="#FFFFFF" stop-opacity="0.24"/>
+      <stop offset="45%" stop-color="#FFFFFF" stop-opacity="0.00"/>
+    </linearGradient>
+
+    <!-- Shield metallic gradient: cool steel communicates "vault / safe" -->
+    <linearGradient id="shieldGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"  stop-color="#3A3F4A"/>
+      <stop offset="50%" stop-color="#1B1E26"/>
+      <stop offset="100%" stop-color="#0E1015"/>
+    </linearGradient>
+
+    <!-- Shield rim highlight -->
+    <linearGradient id="shieldRim" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"  stop-color="#FFFFFF" stop-opacity="0.55"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0.05"/>
+    </linearGradient>
+
+    <!-- Cursor / comet gradient: bright white core -> warm tail -->
+    <linearGradient id="cursorGrad" x1="0" y1="1" x2="1" y2="0">
+      <stop offset="0%"  stop-color="#FFD37A"/>
+      <stop offset="55%" stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#FFE9B0"/>
+    </linearGradient>
+
+    <!-- Soft glow under the comet cursor -->
+    <filter id="cursorGlow" x="-40%" y="-40%" width="180%" height="180%">
+      <feGaussianBlur in="SourceAlpha" stdDeviation="6"/>
+      <feOffset dx="0" dy="2" result="off"/>
+      <feComponentTransfer in="off" result="shadow">
+        <feFuncA type="linear" slope="0.6"/>
+      </feComponentTransfer>
+      <feMerge>
+        <feMergeNode in="shadow"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+
+    <!-- Padlock body gradient (gold/brass = locked / secure) -->
+    <linearGradient id="lockGrad" x1="0" y1="0" x2="0" y2="1">
+      <stop offset="0%"  stop-color="#FFD37A"/>
+      <stop offset="60%" stop-color="#E0A93E"/>
+      <stop offset="100%" stop-color="#8A5E18"/>
+    </linearGradient>
+  </defs>
+
+  <!-- ============== BASE ============== -->
+  <g clip-path="url(#squircle)">
+    <rect x="0" y="0" width="512" height="512" fill="url(#rustGrad)"/>
+    <rect x="0" y="0" width="512" height="512" fill="url(#gloss)"/>
+
+    <!-- Faint concentric rings: subtle "vault / radar" feel -->
+    <g fill="none" stroke="#FFFFFF" stroke-opacity="0.07" stroke-width="2">
+      <circle cx="256" cy="244" r="210"/>
+      <circle cx="256" cy="244" r="168"/>
+    </g>
+  </g>
+
+  <!-- ============== SHIELD (local security) ============== -->
+  <!-- Filled shield silhouette behind the prompt = "data is vaulted locally" -->
+  <path d="
+    M 256 76
+    L 392 132
+    L 392 252
+    C 392 356  326 424  256 452
+    C 186 424  120 356  120 252
+    L 120 132
+    Z"
+    fill="url(#shieldGrad)"
+    stroke="url(#shieldRim)"
+    stroke-width="3"
+    stroke-linejoin="round"/>
+
+  <!-- Inner shield highlight ring -->
+  <path d="
+    M 256 92
+    L 378 142
+    L 378 252
+    C 378 346  320 408  256 434
+    C 192 408  134 346  134 252
+    L 134 142
+    Z"
+    fill="none"
+    stroke="#FFFFFF"
+    stroke-opacity="0.10"
+    stroke-width="2"
+    stroke-linejoin="round"/>
+
+  <!-- ============== PROMPT "$" + COMET CURSOR ============== -->
+  <!-- The "$" anchor + streaking ">" = "Rust-fast terminal prompt" -->
+  <g font-family="ui-monospace, 'SF Mono', 'JetBrains Mono', Menlo, Consolas, monospace"
+     text-rendering="geometricPrecision">
+    <text x="172" y="288"
+          font-size="110"
+          font-weight="700"
+          fill="#FFFFFF"
+          fill-opacity="0.92"
+          text-anchor="middle"
+          dominant-baseline="alphabetic">$</text>
+  </g>
+
+  <!-- Comet cursor ">" with motion tail = speed -->
+  <g filter="url(#cursorGlow)">
+    <!-- Trailing chevrons (motion lines) -->
+    <g fill="none" stroke="#FFE9B0" stroke-linecap="round" stroke-linejoin="round">
+      <path d="M 232 224 L 272 248 L 232 272"
+            stroke-width="9" stroke-opacity="0.28"/>
+      <path d="M 250 220 L 296 248 L 250 276"
+            stroke-width="11" stroke-opacity="0.55"/>
+    </g>
+    <!-- Main cursor chevron -->
+    <path d="M 272 214 L 332 248 L 272 282"
+          fill="none"
+          stroke="url(#cursorGrad)"
+          stroke-width="20"
+          stroke-linecap="round"
+          stroke-linejoin="round"/>
+    <!-- Bright core dot at the chevron tip -->
+    <circle cx="338" cy="248" r="9" fill="#FFFFFF"/>
+  </g>
+
+  <!-- ============== PADLOCK (local security accent) ============== -->
+  <!-- Closed brass padlock at the shield base: "no network, locked locally" -->
+  <g>
+    <!-- Shackle (arch) -->
+    <path d="
+      M 232 372
+      L 232 354
+      C 232 332  244 320  256 320
+      C 268 320  280 332  280 354
+      L 280 372"
+      fill="none"
+      stroke="url(#lockGrad)"
+      stroke-width="9"
+      stroke-linecap="round"/>
+    <!-- Lock body -->
+    <rect x="218" y="370" width="76" height="58" rx="9" ry="9"
+          fill="url(#lockGrad)"
+          stroke="#5A3C0A"
+          stroke-width="2"/>
+    <!-- Keyhole -->
+    <circle cx="256" cy="394" r="6" fill="#2A1B04"/>
+    <rect x="253" y="394" width="6" height="14" fill="#2A1B04"/>
+  </g>
+
+  <!-- ============== CORNER RIVETS (security accent) ============== -->
+  <g fill="#1B1B1F" fill-opacity="0.78">
+    <circle cx="96"  cy="96"  r="10"/>
+    <circle cx="96"  cy="96"  r="3.5" fill="#FFD37A"/>
+    <circle cx="416" cy="96"  r="10"/>
+    <circle cx="416" cy="96"  r="3.5" fill="#FFD37A"/>
+    <circle cx="96"  cy="416" r="10"/>
+    <circle cx="96"  cy="416" r="3.5" fill="#FFD37A"/>
+    <circle cx="416" cy="416" r="10"/>
+    <circle cx="416" cy="416" r="3.5" fill="#FFD37A"/>
+  </g>
+
+  <!-- ============== BASE STROKE (crisp app-tile edge) ============== -->
+  <path d="
+    M 96 32
+    H 416
+    A 64 64 0 0 1 480 96
+    V 416
+    A 64 64 0 0 1 416 480
+    H 96
+    A 64 64 0 0 1 32 416
+    V 96
+    A 64 64 0 0 1 96 32
+    Z"
+    fill="none"
+    stroke="#1B1B1F"
+    stroke-opacity="0.35"
+    stroke-width="2"/>
+</svg>

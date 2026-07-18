@@ -506,6 +506,138 @@ mod tests {
             "set must be empty after the only failed command's DB write completes"
         );
     }
+
+    /// Pin the data-structure contract for the Shift+Delete suggestion-delete
+    /// feature (user-initiated dirty-data cleanup).
+    ///
+    /// When the user hits Shift+Delete on a highlighted suggestion item, the
+    /// app.rs handler does (in order, inside a single `state.write()` critical
+    /// section):
+    ///   1. `tab.command_history.retain(|c| c != &cmd)` — drop from session hist
+    ///   2. `tab.suggestions.retain(|c| c != &cmd)` — drop from popup list
+    ///   3. Clamp `tab.suggestion_selected` to `suggestions.len().saturating_sub(1)`
+    ///   4. If suggestions is now empty, hide the popup and clear `suggestion`
+    ///   5. `state.recent_failed_commands.insert(cmd)` — guard against DB source
+    ///      re-surfacing it during the async `mark_command_failed` write
+    ///
+    /// This test pins steps 1–4 against a future regression. Step 5 is already
+    /// covered by `recent_failed_commands_tracks_failed_commands_until_db_write_completes`.
+    #[test]
+    fn suggestion_delete_removes_command_and_clamps_selection() {
+        let mut state = state_with_tabs(&["alpha"]);
+        let tab = state.sessions.first_mut().unwrap();
+        tab.command_history = vec![
+            "ls".to_string(),
+            "pwdwd".to_string(), // the typo the user wants gone
+            "git status".to_string(),
+        ];
+        tab.suggestions = vec![
+            "ls".to_string(),
+            "pwdwd".to_string(), // highlighted (selected)
+            "git status".to_string(),
+        ];
+        tab.suggestion_selected = 1; // user has "pwdwd" highlighted
+        tab.suggestion_visible = true;
+        tab.suggestion = Some("dwd".to_string()); // inline ghost text
+
+        // Simulate the handler: delete "pwdwd".
+        let cmd_to_delete = "pwdwd".to_string();
+        let tab = state.sessions.first_mut().unwrap();
+        tab.command_history.retain(|c| c != &cmd_to_delete);
+        tab.suggestions.retain(|c| c != &cmd_to_delete);
+        if tab.suggestion_selected >= tab.suggestions.len() {
+            tab.suggestion_selected = tab.suggestions.len().saturating_sub(1);
+        }
+        if tab.suggestions.is_empty() {
+            tab.suggestion_visible = false;
+            tab.suggestion = None;
+            tab.suggestion_selected = 0;
+        }
+
+        // Verify command_history no longer contains the deleted command.
+        let tab = state.sessions.first().unwrap();
+        assert!(
+            !tab.command_history.contains(&cmd_to_delete),
+            "deleted command must not remain in command_history: {:?}",
+            tab.command_history
+        );
+        assert_eq!(
+            tab.command_history,
+            vec!["ls".to_string(), "git status".to_string()]
+        );
+
+        // Verify suggestions list no longer contains the deleted command.
+        assert!(
+            !tab.suggestions.contains(&cmd_to_delete),
+            "deleted command must not remain in suggestions: {:?}",
+            tab.suggestions
+        );
+        assert_eq!(
+            tab.suggestions,
+            vec!["ls".to_string(), "git status".to_string()]
+        );
+
+        // The selection was at index 1; after deleting index 1, the list
+        // shrunk to len 2, so index 1 is still valid (now points at "git status").
+        assert_eq!(
+            tab.suggestion_selected, 1,
+            "selection should remain at 1 (still valid, now points at git status)"
+        );
+        assert!(
+            tab.suggestion_visible,
+            "popup should remain visible — there are still suggestions to show"
+        );
+    }
+
+    /// Variant of `suggestion_delete_removes_command_and_clamps_selection` for
+    /// the edge case where deleting the LAST suggestion empties the list. The
+    /// handler must hide the popup and clear `suggestion_selected` and
+    /// `suggestion` so stale state doesn't leak into the next keystroke.
+    #[test]
+    fn suggestion_delete_last_item_hides_popup() {
+        let mut state = state_with_tabs(&["alpha"]);
+        let tab = state.sessions.first_mut().unwrap();
+        tab.command_history = vec!["pwdwd".to_string()];
+        tab.suggestions = vec!["pwdwd".to_string()];
+        tab.suggestion_selected = 0;
+        tab.suggestion_visible = true;
+        tab.suggestion = Some("dwd".to_string());
+
+        let cmd_to_delete = "pwdwd".to_string();
+        let tab = state.sessions.first_mut().unwrap();
+        tab.command_history.retain(|c| c != &cmd_to_delete);
+        tab.suggestions.retain(|c| c != &cmd_to_delete);
+        if tab.suggestion_selected >= tab.suggestions.len() {
+            tab.suggestion_selected = tab.suggestions.len().saturating_sub(1);
+        }
+        if tab.suggestions.is_empty() {
+            tab.suggestion_visible = false;
+            tab.suggestion = None;
+            tab.suggestion_selected = 0;
+        }
+
+        let tab = state.sessions.first().unwrap();
+        assert!(
+            tab.suggestions.is_empty(),
+            "suggestions must be empty after deleting the only item"
+        );
+        assert!(
+            !tab.suggestion_visible,
+            "popup must be hidden when there are no suggestions"
+        );
+        assert_eq!(
+            tab.suggestion_selected, 0,
+            "suggestion_selected must reset to 0 when popup is hidden"
+        );
+        assert_eq!(
+            tab.suggestion, None,
+            "inline ghost text must be cleared when suggestions are empty"
+        );
+        assert!(
+            tab.command_history.is_empty(),
+            "command_history must be empty after deleting the only command"
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]

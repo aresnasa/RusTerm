@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use chrono::Utc;
 use chrono::TimeZone;
+use chrono::Utc;
 
 use crate::HistoryMatch;
 
@@ -82,12 +82,19 @@ impl FishHistoryProvider {
             .map(|(command, (count, ts))| {
                 let recency = if let Some(t) = ts {
                     let age = now_secs - t;
-                    if age < 3600 { 90.0 }
-                    else if age < 86400 { 70.0 }
-                    else if age < 259200 { 50.0 }
-                    else if age < 604800 { 30.0 }
-                    else if age < 2592000 { 15.0 }
-                    else { 5.0 }
+                    if age < 3600 {
+                        90.0
+                    } else if age < 86400 {
+                        70.0
+                    } else if age < 259200 {
+                        50.0
+                    } else if age < 604800 {
+                        30.0
+                    } else if age < 2592000 {
+                        15.0
+                    } else {
+                        5.0
+                    }
                 } else {
                     5.0
                 };
@@ -99,11 +106,18 @@ impl FishHistoryProvider {
                     None,
                     timestamp,
                     (count as f32).ln() * 20.0 + recency,
+                    // fish history file format has no exit code — format
+                    // limitation, unavoidable.
+                    None,
                 )
             })
             .collect();
 
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(limit);
         results
     }

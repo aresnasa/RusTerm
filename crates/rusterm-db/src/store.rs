@@ -321,6 +321,50 @@ impl Database {
         Ok(())
     }
 
+    /// Return ALL history rows, unfiltered, without grouping or ranking.
+    ///
+    /// Used by the analytics mirror (`rusterm-analytics::mirror_from_sqlite`)
+    /// to bulk-copy the OLTP store into DuckDB for OLAP queries. This is a
+    /// full table scan — it does NOT apply the `HAVING` clause that
+    /// `search_history` uses to filter failed commands, because analytics
+    /// queries (success rate, known-failed count) need to see every row,
+    /// including failures.
+    ///
+    /// For typical usage, this returns <100k rows and fits comfortably in
+    /// memory. If history grows beyond that, callers should switch to
+    /// streaming (cursor-based) reads.
+    pub async fn all_history(&self) -> anyhow::Result<Vec<HistoryEntry>> {
+        let rows: Vec<HistoryEntry> = self
+            .conn
+            .lock()
+            .await
+            .call::<_, Vec<HistoryEntry>, rusqlite::Error>(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, command, session_id, cwd, hostname, exit_code, \
+                     duration_ms, created_at FROM history ORDER BY created_at ASC",
+                )?;
+                let rows = stmt
+                    .query_map([], |row| {
+                        Ok(HistoryEntry {
+                            id: row.get(0)?,
+                            command: row.get(1)?,
+                            session_id: row.get(2)?,
+                            cwd: row.get(3)?,
+                            hostname: row.get(4)?,
+                            exit_code: row.get(5)?,
+                            duration_ms: row.get(6)?,
+                            created_at: row.get(7)?,
+                        })
+                    })?
+                    .filter_map(|r| r.ok())
+                    .collect();
+                Ok(rows)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("All history query error: {:?}", e))?;
+        Ok(rows)
+    }
+
     /// Search command history with frecency ranking (frequency + recency + success).
     /// Groups by command, counts executions, and ranks by a combined
     /// score of frequency, recency, and success rate inspired by atuin.

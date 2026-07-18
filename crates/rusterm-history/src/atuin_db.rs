@@ -22,16 +22,35 @@ impl AtuinDbProvider {
 
     /// Search with frecency ranking: frequency + recency combined.
     /// Groups by command, counts executions, ranks by a combined score.
+    ///
+    /// WHY READ `exit_code`: atuin stores a per-execution `exit_code` column.
+    /// RusTerm's `search_history` HAVING clause keeps commands whose every
+    /// recorded row has a non-zero exit_code OUT of suggestions (treats them
+    /// as known-failed). Without reading `exit_code` here, a failed command
+    /// imported from atuin would land in the RusTerm DB as `exit_code = NULL`,
+    /// which the HAVING clause keeps ("unknown, assume success") — re-surfacing
+    /// the typo in the suggestion popup. Reading `exit_code` lets us propagate
+    /// a non-zero value through `HistoryMatch` -> `HistoryEntry` so the DB row
+    /// correctly marks the command as failed.
+    ///
+    /// Note: GROUP BY command means a command with mixed success/failure
+    /// rows in atuin collapses to one row here. We pick `MAX(exit_code)` so
+    /// if ANY atuin row failed, we surface a non-zero exit code — this biases
+    /// toward "don't suggest" (safer). The mixed case is rare in practice
+    /// because if the user ever ran the command successfully, atuin will have
+    /// a 0-exit row too, and `MAX` would still be non-zero — but the next
+    /// time the user runs it successfully in RusTerm, `save_history` adds a
+    /// 0-row and the HAVING clause re-enables suggestions. So the bias is
+    /// self-correcting.
     pub fn search(&self, query: &str, limit: usize) -> Result<Vec<HistoryMatch>> {
-        let conn = Connection::open_with_flags(
-            &self.db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
+        let conn =
+            Connection::open_with_flags(&self.db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
 
         let now_secs = Utc::now().timestamp();
         let pattern = format!("{}%", query);
         let mut stmt = conn.prepare(
-            "SELECT command, cwd, hostname, MAX(timestamp) as ts, COUNT(*) as cnt
+            "SELECT command, cwd, hostname, MAX(timestamp) as ts, COUNT(*) as cnt,
+                    MAX(exit_code) as max_exit
              FROM history
              WHERE command LIKE ?1 AND deleted_at IS NULL
              GROUP BY command
@@ -52,20 +71,26 @@ impl AtuinDbProvider {
                 let hostname: Option<String> = row.get(2)?;
                 let ts_ns: i64 = row.get(3)?;
                 let count: i64 = row.get(4)?;
-                Ok((command, cwd, hostname, ts_ns, count))
+                let max_exit: Option<i64> = row.get(5)?;
+                Ok((command, cwd, hostname, ts_ns, count, max_exit))
             })?
             .filter_map(|r| r.ok())
-            .map(|(command, cwd, hostname, ts_ns, count)| {
+            .map(|(command, cwd, hostname, ts_ns, count, max_exit)| {
                 let timestamp = DateTime::from_timestamp_nanos(ts_ns);
                 let age_hours = (Utc::now() - timestamp).num_hours().max(1) as f32;
                 let recency_score = 1.0 / (1.0 + age_hours / 24.0);
                 let frequency_score = (count as f32).ln() * 20.0;
+                // atuin stores exit_code as INTEGER; NULL means atuin didn't
+                // capture it (older atuin or shell without integration).
+                // Preserve as Option<i32> — non-zero means atuin saw a failure.
+                let exit_code = max_exit.and_then(|v| i32::try_from(v).ok());
                 HistoryMatch::new(
                     command,
                     cwd,
                     hostname,
                     Some(timestamp),
                     recency_score + frequency_score,
+                    exit_code,
                 )
             })
             .collect();
@@ -74,13 +99,11 @@ impl AtuinDbProvider {
     }
 
     pub fn recent(&self, limit: usize) -> Result<Vec<HistoryMatch>> {
-        let conn = Connection::open_with_flags(
-            &self.db_path,
-            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
-        )?;
+        let conn =
+            Connection::open_with_flags(&self.db_path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY)?;
 
         let mut stmt = conn.prepare(
-            "SELECT command, cwd, hostname, timestamp FROM history
+            "SELECT command, cwd, hostname, timestamp, exit_code FROM history
              WHERE deleted_at IS NULL
              ORDER BY timestamp DESC LIMIT ?1",
         )?;
@@ -91,18 +114,14 @@ impl AtuinDbProvider {
                 let cwd: Option<String> = row.get(1)?;
                 let hostname: Option<String> = row.get(2)?;
                 let ts_ns: i64 = row.get(3)?;
-                Ok((command, cwd, hostname, ts_ns))
+                let exit_code: Option<i64> = row.get(4)?;
+                Ok((command, cwd, hostname, ts_ns, exit_code))
             })?
             .filter_map(|r| r.ok())
-            .map(|(command, cwd, hostname, ts_ns)| {
+            .map(|(command, cwd, hostname, ts_ns, exit_code)| {
                 let timestamp = DateTime::from_timestamp_nanos(ts_ns);
-                HistoryMatch::new(
-                    command,
-                    cwd,
-                    hostname,
-                    Some(timestamp),
-                    1.0,
-                )
+                let exit_code = exit_code.and_then(|v| i32::try_from(v).ok());
+                HistoryMatch::new(command, cwd, hostname, Some(timestamp), 1.0, exit_code)
             })
             .collect();
 

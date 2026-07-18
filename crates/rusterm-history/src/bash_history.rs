@@ -40,16 +40,27 @@ impl BashHistoryProvider {
 
         let mut results: Vec<HistoryMatch> = counts
             .into_iter()
-            .map(|(command, count)| HistoryMatch::new(
-                command,
-                None,
-                None,
-                None,
-                (count as f32).ln() * 20.0 + 5.0,
-            ))
+            .map(|(command, count)| {
+                HistoryMatch::new(
+                    command,
+                    None,
+                    None,
+                    None,
+                    (count as f32).ln() * 20.0 + 5.0,
+                    // bash history file format has no exit code — leave None so
+                    // downstream (DB import) can mark NULL. The HAVING clause
+                    // keeps NULL rows as "unknown, assume success"; that's the
+                    // best we can do for sources without exit-code info.
+                    None,
+                )
+            })
             .collect();
 
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(limit);
         results
     }

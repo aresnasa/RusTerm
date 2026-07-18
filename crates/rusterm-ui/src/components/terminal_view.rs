@@ -420,6 +420,16 @@ pub fn TerminalView(
     on_suggestion_navigate: EventHandler<Option<usize>>,
     on_suggestion_accept: EventHandler<String>,
     on_suggestion_dismiss: EventHandler<()>,
+    /// Delete the currently-selected suggestion from history (dirty-data
+    /// cleanup). Triggered by Shift+Delete while the suggestion panel is open.
+    /// The handler in `app.rs` removes the command from `command_history`,
+    /// inserts it into `recent_failed_commands` as an immediate guard, and
+    /// spawns `mark_command_failed(&cmd, 1)` so the failure marker is durable
+    /// against the next history import. We use `mark_command_failed` (NOT
+    /// `delete_history_by_command`) because deletion would let the next
+    /// `~/.bash_history` import re-introduce the command as `exit_code = NULL`,
+    /// which the HAVING clause keeps — re-surfacing the typo.
+    on_suggestion_delete: EventHandler<String>,
     onekey_visible: bool,
     onekey_entries: Vec<OneKeyMatch>,
     onekey_selected: usize,
@@ -601,6 +611,24 @@ pub fn TerminalView(
                 }
                 Key::Escape => {
                     on_suggestion_dismiss.call(());
+                    return;
+                }
+                // Shift+Delete: delete the currently-selected suggestion from
+                // history. This is the user-facing dirty-data cleanup affordance
+                // — typos and broken commands that snuck into suggestions (from
+                // bash/zsh flat history files that have no exit-code info) can
+                // be purged on the spot. The handler in app.rs marks the command
+                // as failed durably (via `mark_command_failed`) so subsequent
+                // history imports skip it.
+                //
+                // Why Shift+Delete (not Ctrl+Delete or plain Delete)? Matches
+                // the convention used by VS Code and IntelliJ for
+                // "delete suggestion" / "remove autocomplete entry". Plain
+                // Delete is reserved for shell-side forward-delete.
+                Key::Delete if shift => {
+                    if let Some(cmd) = closure_suggestions.get(current_suggestion_selected) {
+                        on_suggestion_delete.call(cmd.clone());
+                    }
                     return;
                 }
                 // Enter falls through to PTY normally (also dismisses panel)
@@ -1167,6 +1195,9 @@ pub fn TerminalView(
                     },
                     on_dismiss: move |_: ()| {
                         on_suggestion_dismiss.call(());
+                    },
+                    on_delete: move |cmd: String| {
+                        on_suggestion_delete.call(cmd);
                     },
                 }
             }

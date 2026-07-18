@@ -1654,8 +1654,22 @@ pub fn App() -> Element {
     let mut input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>> =
         use_signal(HashMap::new);
 
-    // One-time startup: import local shell history (zsh/bash/fish) into the
-    // SQLite DB so suggestions can draw from a single unified source.
+    // One-time startup: import local shell history (zsh/bash/fish/atuin) into
+    // the SQLite DB so suggestions can draw from a single unified source.
+    //
+    // DIRTY-DATA GUARD: we filter out commands that are already marked as
+    // known-failed in the DB. Without this, every app launch would re-import
+    // `~/.bash_history` / `~/.zsh_history` (which contain old failed commands
+    // from OTHER terminals — those files have no exit-code info) as
+    // `exit_code = NULL` rows, which the HAVING clause keeps as "unknown,
+    // assume success" — re-surfacing the user's typos in the suggestion popup
+    // on every launch. The filter mirrors the shell-connection import path.
+    //
+    // EXIT-CODE PROPAGATION: atuin stores per-execution `exit_code`; we now
+    // read it (see `AtuinDbProvider::search`) so failed commands imported
+    // from atuin land with a non-zero exit code and are filtered by HAVING.
+    // bash/zsh/fish flat-file sources have no exit code → None → still NULL
+    // → filtered here by `known_failed_commands`.
     let _history_import = use_future(|| async move {
         let db_path = dirs::data_dir()
             .unwrap_or_default()
@@ -1676,18 +1690,40 @@ pub fn App() -> Element {
             return;
         }
 
+        // Fetch the known-failed set BEFORE building entries so we can skip
+        // commands the user has previously marked as failed. This is the
+        // critical guard against re-introducing typos as NULL-exit-code rows
+        // on every app launch.
+        let failed_set = db.known_failed_commands().await.unwrap_or_default();
+        let skipped_failed = local_commands
+            .iter()
+            .filter(|m| failed_set.contains(&m.command))
+            .count();
+        if skipped_failed > 0 {
+            tracing::info!(
+                "Skipping {} known-failed commands during startup import",
+                skipped_failed
+            );
+        }
+
         // Replace previous local import (delete by hostname to avoid duplicates)
         let _ = db.delete_history_by_hostname("local").await;
 
         let entries: Vec<_> = local_commands
             .iter()
+            .filter(|m| !failed_set.contains(&m.command))
             .map(|m| rusterm_db::history::HistoryEntry {
                 id: uuid::Uuid::new_v4().to_string(),
                 command: m.command.clone(),
                 session_id: "local-import".to_string(),
                 cwd: m.cwd.clone(),
                 hostname: Some("local".to_string()),
-                exit_code: None,
+                // Propagate atuin's exit_code so failed commands imported
+                // from atuin are correctly marked as failed (and filtered
+                // by HAVING). bash/zsh/fish sources have None — those land
+                // as NULL, but the failed_set filter above already removed
+                // any of them that we know to have failed.
+                exit_code: m.exit_code,
                 duration_ms: None,
                 created_at: m
                     .timestamp
@@ -2042,6 +2078,7 @@ pub fn App() -> Element {
                                     let sid_for_sug_nav = tab.id.clone();
                                     let sid_for_sug_accept = tab.id.clone();
                                     let sid_for_sug_dismiss = tab.id.clone();
+                                    let sid_for_sug_delete = tab.id.clone();
                                     let sid_for_ok = tab.id.clone();
                                     let sid_for_ok_sel = tab.id.clone();
                                     let sid_for_ok_save = tab.id.clone();
@@ -2412,6 +2449,168 @@ pub fn App() -> Element {
                                                 state_for_cmd.write().sessions.iter_mut()
                                                     .find(|t| t.id == sid_for_sug_dismiss)
                                                     .map(|tab| tab.suggestion_visible = false);
+                                            },
+                                            on_suggestion_delete: move |cmd: String| {
+                                                // Shift+Delete on a suggestion item: the user wants
+                                                // this command GONE from suggestions — it's a typo
+                                                // or broken command that slipped past the failed-
+                                                // command filter (most likely because it came from
+                                                // `~/.bash_history` / `~/.zsh_history`, which have
+                                                // no exit-code info, so it landed as NULL and HAVING
+                                                // kept it).
+                                                //
+                                                // We do the deletion in three layers, mirroring the
+                                                // runtime-failure path:
+                                                //   1. IMMEDIATE (synchronous): remove from
+                                                //      `tab.command_history` so the session-history
+                                                //      source stops surfacing it on the next
+                                                //      keystroke; insert into
+                                                //      `recent_failed_commands` so the DB source
+                                                //      is also guarded during the async DB write;
+                                                //      remove from `tab.suggestions` and clamp
+                                                //      `suggestion_selected` so the popup updates
+                                                //      instantly.
+                                                //   2. DURABLE (async spawn): call
+                                                //      `mark_command_failed(&cmd, 1)`. This DELETEs
+                                                //      any prior rows for the command (including
+                                                //      the NULL-exit-code import row that was
+                                                //      causing the re-surface) and inserts a
+                                                //      single row with `exit_code = 1`. The HAVING
+                                                //      clause now filters it, AND the next history
+                                                //      import skips it because it's in
+                                                //      `known_failed_commands`. We use
+                                                //      `mark_command_failed` (NOT
+                                                //      `delete_history_by_command`) because
+                                                //      deletion would let the next import
+                                                //      re-introduce the command as NULL.
+                                                //   3. POST-COMMIT: remove from
+                                                //      `recent_failed_commands` — the DB's HAVING
+                                                //      clause takes over.
+                                                //
+                                                // Borrow-checker note: `state_for_cmd.write()`
+                                                // takes &mut self, so we collect everything we
+                                                // need from the write() critical section, drop it,
+                                                // then clone the Signal for the spawn.
+                                                let cmd_for_spawn = cmd.clone();
+                                                let mut state_for_mark = state_for_cmd;
+                                                {
+                                                    let mut s = state_for_mark.write();
+                                                    if let Some(tab) = s.sessions.iter_mut()
+                                                        .find(|t| t.id == sid_for_sug_delete)
+                                                    {
+                                                        // 1a. Remove from session history
+                                                        tab.command_history.retain(|c| c != &cmd);
+                                                        // 1b. Remove from the visible suggestions list
+                                                        tab.suggestions.retain(|c| c != &cmd);
+                                                        // 1c. Clamp selection: if we deleted the
+                                                        // selected item or one before it, decrement;
+                                                        // then guard against the now-shorter list.
+                                                        if tab.suggestion_selected
+                                                            >= tab.suggestions.len()
+                                                        {
+                                                            tab.suggestion_selected = tab
+                                                                .suggestions
+                                                                .len()
+                                                                .saturating_sub(1);
+                                                        }
+                                                        // 1d. If the popup is now empty, hide it
+                                                        // and clear the inline ghost text.
+                                                        if tab.suggestions.is_empty() {
+                                                            tab.suggestion_visible = false;
+                                                            tab.suggestion = None;
+                                                            tab.suggestion_selected = 0;
+                                                        } else {
+                                                            // Refresh the inline ghost text to
+                                                            // reflect the new top suggestion.
+                                                            // We need the current cursor line to
+                                                            // compute the suffix; fetch it from
+                                                            // the terminal.
+                                                            // (Done below outside the write() lock
+                                                            // to avoid holding two locks.)
+                                                        }
+                                                    }
+                                                    // 1e. Immediate guard against the DB source
+                                                    // re-surfacing the command during the async
+                                                    // write window.
+                                                    s.recent_failed_commands.insert(cmd.clone());
+                                                }
+                                                // Refresh the inline ghost text: recompute the
+                                                // suffix from the new top suggestion vs. the
+                                                // current cursor line.
+                                                {
+                                                    let terminals = state_for_mark.read().terminals.clone();
+                                                    if let Some(handle) = terminals.get(&sid_for_sug_delete) {
+                                                        let line = handle.lock().terminal.extract_current_line();
+                                                        let cmd_part = strip_prompt(line.trim());
+                                                        let suggestions = state_for_mark.read()
+                                                            .sessions.iter()
+                                                            .find(|t| t.id == sid_for_sug_delete)
+                                                            .map(|t| t.suggestions.clone())
+                                                            .unwrap_or_default();
+                                                        let new_suffix = suggestions.first().map(|first| {
+                                                            if first.len() > cmd_part.len()
+                                                                && first.starts_with(&cmd_part)
+                                                            {
+                                                                first[cmd_part.len()..].to_string()
+                                                            } else {
+                                                                String::new()
+                                                            }
+                                                        }).unwrap_or_default();
+                                                        state_for_mark.write().sessions.iter_mut()
+                                                            .find(|t| t.id == sid_for_sug_delete)
+                                                            .map(|tab| {
+                                                                tab.suggestion = if new_suffix.is_empty() {
+                                                                    None
+                                                                } else {
+                                                                    Some(new_suffix)
+                                                                };
+                                                            });
+                                                    }
+                                                }
+                                                // Force suggestion list refresh on next keystroke.
+                                                {
+                                                    let mut s = state_for_mark.write();
+                                                    s.suggestion_epoch = s.suggestion_epoch.wrapping_add(1);
+                                                }
+                                                // 2. Durable: mark as failed in DB.
+                                                spawn(async move {
+                                                    let db_path = dirs::data_dir()
+                                                        .unwrap_or_default()
+                                                        .join("rusterm")
+                                                        .join("rusterm.db");
+                                                    match rusterm_db::Database::open(Some(db_path)).await {
+                                                        Ok(db) => {
+                                                            if let Err(e) = db.mark_command_failed(&cmd_for_spawn, 1).await {
+                                                                tracing::warn!(
+                                                                    "[SUGGESTION-DELETE] mark_command_failed failed for {:?}: {}",
+                                                                    cmd_for_spawn,
+                                                                    e
+                                                                );
+                                                                // Leave in recent_failed_commands —
+                                                                // better to over-filter than
+                                                                // re-surface a typo the user just
+                                                                // deleted.
+                                                                return;
+                                                            }
+                                                            // 3. DB write committed — HAVING takes
+                                                            // over. Remove the UI-side guard.
+                                                            state_for_mark.write()
+                                                                .recent_failed_commands
+                                                                .remove(&cmd_for_spawn);
+                                                            tracing::info!(
+                                                                "[SUGGESTION-DELETE] marked {:?} as failed in DB (user-initiated)",
+                                                                cmd_for_spawn
+                                                            );
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::warn!(
+                                                                "[SUGGESTION-DELETE] failed to open DB for {:?}: {}",
+                                                                cmd_for_spawn,
+                                                                e
+                                                            );
+                                                        }
+                                                    }
+                                                });
                                             },
                                             onekey_visible: ok_visible,
                                             onekey_entries: ok_entries,

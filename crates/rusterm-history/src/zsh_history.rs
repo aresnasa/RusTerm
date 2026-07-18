@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 
-use chrono::Utc;
 use chrono::TimeZone;
+use chrono::Utc;
 
 use crate::HistoryMatch;
 
@@ -50,7 +50,10 @@ impl ZshHistoryProvider {
                     let cmd = &rest[semicolon_pos + 1..];
 
                     // Parse timestamp from `timestamp:duration`
-                    current_ts = meta.split(':').next().and_then(|s| s.trim().parse::<i64>().ok());
+                    current_ts = meta
+                        .split(':')
+                        .next()
+                        .and_then(|s| s.trim().parse::<i64>().ok());
                     current_cmd.push_str(cmd);
                 } else {
                     current_cmd.push_str(rest);
@@ -90,12 +93,19 @@ impl ZshHistoryProvider {
             .map(|(command, (count, ts))| {
                 let recency = if let Some(t) = ts {
                     let age = now_secs - t;
-                    if age < 3600 { 90.0 }
-                    else if age < 86400 { 70.0 }
-                    else if age < 259200 { 50.0 }
-                    else if age < 604800 { 30.0 }
-                    else if age < 2592000 { 15.0 }
-                    else { 5.0 }
+                    if age < 3600 {
+                        90.0
+                    } else if age < 86400 {
+                        70.0
+                    } else if age < 259200 {
+                        50.0
+                    } else if age < 604800 {
+                        30.0
+                    } else if age < 2592000 {
+                        15.0
+                    } else {
+                        5.0
+                    }
                 } else {
                     5.0
                 };
@@ -107,11 +117,18 @@ impl ZshHistoryProvider {
                     None,
                     timestamp,
                     (count as f32).ln() * 20.0 + recency,
+                    // zsh extended history format `: ts:dur;cmd` has no exit
+                    // code — format limitation, unavoidable.
+                    None,
                 )
             })
             .collect();
 
-        results.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+        results.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
         results.truncate(limit);
         results
     }
