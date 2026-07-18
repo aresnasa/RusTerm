@@ -90,10 +90,26 @@ html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#
 .sug-row .sug-del:hover{color:#f7768e !important;}
 </style>"#;
 
-    let cfg = dioxus::desktop::Config::new()
+    let mut cfg = dioxus::desktop::Config::new()
         .with_window(window)
         .with_background_color((26, 27, 38, 255))
         .with_custom_head(head_html.to_string());
+
+    // Window icon. The ICO at `assets/icon.ico` ships with 16..256px frames;
+    // `image::load_from_memory` (called transitively by dioxus's
+    // `icon_from_memory`) picks the largest frame and decodes it to RGBA.
+    // Failure here is non-fatal — the app still launches, just with the
+    // platform-default window icon — so we log and continue instead of
+    // panicking.
+    let icon_bytes = include_bytes!("../../../assets/icon.ico");
+    match dioxus::desktop::icon_from_memory::<dioxus::desktop::tao::window::Icon>(icon_bytes) {
+        Ok(icon) => {
+            cfg = cfg.with_icon(icon);
+        }
+        Err(e) => {
+            tracing::warn!("failed to decode embedded window icon: {e}");
+        }
+    }
 
     dioxus::LaunchBuilder::new()
         .with_cfg(cfg)
