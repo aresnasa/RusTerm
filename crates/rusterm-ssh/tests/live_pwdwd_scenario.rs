@@ -53,7 +53,15 @@ async fn connect_and_run(
     inputs: &[&str],
 ) -> anyhow::Result<Vec<u8>> {
     let config = Arc::new(client::Config::default());
-    let mut handle = client::connect(config, (host, 22), rusterm_ssh::client::Handler).await?;
+    // Live SSH test scenario: disable host key verification since this is
+    // a manual integration test against a user-supplied host. We don't
+    // want to pollute known_hosts with test hosts, and the test is only
+    // run when the user explicitly opts in via RUSTERM_LIVE_SSH_TEST=1.
+    let handler = rusterm_ssh::client::Handler::new(
+        host.to_string(),
+        rusterm_ssh::known_hosts::HostKeyPolicy::Disabled,
+    );
+    let mut handle = client::connect(config, (host, 22), handler).await?;
 
     // Try publickey auth first (the test host has ~/.ssh/id_rsa set up).
     let mut authed = false;

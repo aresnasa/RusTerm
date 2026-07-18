@@ -22,9 +22,11 @@ use crate::components::Sidebar;
 use crate::components::TabBar;
 use crate::components::TerminalView;
 use crate::components::connection_dialog::NewConnectionForm;
+use crate::layout::PaneLayout;
 use crate::state::{
     AppState, Modal, OneKeyMatch, OneKeyPopupState, SessionTab, TerminalEntry, UnlockState,
-    move_session_to_leftmost,
+    cycle_layout_preset, move_session_to_leftmost, resize_layout_col, resize_layout_row,
+    toggle_comparison_mode, toggle_pane_zoom,
 };
 
 fn save_config(state: &Signal<AppState>) {
@@ -38,6 +40,929 @@ fn save_config(state: &Signal<AppState>) {
     };
     if let Err(e) = cm.save_connections(&s.connections) {
         tracing::error!("Failed to save connections: {}", e);
+    }
+}
+
+/// Human-readable label for the current layout preset, shown in the status
+/// bar's layout toolbar. Kept short so it fits in the status bar's small
+/// footprint. Used instead of `{:?}` because dioxus's rsx! formatter
+/// doesn't support `#?` and the default `Debug` output is too long.
+fn layout_label(preset: crate::layout::LayoutPreset) -> &'static str {
+    use crate::layout::LayoutPreset::*;
+    match preset {
+        Single => "1",
+        Split2H => "2H",
+        Split2V => "2V",
+        Grid4 => "4",
+        Grid8 => "8",
+    }
+}
+
+/// Render a single TerminalView for the session identified by `session_id`.
+///
+/// This is the shared rendering helper used by both the single-pane path
+/// (where `session_id` is the active session) and the multi-pane path
+/// (where `session_id` is one of the panes in the layout). It encapsulates
+/// the ~600 lines of closures that wire up TerminalView's on_resize /
+/// on_input / on_command / on_scroll_* / on_suggestion_* / on_onekey_* /
+/// on_reconnect handlers.
+///
+/// If the session isn't found in `state.sessions` (e.g., it was closed
+/// between the layout snapshot and this render call), we render an empty
+/// div — the caller's pane_rect still reserves space, but no terminal
+/// content is drawn. This avoids a panic on the race where a session is
+/// closed mid-render.
+fn render_terminal_pane(
+    mut state: Signal<AppState>,
+    input_senders: Signal<std::collections::HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    session_id: String,
+) -> Element {
+    let tabs = &state.read().sessions;
+    match tabs.iter().find(|t| t.id == session_id) {
+        Some(tab) => {
+            let sid_clone = tab.id.clone();
+            let sid_for_cmd = tab.id.clone();
+            let sid_for_resize = tab.id.clone();
+            let sid_for_scroll_up = tab.id.clone();
+            let sid_for_scroll_down = tab.id.clone();
+            let sid_for_scroll_bottom = tab.id.clone();
+            let sid_for_sug_nav = tab.id.clone();
+            let sid_for_sug_accept = tab.id.clone();
+            let sid_for_sug_dismiss = tab.id.clone();
+            let sid_for_sug_delete = tab.id.clone();
+            let sid_for_ok = tab.id.clone();
+            let sid_for_ok_sel = tab.id.clone();
+            let sid_for_ok_save = tab.id.clone();
+            let sid_for_ok_dismiss = tab.id.clone();
+            let sid_for_reconnect = tab.id.clone();
+            let senders = input_senders;
+            let mut state_for_cmd = state;
+            // OneKey popup state for this session (if any).
+            let ok_popup = state
+                .read()
+                .onekey_popups
+                .get(&tab.id)
+                .cloned()
+                .unwrap_or_default();
+            let ok_visible = ok_popup.visible;
+            let ok_entries = ok_popup.matches.clone();
+            let ok_selected = ok_popup.selected;
+            // Whether this session's channel has dropped (Enter → reconnect).
+            let tab_disconnected = state.read().disconnected_sessions.contains(&tab.id);
+            rsx! {
+                TerminalView {
+                    session_id: tab.id.clone(),
+                    render_output: tab.render_output.clone(),
+                    version: tab.version,
+                    suggestion: tab.suggestion.clone(),
+                    suggestions: tab.suggestions.clone(),
+                    suggestion_selected: tab.suggestion_selected,
+                    suggestion_visible: tab.suggestion_visible,
+                    on_resize: move |(cols, rows, pw, ph): (u16, u16, u32, u32)| {
+                        let terminals = state.read().terminals.clone();
+                        if let Some(handle) = terminals.get(&sid_for_resize) {
+                            let mut entry = handle.lock();
+                            entry.terminal.resize(cols, rows, pw, ph);
+                            entry.scroll_offset = 0; // Reset scroll on resize
+                            // Re-render after resize so the UI updates immediately
+                            let render_result = entry.render_current();
+                            let mut s = state.write();
+                            if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == sid_for_resize) {
+                                tab.render_output = render_result;
+                                tab.version += 1;
+                            }
+                        }
+                        // Propagate resize to SSH session
+                        if let Some(tx) = state.read().resize_senders.get(&sid_for_resize) {
+                            let _ = tx.send((cols, rows, pw, ph));
+                        }
+                    },
+                    on_input: move |data: Vec<u8>| {
+                        let is_enter = data.contains(&0x0d);
+                        tracing::info!(
+                            "[INPUT] session={} is_enter={} data_len={} data={:?}",
+                            &sid_clone[..sid_clone.len().min(8)],
+                            is_enter,
+                            data.len(),
+                            &data[..data.len().min(32)]
+                        );
+                        // Log input
+                        {
+                            let logs = state_for_cmd.read().session_logs.clone();
+                            if let Some(log) = logs.get(&sid_clone) {
+                                log.lock().log_input(&data);
+                            }
+                        }
+                        // --- Comparison-mode broadcast ---
+                        // When the active tab's layout has comparison mode
+                        // ON, every keystroke is sent to every pane's PTY
+                        // (the tmux synchronize-panes feature). This lets
+                        // the user run the same command across N hosts and
+                        // watch the outputs side-by-side.
+                        //
+                        // When comparison is OFF (or no layout exists),
+                        // input only goes to this pane's session — the
+                        // legacy non-broadcast path.
+                        let broadcast_targets = crate::state::broadcast_targets(&state_for_cmd.read());
+                        let is_broadcast = broadcast_targets.len() > 1
+                            || (broadcast_targets.len() == 1 && broadcast_targets[0] != sid_clone);
+                        if is_broadcast {
+                            tracing::info!(
+                                "[INPUT] comparison mode ON — broadcasting to {} sessions",
+                                broadcast_targets.len()
+                            );
+                            for target_sid in &broadcast_targets {
+                                if let Some(sender) = senders.read().get(target_sid).cloned() {
+                                    match sender.send(data.clone()) {
+                                        Ok(()) => tracing::info!(
+                                            "[INPUT] broadcast to session {} ok",
+                                            &target_sid[..target_sid.len().min(8)]
+                                        ),
+                                        Err(e) => tracing::warn!(
+                                            "[INPUT] broadcast to session {} FAILED: {}",
+                                            &target_sid[..target_sid.len().min(8)],
+                                            e
+                                        ),
+                                    }
+                                }
+                            }
+                        } else {
+                            // Non-broadcast path: send only to this pane's session.
+                            let send_ok = senders.read().get(&sid_clone).cloned();
+                            if let Some(sender) = send_ok {
+                                match sender.send(data) {
+                                    Ok(()) => tracing::info!("[INPUT] sent to PTY ok"),
+                                    Err(e) => tracing::warn!("[INPUT] FAILED to send to PTY: {}", e),
+                                }
+                            } else {
+                                tracing::warn!("[INPUT] no sender for session — PTY channel is dead");
+                            }
+                        }
+                        // Query history for suggestion (on non-Enter input)
+                        if !is_enter {
+                            let sid_sug = sid_clone.clone();
+                            let epoch = {
+                                let mut s = state_for_cmd.write();
+                                s.suggestion_epoch += 1;
+                                s.suggestion_epoch
+                            };
+                            spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+                                let current_epoch = state_for_cmd.read().suggestion_epoch;
+                                if current_epoch != epoch {
+                                    tracing::info!(
+                                        "[SUGGESTION-QUERY] STALE — spawn epoch={} but current={} (skipped)",
+                                        epoch,
+                                        current_epoch
+                                    );
+                                    return;
+                                }
+
+                                // Extract the current line AFTER debounce
+                                let line = {
+                                    let terminals = state_for_cmd.read().terminals.clone();
+                                    if let Some(handle) = terminals.get(&sid_sug) {
+                                        handle.lock().terminal.extract_current_line()
+                                    } else {
+                                        return;
+                                    }
+                                };
+                                let line = line.trim().to_string();
+
+                                if line.is_empty() {
+                                    tracing::info!(
+                                        "[SUGGESTION-QUERY] session={} line empty — hiding popup",
+                                        &sid_sug[..sid_sug.len().min(8)]
+                                    );
+                                    state_for_cmd.write().sessions.iter_mut()
+                                        .find(|t| t.id == sid_sug)
+                                        .map(|tab| {
+                                            tab.suggestion = None;
+                                            tab.suggestions = Vec::new();
+                                            tab.suggestion_visible = false;
+                                            tab.suggestion_selected = 0;
+                                        });
+                                    return;
+                                }
+
+                                // Strip prompt prefix to get the command part
+                                let cmd_part = strip_prompt(&line);
+
+                                if cmd_part.is_empty() {
+                                    tracing::info!(
+                                        "[SUGGESTION-QUERY] session={} cmd_part empty (line={:?}) — hiding popup",
+                                        &sid_sug[..sid_sug.len().min(8)],
+                                        line
+                                    );
+                                    state_for_cmd.write().sessions.iter_mut()
+                                        .find(|t| t.id == sid_sug)
+                                        .map(|tab| {
+                                            tab.suggestion = None;
+                                            tab.suggestions = Vec::new();
+                                            tab.suggestion_visible = false;
+                                            tab.suggestion_selected = 0;
+                                        });
+                                    return;
+                                }
+
+                                let cmd_lower = cmd_part.to_lowercase();
+                                let mut all_suggestions: Vec<String> = Vec::new();
+                                let mut seen = std::collections::HashSet::new();
+
+                                // TIMING WINDOW GUARD: snapshot the
+                                // recent-failed set BEFORE querying
+                                // either source. A command that just
+                                // failed (rc != 0) is in this set
+                                // synchronously, even though its
+                                // durable DB failure marker is still
+                                // being written by the `mark_command_failed`
+                                // spawn. Without this filter, the DB
+                                // source would re-surface the command
+                                // during that window because the prior
+                                // `exit_code = NULL` import row is still
+                                // there and HAVING keeps NULL rows.
+                                let recent_failed: std::collections::HashSet<String> =
+                                    state_for_cmd
+                                        .read()
+                                        .recent_failed_commands
+                                        .clone();
+
+                                // 1. Session command history — count frequency, sort by it
+                                let session_hist = state_for_cmd.read().sessions
+                                    .iter().find(|t| t.id == sid_sug)
+                                    .map(|t| t.command_history.clone())
+                                    .unwrap_or_default();
+
+                                // Count occurrences and sort by frequency descending
+                                let mut freq: std::collections::HashMap<&String, usize> = std::collections::HashMap::new();
+                                for cmd in session_hist.iter() {
+                                    if cmd.to_lowercase().starts_with(&cmd_lower)
+                                        && cmd != &cmd_part
+                                        && !seen.contains(cmd.to_lowercase().as_str())
+                                        && !recent_failed.contains(cmd)
+                                    {
+                                        *freq.entry(cmd).or_insert(0) += 1;
+                                    }
+                                }
+                                let mut freq_vec: Vec<(&String, usize)> = freq.into_iter().collect();
+                                freq_vec.sort_by(|a, b| b.1.cmp(&a.1));
+                                for (cmd, _count) in freq_vec.iter().take(15) {
+                                    seen.insert(cmd.to_lowercase().clone());
+                                    all_suggestions.push((*cmd).clone());
+                                }
+
+                                // 2. SQLite FTS5 — unified history DB (local import + remote
+                                //    imports + session commands), frecency-scored (atuin-style:
+                                //    frequency + recency + success rate). This replaces the
+                                //    per-keystroke file reads — local shell history is imported
+                                //    into the DB at app startup.
+                                {
+                                    let db_path = dirs::data_dir()
+                                        .unwrap_or_default()
+                                        .join("rusterm")
+                                        .join("rusterm.db");
+                                    if let Ok(db) = rusterm_db::Database::open(Some(db_path)).await {
+                                        if let Ok(results) = db.search_history(&cmd_part, 30).await {
+                                            for entry in results {
+                                                if entry.command.to_lowercase().starts_with(&cmd_lower)
+                                                    && entry.command != cmd_part
+                                                    && !seen.contains(entry.command.to_lowercase().as_str())
+                                                    && !recent_failed.contains(&entry.command)
+                                                {
+                                                    seen.insert(entry.command.to_lowercase().clone());
+                                                    all_suggestions.push(entry.command);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+
+                                // Check epoch again before writing results
+                                if state_for_cmd.read().suggestion_epoch != epoch {
+                                    return;
+                                }
+
+                                // Truncate to 8 suggestions max
+                                all_suggestions.truncate(15);
+
+                                tracing::info!(
+                                    "[SUGGESTION-QUERY] session={} cmd_part={:?} epoch={} current_epoch={} results={:?} recent_failed={:?}",
+                                    &sid_sug[..sid_sug.len().min(8)],
+                                    cmd_part,
+                                    epoch,
+                                    state_for_cmd.read().suggestion_epoch,
+                                    all_suggestions,
+                                    recent_failed
+                                );
+
+                                if all_suggestions.is_empty() {
+                                    state_for_cmd.write().sessions.iter_mut()
+                                        .find(|t| t.id == sid_sug)
+                                        .map(|tab| {
+                                            tab.suggestion = None;
+                                            tab.suggestions = Vec::new();
+                                            tab.suggestion_visible = false;
+                                            tab.suggestion_selected = 0;
+                                        });
+                                } else {
+                                    // First suggestion suffix is the inline ghost text
+                                    let first = &all_suggestions[0];
+                                    let suffix = if first.len() > cmd_part.len() {
+                                        first[cmd_part.len()..].to_string()
+                                    } else {
+                                        String::new()
+                                    };
+                                    state_for_cmd.write().sessions.iter_mut()
+                                        .find(|t| t.id == sid_sug)
+                                        .map(|tab| {
+                                            tab.suggestion = if suffix.is_empty() { None } else { Some(suffix) };
+                                            tab.suggestions = all_suggestions;
+                                            tab.suggestion_visible = true;
+                                            tab.suggestion_selected = 0;
+                                        });
+                                }
+                            });
+                        }
+                    },
+                    on_command: move |_: String| {
+                        tracing::info!(
+                            "[COMMAND] Enter pressed, session={}",
+                            &sid_for_cmd[..sid_for_cmd.len().min(8)]
+                        );
+                        // Clear suggestion on Enter
+                        state_for_cmd.write().sessions.iter_mut()
+                            .find(|t| t.id == sid_for_cmd)
+                            .map(|tab| {
+                                tab.suggestion = None;
+                                tab.suggestions = Vec::new();
+                                tab.suggestion_visible = false;
+                                tab.suggestion_selected = 0;
+                            });
+
+                        let terminals = state_for_cmd.read().terminals.clone();
+                        if let Some(handle) = terminals.get(&sid_for_cmd) {
+                            let raw_line = handle.lock().terminal.extract_current_line();
+                            let cmd = strip_prompt(raw_line.trim());
+                            tracing::info!(
+                                "[COMMAND] session={} raw_line={:?} cmd={:?}",
+                                &sid_for_cmd[..sid_for_cmd.len().min(8)],
+                                raw_line,
+                                cmd
+                            );
+                            if !cmd.is_empty() {
+                                // DEFERRED RECORDING — do NOT push to
+                                // command_history or save to DB yet. The
+                                // command might fail (typos, broken
+                                // commands), and the user explicitly
+                                // doesn't want failed commands showing
+                                // up in suggestions. Instead, queue it
+                                // and wait for the shell's OSC 133;D
+                                // exit-code report (shell integration).
+                                // Only on rc==0 will we commit the
+                                // command to history + DB. On rc!=0 we
+                                // silently drop it. If the shell never
+                                // emits OSC 133;D, the entry stays
+                                // queued until the per-session cap
+                                // (MAX_PENDING below) evicts it — by
+                                // design, we'd rather suggest nothing
+                                // than suggest failed commands.
+                                let entry_id = uuid::Uuid::new_v4().to_string();
+                                let mut s = state_for_cmd.write();
+                                let queue = s
+                                    .pending_exit_check
+                                    .entry(sid_for_cmd.clone())
+                                    .or_default();
+                                // Defensive cap: if the shell never emits
+                                // OSC 133;D (no shell integration, or
+                                // integration not yet loaded), the queue
+                                // would grow unboundedly. Drop the oldest
+                                // entry to keep the queue bounded — those
+                                // dropped entries are commands we couldn't
+                                // confirm succeeded, so dropping them is
+                                // consistent with "never suggest failed
+                                // commands". 32 is plenty for any
+                                // realistic prompt-then-Enter burst.
+                                const MAX_PENDING: usize = 32;
+                                while queue.len() >= MAX_PENDING {
+                                    queue.pop_front();
+                                }
+                                queue.push_back((cmd, entry_id));
+                            }
+                        }
+                    },
+                    on_scroll_up: move |rows: usize| {
+                        let terminals = state_for_cmd.read().terminals.clone();
+                        if let Some(handle) = terminals.get(&sid_for_scroll_up) {
+                            let render_result = handle.lock().scroll_up(rows);
+                            let mut s = state_for_cmd.write();
+                            if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == sid_for_scroll_up) {
+                                tab.render_output = render_result;
+                                tab.version += 1;
+                            }
+                        }
+                    },
+                    on_scroll_down: move |rows: usize| {
+                        let terminals = state_for_cmd.read().terminals.clone();
+                        if let Some(handle) = terminals.get(&sid_for_scroll_down) {
+                            let render_result = handle.lock().scroll_down(rows);
+                            let mut s = state_for_cmd.write();
+                            if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == sid_for_scroll_down) {
+                                tab.render_output = render_result;
+                                tab.version += 1;
+                            }
+                        }
+                    },
+                    on_scroll_to_bottom: move |_: ()| {
+                        let terminals = state_for_cmd.read().terminals.clone();
+                        if let Some(handle) = terminals.get(&sid_for_scroll_bottom) {
+                            let render_result = handle.lock().scroll_to_bottom();
+                            let mut s = state_for_cmd.write();
+                            if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == sid_for_scroll_bottom) {
+                                tab.render_output = render_result;
+                                tab.version += 1;
+                            }
+                        }
+                    },
+                    on_suggestion_navigate: move |idx: Option<usize>| {
+                        if let Some(i) = idx {
+                            state_for_cmd.write().sessions.iter_mut()
+                                .find(|t| t.id == sid_for_sug_nav)
+                                .map(|tab| tab.suggestion_selected = i);
+                        }
+                    },
+                    on_suggestion_accept: move |cmd: String| {
+                        // Accept: compute the suffix and send it
+                        let suffix = {
+                            let terminals = state_for_cmd.read().terminals.clone();
+                            if let Some(handle) = terminals.get(&sid_for_sug_accept) {
+                                let line = handle.lock().terminal.extract_current_line();
+                                let cmd_part = strip_prompt(line.trim());
+                                if cmd.starts_with(&cmd_part) && cmd_part.len() < cmd.len() {
+                                    cmd[cmd_part.len()..].to_string()
+                                } else {
+                                    String::new()
+                                }
+                            } else {
+                                String::new()
+                            }
+                        };
+                        if !suffix.is_empty() {
+                            if let Some(sender) = senders.read().get(&sid_for_sug_accept) {
+                                let _ = sender.send(suffix.as_bytes().to_vec());
+                            }
+                        }
+                        // Dismiss dropdown and clear suggestion
+                        state_for_cmd.write().sessions.iter_mut()
+                            .find(|t| t.id == sid_for_sug_accept)
+                            .map(|tab| {
+                                tab.suggestion_visible = false;
+                                tab.suggestion = None;
+                                tab.suggestions = Vec::new();
+                                tab.suggestion_selected = 0;
+                            });
+                    },
+                    on_suggestion_dismiss: move |_: ()| {
+                        state_for_cmd.write().sessions.iter_mut()
+                            .find(|t| t.id == sid_for_sug_dismiss)
+                            .map(|tab| tab.suggestion_visible = false);
+                    },
+                    on_suggestion_delete: move |cmd: String| {
+                        // Shift+Delete on a suggestion item: the user wants
+                        // this command GONE from suggestions — it's a typo
+                        // or broken command that slipped past the failed-
+                        // command filter (most likely because it came from
+                        // `~/.bash_history` / `~/.zsh_history`, which have
+                        // no exit-code info, so it landed as NULL and HAVING
+                        // kept it).
+                        //
+                        // We do the deletion in three layers, mirroring the
+                        // runtime-failure path:
+                        //   1. IMMEDIATE (synchronous): remove from
+                        //      `tab.command_history` so the session-history
+                        //      source stops surfacing it on the next
+                        //      keystroke; insert into
+                        //      `recent_failed_commands` so the DB source
+                        //      is also guarded during the async DB write;
+                        //      remove from `tab.suggestions` and clamp
+                        //      `suggestion_selected` so the popup updates
+                        //      instantly.
+                        //   2. DURABLE (async spawn): call
+                        //      `mark_command_failed(&cmd, 1)`. This DELETEs
+                        //      any prior rows for the command (including
+                        //      the NULL-exit-code import row that was
+                        //      causing the re-surface) and inserts a
+                        //      single row with `exit_code = 1`. The HAVING
+                        //      clause now filters it, AND the next history
+                        //      import skips it because it's in
+                        //      `known_failed_commands`. We use
+                        //      `mark_command_failed` (NOT
+                        //      `delete_history_by_command`) because
+                        //      deletion would let the next import
+                        //      re-introduce the command as NULL.
+                        //   3. POST-COMMIT: remove from
+                        //      `recent_failed_commands` — the DB's HAVING
+                        //      clause takes over.
+                        //
+                        // Borrow-checker note: `state_for_cmd.write()`
+                        // takes &mut self, so we collect everything we
+                        // need from the write() critical section, drop it,
+                        // then clone the Signal for the spawn.
+                        let cmd_for_spawn = cmd.clone();
+                        let mut state_for_mark = state_for_cmd;
+                        {
+                            let mut s = state_for_mark.write();
+                            if let Some(tab) = s.sessions.iter_mut()
+                                .find(|t| t.id == sid_for_sug_delete)
+                            {
+                                // 1a. Remove from session history
+                                tab.command_history.retain(|c| c != &cmd);
+                                // 1b. Remove from the visible suggestions list
+                                tab.suggestions.retain(|c| c != &cmd);
+                                // 1c. Clamp selection: if we deleted the
+                                // selected item or one before it, decrement;
+                                // then guard against the now-shorter list.
+                                if tab.suggestion_selected
+                                    >= tab.suggestions.len()
+                                {
+                                    tab.suggestion_selected = tab
+                                        .suggestions
+                                        .len()
+                                        .saturating_sub(1);
+                                }
+                                // 1d. If the popup is now empty, hide it
+                                // and clear the inline ghost text.
+                                if tab.suggestions.is_empty() {
+                                    tab.suggestion_visible = false;
+                                    tab.suggestion = None;
+                                    tab.suggestion_selected = 0;
+                                } else {
+                                    // Refresh the inline ghost text to
+                                    // reflect the new top suggestion.
+                                    // We need the current cursor line to
+                                    // compute the suffix; fetch it from
+                                    // the terminal.
+                                    // (Done below outside the write() lock
+                                    // to avoid holding two locks.)
+                                }
+                            }
+                            // 1e. Immediate guard against the DB source
+                            // re-surfacing the command during the async
+                            // write window.
+                            s.recent_failed_commands.insert(cmd.clone());
+                        }
+                        // Refresh the inline ghost text: recompute the
+                        // suffix from the new top suggestion vs. the
+                        // current cursor line.
+                        {
+                            let terminals = state_for_mark.read().terminals.clone();
+                            if let Some(handle) = terminals.get(&sid_for_sug_delete) {
+                                let line = handle.lock().terminal.extract_current_line();
+                                let cmd_part = strip_prompt(line.trim());
+                                let suggestions = state_for_mark.read()
+                                    .sessions.iter()
+                                    .find(|t| t.id == sid_for_sug_delete)
+                                    .map(|t| t.suggestions.clone())
+                                    .unwrap_or_default();
+                                let new_suffix = suggestions.first().map(|first| {
+                                    if first.len() > cmd_part.len()
+                                        && first.starts_with(&cmd_part)
+                                    {
+                                        first[cmd_part.len()..].to_string()
+                                    } else {
+                                        String::new()
+                                    }
+                                }).unwrap_or_default();
+                                state_for_mark.write().sessions.iter_mut()
+                                    .find(|t| t.id == sid_for_sug_delete)
+                                    .map(|tab| {
+                                        tab.suggestion = if new_suffix.is_empty() {
+                                            None
+                                        } else {
+                                            Some(new_suffix)
+                                        };
+                                    });
+                            }
+                        }
+                        // Force suggestion list refresh on next keystroke.
+                        {
+                            let mut s = state_for_mark.write();
+                            s.suggestion_epoch = s.suggestion_epoch.wrapping_add(1);
+                        }
+                        // 2. Durable: mark as failed in DB.
+                        spawn(async move {
+                            let db_path = dirs::data_dir()
+                                .unwrap_or_default()
+                                .join("rusterm")
+                                .join("rusterm.db");
+                            match rusterm_db::Database::open(Some(db_path)).await {
+                                Ok(db) => {
+                                    if let Err(e) = db.mark_command_failed(&cmd_for_spawn, 1).await {
+                                        tracing::warn!(
+                                            "[SUGGESTION-DELETE] mark_command_failed failed for {:?}: {}",
+                                            cmd_for_spawn,
+                                            e
+                                        );
+                                        // Leave in recent_failed_commands —
+                                        // better to over-filter than
+                                        // re-surface a typo the user just
+                                        // deleted.
+                                        return;
+                                    }
+                                    // 3. DB write committed — HAVING takes
+                                    // over. Remove the UI-side guard.
+                                    state_for_mark.write()
+                                        .recent_failed_commands
+                                        .remove(&cmd_for_spawn);
+                                    tracing::info!(
+                                        "[SUGGESTION-DELETE] marked {:?} as failed in DB (user-initiated)",
+                                        cmd_for_spawn
+                                    );
+                                }
+                                Err(e) => {
+                                    tracing::warn!(
+                                        "[SUGGESTION-DELETE] failed to open DB for {:?}: {}",
+                                        cmd_for_spawn,
+                                        e
+                                    );
+                                }
+                            }
+                        });
+                    },
+                    onekey_visible: ok_visible,
+                    onekey_entries: ok_entries,
+                    onekey_selected: ok_selected,
+                    on_onekey_navigate: move |idx: Option<usize>| {
+                        if let Some(i) = idx {
+                            state_for_cmd.write().onekey_popups
+                                .entry(sid_for_ok.clone())
+                                .and_modify(|p| p.selected = i);
+                        }
+                    },
+                    on_onekey_select: move |send: String| {
+                        // Send the selected OneKey's value + Enter, then dismiss.
+                        // `send` is the DECRYPTED plaintext (OneKeyMatch.send comes
+                        // from AppState.onekeys, which is decrypted on unlock). Log
+                        // the length to confirm the plaintext (not the encrypted
+                        // blob) is being sent.
+                        tracing::info!(
+                            "[ONEKEY-SELECT] session={} send_len={} first_byte={:?}",
+                            &sid_for_ok_sel[..sid_for_ok_sel.len().min(8)],
+                            send.len(),
+                            send.as_bytes().first().copied()
+                        );
+                        if let Some(sender) = senders.read().get(&sid_for_ok_sel) {
+                            let mut data = send.into_bytes();
+                            // Use \r (carriage return) — the same byte the terminal
+                            // sends for Enter (Key::Enter → 0x0d). The PTY's ICRNL
+                            // converts it to \n for the program. Using \r matches
+                            // real keyboard input exactly.
+                            data.push(b'\r');
+                            let _ = sender.send(data);
+                        }
+                        state_for_cmd.write().onekey_popups
+                            .remove(&sid_for_ok_sel);
+                    },
+                    on_onekey_save: move |_: ()| {
+                        // Save a new OneKey: expect = the matched prompt,
+                        // send = the text typed AFTER the prompt on the
+                        // current line (strips the prompt prefix).
+                        let entry = {
+                            let terminals = state_for_cmd.read().terminals.clone();
+                            let line = terminals.get(&sid_for_ok_save)
+                                .map(|h| h.lock().terminal.extract_current_line())
+                                .unwrap_or_default();
+                            let expect = state_for_cmd.read().onekey_popups
+                                .get(&sid_for_ok_save)
+                                .and_then(|p| p.matched_expect.clone())
+                                .unwrap_or_default();
+                            let send = if let Ok(re) = regex::Regex::new(&format!("(?i){}", expect)) {
+                                match re.find(&line) {
+                                    Some(m) => line[m.end()..].trim().to_string(),
+                                    None => line.trim().to_string(),
+                                }
+                            } else {
+                                line.trim().to_string()
+                            };
+                            let name = if send.is_empty() { "onekey".to_string() } else { send.clone() };
+                            OneKey {
+                                id: uuid::Uuid::new_v4().to_string(),
+                                name,
+                                steps: vec![OneKeyStep {
+                                    label: String::new(),
+                                    expect,
+                                    send: send.clone(),
+                                }],
+                            }
+                        };
+                        if entry.steps.first().is_some_and(|s| !s.send.is_empty()) {
+                            let cm = state_for_cmd.read().config_manager.clone();
+                            if let Some(cm) = cm {
+                                let mut all = state_for_cmd.read().onekeys.clone();
+                                all.push(entry);
+                                if let Err(e) = cm.save_onekeys(&all) {
+                                    tracing::error!("Failed to save OneKey: {}", e);
+                                }
+                                state_for_cmd.write().onekeys = all;
+                            }
+                        }
+                        state_for_cmd.write().onekey_popups.remove(&sid_for_ok_save);
+                    },
+                    on_onekey_dismiss: move |_: ()| {
+                        state_for_cmd.write().onekey_popups.remove(&sid_for_ok_dismiss);
+                    },
+                    disconnected: tab_disconnected,
+                    on_reconnect: move |_: ()| {
+                        reconnect_session(state_for_cmd, senders, sid_for_reconnect.clone());
+                    },
+                }
+            }
+        }
+        None => rsx! { div {} },
+    }
+}
+
+/// Multi-pane container: renders a `PaneLayout` as a grid of `TerminalView`
+/// panes positioned absolutely within a relative-positioned container. Each
+/// pane is sized according to the layout's per-row and per-column fractions.
+/// Splitter bars are rendered between adjacent panes so the user can
+/// click-resize them.
+///
+/// ## Cross-terminal comparison mode
+///
+/// When the layout's `comparison` flag is set, a banner is displayed at the
+/// top warning the user that input is being broadcast. The actual broadcast
+/// logic lives in each pane's `on_input` handler — when comparison is on,
+/// `app.rs`'s input routing sends the keystrokes to every pane's PTY
+/// (not just the focused one). This component only renders the banner;
+/// the broadcast happens in the input handler.
+///
+/// ## Why this is a function, not a separate component file
+///
+/// `MultiPaneContainer` needs to call `render_terminal_pane` for each
+/// pane (so every pane gets the full TerminalView feature set: OneKey,
+/// suggestions, reconnect). `render_terminal_pane` is defined in this
+/// file and captures `state`/`input_senders` signals — moving it to a
+/// separate component module would create a circular dependency. Keeping
+/// `MultiPaneContainer` here lets it call `render_terminal_pane` directly.
+fn multi_pane_container(
+    state: Signal<AppState>,
+    input_senders: Signal<std::collections::HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    layout: PaneLayout,
+) -> Element {
+    // Default container dimensions. The actual CSS measurement happens
+    // inside each pane's TerminalView on_resize handler (which fires
+    // ~100ms after mount). These defaults are just for the initial
+    // splitter bar positions; once panes measure themselves, their
+    // on_resize updates the underlying Terminal model.
+    let container_w = 1200.0_f64;
+    let container_h = 800.0_f64;
+
+    // Collect visible panes: (index, session_id, rect).
+    let visible: Vec<(usize, String, (f64, f64, f64, f64))> = layout
+        .visible_panes(container_w, container_h)
+        .map(|(idx, pane, rect)| (idx, pane.session_id.clone(), rect))
+        .collect();
+
+    let comparison_on = layout.comparison;
+
+    rsx! {
+        div {
+            id: "multi-pane-container",
+            style: "position: absolute; left: 0; right: 0; top: 0; bottom: 0; overflow: hidden;",
+
+            // Comparison-mode banner.
+            {comparison_on.then(|| rsx! {
+                div {
+                    style: "
+                        position: absolute;
+                        top: 0; left: 0; right: 0;
+                        height: 20px;
+                        background: #7aa2f7;
+                        color: #1a1b26;
+                        font-size: 11px;
+                        font-weight: 600;
+                        display: flex;
+                        align-items: center;
+                        justify-content: center;
+                        z-index: 100;
+                        pointer-events: none;
+                    ",
+                    "⚠ Comparison mode ON — input is broadcast to all panes"
+                }
+            })}
+
+            // Render each pane in its computed rectangle.
+            for (idx, session_id, (x, y, w, h)) in &visible {
+                div {
+                    key: "pane-{idx}-{session_id}",
+                    style: format!(
+                        "position: absolute; left: {x}px; top: {y}px; width: {w}px; height: {h}px; overflow: hidden;",
+                        x = x, y = y, w = w, h = h
+                    ),
+                    {render_terminal_pane(state, input_senders, session_id.clone())}
+                }
+            }
+
+            // Vertical splitter bars between adjacent columns.
+            {render_col_splitters(&layout, container_w, state)}
+            // Horizontal splitter bars between adjacent rows.
+            {render_row_splitters(&layout, container_h, state)}
+        }
+    }
+}
+
+/// Render vertical splitter bars between adjacent columns. Click to grow
+/// the left column, right-click to shrink it (5% step).
+fn render_col_splitters(
+    layout: &PaneLayout,
+    container_w: f64,
+    mut state: Signal<AppState>,
+) -> Element {
+    let cols = layout.cols();
+    if cols < 2 {
+        return rsx! {};
+    }
+    let mut boundaries = Vec::new();
+    let mut acc = 0.0_f64;
+    for (i, frac) in layout.col_fracs.iter().enumerate() {
+        if i > 0 {
+            boundaries.push(acc * container_w);
+        }
+        acc += frac;
+    }
+    rsx! {
+        for (col_idx, x) in boundaries.iter().enumerate() {
+            div {
+                key: "col-split-{col_idx}",
+                style: format!(
+                    "position: absolute; left: {x}px; top: 0; bottom: 0; width: 4px; \
+                     margin-left: -2px; cursor: col-resize; background: #2a2b3d; z-index: 50;",
+                    x = x
+                ),
+                onmousedown: move |_| {
+                    let delta = 0.05;
+                    if resize_layout_col(&mut state.write(), col_idx, delta) {
+                        tracing::info!("[LAYOUT] col {} grown by {:.2}", col_idx, delta);
+                    }
+                },
+                oncontextmenu: move |e: MouseEvent| {
+                    e.prevent_default();
+                    let delta = -0.05;
+                    if resize_layout_col(&mut state.write(), col_idx, delta) {
+                        tracing::info!("[LAYOUT] col {} shrunk by {:.2}", col_idx, -delta);
+                    }
+                },
+                title: "Click to grow left column, right-click to shrink",
+            }
+        }
+    }
+}
+
+/// Render horizontal splitter bars between adjacent rows. Click to grow
+/// the top row, right-click to shrink it (5% step).
+fn render_row_splitters(
+    layout: &PaneLayout,
+    container_h: f64,
+    mut state: Signal<AppState>,
+) -> Element {
+    let rows = layout.rows();
+    if rows < 2 {
+        return rsx! {};
+    }
+    let mut boundaries = Vec::new();
+    let mut acc = 0.0_f64;
+    for (i, frac) in layout.row_fracs.iter().enumerate() {
+        if i > 0 {
+            boundaries.push(acc * container_h);
+        }
+        acc += frac;
+    }
+    rsx! {
+        for (row_idx, y) in boundaries.iter().enumerate() {
+            div {
+                key: "row-split-{row_idx}",
+                style: format!(
+                    "position: absolute; top: {y}px; left: 0; right: 0; height: 4px; \
+                     margin-top: -2px; cursor: row-resize; background: #2a2b3d; z-index: 50;",
+                    y = y
+                ),
+                onmousedown: move |_| {
+                    let delta = 0.05;
+                    if resize_layout_row(&mut state.write(), row_idx, delta) {
+                        tracing::info!("[LAYOUT] row {} grown by {:.2}", row_idx, delta);
+                    }
+                },
+                oncontextmenu: move |e: MouseEvent| {
+                    e.prevent_default();
+                    let delta = -0.05;
+                    if resize_layout_row(&mut state.write(), row_idx, delta) {
+                        tracing::info!("[LAYOUT] row {} shrunk by {:.2}", row_idx, -delta);
+                    }
+                },
+                title: "Click to grow top row, right-click to shrink",
+            }
+        }
     }
 }
 
@@ -2081,6 +3006,35 @@ pub fn App() -> Element {
                         }
                     }
                 }
+                // Cmd/Ctrl+Shift+L → cycle pane layout preset
+                // (1 → 2H → 2V → 4 → 8 → 1).
+                if (mods.meta() || mods.ctrl()) && mods.shift() && !mods.alt() {
+                    if let Key::Character(ref s) = e.key() {
+                        if s.eq_ignore_ascii_case("l") {
+                            e.prevent_default();
+                            let next = cycle_layout_preset(&mut state.write());
+                            if let Some(p) = next {
+                                tracing::info!("[LAYOUT] hotkey cycled to {:?}", p);
+                            }
+                        }
+                        // Cmd/Ctrl+Shift+C → toggle comparison mode.
+                        if s.eq_ignore_ascii_case("c") {
+                            e.prevent_default();
+                            let on = toggle_comparison_mode(&mut state.write());
+                            tracing::info!("[LAYOUT] hotkey toggled comparison: {:?}", on);
+                        }
+                        // Cmd/Ctrl+Shift+F → toggle fullscreen (zoom)
+                        // on the active pane.
+                        if s.eq_ignore_ascii_case("f") {
+                            e.prevent_default();
+                            let active = state.read().active_session.clone();
+                            if let Some(sid) = active {
+                                let toggled = toggle_pane_zoom(&mut state.write(), &sid);
+                                tracing::info!("[LAYOUT] hotkey zoom for {}: applied={}", sid, toggled);
+                            }
+                        }
+                    }
+                }
             },
 
             // Sidebar
@@ -2231,6 +3185,19 @@ pub fn App() -> Element {
                         state.write().resize_senders.remove(&id);
                         state.write().terminals.remove(&id);
                         state.write().sessions.retain(|s| s.id != id);
+                        // --- Layout cleanup ---
+                        // Remove the closed session's own layout entry (if it
+                        // was a tab anchor) and clear the session from any
+                        // other tab's layout panes (so a dangling reference
+                        // doesn't try to render a dead session).
+                        state.write().layouts.remove(&id);
+                        for (_, layout) in state.write().layouts.iter_mut() {
+                            for pane in layout.panes.iter_mut() {
+                                if pane.session_id == id {
+                                    pane.session_id = String::new();
+                                }
+                            }
+                        }
                         let first_id = state.read().sessions.first().map(|s| s.id.clone());
                         if state.read().active_session.as_ref() == Some(&id) {
                             state.write().active_session = first_id;
@@ -2243,8 +3210,18 @@ pub fn App() -> Element {
                     id: "terminal-content",
                     style: "flex: 1; position: relative; overflow: hidden; min-height: 0; width: 100%; min-width: 0;",
 
-                    match state.read().active_session {
-                        None => rsx! {
+                    // Check whether the active tab has a multi-pane layout
+                    // applied. If it does (and isn't zoomed to a single pane),
+                    // we render every pane side-by-side via the multi-pane
+                    // path. Otherwise we fall through to the legacy single-
+                    // session rendering path below.
+                    {let active_id = state.read().active_session.clone();
+                    let layout_snapshot = active_id.as_ref()
+                        .and_then(|sid| state.read().layouts.get(sid).cloned());
+                    let is_multi = layout_snapshot.as_ref()
+                        .is_some_and(|l| l.is_multi_pane());
+                    match (active_id, is_multi) {
+                        (None, _) => rsx! {
                             div {
                                 style: "
                                     position: absolute;
@@ -2258,671 +3235,39 @@ pub fn App() -> Element {
                                 "Welcome to RusTerm — Press + New to create a connection"
                             }
                         },
-                        Some(ref sid) => {
-                            let tabs = &state.read().sessions;
-                            match tabs.iter().find(|t| t.id == *sid) {
-                                Some(tab) => {
-                                    let sid_clone = tab.id.clone();
-                                    let sid_for_cmd = tab.id.clone();
-                                    let sid_for_resize = tab.id.clone();
-                                    let sid_for_scroll_up = tab.id.clone();
-                                    let sid_for_scroll_down = tab.id.clone();
-                                    let sid_for_scroll_bottom = tab.id.clone();
-                                    let sid_for_sug_nav = tab.id.clone();
-                                    let sid_for_sug_accept = tab.id.clone();
-                                    let sid_for_sug_dismiss = tab.id.clone();
-                                    let sid_for_sug_delete = tab.id.clone();
-                                    let sid_for_ok = tab.id.clone();
-                                    let sid_for_ok_sel = tab.id.clone();
-                                    let sid_for_ok_save = tab.id.clone();
-                                    let sid_for_ok_dismiss = tab.id.clone();
-                                    let sid_for_reconnect = tab.id.clone();
-                                    let senders = input_senders;
-                                    let mut state_for_cmd = state;
-                                    // OneKey popup state for this session (if any).
-                                    let ok_popup = state.read().onekey_popups.get(&tab.id).cloned().unwrap_or_default();
-                                    let ok_visible = ok_popup.visible;
-                                    let ok_entries = ok_popup.matches.clone();
-                                    let ok_selected = ok_popup.selected;
-                                    // Whether this session's channel has dropped (Enter → reconnect).
-                                    let tab_disconnected = state.read().disconnected_sessions.contains(&tab.id);
-                                    rsx! {
-                                        TerminalView {
-                                            session_id: tab.id.clone(),
-                                            render_output: tab.render_output.clone(),
-                                            version: tab.version,
-                                            suggestion: tab.suggestion.clone(),
-                                            suggestions: tab.suggestions.clone(),
-                                            suggestion_selected: tab.suggestion_selected,
-                                            suggestion_visible: tab.suggestion_visible,
-                                            on_resize: move |(cols, rows, pw, ph): (u16, u16, u32, u32)| {
-                                                let terminals = state.read().terminals.clone();
-                                                if let Some(handle) = terminals.get(&sid_for_resize) {
-                                                    let mut entry = handle.lock();
-                                                    entry.terminal.resize(cols, rows, pw, ph);
-                                                    entry.scroll_offset = 0; // Reset scroll on resize
-                                                    // Re-render after resize so the UI updates immediately
-                                                    let render_result = entry.render_current();
-                                                    let mut s = state.write();
-                                                    if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == sid_for_resize) {
-                                                        tab.render_output = render_result;
-                                                        tab.version += 1;
-                                                    }
-                                                }
-                                                // Propagate resize to SSH session
-                                                if let Some(tx) = state.read().resize_senders.get(&sid_for_resize) {
-                                                    let _ = tx.send((cols, rows, pw, ph));
-                                                }
-                                            },
-                                            on_input: move |data: Vec<u8>| {
-                                                let is_enter = data.contains(&0x0d);
-                                                tracing::info!(
-                                                    "[INPUT] session={} is_enter={} data_len={} data={:?}",
-                                                    &sid_clone[..sid_clone.len().min(8)],
-                                                    is_enter,
-                                                    data.len(),
-                                                    &data[..data.len().min(32)]
-                                                );
-                                                // Log input
-                                                {
-                                                    let logs = state_for_cmd.read().session_logs.clone();
-                                                    if let Some(log) = logs.get(&sid_clone) {
-                                                        log.lock().log_input(&data);
-                                                    }
-                                                }
-                                                let send_ok = senders.read().get(&sid_clone).cloned();
-                                                if let Some(sender) = send_ok {
-                                                    match sender.send(data) {
-                                                        Ok(()) => tracing::info!("[INPUT] sent to PTY ok"),
-                                                        Err(e) => tracing::warn!("[INPUT] FAILED to send to PTY: {}", e),
-                                                    }
-                                                } else {
-                                                    tracing::warn!("[INPUT] no sender for session — PTY channel is dead");
-                                                }
-                                                // Query history for suggestion (on non-Enter input)
-                                                if !is_enter {
-                                                    let sid_sug = sid_clone.clone();
-                                                    let epoch = {
-                                                        let mut s = state_for_cmd.write();
-                                                        s.suggestion_epoch += 1;
-                                                        s.suggestion_epoch
-                                                    };
-                                                    spawn(async move {
-                                                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-                                                        let current_epoch = state_for_cmd.read().suggestion_epoch;
-                                                        if current_epoch != epoch {
-                                                            tracing::info!(
-                                                                "[SUGGESTION-QUERY] STALE — spawn epoch={} but current={} (skipped)",
-                                                                epoch,
-                                                                current_epoch
-                                                            );
-                                                            return;
-                                                        }
-
-                                                        // Extract the current line AFTER debounce
-                                                        let line = {
-                                                            let terminals = state_for_cmd.read().terminals.clone();
-                                                            if let Some(handle) = terminals.get(&sid_sug) {
-                                                                handle.lock().terminal.extract_current_line()
-                                                            } else {
-                                                                return;
-                                                            }
-                                                        };
-                                                        let line = line.trim().to_string();
-
-                                                        if line.is_empty() {
-                                                            tracing::info!(
-                                                                "[SUGGESTION-QUERY] session={} line empty — hiding popup",
-                                                                &sid_sug[..sid_sug.len().min(8)]
-                                                            );
-                                                            state_for_cmd.write().sessions.iter_mut()
-                                                                .find(|t| t.id == sid_sug)
-                                                                .map(|tab| {
-                                                                    tab.suggestion = None;
-                                                                    tab.suggestions = Vec::new();
-                                                                    tab.suggestion_visible = false;
-                                                                    tab.suggestion_selected = 0;
-                                                                });
-                                                            return;
-                                                        }
-
-                                                        // Strip prompt prefix to get the command part
-                                                        let cmd_part = strip_prompt(&line);
-
-                                                        if cmd_part.is_empty() {
-                                                            tracing::info!(
-                                                                "[SUGGESTION-QUERY] session={} cmd_part empty (line={:?}) — hiding popup",
-                                                                &sid_sug[..sid_sug.len().min(8)],
-                                                                line
-                                                            );
-                                                            state_for_cmd.write().sessions.iter_mut()
-                                                                .find(|t| t.id == sid_sug)
-                                                                .map(|tab| {
-                                                                    tab.suggestion = None;
-                                                                    tab.suggestions = Vec::new();
-                                                                    tab.suggestion_visible = false;
-                                                                    tab.suggestion_selected = 0;
-                                                                });
-                                                            return;
-                                                        }
-
-                                                        let cmd_lower = cmd_part.to_lowercase();
-                                                        let mut all_suggestions: Vec<String> = Vec::new();
-                                                        let mut seen = std::collections::HashSet::new();
-
-                                                        // TIMING WINDOW GUARD: snapshot the
-                                                        // recent-failed set BEFORE querying
-                                                        // either source. A command that just
-                                                        // failed (rc != 0) is in this set
-                                                        // synchronously, even though its
-                                                        // durable DB failure marker is still
-                                                        // being written by the `mark_command_failed`
-                                                        // spawn. Without this filter, the DB
-                                                        // source would re-surface the command
-                                                        // during that window because the prior
-                                                        // `exit_code = NULL` import row is still
-                                                        // there and HAVING keeps NULL rows.
-                                                        let recent_failed: std::collections::HashSet<String> =
-                                                            state_for_cmd
-                                                                .read()
-                                                                .recent_failed_commands
-                                                                .clone();
-
-                                                        // 1. Session command history — count frequency, sort by it
-                                                        let session_hist = state_for_cmd.read().sessions
-                                                            .iter().find(|t| t.id == sid_sug)
-                                                            .map(|t| t.command_history.clone())
-                                                            .unwrap_or_default();
-
-                                                        // Count occurrences and sort by frequency descending
-                                                        let mut freq: std::collections::HashMap<&String, usize> = std::collections::HashMap::new();
-                                                        for cmd in session_hist.iter() {
-                                                            if cmd.to_lowercase().starts_with(&cmd_lower)
-                                                                && cmd != &cmd_part
-                                                                && !seen.contains(cmd.to_lowercase().as_str())
-                                                                && !recent_failed.contains(cmd)
-                                                            {
-                                                                *freq.entry(cmd).or_insert(0) += 1;
-                                                            }
-                                                        }
-                                                        let mut freq_vec: Vec<(&String, usize)> = freq.into_iter().collect();
-                                                        freq_vec.sort_by(|a, b| b.1.cmp(&a.1));
-                                                        for (cmd, _count) in freq_vec.iter().take(15) {
-                                                            seen.insert(cmd.to_lowercase().clone());
-                                                            all_suggestions.push((*cmd).clone());
-                                                        }
-
-                                                        // 2. SQLite FTS5 — unified history DB (local import + remote
-                                                        //    imports + session commands), frecency-scored (atuin-style:
-                                                        //    frequency + recency + success rate). This replaces the
-                                                        //    per-keystroke file reads — local shell history is imported
-                                                        //    into the DB at app startup.
-                                                        {
-                                                            let db_path = dirs::data_dir()
-                                                                .unwrap_or_default()
-                                                                .join("rusterm")
-                                                                .join("rusterm.db");
-                                                            if let Ok(db) = rusterm_db::Database::open(Some(db_path)).await {
-                                                                if let Ok(results) = db.search_history(&cmd_part, 30).await {
-                                                                    for entry in results {
-                                                                        if entry.command.to_lowercase().starts_with(&cmd_lower)
-                                                                            && entry.command != cmd_part
-                                                                            && !seen.contains(entry.command.to_lowercase().as_str())
-                                                                            && !recent_failed.contains(&entry.command)
-                                                                        {
-                                                                            seen.insert(entry.command.to_lowercase().clone());
-                                                                            all_suggestions.push(entry.command);
-                                                                        }
-                                                                    }
-                                                                }
-                                                            }
-                                                        }
-
-                                                        // Check epoch again before writing results
-                                                        if state_for_cmd.read().suggestion_epoch != epoch {
-                                                            return;
-                                                        }
-
-                                                        // Truncate to 8 suggestions max
-                                                        all_suggestions.truncate(15);
-
-                                                        tracing::info!(
-                                                            "[SUGGESTION-QUERY] session={} cmd_part={:?} epoch={} current_epoch={} results={:?} recent_failed={:?}",
-                                                            &sid_sug[..sid_sug.len().min(8)],
-                                                            cmd_part,
-                                                            epoch,
-                                                            state_for_cmd.read().suggestion_epoch,
-                                                            all_suggestions,
-                                                            recent_failed
-                                                        );
-
-                                                        if all_suggestions.is_empty() {
-                                                            state_for_cmd.write().sessions.iter_mut()
-                                                                .find(|t| t.id == sid_sug)
-                                                                .map(|tab| {
-                                                                    tab.suggestion = None;
-                                                                    tab.suggestions = Vec::new();
-                                                                    tab.suggestion_visible = false;
-                                                                    tab.suggestion_selected = 0;
-                                                                });
-                                                        } else {
-                                                            // First suggestion suffix is the inline ghost text
-                                                            let first = &all_suggestions[0];
-                                                            let suffix = if first.len() > cmd_part.len() {
-                                                                first[cmd_part.len()..].to_string()
-                                                            } else {
-                                                                String::new()
-                                                            };
-                                                            state_for_cmd.write().sessions.iter_mut()
-                                                                .find(|t| t.id == sid_sug)
-                                                                .map(|tab| {
-                                                                    tab.suggestion = if suffix.is_empty() { None } else { Some(suffix) };
-                                                                    tab.suggestions = all_suggestions;
-                                                                    tab.suggestion_visible = true;
-                                                                    tab.suggestion_selected = 0;
-                                                                });
-                                                        }
-                                                    });
-                                                }
-                                            },
-                                            on_command: move |_: String| {
-                                                tracing::info!(
-                                                    "[COMMAND] Enter pressed, session={}",
-                                                    &sid_for_cmd[..sid_for_cmd.len().min(8)]
-                                                );
-                                                // Clear suggestion on Enter
-                                                state_for_cmd.write().sessions.iter_mut()
-                                                    .find(|t| t.id == sid_for_cmd)
-                                                    .map(|tab| {
-                                                        tab.suggestion = None;
-                                                        tab.suggestions = Vec::new();
-                                                        tab.suggestion_visible = false;
-                                                        tab.suggestion_selected = 0;
-                                                    });
-
-                                                let terminals = state_for_cmd.read().terminals.clone();
-                                                if let Some(handle) = terminals.get(&sid_for_cmd) {
-                                                    let raw_line = handle.lock().terminal.extract_current_line();
-                                                    let cmd = strip_prompt(raw_line.trim());
-                                                    tracing::info!(
-                                                        "[COMMAND] session={} raw_line={:?} cmd={:?}",
-                                                        &sid_for_cmd[..sid_for_cmd.len().min(8)],
-                                                        raw_line,
-                                                        cmd
-                                                    );
-                                                    if !cmd.is_empty() {
-                                                        // DEFERRED RECORDING — do NOT push to
-                                                        // command_history or save to DB yet. The
-                                                        // command might fail (typos, broken
-                                                        // commands), and the user explicitly
-                                                        // doesn't want failed commands showing
-                                                        // up in suggestions. Instead, queue it
-                                                        // and wait for the shell's OSC 133;D
-                                                        // exit-code report (shell integration).
-                                                        // Only on rc==0 will we commit the
-                                                        // command to history + DB. On rc!=0 we
-                                                        // silently drop it. If the shell never
-                                                        // emits OSC 133;D, the entry stays
-                                                        // queued until the per-session cap
-                                                        // (MAX_PENDING below) evicts it — by
-                                                        // design, we'd rather suggest nothing
-                                                        // than suggest failed commands.
-                                                        let entry_id = uuid::Uuid::new_v4().to_string();
-                                                        let mut s = state_for_cmd.write();
-                                                        let queue = s
-                                                            .pending_exit_check
-                                                            .entry(sid_for_cmd.clone())
-                                                            .or_default();
-                                                        // Defensive cap: if the shell never emits
-                                                        // OSC 133;D (no shell integration, or
-                                                        // integration not yet loaded), the queue
-                                                        // would grow unboundedly. Drop the oldest
-                                                        // entry to keep the queue bounded — those
-                                                        // dropped entries are commands we couldn't
-                                                        // confirm succeeded, so dropping them is
-                                                        // consistent with "never suggest failed
-                                                        // commands". 32 is plenty for any
-                                                        // realistic prompt-then-Enter burst.
-                                                        const MAX_PENDING: usize = 32;
-                                                        while queue.len() >= MAX_PENDING {
-                                                            queue.pop_front();
-                                                        }
-                                                        queue.push_back((cmd, entry_id));
-                                                    }
-                                                }
-                                            },
-                                            on_scroll_up: move |rows: usize| {
-                                                let terminals = state_for_cmd.read().terminals.clone();
-                                                if let Some(handle) = terminals.get(&sid_for_scroll_up) {
-                                                    let render_result = handle.lock().scroll_up(rows);
-                                                    let mut s = state_for_cmd.write();
-                                                    if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == sid_for_scroll_up) {
-                                                        tab.render_output = render_result;
-                                                        tab.version += 1;
-                                                    }
-                                                }
-                                            },
-                                            on_scroll_down: move |rows: usize| {
-                                                let terminals = state_for_cmd.read().terminals.clone();
-                                                if let Some(handle) = terminals.get(&sid_for_scroll_down) {
-                                                    let render_result = handle.lock().scroll_down(rows);
-                                                    let mut s = state_for_cmd.write();
-                                                    if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == sid_for_scroll_down) {
-                                                        tab.render_output = render_result;
-                                                        tab.version += 1;
-                                                    }
-                                                }
-                                            },
-                                            on_scroll_to_bottom: move |_: ()| {
-                                                let terminals = state_for_cmd.read().terminals.clone();
-                                                if let Some(handle) = terminals.get(&sid_for_scroll_bottom) {
-                                                    let render_result = handle.lock().scroll_to_bottom();
-                                                    let mut s = state_for_cmd.write();
-                                                    if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == sid_for_scroll_bottom) {
-                                                        tab.render_output = render_result;
-                                                        tab.version += 1;
-                                                    }
-                                                }
-                                            },
-                                            on_suggestion_navigate: move |idx: Option<usize>| {
-                                                if let Some(i) = idx {
-                                                    state_for_cmd.write().sessions.iter_mut()
-                                                        .find(|t| t.id == sid_for_sug_nav)
-                                                        .map(|tab| tab.suggestion_selected = i);
-                                                }
-                                            },
-                                            on_suggestion_accept: move |cmd: String| {
-                                                // Accept: compute the suffix and send it
-                                                let suffix = {
-                                                    let terminals = state_for_cmd.read().terminals.clone();
-                                                    if let Some(handle) = terminals.get(&sid_for_sug_accept) {
-                                                        let line = handle.lock().terminal.extract_current_line();
-                                                        let cmd_part = strip_prompt(line.trim());
-                                                        if cmd.starts_with(&cmd_part) && cmd_part.len() < cmd.len() {
-                                                            cmd[cmd_part.len()..].to_string()
-                                                        } else {
-                                                            String::new()
-                                                        }
-                                                    } else {
-                                                        String::new()
-                                                    }
-                                                };
-                                                if !suffix.is_empty() {
-                                                    if let Some(sender) = senders.read().get(&sid_for_sug_accept) {
-                                                        let _ = sender.send(suffix.as_bytes().to_vec());
-                                                    }
-                                                }
-                                                // Dismiss dropdown and clear suggestion
-                                                state_for_cmd.write().sessions.iter_mut()
-                                                    .find(|t| t.id == sid_for_sug_accept)
-                                                    .map(|tab| {
-                                                        tab.suggestion_visible = false;
-                                                        tab.suggestion = None;
-                                                        tab.suggestions = Vec::new();
-                                                        tab.suggestion_selected = 0;
-                                                    });
-                                            },
-                                            on_suggestion_dismiss: move |_: ()| {
-                                                state_for_cmd.write().sessions.iter_mut()
-                                                    .find(|t| t.id == sid_for_sug_dismiss)
-                                                    .map(|tab| tab.suggestion_visible = false);
-                                            },
-                                            on_suggestion_delete: move |cmd: String| {
-                                                // Shift+Delete on a suggestion item: the user wants
-                                                // this command GONE from suggestions — it's a typo
-                                                // or broken command that slipped past the failed-
-                                                // command filter (most likely because it came from
-                                                // `~/.bash_history` / `~/.zsh_history`, which have
-                                                // no exit-code info, so it landed as NULL and HAVING
-                                                // kept it).
-                                                //
-                                                // We do the deletion in three layers, mirroring the
-                                                // runtime-failure path:
-                                                //   1. IMMEDIATE (synchronous): remove from
-                                                //      `tab.command_history` so the session-history
-                                                //      source stops surfacing it on the next
-                                                //      keystroke; insert into
-                                                //      `recent_failed_commands` so the DB source
-                                                //      is also guarded during the async DB write;
-                                                //      remove from `tab.suggestions` and clamp
-                                                //      `suggestion_selected` so the popup updates
-                                                //      instantly.
-                                                //   2. DURABLE (async spawn): call
-                                                //      `mark_command_failed(&cmd, 1)`. This DELETEs
-                                                //      any prior rows for the command (including
-                                                //      the NULL-exit-code import row that was
-                                                //      causing the re-surface) and inserts a
-                                                //      single row with `exit_code = 1`. The HAVING
-                                                //      clause now filters it, AND the next history
-                                                //      import skips it because it's in
-                                                //      `known_failed_commands`. We use
-                                                //      `mark_command_failed` (NOT
-                                                //      `delete_history_by_command`) because
-                                                //      deletion would let the next import
-                                                //      re-introduce the command as NULL.
-                                                //   3. POST-COMMIT: remove from
-                                                //      `recent_failed_commands` — the DB's HAVING
-                                                //      clause takes over.
-                                                //
-                                                // Borrow-checker note: `state_for_cmd.write()`
-                                                // takes &mut self, so we collect everything we
-                                                // need from the write() critical section, drop it,
-                                                // then clone the Signal for the spawn.
-                                                let cmd_for_spawn = cmd.clone();
-                                                let mut state_for_mark = state_for_cmd;
-                                                {
-                                                    let mut s = state_for_mark.write();
-                                                    if let Some(tab) = s.sessions.iter_mut()
-                                                        .find(|t| t.id == sid_for_sug_delete)
-                                                    {
-                                                        // 1a. Remove from session history
-                                                        tab.command_history.retain(|c| c != &cmd);
-                                                        // 1b. Remove from the visible suggestions list
-                                                        tab.suggestions.retain(|c| c != &cmd);
-                                                        // 1c. Clamp selection: if we deleted the
-                                                        // selected item or one before it, decrement;
-                                                        // then guard against the now-shorter list.
-                                                        if tab.suggestion_selected
-                                                            >= tab.suggestions.len()
-                                                        {
-                                                            tab.suggestion_selected = tab
-                                                                .suggestions
-                                                                .len()
-                                                                .saturating_sub(1);
-                                                        }
-                                                        // 1d. If the popup is now empty, hide it
-                                                        // and clear the inline ghost text.
-                                                        if tab.suggestions.is_empty() {
-                                                            tab.suggestion_visible = false;
-                                                            tab.suggestion = None;
-                                                            tab.suggestion_selected = 0;
-                                                        } else {
-                                                            // Refresh the inline ghost text to
-                                                            // reflect the new top suggestion.
-                                                            // We need the current cursor line to
-                                                            // compute the suffix; fetch it from
-                                                            // the terminal.
-                                                            // (Done below outside the write() lock
-                                                            // to avoid holding two locks.)
-                                                        }
-                                                    }
-                                                    // 1e. Immediate guard against the DB source
-                                                    // re-surfacing the command during the async
-                                                    // write window.
-                                                    s.recent_failed_commands.insert(cmd.clone());
-                                                }
-                                                // Refresh the inline ghost text: recompute the
-                                                // suffix from the new top suggestion vs. the
-                                                // current cursor line.
-                                                {
-                                                    let terminals = state_for_mark.read().terminals.clone();
-                                                    if let Some(handle) = terminals.get(&sid_for_sug_delete) {
-                                                        let line = handle.lock().terminal.extract_current_line();
-                                                        let cmd_part = strip_prompt(line.trim());
-                                                        let suggestions = state_for_mark.read()
-                                                            .sessions.iter()
-                                                            .find(|t| t.id == sid_for_sug_delete)
-                                                            .map(|t| t.suggestions.clone())
-                                                            .unwrap_or_default();
-                                                        let new_suffix = suggestions.first().map(|first| {
-                                                            if first.len() > cmd_part.len()
-                                                                && first.starts_with(&cmd_part)
-                                                            {
-                                                                first[cmd_part.len()..].to_string()
-                                                            } else {
-                                                                String::new()
-                                                            }
-                                                        }).unwrap_or_default();
-                                                        state_for_mark.write().sessions.iter_mut()
-                                                            .find(|t| t.id == sid_for_sug_delete)
-                                                            .map(|tab| {
-                                                                tab.suggestion = if new_suffix.is_empty() {
-                                                                    None
-                                                                } else {
-                                                                    Some(new_suffix)
-                                                                };
-                                                            });
-                                                    }
-                                                }
-                                                // Force suggestion list refresh on next keystroke.
-                                                {
-                                                    let mut s = state_for_mark.write();
-                                                    s.suggestion_epoch = s.suggestion_epoch.wrapping_add(1);
-                                                }
-                                                // 2. Durable: mark as failed in DB.
-                                                spawn(async move {
-                                                    let db_path = dirs::data_dir()
-                                                        .unwrap_or_default()
-                                                        .join("rusterm")
-                                                        .join("rusterm.db");
-                                                    match rusterm_db::Database::open(Some(db_path)).await {
-                                                        Ok(db) => {
-                                                            if let Err(e) = db.mark_command_failed(&cmd_for_spawn, 1).await {
-                                                                tracing::warn!(
-                                                                    "[SUGGESTION-DELETE] mark_command_failed failed for {:?}: {}",
-                                                                    cmd_for_spawn,
-                                                                    e
-                                                                );
-                                                                // Leave in recent_failed_commands —
-                                                                // better to over-filter than
-                                                                // re-surface a typo the user just
-                                                                // deleted.
-                                                                return;
-                                                            }
-                                                            // 3. DB write committed — HAVING takes
-                                                            // over. Remove the UI-side guard.
-                                                            state_for_mark.write()
-                                                                .recent_failed_commands
-                                                                .remove(&cmd_for_spawn);
-                                                            tracing::info!(
-                                                                "[SUGGESTION-DELETE] marked {:?} as failed in DB (user-initiated)",
-                                                                cmd_for_spawn
-                                                            );
-                                                        }
-                                                        Err(e) => {
-                                                            tracing::warn!(
-                                                                "[SUGGESTION-DELETE] failed to open DB for {:?}: {}",
-                                                                cmd_for_spawn,
-                                                                e
-                                                            );
-                                                        }
-                                                    }
-                                                });
-                                            },
-                                            onekey_visible: ok_visible,
-                                            onekey_entries: ok_entries,
-                                            onekey_selected: ok_selected,
-                                            on_onekey_navigate: move |idx: Option<usize>| {
-                                                if let Some(i) = idx {
-                                                    state_for_cmd.write().onekey_popups
-                                                        .entry(sid_for_ok.clone())
-                                                        .and_modify(|p| p.selected = i);
-                                                }
-                                            },
-                                            on_onekey_select: move |send: String| {
-                                                // Send the selected OneKey's value + Enter, then dismiss.
-                                                // `send` is the DECRYPTED plaintext (OneKeyMatch.send comes
-                                                // from AppState.onekeys, which is decrypted on unlock). Log
-                                                // the length to confirm the plaintext (not the encrypted
-                                                // blob) is being sent.
-                                                tracing::info!(
-                                                    "[ONEKEY-SELECT] session={} send_len={} first_byte={:?}",
-                                                    &sid_for_ok_sel[..sid_for_ok_sel.len().min(8)],
-                                                    send.len(),
-                                                    send.as_bytes().first().copied()
-                                                );
-                                                if let Some(sender) = senders.read().get(&sid_for_ok_sel) {
-                                                    let mut data = send.into_bytes();
-                                                    // Use \r (carriage return) — the same byte the terminal
-                                                    // sends for Enter (Key::Enter → 0x0d). The PTY's ICRNL
-                                                    // converts it to \n for the program. Using \r matches
-                                                    // real keyboard input exactly.
-                                                    data.push(b'\r');
-                                                    let _ = sender.send(data);
-                                                }
-                                                state_for_cmd.write().onekey_popups
-                                                    .remove(&sid_for_ok_sel);
-                                            },
-                                            on_onekey_save: move |_: ()| {
-                                                // Save a new OneKey: expect = the matched prompt,
-                                                // send = the text typed AFTER the prompt on the
-                                                // current line (strips the prompt prefix).
-                                                let entry = {
-                                                    let terminals = state_for_cmd.read().terminals.clone();
-                                                    let line = terminals.get(&sid_for_ok_save)
-                                                        .map(|h| h.lock().terminal.extract_current_line())
-                                                        .unwrap_or_default();
-                                                    let expect = state_for_cmd.read().onekey_popups
-                                                        .get(&sid_for_ok_save)
-                                                        .and_then(|p| p.matched_expect.clone())
-                                                        .unwrap_or_default();
-                                                    let send = if let Ok(re) = regex::Regex::new(&format!("(?i){}", expect)) {
-                                                        match re.find(&line) {
-                                                            Some(m) => line[m.end()..].trim().to_string(),
-                                                            None => line.trim().to_string(),
-                                                        }
-                                                    } else {
-                                                        line.trim().to_string()
-                                                    };
-                                                    let name = if send.is_empty() { "onekey".to_string() } else { send.clone() };
-                                                    OneKey {
-                                                        id: uuid::Uuid::new_v4().to_string(),
-                                                        name,
-                                                        steps: vec![OneKeyStep {
-                                                            label: String::new(),
-                                                            expect,
-                                                            send: send.clone(),
-                                                        }],
-                                                    }
-                                                };
-                                                if entry.steps.first().is_some_and(|s| !s.send.is_empty()) {
-                                                    let cm = state_for_cmd.read().config_manager.clone();
-                                                    if let Some(cm) = cm {
-                                                        let mut all = state_for_cmd.read().onekeys.clone();
-                                                        all.push(entry);
-                                                        if let Err(e) = cm.save_onekeys(&all) {
-                                                            tracing::error!("Failed to save OneKey: {}", e);
-                                                        }
-                                                        state_for_cmd.write().onekeys = all;
-                                                    }
-                                                }
-                                                state_for_cmd.write().onekey_popups.remove(&sid_for_ok_save);
-                                            },
-                                            on_onekey_dismiss: move |_: ()| {
-                                                state_for_cmd.write().onekey_popups.remove(&sid_for_ok_dismiss);
-                                            },
-                                            disconnected: tab_disconnected,
-                                            on_reconnect: move |_: ()| {
-                                                reconnect_session(state_for_cmd, senders, sid_for_reconnect.clone());
-                                            },
-                                        }
-                                    }
-                                }
-                                None => rsx! { div {} },
+                        (Some(sid), false) => {
+                            // Single-pane path: render the active session's
+                            // TerminalView directly. This is the legacy flow
+                            // that preserves all existing behaviour (OneKey,
+                            // suggestions, reconnect, etc.). When a multi-pane
+                            // layout is applied but currently zoomed to one
+                            // pane, we also take this path — the zoomed pane's
+                            // TerminalView fills the container, and its resize
+                            // handler will measure the full container size.
+                            //
+                            // If a layout exists but is zoomed, we look up the
+                            // zoomed pane's session_id and render THAT instead
+                            // of `sid` (the active session). This is what makes
+                            // zoom mode actually work: the user's active tab
+                            // is `sid`, but the visible content is the zoomed
+                            // pane's session.
+                            let render_sid = layout_snapshot.as_ref()
+                                .and_then(|l| l.zoomed)
+                                .and_then(|idx| layout_snapshot.as_ref()?.panes.get(idx).map(|p| p.session_id.clone()))
+                                .unwrap_or(sid);
+                            render_terminal_pane(state, input_senders, render_sid)
+                        }
+                        (Some(_sid), true) => {
+                            // Multi-pane path: iterate over visible panes and
+                            // render each one positioned absolutely via the
+                            // layout's pane_rect. Splitter bars are rendered
+                            // between panes to support drag-resize.
+                            let layout = layout_snapshot.expect("is_multi implies layout exists");
+                            rsx! {
+                                {multi_pane_container(state, input_senders, layout)}
                             }
                         }
-                    }
+                    }}
 
                     // AI panel overlay
                     AiPanel {
@@ -2999,6 +3344,56 @@ pub fn App() -> Element {
                     div {
                         style: "margin-left: auto; display: flex; gap: 12px; align-items: center;",
 
+                        // --- Multi-pane layout controls ---
+                        // The layout toolbar lets the user cycle the active tab's
+                        // pane preset (Single → Split2H → Split2V → Grid4 → Grid8),
+                        // toggle the cross-terminal comparison mode (synchronized
+                        // scrolling + input broadcast), and zoom the active pane
+                        // to fill the container (全屏模式). When no session is
+                        // active, these are no-ops (cycle returns None).
+                        span {
+                            style: "cursor: pointer; color: #7aa2f7; font-size: 11px; user-select: none;",
+                            onclick: move |_| {
+                                let next = cycle_layout_preset(&mut state.write());
+                                if let Some(p) = next {
+                                    tracing::info!("[LAYOUT] cycled to {:?}", p);
+                                }
+                            },
+                            title: "Cycle pane layout (1 → 2H → 2V → 4 → 8 → 1)",
+                            "Layout: {layout_label(state.read().layout_preset)}"
+                        }
+                        span {
+                            style: format!(
+                                "cursor: pointer; font-size: 11px; user-select: none; padding: 0 6px; border-radius: 3px; {};",
+                                if state.read().layouts.get(&state.read().active_session.clone().unwrap_or_default())
+                                    .is_some_and(|l| l.comparison) {
+                                    "background: #7aa2f7; color: #1a1b26;"
+                                } else {
+                                    "color: #7aa2f7; border: 1px solid #2a2b3d;"
+                                }
+                            ),
+                            onclick: move |_| {
+                                let on = toggle_comparison_mode(&mut state.write());
+                                tracing::info!("[LAYOUT] comparison mode toggled: {:?}", on);
+                            },
+                            title: "Toggle comparison mode (sync scroll + broadcast input)",
+                            "Compare"
+                        }
+                        span {
+                            style: "cursor: pointer; color: #7aa2f7; font-size: 11px; user-select: none;",
+                            onclick: move |_| {
+                                // Zoom the active session's pane. If the layout
+                                // is Single, this is a no-op (toggle_pane_zoom
+                                // returns false because there's no layout entry).
+                                let active = state.read().active_session.clone();
+                                if let Some(sid) = active {
+                                    let toggled = toggle_pane_zoom(&mut state.write(), &sid);
+                                    tracing::info!("[LAYOUT] zoom toggle for {}: applied={}", sid, toggled);
+                                }
+                            },
+                            title: "Toggle fullscreen (zoom) on the active pane",
+                            "⤢"
+                        }
                         span {
                             style: "cursor: pointer; color: #565f89;",
                             "Sessions: {state.read().sessions.len()}"

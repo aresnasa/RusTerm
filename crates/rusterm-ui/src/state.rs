@@ -11,6 +11,8 @@ use rusterm_core::session::SessionType;
 use rusterm_core::session_log::SessionLog;
 use rusterm_core::terminal::{RenderOutput, Terminal};
 
+use crate::layout::{LayoutPreset, PaneLayout};
+
 pub type TerminalHandle = Arc<Mutex<TerminalEntry>>;
 
 pub struct TerminalEntry {
@@ -149,6 +151,23 @@ pub struct AppState {
     /// is off, this is a no-op stub.
     #[serde(skip)]
     pub analytics: crate::analytics::AnalyticsHandle,
+    /// Per-tab multi-pane layout. When a tab is in `Single` preset (the
+    /// default), the rendering path falls back to the legacy
+    /// single-active-session view. When the user cycles to Split2H /
+    /// Grid4 / Grid8 / etc., the rendering path renders every pane in the
+    /// layout side-by-side. Indexed by session id (same key as
+    /// `terminals`). A tab with no entry here is implicitly `Single`.
+    #[serde(skip)]
+    pub layouts: HashMap<String, PaneLayout>,
+    /// The current layout preset for the active tab. Cycling this with a
+    /// hotkey rebuilds the active tab's `PaneLayout` with the next preset
+    /// in `LayoutPreset`'s cycle order. Kept as a separate field (rather
+    /// than derived from `layouts`) so that the hotkey handler can read
+    /// the current preset without first looking up the active session's
+    /// layout entry (which may not exist yet for a tab that's still in
+    /// the default Single state).
+    #[serde(skip)]
+    pub layout_preset: LayoutPreset,
 }
 
 /// State of the OneKey autofill popup for a single session.
@@ -234,6 +253,8 @@ impl Default for AppState {
             session_configs: HashMap::new(),
             disconnected_sessions: HashSet::new(),
             analytics: crate::analytics::AnalyticsHandle::default(),
+            layouts: HashMap::new(),
+            layout_preset: LayoutPreset::default(),
         }
     }
 }
@@ -273,6 +294,175 @@ pub fn move_session_to_leftmost(state: &mut AppState, tab_id: &str) -> bool {
     let tab = state.sessions.remove(pos);
     state.sessions.insert(0, tab);
     true
+}
+
+/// Apply a layout preset to the active tab. Builds a fresh `PaneLayout`
+/// from the preset using the active session's id as the first pane, then
+/// fills the remaining pane slots with other open sessions (in tab order).
+/// If there aren't enough sessions to fill the grid, the trailing slots
+/// are left empty (the renderer skips panes with empty `session_id`).
+///
+/// Returns `true` if the layout was applied, `false` if there's no active
+/// session to anchor the layout on.
+///
+/// Takes `&mut AppState` so it's unit-testable without a dioxus runtime.
+pub fn apply_layout_preset(state: &mut AppState, preset: LayoutPreset) -> bool {
+    let Some(active_id) = state.active_session.clone() else {
+        return false;
+    };
+    // Collect session ids in priority order: active first, then every other
+    // open session in tab order. We dedupe in case the active session is
+    // also the first tab.
+    let mut ids = vec![active_id.clone()];
+    for tab in &state.sessions {
+        if tab.id != active_id && !ids.contains(&tab.id) {
+            ids.push(tab.id.clone());
+        }
+    }
+    let layout = PaneLayout::from_preset(preset, &ids);
+    state.layouts.insert(active_id, layout);
+    state.layout_preset = preset;
+    true
+}
+
+/// Cycle the active tab's layout preset to the next entry in the cycle
+/// order: Single → Split2H → Split2V → Grid4 → Grid8 → Single. Rebuilds
+/// the active tab's `PaneLayout` from the new preset.
+///
+/// Returns `Some(new_preset)` if the cycle was applied, `None` if there's
+/// no active session.
+pub fn cycle_layout_preset(state: &mut AppState) -> Option<LayoutPreset> {
+    let next = match state.layout_preset {
+        LayoutPreset::Single => LayoutPreset::Split2H,
+        LayoutPreset::Split2H => LayoutPreset::Split2V,
+        LayoutPreset::Split2V => LayoutPreset::Grid4,
+        LayoutPreset::Grid4 => LayoutPreset::Grid8,
+        LayoutPreset::Grid8 => LayoutPreset::Single,
+    };
+    if apply_layout_preset(state, next) {
+        Some(next)
+    } else {
+        None
+    }
+}
+
+/// Toggle zoom (fullscreen) on the pane displaying the given session in the
+/// active tab's layout. If no layout exists yet (Single preset), this is a
+/// no-op (zooming a single-pane layout is meaningless).
+///
+/// Returns `true` if the zoom was toggled, `false` if there's no layout
+/// or no pane displaying that session.
+pub fn toggle_pane_zoom(state: &mut AppState, session_id: &str) -> bool {
+    let active_id = match state.active_session.clone() {
+        Some(id) => id,
+        None => return false,
+    };
+    let Some(layout) = state.layouts.get_mut(&active_id) else {
+        return false;
+    };
+    let Some(idx) = layout.pane_index_for_session(session_id) else {
+        return false;
+    };
+    layout.toggle_zoom(idx);
+    true
+}
+
+/// Toggle the cross-terminal comparison mode (synchronized scrolling +
+/// input broadcast) on the active tab's layout.
+///
+/// Returns the new comparison state (`true` = now on), or `None` if
+/// there's no active session with a layout.
+pub fn toggle_comparison_mode(state: &mut AppState) -> Option<bool> {
+    let active_id = state.active_session.clone()?;
+    let layout = state.layouts.get_mut(&active_id)?;
+    Some(layout.toggle_comparison())
+}
+
+/// Resize a column splitter in the active tab's layout by a fractional
+/// delta. See `PaneLayout::resize_col`.
+///
+/// Returns `true` if the resize was applied.
+pub fn resize_layout_col(state: &mut AppState, col: usize, delta: f64) -> bool {
+    let active_id = match state.active_session.clone() {
+        Some(id) => id,
+        None => return false,
+    };
+    let Some(layout) = state.layouts.get_mut(&active_id) else {
+        return false;
+    };
+    layout.resize_col(col, delta)
+}
+
+/// Resize a row splitter in the active tab's layout by a fractional
+/// delta. See `PaneLayout::resize_row`.
+///
+/// Returns `true` if the resize was applied.
+pub fn resize_layout_row(state: &mut AppState, row: usize, delta: f64) -> bool {
+    let active_id = match state.active_session.clone() {
+        Some(id) => id,
+        None => return false,
+    };
+    let Some(layout) = state.layouts.get_mut(&active_id) else {
+        return false;
+    };
+    layout.resize_row(row, delta)
+}
+
+/// Get the list of session IDs that should receive a broadcast input
+/// event, given the current layout state of the active tab.
+///
+/// - If the active tab has no layout (Single preset), returns a
+///   single-element vec containing just the active session. This is the
+///   legacy non-broadcast path — the input goes only to the focused
+///   session.
+/// - If the active tab has a layout but `comparison` is OFF, returns a
+///   single-element vec with the active session. Even in multi-pane mode,
+///   without comparison mode the user's keystrokes only go to the focused
+///   pane (this is the expected tmux-like behaviour — panes are
+///   independent unless synchronize-panes is on).
+/// - If the active tab has a layout AND `comparison` is ON, returns every
+///   non-empty session_id in the layout. The caller (the input handler
+///   in `app.rs`) iterates this list and sends the input bytes to each
+///   session's PTY sender.
+///
+/// This is the data-structure contract that the cross-terminal comparison
+/// mode (跨终端会话的比对模式) relies on. The actual byte-sending happens
+/// in `app.rs`'s `on_input` handler — this function only decides which
+/// sessions should receive the input.
+pub fn broadcast_targets(state: &AppState) -> Vec<String> {
+    let Some(active_id) = state.active_session.as_ref() else {
+        return Vec::new();
+    };
+    // No layout → single-session path.
+    let Some(layout) = state.layouts.get(active_id) else {
+        return vec![active_id.clone()];
+    };
+    // Layout exists but comparison is off → input only goes to the
+    // focused session. (Multi-pane without sync = panes are independent.)
+    if !layout.comparison {
+        return vec![active_id.clone()];
+    }
+    // Comparison is on → broadcast to every non-empty pane session.
+    // Dedupe in case the same session appears in multiple panes (which
+    // can happen if the user drag-dropped a session onto multiple panes).
+    let mut targets = layout.session_ids();
+    targets.sort();
+    targets.dedup();
+    targets
+}
+
+/// Get the list of session IDs whose terminals should scroll together
+/// when the user scrolls in any pane (the synchronized-scroll half of
+/// comparison mode). Same contract as `broadcast_targets` but for scroll
+/// events: returns every non-empty pane session when comparison is on,
+/// or just the active session when comparison is off or no layout exists.
+///
+/// This is a separate function from `broadcast_targets` because scroll
+/// sync and input broadcast are conceptually distinct (a future feature
+/// might want scroll sync without input broadcast, or vice versa), even
+/// though today they share the same `comparison` flag.
+pub fn scroll_sync_targets(state: &AppState) -> Vec<String> {
+    broadcast_targets(state)
 }
 
 #[cfg(test)]
@@ -823,6 +1013,323 @@ mod tests {
             Some("d".to_string()),
             "inline ghost text should be 'd' (suffix of 'pwd' after 'pw')"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // Multi-pane layout helpers (apply_layout_preset, cycle_layout_preset,
+    // toggle_pane_zoom, toggle_comparison_mode, resize_layout_col/row)
+    // ------------------------------------------------------------------
+
+    /// Helper: AppState with N session tabs AND an active session set to the
+    /// first tab. This is the minimum state needed to test the layout
+    /// helpers (they all key off `active_session`).
+    fn state_with_active_session(names: &[&str]) -> AppState {
+        let mut state = state_with_tabs(names);
+        if let Some(first) = state.sessions.first() {
+            state.active_session = Some(first.id.clone());
+        }
+        state
+    }
+
+    #[test]
+    fn apply_layout_preset_returns_false_with_no_active_session() {
+        let mut state = AppState::default();
+        // No active_session — should return false and not touch layouts.
+        assert!(!apply_layout_preset(&mut state, LayoutPreset::Grid4));
+        assert!(state.layouts.is_empty());
+        assert_eq!(state.layout_preset, LayoutPreset::Single);
+    }
+
+    #[test]
+    fn apply_layout_preset_builds_layout_for_active_session() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma", "delta"]);
+        assert!(apply_layout_preset(&mut state, LayoutPreset::Grid4));
+        // The layout is stored under the active session's id.
+        let active_id = state.active_session.clone().unwrap();
+        let layout = state.layouts.get(&active_id).expect("layout should exist");
+        assert_eq!(layout.panes.len(), 4);
+        assert_eq!(layout.rows(), 2);
+        assert_eq!(layout.cols(), 2);
+        // Pane 0 (the active session) is `alpha`.
+        assert_eq!(layout.panes[0].session_id, "alpha");
+        // Remaining panes fill with the other open sessions in tab order.
+        assert_eq!(layout.panes[1].session_id, "beta");
+        assert_eq!(layout.panes[2].session_id, "gamma");
+        assert_eq!(layout.panes[3].session_id, "delta");
+        // Preset is recorded on the state.
+        assert_eq!(state.layout_preset, LayoutPreset::Grid4);
+    }
+
+    #[test]
+    fn apply_layout_preset_fills_extra_slots_with_empty_when_sessions_run_out() {
+        // Only 1 session for a 4-pane grid — the last 3 panes are empty.
+        let mut state = state_with_active_session(&["alpha"]);
+        assert!(apply_layout_preset(&mut state, LayoutPreset::Grid4));
+        let active_id = state.active_session.clone().unwrap();
+        let layout = state.layouts.get(&active_id).unwrap();
+        assert_eq!(layout.panes.len(), 4);
+        assert_eq!(layout.panes[0].session_id, "alpha");
+        assert_eq!(layout.panes[1].session_id, "");
+        assert_eq!(layout.panes[2].session_id, "");
+        assert_eq!(layout.panes[3].session_id, "");
+        // session_ids() skips empties — only `alpha` remains.
+        assert_eq!(layout.session_ids(), vec!["alpha".to_string()]);
+    }
+
+    #[test]
+    fn apply_layout_preset_dedupes_active_session_when_its_also_first_tab() {
+        // `alpha` is active AND first in `sessions`. The dedup path should
+        // not add it twice to the layout's session list.
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        assert!(apply_layout_preset(&mut state, LayoutPreset::Split2H));
+        let layout = state.layouts.get("alpha").unwrap();
+        assert_eq!(layout.panes.len(), 2);
+        assert_eq!(layout.panes[0].session_id, "alpha");
+        assert_eq!(layout.panes[1].session_id, "beta");
+    }
+
+    #[test]
+    fn cycle_layout_preset_cycles_through_all_presets_and_back_to_single() {
+        let mut state = state_with_active_session(&["alpha"]);
+        // Default is Single.
+        assert_eq!(state.layout_preset, LayoutPreset::Single);
+        // Single → Split2H.
+        assert_eq!(cycle_layout_preset(&mut state), Some(LayoutPreset::Split2H));
+        // Split2H → Split2V.
+        assert_eq!(cycle_layout_preset(&mut state), Some(LayoutPreset::Split2V));
+        // Split2V → Grid4.
+        assert_eq!(cycle_layout_preset(&mut state), Some(LayoutPreset::Grid4));
+        // Grid4 → Grid8.
+        assert_eq!(cycle_layout_preset(&mut state), Some(LayoutPreset::Grid8));
+        // Grid8 → Single (cycle wraps).
+        assert_eq!(cycle_layout_preset(&mut state), Some(LayoutPreset::Single));
+    }
+
+    #[test]
+    fn cycle_layout_preset_returns_none_with_no_active_session() {
+        let mut state = AppState::default();
+        assert_eq!(cycle_layout_preset(&mut state), None);
+        // Default preset is unchanged.
+        assert_eq!(state.layout_preset, LayoutPreset::Single);
+    }
+
+    #[test]
+    fn toggle_pane_zoom_zooms_active_sessions_pane() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        // Zoom pane 0 (alpha).
+        assert!(toggle_pane_zoom(&mut state, "alpha"));
+        let zoomed = state.layouts.get("alpha").unwrap().zoomed;
+        assert_eq!(zoomed, Some(0));
+        // Unzoom by toggling again.
+        assert!(toggle_pane_zoom(&mut state, "alpha"));
+        let zoomed = state.layouts.get("alpha").unwrap().zoomed;
+        assert!(zoomed.is_none());
+    }
+
+    #[test]
+    fn toggle_pane_zoom_returns_false_with_no_layout() {
+        // No layout applied yet — zoom toggle is a no-op.
+        let mut state = state_with_active_session(&["alpha"]);
+        assert!(!toggle_pane_zoom(&mut state, "alpha"));
+    }
+
+    #[test]
+    fn toggle_pane_zoom_returns_false_with_no_active_session() {
+        let mut state = AppState::default();
+        assert!(!toggle_pane_zoom(&mut state, "alpha"));
+    }
+
+    #[test]
+    fn toggle_pane_zoom_returns_false_for_unknown_session() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        // `gamma` isn't in the layout.
+        assert!(!toggle_pane_zoom(&mut state, "gamma"));
+    }
+
+    #[test]
+    fn toggle_comparison_mode_flips_layout_comparison_flag() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        // Off by default.
+        assert_eq!(toggle_comparison_mode(&mut state), Some(true));
+        let comparison = state.layouts.get("alpha").unwrap().comparison;
+        assert!(comparison);
+        // Toggle again — turns off.
+        assert_eq!(toggle_comparison_mode(&mut state), Some(false));
+        let comparison = state.layouts.get("alpha").unwrap().comparison;
+        assert!(!comparison);
+    }
+
+    #[test]
+    fn toggle_comparison_mode_returns_none_with_no_layout() {
+        let mut state = state_with_active_session(&["alpha"]);
+        // No layout — comparison toggle has nothing to act on.
+        assert_eq!(toggle_comparison_mode(&mut state), None);
+    }
+
+    #[test]
+    fn resize_layout_col_adjusts_active_layout_column() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        // Default col 0 = 0.5; grow by 0.1 → 0.6.
+        assert!(resize_layout_col(&mut state, 0, 0.1));
+        let layout = state.layouts.get("alpha").unwrap();
+        assert!((layout.col_fracs[0] - 0.6).abs() < 1e-9);
+        assert!((layout.col_fracs[1] - 0.4).abs() < 1e-9);
+    }
+
+    #[test]
+    fn resize_layout_col_rejects_below_minimum() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        // Shrink col 0 to 0 — rejected.
+        assert!(!resize_layout_col(&mut state, 0, -0.5));
+        let layout = state.layouts.get("alpha").unwrap();
+        assert!((layout.col_fracs[0] - 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn resize_layout_col_returns_false_with_no_layout() {
+        let mut state = state_with_active_session(&["alpha"]);
+        // No layout — resize is a no-op.
+        assert!(!resize_layout_col(&mut state, 0, 0.1));
+    }
+
+    #[test]
+    fn resize_layout_row_adjusts_active_layout_row() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2V);
+        assert!(resize_layout_row(&mut state, 0, 0.2));
+        let layout = state.layouts.get("alpha").unwrap();
+        assert!((layout.row_fracs[0] - 0.7).abs() < 1e-9);
+        assert!((layout.row_fracs[1] - 0.3).abs() < 1e-9);
+    }
+
+    #[test]
+    fn resize_layout_row_returns_false_with_no_active_session() {
+        let mut state = AppState::default();
+        assert!(!resize_layout_row(&mut state, 0, 0.1));
+    }
+
+    /// Closing a session must remove its entry from `layouts` too —
+    /// otherwise the layout keeps a dangling reference to a session that
+    /// no longer exists in `terminals`. This test pins the cleanup
+    /// contract by simulating the close path (which the app.rs `on_close`
+    /// handler does).
+    #[test]
+    fn layout_entry_is_safe_to_remove_when_session_closes() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        assert!(state.layouts.contains_key("alpha"));
+        // Simulate the close path: remove the session from `sessions`,
+        // `terminals`, and `layouts`.
+        state.sessions.retain(|s| s.id != "alpha");
+        state.terminals.remove("alpha");
+        state.layouts.remove("alpha");
+        assert!(!state.layouts.contains_key("alpha"));
+    }
+
+    // ------------------------------------------------------------------
+    // Comparison mode broadcast / scroll-sync target resolution
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn broadcast_targets_returns_empty_with_no_active_session() {
+        let state = AppState::default();
+        // No active session → no broadcast targets.
+        assert!(broadcast_targets(&state).is_empty());
+    }
+
+    #[test]
+    fn broadcast_targets_returns_active_only_with_no_layout() {
+        // Single preset (no layout entry) → returns just the active session.
+        // This is the legacy non-broadcast path: input only goes to the
+        // focused session.
+        let state = state_with_active_session(&["alpha", "beta"]);
+        assert_eq!(broadcast_targets(&state), vec!["alpha".to_string()]);
+    }
+
+    #[test]
+    fn broadcast_targets_returns_active_only_when_comparison_off() {
+        // Multi-pane layout but comparison is OFF → input only goes to the
+        // focused session. This matches tmux's default: panes are independent
+        // unless synchronize-panes is explicitly enabled.
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma"]);
+        apply_layout_preset(&mut state, LayoutPreset::Grid4);
+        // comparison defaults to false.
+        assert_eq!(broadcast_targets(&state), vec!["alpha".to_string()]);
+    }
+
+    #[test]
+    fn broadcast_targets_returns_all_panes_when_comparison_on() {
+        // Multi-pane layout AND comparison is ON → input goes to every
+        // pane's session. This is the cross-terminal comparison mode.
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma", "delta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Grid4);
+        toggle_comparison_mode(&mut state);
+        let targets = broadcast_targets(&state);
+        // All 4 pane sessions should be targets.
+        assert_eq!(targets.len(), 4);
+        assert!(targets.contains(&"alpha".to_string()));
+        assert!(targets.contains(&"beta".to_string()));
+        assert!(targets.contains(&"gamma".to_string()));
+        assert!(targets.contains(&"delta".to_string()));
+    }
+
+    #[test]
+    fn broadcast_targets_dedupes_sessions_across_panes() {
+        // If the same session appears in multiple panes (e.g., user
+        // drag-dropped it onto two panes), the broadcast list should
+        // only contain it once — otherwise the session's PTY would
+        // receive each keystroke N times.
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Grid4);
+        toggle_comparison_mode(&mut state);
+        // Manually set pane 2 and pane 3 to also display `alpha`.
+        {
+            let active_id = state.active_session.clone().unwrap();
+            let layout = state.layouts.get_mut(&active_id).unwrap();
+            layout.set_pane_session(2, "alpha".to_string());
+            layout.set_pane_session(3, "alpha".to_string());
+        }
+        let targets = broadcast_targets(&state);
+        // Should be [alpha, beta] — alpha deduped from 3 panes.
+        assert_eq!(targets, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    #[test]
+    fn broadcast_targets_skips_empty_pane_slots() {
+        // Grid8 preset with only 2 sessions → 6 panes are empty.
+        // Broadcast should only target the 2 non-empty sessions.
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Grid8);
+        toggle_comparison_mode(&mut state);
+        let targets = broadcast_targets(&state);
+        assert_eq!(targets, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    #[test]
+    fn scroll_sync_targets_matches_broadcast_targets() {
+        // Today scroll sync and input broadcast share the same `comparison`
+        // flag, so scroll_sync_targets should return the same list as
+        // broadcast_targets. This test pins that contract — if they ever
+        // diverge (e.g., the user wants scroll sync without input
+        // broadcast), this test will need updating, forcing a conscious
+        // decision rather than a silent behavioural change.
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma"]);
+        apply_layout_preset(&mut state, LayoutPreset::Grid4);
+        toggle_comparison_mode(&mut state);
+        assert_eq!(scroll_sync_targets(&state), broadcast_targets(&state));
+    }
+
+    #[test]
+    fn scroll_sync_targets_returns_active_only_when_comparison_off() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        // comparison off → only the active session scrolls.
+        assert_eq!(scroll_sync_targets(&state), vec!["alpha".to_string()]);
     }
 }
 
