@@ -443,6 +443,7 @@ impl ConfigManager {
                 terminal_type: ssh.terminal_type.clone(),
                 proxy_jump: ssh.proxy_jump.clone(),
                 keepalive_interval: ssh.keepalive_interval,
+                host_key_policy: ssh.host_key_policy.clone(),
             }),
             ConnectionKind::Serial(s) => PersistedConnectionKind::Serial(s.clone()),
             ConnectionKind::Telnet(t) => PersistedConnectionKind::Telnet(t.clone()),
@@ -498,6 +499,7 @@ impl ConfigManager {
                 terminal_type: ssh.terminal_type,
                 proxy_jump: ssh.proxy_jump,
                 keepalive_interval: ssh.keepalive_interval,
+                host_key_policy: ssh.host_key_policy,
             }),
             PersistedConnectionKind::Serial(s) => ConnectionKind::Serial(s),
             PersistedConnectionKind::Telnet(t) => ConnectionKind::Telnet(t),
@@ -536,7 +538,7 @@ mod tests {
     use super::*;
     use crate::config::{
         ConnectionKind, OneKey, OneKeyStep, SerialConfig, SshAuth, SshConfig, TcpConfig,
-        TelnetConfig,
+        TelnetConfig, default_host_key_policy,
     };
 
     fn test_config_manager() -> (ConfigManager, tempfile::TempDir) {
@@ -696,6 +698,7 @@ mod tests {
                 terminal_type: "xterm-256color".to_string(),
                 proxy_jump: None,
                 keepalive_interval: Some(30),
+                host_key_policy: default_host_key_policy(),
             }),
             group: Some("Production".to_string()),
             tags: vec!["linux".to_string()],
@@ -743,6 +746,7 @@ mod tests {
                 terminal_type: "xterm-256color".to_string(),
                 proxy_jump: None,
                 keepalive_interval: None,
+                host_key_policy: default_host_key_policy(),
             }),
             group: None,
             tags: vec![],
@@ -843,6 +847,7 @@ mod tests {
                 terminal_type: "xterm-256color".to_string(),
                 proxy_jump: None,
                 keepalive_interval: None,
+                host_key_policy: default_host_key_policy(),
             }),
             group: None,
             tags: vec![],
@@ -889,6 +894,7 @@ mod tests {
                 terminal_type: "xterm-256color".to_string(),
                 proxy_jump: None,
                 keepalive_interval: None,
+                host_key_policy: default_host_key_policy(),
             }),
             group: None,
             tags: vec![],

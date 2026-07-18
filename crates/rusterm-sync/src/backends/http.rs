@@ -67,7 +67,7 @@ impl EncryptedSyncBackend for HttpBackend {
             .header("Content-Type", "application/octet-stream")
             .body(data.to_vec());
         if let Some(token) = &self.config.token {
-            req = req.bearer_auth(token);
+            req = req.bearer_auth(token.expect_inline());
         }
         let resp = req.send().await?;
         let status = resp.status();
@@ -87,7 +87,7 @@ impl EncryptedSyncBackend for HttpBackend {
         let url = self.blob_url();
         let mut req = self.client.get(&url);
         if let Some(token) = &self.config.token {
-            req = req.bearer_auth(token);
+            req = req.bearer_auth(token.expect_inline());
         }
         let resp = req.send().await?;
         let status = resp.status();

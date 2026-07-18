@@ -33,10 +33,10 @@ regex = "1"
 # SSH
 russh = { version = "0.61", features = ["aws-lc-rs"] }
 russh-config = "0.58"
-russh-keys = "0.49"
 
 # Crypto & Security
 aes-gcm = "0.10"
+chacha20poly1305 = "0.10"
 argon2 = "0.5"
 keyring = "3"
 zeroize = { version = "1", features = ["derive"] }
@@ -67,7 +67,7 @@ bytes = "1"
 
 # Plugin system
 wasmtime = { version = "45", default-features = false, features = ["cranelift", "pooling-allocator"] }
-wasmtime-wasi = "45"
+wasmtime-wasi = "45.0.3"
 
 # Logging
 tracing = "0.1"

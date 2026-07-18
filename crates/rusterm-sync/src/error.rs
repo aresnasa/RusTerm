@@ -20,6 +20,12 @@ pub enum SyncError {
     #[error("unsupported blob version: {0}")]
     UnsupportedVersion(u8),
 
+    /// The remote blob's header specifies a cipher id this client does not
+    /// know. The id is included for diagnostics. The blob is intact — a newer
+    /// client that knows the cipher can still decrypt it.
+    #[error("unsupported cipher id in blob header: {0}")]
+    UnsupportedCipher(u8),
+
     /// Decryption failed. Usually means the master password used locally does
     /// not match the one used to push the blob (different machine, rotated
     /// password, or wrong user).

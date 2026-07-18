@@ -1618,6 +1618,7 @@ fn rebuild_connection(original: &ConnectionConfig, form: &NewConnectionForm) -> 
                 terminal_type,
                 proxy_jump: ssh.proxy_jump.clone(),
                 keepalive_interval: ssh.keepalive_interval,
+                host_key_policy: ssh.host_key_policy.clone(),
             })
         }
         other => other.clone(),
@@ -3052,6 +3053,7 @@ pub fn App() -> Element {
                     terminal_type,
                     proxy_jump: None,
                     keepalive_interval: None,
+                    host_key_policy: rusterm_core::config::default_host_key_policy(),
                 };
 
                 let config = ConnectionConfig {

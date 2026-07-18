@@ -104,7 +104,7 @@ impl GistBackend {
         let resp = self
             .client
             .post(&url)
-            .bearer_auth(&self.config.token)
+            .bearer_auth(self.config.token.expect_inline())
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .header("User-Agent", "rusterm-sync")
@@ -147,7 +147,7 @@ impl GistBackend {
         let resp = self
             .client
             .patch(&url)
-            .bearer_auth(&self.config.token)
+            .bearer_auth(self.config.token.expect_inline())
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .header("User-Agent", "rusterm-sync")
@@ -197,7 +197,7 @@ impl EncryptedSyncBackend for GistBackend {
         let resp = self
             .client
             .get(&url)
-            .bearer_auth(&self.config.token)
+            .bearer_auth(self.config.token.expect_inline())
             .header("Accept", "application/vnd.github+json")
             .header("X-GitHub-Api-Version", "2022-11-28")
             .header("User-Agent", "rusterm-sync")

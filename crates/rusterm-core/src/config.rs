@@ -28,6 +28,23 @@ pub struct SshConfig {
     pub terminal_type: String,
     pub proxy_jump: Option<String>,
     pub keepalive_interval: Option<u64>,
+    /// Host key verification policy.
+    ///
+    /// - `"accept-new"` (default): TOFU — first connection records the
+    ///   server's host key fingerprint to `known_hosts`; subsequent
+    ///   connections reject mismatched keys (MITM protection).
+    /// - `"strict"`: reject any host whose key is not already in
+    ///   `known_hosts`. Safest mode; requires the user to pre-populate
+    ///   `known_hosts` (e.g. via `ssh-keyscan` or a previous `accept-new`
+    ///   run on a trusted network).
+    /// - `"disabled"`: skip verification entirely. **INSECURE** — vulnerable
+    ///   to MITM. Provided only for break-glass / lab scenarios.
+    #[serde(default = "default_host_key_policy")]
+    pub host_key_policy: String,
+}
+
+pub fn default_host_key_policy() -> String {
+    "accept-new".to_string()
 }
 
 // NOTE: `Debug` for `SshAuth` is implemented manually below to ensure passwords
@@ -230,6 +247,8 @@ pub struct PersistedSshConfig {
     pub terminal_type: String,
     pub proxy_jump: Option<String>,
     pub keepalive_interval: Option<u64>,
+    #[serde(default = "default_host_key_policy")]
+    pub host_key_policy: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -263,6 +282,7 @@ mod tests {
                 terminal_type: "xterm-256color".to_string(),
                 proxy_jump: None,
                 keepalive_interval: Some(30),
+                host_key_policy: default_host_key_policy(),
             }),
             group: Some("Production".to_string()),
             tags: vec!["linux".to_string(), "prod".to_string()],
@@ -308,6 +328,7 @@ mod tests {
                 terminal_type: "xterm-256color".to_string(),
                 proxy_jump: None,
                 keepalive_interval: None,
+                host_key_policy: default_host_key_policy(),
             }),
             ConnectionKind::Serial(SerialConfig {
                 port: "/dev/ttyS0".to_string(),

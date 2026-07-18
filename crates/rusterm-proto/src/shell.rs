@@ -1,7 +1,7 @@
 use std::io::{Read, Write};
 use std::sync::Arc;
 
-use portable_pty::{native_pty_system, CommandBuilder, PtySize};
+use portable_pty::{CommandBuilder, PtySize, native_pty_system};
 use tokio::sync::mpsc;
 
 use rusterm_core::config::ShellConfig;
@@ -34,6 +34,12 @@ impl ShellConnection {
         } else {
             CommandBuilder::new_default_prog()
         };
+
+        // Forward user-supplied args (e.g. `zsh -l`, `bash --noprofile`).
+        // Without this, `ShellConfig.args` would be silently dropped.
+        for arg in &config.args {
+            cmd.arg(arg);
+        }
 
         if let Some(dir) = &config.working_dir {
             cmd.cwd(dir);
@@ -160,7 +166,7 @@ impl ShellConnection {
                     break;
                 }
             }
-            let _ = resize_rx.close();
+            resize_rx.close();
         });
 
         let _ = event_tx.send(SessionEvent::Connected(session_id));

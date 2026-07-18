@@ -9,17 +9,92 @@ use rusterm_core::event::SessionEvent;
 use rusterm_core::session::{Session, SessionId, SessionType};
 use rusterm_core::terminal::TerminalSize;
 
-#[derive(Debug)]
-pub struct Handler;
+use crate::known_hosts::{HostKeyPolicy, verify_server_key};
+
+/// russh `Handler` carrying the per-connection state needed to verify
+/// the server's host key against `known_hosts`.
+///
+/// The russh `client::Handler` trait is constructed *by us* before the
+/// connection is established, so this is where we stash the host name and
+/// the user's [`HostKeyPolicy`]. The actual verification logic lives in
+/// [`crate::known_hosts::verify_server_key`].
+#[derive(Debug, Clone)]
+pub struct Handler {
+    host: String,
+    policy: HostKeyPolicy,
+}
+
+impl Handler {
+    /// Build a handler for a connection to `host` with the given policy.
+    ///
+    /// `policy` is derived from `SshConfig::host_key_policy` by the caller
+    /// (see [`SshClient::connect`]). We don't take the whole `SshConfig`
+    /// here to avoid leaking secrets (e.g. password) into the handler —
+    /// the handler is moved across tasks and the smaller its surface the
+    /// better.
+    pub fn new(host: String, policy: HostKeyPolicy) -> Self {
+        Self { host, policy }
+    }
+}
 
 impl client::Handler for Handler {
     type Error = russh::Error;
 
+    /// Verify the server's host key against `known_hosts`.
+    ///
+    /// russh calls this with the server's presented public key. We return
+    /// `Ok(true)` to accept, `Ok(false)` to reject. We MUST NOT return
+    /// `Err` — russh's API contract treats that as a fatal protocol error
+    /// and may panic or hang the connection, so even on internal failures
+    /// we fail closed via `Ok(false)` and log the reason.
     async fn check_server_key(
         &mut self,
-        _server_public_key: &russh::keys::ssh_key::PublicKey,
+        server_public_key: &russh::keys::ssh_key::PublicKey,
     ) -> Result<bool, Self::Error> {
-        Ok(true)
+        let outcome = verify_server_key(&self.host, server_public_key, self.policy, None);
+        match outcome {
+            crate::known_hosts::VerifyOutcome::Matched => {
+                tracing::info!(
+                    "[SSH] host key for {:?} matches known_hosts entry",
+                    self.host
+                );
+                Ok(true)
+            }
+            crate::known_hosts::VerifyOutcome::Added => {
+                // TOFU: first contact, key was recorded.
+                Ok(true)
+            }
+            crate::known_hosts::VerifyOutcome::Mismatch {
+                expected,
+                presented,
+            } => {
+                // LIKELY MITM. Reject and log loudly — include both
+                // fingerprints so the user can investigate which key is
+                // the "real" one (e.g. via out-of-band verification).
+                tracing::error!(
+                    "[SSH] HOST KEY MISMATCH for {:?} — possible MITM! \
+                     expected fingerprint {}, presented {}. Rejecting.",
+                    self.host,
+                    expected,
+                    presented
+                );
+                Ok(false)
+            }
+            crate::known_hosts::VerifyOutcome::UnknownHost => {
+                // Strict mode: host not in known_hosts → reject.
+                tracing::warn!(
+                    "[SSH] host {:?} not in known_hosts and policy is strict — rejecting. \
+                     Pre-populate known_hosts (e.g. via ssh-keyscan) or relax to accept-new.",
+                    self.host
+                );
+                Ok(false)
+            }
+            crate::known_hosts::VerifyOutcome::Skipped => {
+                // Verification disabled — accept, but we already warned
+                // inside verify_server_key.
+                Ok(true)
+            }
+        }
     }
 }
 
@@ -67,16 +142,14 @@ impl SshClient {
                     // prompt, but some servers (e.g. Google's) send a second OTP
                     // prompt we cannot answer — sending the password there is
                     // harmless and lets the server reject it explicitly.
-                    let answers: Vec<String> = prompts
-                        .iter()
-                        .map(|_p| password.to_string())
-                        .collect();
+                    let answers: Vec<String> =
+                        prompts.iter().map(|_p| password.to_string()).collect();
                     response = handle
                         .authenticate_keyboard_interactive_respond(answers)
                         .await?;
                 }
             }
-    }
+        }
     }
 
     pub async fn connect(
@@ -86,8 +159,18 @@ impl SshClient {
     ) -> anyhow::Result<(Session, SshSession)> {
         let config = Arc::new(client::Config::default());
 
-        let mut handle =
-            client::connect(config, (self.config.host.as_str(), self.config.port), Handler).await?;
+        // Derive the host-key verification policy from the user's config.
+        // Unknown / empty values fall back to AcceptNew (TOFU) inside
+        // `HostKeyPolicy::parse`.
+        let policy = HostKeyPolicy::parse(&self.config.host_key_policy);
+        let handler = Handler::new(self.config.host.clone(), policy);
+
+        let mut handle = client::connect(
+            config,
+            (self.config.host.as_str(), self.config.port),
+            handler,
+        )
+        .await?;
 
         match &self.config.auth {
             SshAuth::Password { password } => {
@@ -101,7 +184,9 @@ impl SshClient {
                     // before giving up — this is what OpenSSH's ssh client does too.
                     tracing::info!(
                         "[SSH] password auth returned {:?}, trying keyboard-interactive fallback for {}@{}",
-                        result, self.config.username, self.config.host
+                        result,
+                        self.config.username,
+                        self.config.host
                     );
                     let ki_result = Self::auth_keyboard_interactive(
                         &mut handle,
@@ -122,7 +207,9 @@ impl SshClient {
             } => {
                 let expanded_path = if private_key_path.starts_with("~/") {
                     if let Some(home) = dirs::home_dir() {
-                        home.join(&private_key_path[2..]).to_string_lossy().to_string()
+                        home.join(&private_key_path[2..])
+                            .to_string_lossy()
+                            .to_string()
                     } else {
                         private_key_path.clone()
                     }
@@ -132,11 +219,7 @@ impl SshClient {
                 let key_data = match std::fs::read_to_string(&expanded_path) {
                     Ok(s) => s,
                     Err(e) => {
-                        anyhow::bail!(
-                            "Failed to read private key '{}': {}",
-                            expanded_path,
-                            e
-                        );
+                        anyhow::bail!("Failed to read private key '{}': {}", expanded_path, e);
                     }
                 };
                 let key = match russh::keys::ssh_key::PrivateKey::from_openssh(&key_data) {
@@ -162,8 +245,7 @@ impl SshClient {
                 let best_rsa_hash = handle.best_supported_rsa_hash().await?;
                 let hash_alg = best_rsa_hash.flatten();
 
-                let key_with_alg =
-                    russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg);
+                let key_with_alg = russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg);
                 let result = handle
                     .authenticate_publickey(&self.config.username, key_with_alg)
                     .await?;
@@ -262,7 +344,10 @@ impl SshClient {
                         let bytes = data.to_vec();
                         // Skip if identical to the last Data message
                         if last_data.as_ref() == Some(&bytes) {
-                            tracing::debug!("[SSH] skipping ExtendedData duplicate of Data ({} bytes)", bytes.len());
+                            tracing::debug!(
+                                "[SSH] skipping ExtendedData duplicate of Data ({} bytes)",
+                                bytes.len()
+                            );
                             continue;
                         }
                         bytes
@@ -371,7 +456,8 @@ pub struct SshSession {
 
 impl SshSession {
     pub async fn disconnect(&self) -> anyhow::Result<()> {
-        if self.disconnected
+        if self
+            .disconnected
             .compare_exchange(
                 false,
                 true,
@@ -427,7 +513,9 @@ if [ -f ~/.local/share/fish/fish_history ]; then head -5000 ~/.local/share/fish/
                 Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
                 _ => {}
             }
-            if output.len() > 5 * 1024 * 1024 { break; }
+            if output.len() > 5 * 1024 * 1024 {
+                break;
+            }
         }
 
         let raw = String::from_utf8_lossy(&output);
@@ -441,7 +529,10 @@ if [ -f ~/.local/share/fish/fish_history ]; then head -5000 ~/.local/share/fish/
         }
 
         let parsed = parse_remote_history(&raw);
-        tracing::info!("[SSH] Exec: parsed {} unique remote history commands", parsed.len());
+        tracing::info!(
+            "[SSH] Exec: parsed {} unique remote history commands",
+            parsed.len()
+        );
         Ok(parsed)
     }
 
@@ -472,21 +563,21 @@ if [ -f ~/.local/share/fish/fish_history ]; then head -5000 ~/.local/share/fish/
                 Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
                 _ => {}
             }
-            if output.len() > 5 * 1024 * 1024 { break; }
+            if output.len() > 5 * 1024 * 1024 {
+                break;
+            }
         }
 
         let raw = String::from_utf8_lossy(&output);
-        tracing::info!(
-            "[SSH] Shell fallback raw output: {} bytes",
-            output.len()
-        );
+        tracing::info!("[SSH] Shell fallback raw output: {} bytes", output.len());
 
         // Extract content between markers to skip prompt + command echo
         let start_marker = "__RUSTERM_HIST_START__";
         let end_marker = "__RUSTERM_HIST_END__";
         let extracted: String = {
             let raw_str = raw.as_ref();
-            if let (Some(start), Some(end)) = (raw_str.find(start_marker), raw_str.find(end_marker)) {
+            if let (Some(start), Some(end)) = (raw_str.find(start_marker), raw_str.find(end_marker))
+            {
                 if end > start {
                     raw_str[start + start_marker.len()..end].to_string()
                 } else {
@@ -499,7 +590,10 @@ if [ -f ~/.local/share/fish/fish_history ]; then head -5000 ~/.local/share/fish/
         };
 
         let parsed = parse_remote_history(&extracted);
-        tracing::info!("[SSH] Shell fallback: parsed {} unique remote history commands", parsed.len());
+        tracing::info!(
+            "[SSH] Shell fallback: parsed {} unique remote history commands",
+            parsed.len()
+        );
         Ok(parsed)
     }
 }
@@ -526,7 +620,10 @@ pub fn parse_remote_history(raw: &str) -> Vec<String> {
         }
 
         // Fish metadata
-        if trimmed.starts_with("when:") || trimmed.starts_with("paths:") || trimmed.starts_with("  - /") {
+        if trimmed.starts_with("when:")
+            || trimmed.starts_with("paths:")
+            || trimmed.starts_with("  - /")
+        {
             continue;
         }
 
@@ -568,7 +665,11 @@ pub fn parse_remote_history(raw: &str) -> Vec<String> {
     commands
 }
 
-fn flush_cmd(current: &mut String, seen: &mut std::collections::HashSet<String>, out: &mut Vec<String>) {
+fn flush_cmd(
+    current: &mut String,
+    seen: &mut std::collections::HashSet<String>,
+    out: &mut Vec<String>,
+) {
     if !current.is_empty() {
         let c = current.trim().to_string();
         if !c.is_empty() && seen.insert(c.clone()) {
