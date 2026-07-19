@@ -6506,7 +6506,11 @@ name = "rusterm-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "base64",
  "dioxus",
+ "objc2",
+ "objc2-app-kit",
+ "objc2-foundation",
  "resvg",
  "rusterm-ai",
  "rusterm-core",

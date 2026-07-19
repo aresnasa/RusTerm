@@ -22,6 +22,12 @@ dioxus.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 anyhow.workspace = true
+base64.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["NSApplication", "NSImage", "NSResponder"] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSData"] }
 
 [build-dependencies]
 # SVG -> PNG rasterizer at build time. The triplet must be version-aligned:

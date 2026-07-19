@@ -1,0 +1,15 @@
+[application]
+out_dir = "../../dist"
+asset_dir = "../../assets"
+
+[bundle]
+identifier = "com.rusterm.app"
+publisher = "RusTerm"
+icon = ["../../assets/AppIcon.icns"]
+category = "DeveloperTool"
+short_description = "A modern terminal and SSH client"
+long_description = "RusTerm is a modern terminal and SSH client with draggable multi-session panes."
+
+[bundle.macos]
+bundle_name = "RusTerm"
+minimum_system_version = "10.15"

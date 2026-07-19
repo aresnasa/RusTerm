@@ -560,6 +560,36 @@ pub fn resize_layout_row(state: &mut AppState, row: usize, delta: f64) -> bool {
     layout.resize_row(row, delta)
 }
 
+/// Promote the active layout to floating windows and bring `pane_idx` to the
+/// front. The active session remains the layout anchor.
+pub fn begin_floating_pane_move(state: &mut AppState, pane_idx: usize) -> bool {
+    let Some(active_id) = state.active_session.clone() else {
+        return false;
+    };
+    let Some(layout) = state.layouts.get_mut(&active_id) else {
+        return false;
+    };
+    layout.bring_floating_pane_to_front(pane_idx)
+}
+
+/// Move one pane window in the active layout by a CSS-pixel delta.
+pub fn move_floating_pane_for_active(
+    state: &mut AppState,
+    pane_idx: usize,
+    delta_x: f64,
+    delta_y: f64,
+    container_w: f64,
+    container_h: f64,
+) -> bool {
+    let Some(active_id) = state.active_session.clone() else {
+        return false;
+    };
+    let Some(layout) = state.layouts.get_mut(&active_id) else {
+        return false;
+    };
+    layout.move_floating_pane(pane_idx, delta_x, delta_y, container_w, container_h)
+}
+
 /// Get the list of session IDs that should receive a broadcast input
 /// event, given the current layout state of the active tab.
 ///
@@ -904,7 +934,15 @@ pub enum DropSplitOutcome {
 /// unpredictably.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TabDropOutcome {
-    /// The user dropped a session onto its own pane — nothing happened.
+    /// A self-drop expanded the layout. The app runtime must clone the
+    /// dragged session's connection into each contiguous new pane in
+    /// `first_pane_idx..first_pane_idx + pane_count`.
+    SelfDropExpanded {
+        first_pane_idx: usize,
+        pane_count: usize,
+    },
+    /// The user dropped a session onto its own pane at the maximum layout
+    /// size (or without an active layout anchor) — nothing happened.
     NoOpSelfDrop,
     /// The dragged session was moved from another pane into an empty
     /// target pane. `cleared_source_pane` is the pane that previously
@@ -947,16 +985,11 @@ pub enum TabDropOutcome {
 /// and (for split-creation outcomes) schedule a focus-restore.
 ///
 /// Logic (mirrors the prior inline drop handlers):
-/// 1. `dragged_sid == target_pane_session` (self-drop — the "split this
-///    view again" gesture, 自由分裂):
-///    - active session has NO layout (Single preset) → apply Split2H
-///      (`SplitCreated { pane_idx: 1 }`).
-///    - layout exists → GROW the grid to the next larger preset
-///      (2/3→Grid4, 4..7→Grid8), preserving the current pane arrangement
-///      and auto-filling new slots with unplaced background tabs
-///      (`SplitCreated { pane_idx: <first new slot> }`). Repeated drags
-///      freely create more sub-panes: 1→2→4→8.
-///    - already at Grid8 (8 panes) → `NoOpSelfDrop`.
+/// 1. `dragged_sid == target_pane_session` (self-drop — the "clone this
+///    view into a larger grid" gesture): grow 1→2→4→8 while preserving
+///    existing pane assignments. Every newly-created slot stays empty and
+///    is reported through `SelfDropExpanded`; the app runtime then opens an
+///    independent cloned connection in each slot.
 /// 2. `target_pane_session.is_empty()` → look up the dragged session's
 ///    source pane. If `Some(src)` and `src != target`, move the session
 ///    to the target and clear the source (`MovedToEmptyPane`). If the
@@ -981,84 +1014,59 @@ pub fn execute_tab_drop_on_pane(
     target_pane_idx: usize,
     target_pane_session: &str,
 ) -> TabDropOutcome {
-    // Case 1: self-drop. Dragging a tab onto the pane that already shows
-    // it is the "split this view again" gesture (自由分裂):
-    //
-    // - No layout yet (Single preset): dragging the ACTIVE tab down into
-    //   the terminal area is the user's most natural "split this view"
-    //   gesture — the hit-test resolves to pane 0 which holds the active
-    //   session itself, so without this special case the gesture silently
-    //   did nothing (the Task 22 runtime bug). Upgrade to Split2H: pane 0
-    //   keeps the active session, pane 1 is auto-filled with the next
-    //   background tab (or left empty when the active session is the only
-    //   open tab).
-    //
-    // - Layout exists (multi-pane): GROW the grid to the next larger
-    //   preset (Split2H/Split2V→Grid4, Grid4→Grid8), PRESERVING the
-    //   current pane arrangement (unlike `apply_layout_preset`, which
-    //   re-fills all panes in tab order and would blow away manual
-    //   rearrangements). New slots auto-fill with background tabs not
-    //   already in a pane (tab order), or stay empty as drop-zones.
-    //   Repeated self-drops thus freely create more sub-panes:
-    //   1→2→4→8. At Grid8 (max) the self-drop is a no-op.
+    // Case 1: self-drop expands the layout, but deliberately leaves each
+    // new slot empty. Creating PTYs/SSH tasks is an app-runtime concern;
+    // the returned range tells the caller exactly where cloned sessions
+    // must be opened.
     if dragged_sid == target_pane_session {
         let Some(active_id) = state.active_session.clone() else {
             return TabDropOutcome::NoOpSelfDrop;
         };
-        let Some(layout) = state.layouts.get(&active_id).cloned() else {
-            // No layout (Single preset) → Split2H.
-            if apply_layout_preset(state, LayoutPreset::Split2H) {
-                return TabDropOutcome::SplitCreated { pane_idx: 1 };
+
+        let (current_layout, current_pane_count) = match state.layouts.get(&active_id).cloned() {
+            Some(layout) => {
+                let count = layout.panes.len();
+                (layout, count)
             }
-            return TabDropOutcome::NoOpSelfDrop;
+            None => (
+                PaneLayout::from_preset(LayoutPreset::Single, std::slice::from_ref(&active_id)),
+                1,
+            ),
         };
-        // Layout exists → grow to the next larger preset. Infer the
-        // "current" preset from the layout's own pane count (NOT the
-        // global `state.layout_preset` — layouts are per-tab).
-        let n = layout.panes.len();
-        let next = match n {
+
+        let next = match current_pane_count {
             0 | 1 => Some(LayoutPreset::Split2H),
             2 | 3 => Some(LayoutPreset::Grid4),
             4..=7 => Some(LayoutPreset::Grid8),
-            _ => None, // already at Grid8 max
+            _ => None,
         };
         let Some(next) = next else {
             return TabDropOutcome::NoOpSelfDrop;
         };
-        // Preserve the existing pane arrangement: seed the new grid with
-        // the current panes' session ids in order; `from_preset` pads the
-        // extra slots with "" (empty).
-        let ids: Vec<String> = layout.panes.iter().map(|p| p.session_id.clone()).collect();
-        let mut new_layout = PaneLayout::from_preset(next, &ids);
-        new_layout.comparison = layout.comparison;
-        // Auto-fill the new empty slots with background tabs not already
-        // placed, in tab order (mirrors `apply_layout_preset`'s fill
-        // order). Remaining slots stay empty drop-zones.
-        let placed: Vec<String> = new_layout
+
+        let ids: Vec<String> = current_layout
             .panes
             .iter()
-            .map(|p| p.session_id.clone())
-            .filter(|s| !s.is_empty())
+            .map(|pane| pane.session_id.clone())
             .collect();
-        let candidates: Vec<String> = state
-            .sessions
-            .iter()
-            .map(|t| t.id.clone())
-            .filter(|id| !placed.contains(id))
-            .collect();
-        let mut candidates = candidates.into_iter();
-        for pane in new_layout.panes.iter_mut() {
-            if pane.session_id.is_empty()
-                && let Some(sid) = candidates.next()
+        let mut new_layout = PaneLayout::from_preset(next, &ids);
+        new_layout.comparison = current_layout.comparison;
+        if current_layout.is_floating() {
+            new_layout.enable_floating();
+            for (new_pane, current_pane) in
+                new_layout.panes.iter_mut().zip(current_layout.panes.iter())
             {
-                pane.session_id = sid;
+                new_pane.floating = current_pane.floating;
             }
         }
+        let pane_count = new_layout.panes.len().saturating_sub(current_pane_count);
         state.layouts.insert(active_id, new_layout);
         state.layout_preset = next;
-        // `pane_idx` = the first newly-created slot (right after the
-        // preserved ones) — used by the caller for logging/focus.
-        return TabDropOutcome::SplitCreated { pane_idx: n };
+
+        return TabDropOutcome::SelfDropExpanded {
+            first_pane_idx: current_pane_count,
+            pane_count,
+        };
     }
 
     let src_pane = pane_index_for_active_session(state, dragged_sid);
@@ -3080,36 +3088,62 @@ mod tests {
     // mouse-based tab-drag finisher rely on.
     // ------------------------------------------------------------------
 
-    /// Self-drop in a multi-pane layout GROWS the grid to the next
-    /// larger preset (自由分裂): Split2H → Grid4, preserving the existing
-    /// pane arrangement. The new slots stay empty (no more background
-    /// tabs to fill them here).
+    /// Self-drop in a multi-pane layout grows the grid and reports every
+    /// new pane that needs a real cloned connection. Existing panes stay
+    /// in place and all new slots remain empty until the app runtime opens
+    /// those connections.
     #[test]
-    fn execute_tab_drop_self_drop_multi_pane_grows_grid() {
+    fn execute_tab_drop_self_drop_multi_pane_requests_cloned_sessions() {
         let mut state = state_with_active_session(&["alpha", "beta"]);
         apply_layout_preset(&mut state, LayoutPreset::Split2H);
-        // alpha is in pane 0. Drop alpha onto pane 0.
+
         let outcome = execute_tab_drop_on_pane(&mut state, "alpha", 0, "alpha");
-        // First new slot is pane 2 (panes 0/1 preserved).
-        assert_eq!(outcome, TabDropOutcome::SplitCreated { pane_idx: 2 });
+
+        assert_eq!(
+            outcome,
+            TabDropOutcome::SelfDropExpanded {
+                first_pane_idx: 2,
+                pane_count: 2,
+            }
+        );
         assert_eq!(state.layout_preset, LayoutPreset::Grid4);
         let layout = state.layouts.get("alpha").unwrap();
         assert_eq!(layout.panes.len(), 4);
-        // Existing arrangement preserved; new slots empty.
         assert_eq!(layout.panes[0].session_id, "alpha");
         assert_eq!(layout.panes[1].session_id, "beta");
         assert_eq!(layout.panes[2].session_id, "");
         assert_eq!(layout.panes[3].session_id, "");
-        // Active session must NOT change (it's a tab pointer).
         assert_eq!(state.active_session.as_deref(), Some("alpha"));
     }
 
-    /// Self-drop growth auto-fills the new slots with background tabs
-    /// that aren't already placed in a pane (tab order).
     #[test]
-    fn execute_tab_drop_self_drop_growth_fills_new_slots_with_background_tabs() {
+    fn self_drop_growth_preserves_existing_floating_window_positions() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        assert!(begin_floating_pane_move(&mut state, 0));
+        assert!(move_floating_pane_for_active(
+            &mut state, 0, 140.0, 70.0, 1200.0, 800.0,
+        ));
+        let before = state.layouts["alpha"].panes[0].floating;
+
+        let outcome = execute_tab_drop_on_pane(&mut state, "alpha", 0, "alpha");
+
+        assert_eq!(
+            outcome,
+            TabDropOutcome::SelfDropExpanded {
+                first_pane_idx: 2,
+                pane_count: 2,
+            }
+        );
+        assert_eq!(state.layouts["alpha"].panes[0].floating, before);
+        assert!(state.layouts["alpha"].is_floating());
+    }
+
+    /// Existing background tabs must not be silently reused for a self-drop:
+    /// each new pane is reserved for a new session cloned from the dragged one.
+    #[test]
+    fn execute_tab_drop_self_drop_does_not_reuse_background_tabs() {
         let mut state = state_with_active_session(&["alpha", "beta", "gamma", "delta"]);
-        // Build a Split2H manually with only alpha+beta placed.
         state.layout_preset = LayoutPreset::Split2H;
         state.layouts.insert(
             "alpha".to_string(),
@@ -3118,46 +3152,57 @@ mod tests {
                 &["alpha".to_string(), "beta".to_string()],
             ),
         );
+
         let outcome = execute_tab_drop_on_pane(&mut state, "alpha", 0, "alpha");
-        assert_eq!(outcome, TabDropOutcome::SplitCreated { pane_idx: 2 });
+
+        assert_eq!(
+            outcome,
+            TabDropOutcome::SelfDropExpanded {
+                first_pane_idx: 2,
+                pane_count: 2,
+            }
+        );
         let layout = state.layouts.get("alpha").unwrap();
         assert_eq!(layout.panes[0].session_id, "alpha");
         assert_eq!(layout.panes[1].session_id, "beta");
-        // gamma/delta auto-fill the new slots in tab order.
-        assert_eq!(layout.panes[2].session_id, "gamma");
-        assert_eq!(layout.panes[3].session_id, "delta");
+        assert_eq!(layout.panes[2].session_id, "");
+        assert_eq!(layout.panes[3].session_id, "");
     }
 
-    /// Repeated self-drops keep growing: Split2H → Grid4 → Grid8, then
-    /// no-op at the Grid8 maximum.
+    /// Repeated self-drops request one, two, then four cloned sessions as
+    /// the layout grows 1 → 2 → 4 → 8, then no-op at the maximum.
     #[test]
     fn execute_tab_drop_repeated_self_drops_grow_until_grid8_then_noop() {
         let mut state = state_with_active_session(&["alpha"]);
-        // 1st drag (no layout) → Split2H.
         assert_eq!(
             execute_tab_drop_on_pane(&mut state, "alpha", 0, "alpha"),
-            TabDropOutcome::SplitCreated { pane_idx: 1 }
+            TabDropOutcome::SelfDropExpanded {
+                first_pane_idx: 1,
+                pane_count: 1,
+            }
         );
         assert_eq!(state.layouts.get("alpha").unwrap().panes.len(), 2);
-        // 2nd drag → Grid4.
         assert_eq!(
             execute_tab_drop_on_pane(&mut state, "alpha", 0, "alpha"),
-            TabDropOutcome::SplitCreated { pane_idx: 2 }
+            TabDropOutcome::SelfDropExpanded {
+                first_pane_idx: 2,
+                pane_count: 2,
+            }
         );
         assert_eq!(state.layouts.get("alpha").unwrap().panes.len(), 4);
-        // 3rd drag → Grid8.
         assert_eq!(
             execute_tab_drop_on_pane(&mut state, "alpha", 0, "alpha"),
-            TabDropOutcome::SplitCreated { pane_idx: 4 }
+            TabDropOutcome::SelfDropExpanded {
+                first_pane_idx: 4,
+                pane_count: 4,
+            }
         );
         assert_eq!(state.layouts.get("alpha").unwrap().panes.len(), 8);
-        // 4th drag → already at max: no-op, layout unchanged.
         assert_eq!(
             execute_tab_drop_on_pane(&mut state, "alpha", 0, "alpha"),
             TabDropOutcome::NoOpSelfDrop
         );
         assert_eq!(state.layouts.get("alpha").unwrap().panes.len(), 8);
-        // Pane 0 kept the active session throughout.
         assert_eq!(
             state.layouts.get("alpha").unwrap().panes[0].session_id,
             "alpha"
@@ -3165,37 +3210,43 @@ mod tests {
         assert_eq!(state.active_session.as_deref(), Some("alpha"));
     }
 
-    /// Task 22 runtime bug: dragging the ACTIVE tab into its own
-    /// single-pane view (no layout yet) must CREATE a split, not
-    /// silently no-op. This is the user's most natural "drag a tab down
-    /// to split" gesture — the hit-test resolves to pane 0 which holds
-    /// the active session itself, making it a self-drop.
+    /// Dragging the active tab into its own single-pane view reserves pane 1
+    /// for a newly cloned runtime session, even when other tabs exist.
     #[test]
-    fn execute_tab_drop_active_tab_self_drop_single_pane_creates_split() {
+    fn execute_tab_drop_active_tab_self_drop_single_pane_requests_clone() {
         let mut state = state_with_active_session(&["alpha", "beta"]);
-        // No layout for alpha (Single preset).
         assert!(!state.layouts.contains_key("alpha"));
+
         let outcome = execute_tab_drop_on_pane(&mut state, "alpha", 0, "alpha");
-        assert_eq!(outcome, TabDropOutcome::SplitCreated { pane_idx: 1 });
+
+        assert_eq!(
+            outcome,
+            TabDropOutcome::SelfDropExpanded {
+                first_pane_idx: 1,
+                pane_count: 1,
+            }
+        );
         assert_eq!(state.layout_preset, LayoutPreset::Split2H);
         let layout = state.layouts.get("alpha").unwrap();
-        // Pane 0 keeps the active session; pane 1 auto-fills with the
-        // next background tab.
         assert_eq!(layout.panes[0].session_id, "alpha");
-        assert_eq!(layout.panes[1].session_id, "beta");
-        // Active session must NOT change (it's a tab pointer).
+        assert_eq!(layout.panes[1].session_id, "");
         assert_eq!(state.active_session.as_deref(), Some("alpha"));
     }
 
-    /// Same gesture with only ONE open tab: the split is still created;
-    /// pane 1 is left empty (renderer treats empty session_id as "no
-    /// pane here").
     #[test]
-    fn execute_tab_drop_active_tab_self_drop_only_tab_creates_split_with_empty_pane() {
+    fn execute_tab_drop_active_tab_self_drop_only_tab_requests_clone() {
         let mut state = state_with_active_session(&["alpha"]);
         assert!(!state.layouts.contains_key("alpha"));
+
         let outcome = execute_tab_drop_on_pane(&mut state, "alpha", 0, "alpha");
-        assert_eq!(outcome, TabDropOutcome::SplitCreated { pane_idx: 1 });
+
+        assert_eq!(
+            outcome,
+            TabDropOutcome::SelfDropExpanded {
+                first_pane_idx: 1,
+                pane_count: 1,
+            }
+        );
         assert_eq!(state.layout_preset, LayoutPreset::Split2H);
         let layout = state.layouts.get("alpha").unwrap();
         assert_eq!(layout.panes[0].session_id, "alpha");
@@ -3296,6 +3347,34 @@ mod tests {
         assert_eq!(outcome, TabDropOutcome::SplitFallbackSwapFailed);
         // Preset unchanged.
         assert_eq!(state.layout_preset, LayoutPreset::Grid8);
+    }
+
+    #[test]
+    fn floating_pane_move_preserves_layout_anchor_and_other_sessions() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma", "delta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Grid4);
+        let before_sessions = state.layouts["alpha"].session_ids();
+
+        assert!(begin_floating_pane_move(&mut state, 1));
+        let before_other = state.layouts["alpha"].panes[2].floating;
+        assert!(move_floating_pane_for_active(
+            &mut state, 1, 160.0, 90.0, 1200.0, 800.0,
+        ));
+
+        assert_eq!(state.active_session.as_deref(), Some("alpha"));
+        assert_eq!(state.layouts["alpha"].session_ids(), before_sessions);
+        assert_eq!(state.layouts["alpha"].panes[2].floating, before_other);
+        assert!(state.layouts["alpha"].is_floating());
+    }
+
+    #[test]
+    fn floating_pane_move_rejects_missing_layout_without_changing_active_session() {
+        let mut state = state_with_active_session(&["alpha"]);
+        assert!(!begin_floating_pane_move(&mut state, 0));
+        assert!(!move_floating_pane_for_active(
+            &mut state, 0, 20.0, 20.0, 1200.0, 800.0,
+        ));
+        assert_eq!(state.active_session.as_deref(), Some("alpha"));
     }
 }
 

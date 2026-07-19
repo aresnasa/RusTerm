@@ -51,6 +51,19 @@ pub const MIN_PANE_FRAC: f64 = 0.1;
 /// preset; the cap exists so a runaway split-loop can't OOM the app.
 pub const MAX_PANES: usize = 16;
 
+/// Normalized geometry for a freely movable pane window.
+///
+/// Values are fractions of the terminal container, so resizing the app window
+/// preserves each pane's relative position and size.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct FloatingPane {
+    pub x_frac: f64,
+    pub y_frac: f64,
+    pub width_frac: f64,
+    pub height_frac: f64,
+    pub z_index: u32,
+}
+
 /// A single pane's layout metadata. The pane's terminal session is looked
 /// up by `session_id` in `AppState::terminals`; this struct only owns the
 /// geometry.
@@ -63,6 +76,11 @@ pub struct Pane {
     pub row: usize,
     /// Column index (0-based) in the grid.
     pub col: usize,
+    /// Freeform window geometry. `None` keeps the pane in its preset grid
+    /// cell; the first window-move gesture promotes every pane in the layout
+    /// to floating geometry.
+    #[serde(default)]
+    pub floating: Option<FloatingPane>,
 }
 
 /// A multi-pane terminal layout. Owns the list of panes and the per-row and
@@ -158,6 +176,7 @@ impl PaneLayout {
                 session_id,
                 row,
                 col,
+                floating: None,
             });
         }
         // Even distribution. We deliberately don't normalize here — the
@@ -192,6 +211,130 @@ impl PaneLayout {
     /// is in any split-preset other than Single, and not currently zoomed).
     pub fn is_multi_pane(&self) -> bool {
         self.zoomed.is_none() && self.panes.len() > 1
+    }
+
+    /// Whether every pane currently uses freely movable window geometry.
+    pub fn is_floating(&self) -> bool {
+        !self.panes.is_empty() && self.panes.iter().all(|pane| pane.floating.is_some())
+    }
+
+    /// Promote the preset grid to independent floating windows.
+    ///
+    /// Grid cell centers are preserved, while full-height/full-width panes are
+    /// reduced enough to leave movement room on both axes. Calling this again
+    /// is a no-op, so existing user positions are never reset.
+    pub fn enable_floating(&mut self) -> bool {
+        if self.panes.is_empty() {
+            return false;
+        }
+        if self.is_floating() {
+            return true;
+        }
+
+        for (idx, pane) in self.panes.iter_mut().enumerate() {
+            let (cell_x, cell_w) = span(&self.col_fracs, pane.col, 1.0);
+            let (cell_y, cell_h) = span(&self.row_fracs, pane.row, 1.0);
+            let width = cell_w.clamp(0.32, 0.68);
+            let height = cell_h.clamp(0.34, 0.68);
+            let x = (cell_x + (cell_w - width) / 2.0).clamp(0.0, 1.0 - width);
+            let y = (cell_y + (cell_h - height) / 2.0).clamp(0.0, 1.0 - height);
+            pane.floating = Some(FloatingPane {
+                x_frac: x,
+                y_frac: y,
+                width_frac: width,
+                height_frac: height,
+                z_index: idx as u32 + 1,
+            });
+        }
+        true
+    }
+
+    /// Bring a floating pane in front of its siblings without changing its
+    /// session assignment or the active tab/layout anchor.
+    pub fn bring_floating_pane_to_front(&mut self, pane_idx: usize) -> bool {
+        if !self.enable_floating() || pane_idx >= self.panes.len() {
+            return false;
+        }
+        let max_z = self
+            .panes
+            .iter()
+            .filter_map(|pane| pane.floating.map(|geometry| geometry.z_index))
+            .max()
+            .unwrap_or(0);
+        let front_z = if max_z < 90 {
+            max_z + 1
+        } else {
+            // Keep normal moves surgical (only the target changes). Rebase
+            // rarely so pane windows never overtake the z=100 comparison
+            // banner after many drag operations.
+            let mut order: Vec<usize> = (0..self.panes.len())
+                .filter(|idx| *idx != pane_idx)
+                .collect();
+            order.sort_by_key(|idx| {
+                self.panes[*idx]
+                    .floating
+                    .map(|geometry| geometry.z_index)
+                    .unwrap_or(0)
+            });
+            for (position, idx) in order.into_iter().enumerate() {
+                if let Some(geometry) = self.panes[idx].floating.as_mut() {
+                    geometry.z_index = position as u32 + 1;
+                }
+            }
+            self.panes.len() as u32
+        };
+        if let Some(geometry) = self.panes[pane_idx].floating.as_mut() {
+            geometry.z_index = front_z;
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Move one floating pane by a CSS-pixel delta, clamped to the terminal
+    /// container. Coordinates remain normalized so later container resizes
+    /// retain a stable relative arrangement.
+    pub fn move_floating_pane(
+        &mut self,
+        pane_idx: usize,
+        delta_x: f64,
+        delta_y: f64,
+        container_w: f64,
+        container_h: f64,
+    ) -> bool {
+        if !container_w.is_finite()
+            || !container_h.is_finite()
+            || container_w <= 0.0
+            || container_h <= 0.0
+            || !delta_x.is_finite()
+            || !delta_y.is_finite()
+            || !self.enable_floating()
+        {
+            return false;
+        }
+        let Some(geometry) = self
+            .panes
+            .get_mut(pane_idx)
+            .and_then(|pane| pane.floating.as_mut())
+        else {
+            return false;
+        };
+        geometry.x_frac =
+            (geometry.x_frac + delta_x / container_w).clamp(0.0, 1.0 - geometry.width_frac);
+        geometry.y_frac =
+            (geometry.y_frac + delta_y / container_h).clamp(0.0, 1.0 - geometry.height_frac);
+        true
+    }
+
+    /// Return the pane's stacking order. Grid panes use their index so the
+    /// result is deterministic before floating mode is enabled.
+    pub fn pane_z_index(&self, pane_idx: usize) -> Option<u32> {
+        let pane = self.panes.get(pane_idx)?;
+        Some(
+            pane.floating
+                .map(|geometry| geometry.z_index)
+                .unwrap_or(pane_idx as u32 + 1),
+        )
     }
 
     /// Normalize `col_fracs` and `row_fracs` so each sums to exactly 1.0.
@@ -304,6 +447,14 @@ impl PaneLayout {
             // Some other pane is zoomed — this one is hidden.
             return None;
         }
+        if let Some(geometry) = pane.floating {
+            return Some((
+                geometry.x_frac * container_w,
+                geometry.y_frac * container_h,
+                geometry.width_frac * container_w,
+                geometry.height_frac * container_h,
+            ));
+        }
         let (x, w) = span(&self.col_fracs, pane.col, container_w);
         let (y, h) = span(&self.row_fracs, pane.row, container_h);
         Some((x, y, w, h))
@@ -368,22 +519,16 @@ impl PaneLayout {
         if a >= self.panes.len() || b >= self.panes.len() {
             return false;
         }
-        self.panes.swap(a, b);
-        // Re-anchor row/col on the swapped panes so the grid positions
-        // reflect the new occupants. Without this, pane[0] would still
-        // claim (row=0, col=0) but now holds the session that was at
-        // pane[1] (row=0, col=1) — `pane_rect` would still draw it at
-        // the (0,0) cell, which is correct (the cell positions don't
-        // move), but the row/col fields would be inconsistent with the
-        // session_id at that index. The renderer uses `pane_index` for
-        // DOM keys and `pane.row`/`pane.col` only for `pane_rect`, so
-        // this re-anchoring keeps the struct self-consistent.
-        let (ra, ca) = (self.panes[a].row, self.panes[a].col);
-        let (rb, cb) = (self.panes[b].row, self.panes[b].col);
-        self.panes[a].row = rb;
-        self.panes[a].col = cb;
-        self.panes[b].row = ra;
-        self.panes[b].col = ca;
+        // Window geometry belongs to the pane slot, not to the session. Swap
+        // only the occupants so both grid cells and user-positioned floating
+        // windows remain exactly where the user placed them.
+        let (left, right) = self.panes.split_at_mut(b.max(a));
+        let (pane_a, pane_b) = if a < b {
+            (&mut left[a], &mut right[0])
+        } else {
+            (&mut right[0], &mut left[b])
+        };
+        std::mem::swap(&mut pane_a.session_id, &mut pane_b.session_id);
         true
     }
 
@@ -1948,7 +2093,7 @@ mod tests {
         let mut layout_b = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
         let container_w = 1000.0_f64;
         // layout_a: 1 mousemove of 100px.
-        let mut drag_a = SplitDragState {
+        let drag_a = SplitDragState {
             is_col: true,
             idx: 0,
             container_extent: container_w,
@@ -1970,5 +2115,85 @@ mod tests {
             drag_b.last_applied_pos = pos;
         }
         assert!((layout_a.col_fracs[0] - layout_b.col_fracs[0]).abs() < 1e-9);
+    }
+
+    #[test]
+    fn floating_move_changes_only_target_pane_and_preserves_sessions() {
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Grid4, &sids(4));
+        assert!(layout.enable_floating());
+        let before = layout.clone();
+
+        assert!(layout.bring_floating_pane_to_front(1));
+        assert!(layout.move_floating_pane(1, 120.0, 80.0, 1200.0, 800.0));
+
+        assert_eq!(layout.session_ids(), before.session_ids());
+        assert_eq!(layout.panes[0].floating, before.panes[0].floating);
+        assert_eq!(layout.panes[2].floating, before.panes[2].floating);
+        assert_eq!(layout.panes[3].floating, before.panes[3].floating);
+        assert_ne!(layout.panes[1].floating, before.panes[1].floating);
+    }
+
+    #[test]
+    fn floating_move_is_clamped_inside_container() {
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        assert!(layout.move_floating_pane(0, -10_000.0, -10_000.0, 1200.0, 800.0));
+        let top_left = layout.panes[0].floating.unwrap();
+        assert_eq!(top_left.x_frac, 0.0);
+        assert_eq!(top_left.y_frac, 0.0);
+
+        assert!(layout.move_floating_pane(0, 10_000.0, 10_000.0, 1200.0, 800.0));
+        let bottom_right = layout.panes[0].floating.unwrap();
+        assert!((bottom_right.x_frac + bottom_right.width_frac - 1.0).abs() < 1e-9);
+        assert!((bottom_right.y_frac + bottom_right.height_frac - 1.0).abs() < 1e-9);
+    }
+
+    #[test]
+    fn floating_rect_scales_proportionally_after_container_resize() {
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Grid4, &sids(4));
+        assert!(layout.move_floating_pane(2, 100.0, -40.0, 1000.0, 800.0));
+        let small = layout.pane_rect(2, 1000.0, 800.0).unwrap();
+        let large = layout.pane_rect(2, 2000.0, 1600.0).unwrap();
+
+        assert_eq!(
+            large,
+            (small.0 * 2.0, small.1 * 2.0, small.2 * 2.0, small.3 * 2.0)
+        );
+    }
+
+    #[test]
+    fn bringing_floating_pane_forward_does_not_change_active_geometry() {
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Grid4, &sids(4));
+        assert!(layout.enable_floating());
+        let before_rects: Vec<_> = (0..4)
+            .map(|idx| layout.pane_rect(idx, 1200.0, 800.0).unwrap())
+            .collect();
+
+        assert!(layout.bring_floating_pane_to_front(0));
+        let max_z = layout
+            .panes
+            .iter()
+            .filter_map(|pane| pane.floating.map(|geometry| geometry.z_index))
+            .max()
+            .unwrap();
+        assert_eq!(layout.pane_z_index(0), Some(max_z));
+        let after_rects: Vec<_> = (0..4)
+            .map(|idx| layout.pane_rect(idx, 1200.0, 800.0).unwrap())
+            .collect();
+        assert_eq!(before_rects, after_rects);
+    }
+
+    #[test]
+    fn swapping_floating_panes_keeps_window_geometry_in_place() {
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        assert!(layout.enable_floating());
+        let first_geometry = layout.panes[0].floating;
+        let second_geometry = layout.panes[1].floating;
+
+        assert!(layout.swap_panes(0, 1));
+
+        assert_eq!(layout.panes[0].session_id, "s1");
+        assert_eq!(layout.panes[1].session_id, "s0");
+        assert_eq!(layout.panes[0].floating, first_geometry);
+        assert_eq!(layout.panes[1].floating, second_geometry);
     }
 }

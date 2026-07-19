@@ -1,6 +1,39 @@
 use rusterm_core::logging::init_logging;
 use rusterm_core::window_state::WindowState;
 
+use base64::Engine as _;
+
+/// Original SVG copied by `build.rs` and embedded in the executable. Keeping
+/// this separate from the rasterized PNG lets the WebView load an actual SVG
+/// at runtime without relying on a filesystem-relative asset path.
+const APP_ICON_SVG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/assets/gemini-svg.svg"));
+const APP_ICON_PNG: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/icon.png"));
+
+fn app_icon_svg_data_url() -> String {
+    format!(
+        "data:image/svg+xml;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(APP_ICON_SVG)
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn install_macos_application_icon(icon_bytes: &[u8]) -> Result<(), &'static str> {
+    use objc2::{AllocAnyThread as _, MainThreadMarker};
+    use objc2_app_kit::{NSApplication, NSImage};
+    use objc2_foundation::NSData;
+
+    let main_thread = MainThreadMarker::new().ok_or("window callback is not on the main thread")?;
+    let data = NSData::with_bytes(icon_bytes);
+    let image = NSImage::initWithData(NSImage::alloc(), &data)
+        .ok_or("AppKit could not decode the embedded PNG")?;
+    let application = NSApplication::sharedApplication(main_thread);
+
+    // SAFETY: AppKit requires a valid NSImage and main-thread access. Both are
+    // guaranteed above; NSApplication retains the image after this call.
+    unsafe { application.setApplicationIconImage(Some(&image)) };
+    Ok(())
+}
+
 fn main() {
     // Initialize logging. The returned guard MUST live for the entire process
     // lifetime — dropping it early would flush-and-close the non-blocking
@@ -75,7 +108,12 @@ fn main() {
         window = window.with_maximized(true);
     }
 
-    let head_html = r#"<meta name="viewport" content="width=device-width,initial-scale=1.0">
+    let svg_icon_url = app_icon_svg_data_url();
+    let head_html = [
+        r#"<meta name="viewport" content="width=device-width,initial-scale=1.0">
+<link rel="icon" type="image/svg+xml" href=""#,
+        svg_icon_url.as_str(),
+        r#"">
 <style>
 html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#1a1b26;}
 #main{width:100%;height:100%;overflow:hidden;}
@@ -88,12 +126,14 @@ html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#
 *[id^="terminal-input-"]::-webkit-scrollbar{display:none;}
 .sug-row:hover .sug-del{color:#9ece6a !important;}
 .sug-row .sug-del:hover{color:#f7768e !important;}
-</style>"#;
+</style>"#,
+    ]
+    .concat();
 
     let mut cfg = dioxus::desktop::Config::new()
         .with_window(window)
         .with_background_color((26, 27, 38, 255))
-        .with_custom_head(head_html.to_string());
+        .with_custom_head(head_html);
 
     // Window icon. The PNG embedded below is rasterized at build time
     // from `assets/gemini-svg.svg` by `build.rs` (using resvg/usvg/tiny-skia).
@@ -103,8 +143,7 @@ html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#
     // Failure here is non-fatal — the app still launches, just with the
     // platform-default window icon — so we log and continue instead of
     // panicking.
-    let icon_bytes = include_bytes!(concat!(env!("OUT_DIR"), "/icon.png"));
-    match dioxus::desktop::icon_from_memory::<dioxus::desktop::tao::window::Icon>(icon_bytes) {
+    match dioxus::desktop::icon_from_memory::<dioxus::desktop::tao::window::Icon>(APP_ICON_PNG) {
         Ok(icon) => {
             cfg = cfg.with_icon(icon);
         }
@@ -113,7 +152,47 @@ html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#
         }
     }
 
+    // Tao intentionally ignores window icons on macOS because NSWindow has no
+    // icon API. Set NSApplication's icon after Tao creates the native window so
+    // `cargo run` and bare debug binaries also get the correct Dock icon.
+    #[cfg(target_os = "macos")]
+    {
+        cfg = cfg.with_on_window(|_, _| match install_macos_application_icon(APP_ICON_PNG) {
+            Ok(()) => tracing::info!("installed embedded macOS application icon"),
+            Err(error) => tracing::warn!("failed to install macOS application icon: {error}"),
+        });
+    }
+
     dioxus::LaunchBuilder::new()
         .with_cfg(cfg)
         .launch(rusterm_ui::App);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{APP_ICON_PNG, APP_ICON_SVG, app_icon_svg_data_url};
+    use base64::Engine as _;
+
+    #[test]
+    fn embedded_svg_is_available_to_the_webview_at_runtime() {
+        let svg = std::str::from_utf8(APP_ICON_SVG).expect("embedded icon must be UTF-8 SVG");
+        assert!(svg.contains("<svg"));
+        assert!(svg.contains("viewBox=\"0 0 512 512\""));
+
+        let url = app_icon_svg_data_url();
+        let encoded = url
+            .strip_prefix("data:image/svg+xml;base64,")
+            .expect("SVG must be exposed as a data URL");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("SVG data URL must contain valid base64");
+        assert_eq!(decoded, APP_ICON_SVG);
+    }
+
+    #[test]
+    fn embedded_native_icon_is_a_decodable_png() {
+        let icon =
+            dioxus::desktop::icon_from_memory::<dioxus::desktop::tao::window::Icon>(APP_ICON_PNG);
+        assert!(icon.is_ok(), "embedded native icon must be a valid PNG");
+    }
 }

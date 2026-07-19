@@ -354,6 +354,15 @@ The `drag_over_pane` signal is shared between `single_pane_with_drop` and `multi
 - Logs go to daily-rotating JSON files under `~/Library/Application Support/rusterm/logs/` (`rusterm-core::logging::init_logging`); default `EnvFilter` directive `rusterm=info` — launch with `RUST_LOG=rusterm_ui=debug` to see debug lines.
 - Browser MCP can't attach to WKWebView; CGEvent mouse simulation needs Accessibility trust (`AXIsProcessTrusted()` was false for the agent terminal) — file-log forensics is the practical runtime-diagnosis channel.
 
+## Self-drop auto-clones real terminal sessions (2026-07-19)
+
+- `state.rs::execute_tab_drop_on_pane` now returns `TabDropOutcome::SelfDropExpanded { first_pane_idx, pane_count }` for self-drop growth (1→2→4→8). It only mutates layout and leaves all new slots empty; it no longer auto-fills them from unrelated background tabs.
+- `app.rs::open_cloned_sessions_for_self_drop` consumes that outcome at all three drop entry points (manual `finish_tab_drag`, single-pane HTML5 fallback, multi-pane HTML5 fallback). It clones `state.session_configs[source_session_id]` and calls the existing `open_connection(..., Some(pane_idx))` once per new slot.
+- This creates a fresh session ID, terminal model, input sender, close/resize senders, and independent SSH/local-shell task for every new pane while preserving `active_session` as the layout anchor.
+- Supported automatic clone types are `ConnectionKind::Ssh` and `ConnectionKind::Shell`; missing configs or unsupported kinds log `[SPLIT-CLONE]` warnings and leave the reserved panes empty.
+- `open_connection` now returns its new session ID for `[SPLIT-CLONE] source=... target_pane=... new_session=...` diagnostics.
+- Regression tests assert self-drop reserves exactly 1/2/4 clone targets, preserves existing pane order, and never reuses background tabs. `cargo test --workspace` and `cargo build` pass. Runtime binary restarted as PID 49989 for manual WKWebView verification.
+
 ## Known Issues / Future Work
 
 - DuckDB `bundled` build is slow (~2min cold). Consider pre-built libduckdb for CI.
@@ -361,3 +370,21 @@ The `drag_over_pane` signal is shared between `single_pane_with_drop` and `multi
 - No UI panel yet for analytics — the API is ready (`classify`, `success_rate_by_prefix`, `usage_patterns_by_time_of_day`, `behavior_summary`).
 - Shell integration not loaded for fish/nu/pwsh — failed commands in those shells won't be filtered at runtime.
 - `block v0.1.6` future-incompat warning — pre-existing, external dependency, not our code.
+
+
+## Floating pane windows + embedded runtime SVG (2026-07-19)
+
+- `Pane` now has optional normalized `FloatingPane` geometry (`x/y/width/height/z_index`). Preset grids remain the initial layout; pressing the dedicated `⠿` title-bar handle promotes all panes to floating windows and moves only the selected pane.
+- Floating movement uses separate document capture-phase globals (`__rusterm_pane_move_pos`, `__rusterm_pane_move_done`, `_rusterm_pane_move_remove`) plus a never-ending 16ms Dioxus polling future. The session title retains the existing tab/session drag gesture, so window movement and session swapping/cloning do not conflict.
+- Floating panes clamp inside the terminal container, preserve proportional geometry across app resizes, keep `active_session` unchanged, and use z-aware hit testing for overlaps. Grid splitters are hidden in floating mode; cycling a preset restores a grid.
+- Self-drop 1→2→4→8 preserves existing floating geometries and opens real cloned SSH/shell sessions in new panes.
+- `rusterm-app/build.rs` now copies the source SVG to `OUT_DIR/assets/gemini-svg.svg` in addition to rasterizing `icon.png`. Both are embedded with `include_bytes!`; the WebView receives the original SVG as a base64 `data:image/svg+xml` favicon, so packaged/debug builds never depend on runtime working-directory asset paths.
+
+## macOS application icon fix (2026-07-19)
+
+- Root cause of the generic `exec` Dock icon: Tao 0.34's macOS `set_window_icon` is intentionally a no-op; Dioxus `Config::with_icon` cannot set `NSApplication`'s Dock icon.
+- `rusterm-app` now uses `objc2-app-kit` in `Config::with_on_window` to decode the embedded PNG into `NSImage` and call `NSApplication::setApplicationIconImage`, so `cargo run` and bare debug binaries receive the correct Dock icon.
+- `build.rs` renders `assets/gemini-svg.svg` into the embedded 512px PNG, copies the original SVG for the WebView data URL, and generates a complete macOS `AppIcon.icns` iconset (16px through 1024px) via `iconutil`.
+- `assets/AppIcon.icns` is the checked-in Dioxus bundle icon. `crates/rusterm-app/Dioxus.toml` declares `com.rusterm.app`, the ICNS icon, `../../assets` as the asset directory, and macOS metadata.
+- `scripts/bundle-macos.sh` creates and ad-hoc signs `dist/RusTerm.app`; it includes `Contents/Resources/AppIcon.icns`, the source SVG at `Contents/Resources/assets/gemini-svg.svg`, and an `Info.plist` with `CFBundleIconFile=AppIcon.icns`.
+- `scripts/verify-macos-bundle.sh` is the deterministic regression loop for bundle structure, plist metadata, ICNS format, SVG byte equality, executable permissions, and signature. `scripts/update-macos-icon.sh` refreshes the checked-in ICNS after SVG changes.

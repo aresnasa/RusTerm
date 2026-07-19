@@ -28,9 +28,10 @@ use crate::components::connection_dialog::NewConnectionForm;
 use crate::layout::PaneLayout;
 use crate::state::{
     AppState, Modal, OneKeyMatch, OneKeyPopupState, PendingDangerousCommand, SessionTab,
-    TabDropOutcome, TerminalEntry, UnlockState, cycle_layout_preset, execute_tab_drop_on_pane,
-    move_session_to_leftmost, resize_layout_col, resize_layout_row, set_pane_session_for_active,
-    toggle_comparison_mode, toggle_pane_zoom,
+    TabDropOutcome, TerminalEntry, UnlockState, begin_floating_pane_move, cycle_layout_preset,
+    execute_tab_drop_on_pane, move_floating_pane_for_active, move_session_to_leftmost,
+    resize_layout_col, resize_layout_row, set_pane_session_for_active, toggle_comparison_mode,
+    toggle_pane_zoom,
 };
 
 fn save_config(state: &Signal<AppState>) {
@@ -943,6 +944,25 @@ fn single_pane_with_drop(
                         &drop_session_id,
                     );
                     match outcome {
+                        TabDropOutcome::SelfDropExpanded {
+                            first_pane_idx,
+                            pane_count,
+                        } => {
+                            let opened = open_cloned_sessions_for_self_drop(
+                                state,
+                                input_senders,
+                                &dragged_sid,
+                                first_pane_idx,
+                                pane_count,
+                            );
+                            tracing::info!(
+                                "[DROP-SINGLE] self-drop expanded layout: source={} panes={} opened={}",
+                                &dragged_sid[..dragged_sid.len().min(8)],
+                                pane_count,
+                                opened
+                            );
+                            restore_focus_to_active_session(state, 80);
+                        }
                         TabDropOutcome::SplitCreated { pane_idx }
                         | TabDropOutcome::SplitFilledExisting { pane_idx } => {
                             tracing::info!(
@@ -1078,6 +1098,141 @@ pub(crate) struct SplitDragState {
     /// widths), `false` for a row splitter (horizontal bar, drag adjusts
     /// row heights).
     pub(crate) is_col: bool,
+}
+
+/// Active freeform pane-window move. Coordinates are viewport-relative; the
+/// container dimensions are captured at drag start for normalized movement.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(crate) struct PaneMoveState {
+    pub(crate) pane_idx: usize,
+    pub(crate) last_x: f64,
+    pub(crate) last_y: f64,
+    pub(crate) container_w: f64,
+    pub(crate) container_h: f64,
+}
+
+pub(crate) fn build_install_pane_move_script(initial_x: f64, initial_y: f64) -> String {
+    format!(
+        "(function() {{\n\
+            window.__rusterm_pane_move_pos = '{x},{y}';\n\
+            window.__rusterm_pane_move_done = false;\n\
+            if (window._rusterm_pane_move_remove) {{ window._rusterm_pane_move_remove(); }}\n\
+            document.body.style.webkitUserSelect = 'none';\n\
+            document.body.style.userSelect = 'none';\n\
+            if (window.getSelection) {{ window.getSelection().removeAllRanges(); }}\n\
+            var moveHandler = function(e) {{\n\
+                window.__rusterm_pane_move_pos = e.clientX + ',' + e.clientY;\n\
+                e.preventDefault();\n\
+            }};\n\
+            var upHandler = function(e) {{\n\
+                window.__rusterm_pane_move_pos = e.clientX + ',' + e.clientY;\n\
+                window.__rusterm_pane_move_done = true;\n\
+                e.preventDefault();\n\
+                if (window._rusterm_pane_move_remove) {{ window._rusterm_pane_move_remove(); window._rusterm_pane_move_remove = null; }}\n\
+            }};\n\
+            document.addEventListener('mousemove', moveHandler, true);\n\
+            document.addEventListener('mouseup', upHandler, true);\n\
+            window._rusterm_pane_move_remove = function() {{\n\
+                document.removeEventListener('mousemove', moveHandler, true);\n\
+                document.removeEventListener('mouseup', upHandler, true);\n\
+                document.body.style.webkitUserSelect = '';\n\
+                document.body.style.userSelect = '';\n\
+            }};\n\
+        }})()",
+        x = initial_x,
+        y = initial_y,
+    )
+}
+
+fn install_pane_move_js_listeners(initial_x: f64, initial_y: f64) {
+    let script = build_install_pane_move_script(initial_x, initial_y);
+    spawn(async move {
+        let _ = dioxus::document::eval(&script).await;
+    });
+}
+
+pub(crate) fn parse_pane_move_poll_response(s: &str) -> Option<(f64, f64, bool)> {
+    parse_split_drag_poll_response(s)
+}
+
+async fn poll_pane_move_state() -> Option<(f64, f64, bool)> {
+    let result = dioxus::document::eval(
+        "return (function() {\n\
+            var pos = window.__rusterm_pane_move_pos || '';\n\
+            if (!pos) return '';\n\
+            var done = window.__rusterm_pane_move_done ? '1' : '0';\n\
+            return pos + ',' + done;\n\
+        })()",
+    )
+    .await
+    .ok()?;
+    parse_pane_move_poll_response(result.as_str()?)
+}
+
+fn start_pane_move(
+    mut state: Signal<AppState>,
+    mut pane_move: Signal<Option<PaneMoveState>>,
+    pane_idx: usize,
+    start_x: f64,
+    start_y: f64,
+    container_w: f64,
+    container_h: f64,
+) {
+    if !begin_floating_pane_move(&mut state.write(), pane_idx) {
+        return;
+    }
+    pane_move.set(Some(PaneMoveState {
+        pane_idx,
+        last_x: start_x,
+        last_y: start_y,
+        container_w,
+        container_h,
+    }));
+    install_pane_move_js_listeners(start_x, start_y);
+}
+
+fn apply_pane_move_step(
+    mut state: Signal<AppState>,
+    mut pane_move: Signal<Option<PaneMoveState>>,
+    x: f64,
+    y: f64,
+) {
+    let Some(drag) = pane_move() else {
+        return;
+    };
+    if x == drag.last_x && y == drag.last_y {
+        return;
+    }
+    if move_floating_pane_for_active(
+        &mut state.write(),
+        drag.pane_idx,
+        x - drag.last_x,
+        y - drag.last_y,
+        drag.container_w,
+        drag.container_h,
+    ) {
+        pane_move.set(Some(PaneMoveState {
+            last_x: x,
+            last_y: y,
+            ..drag
+        }));
+    }
+}
+
+fn end_pane_move(state: Signal<AppState>, mut pane_move: Signal<Option<PaneMoveState>>) {
+    pane_move.set(None);
+    spawn(async move {
+        let _ = dioxus::document::eval(
+            "(function() {\n\
+                if (window._rusterm_pane_move_remove) { window._rusterm_pane_move_remove(); window._rusterm_pane_move_remove = null; }\n\
+                window.__rusterm_pane_move_pos = '';\n\
+                window.__rusterm_pane_move_done = false;\n\
+                document.body.style.webkitUserSelect = '';\n\
+                document.body.style.userSelect = '';\n\
+            })()",
+        ).await;
+    });
+    restore_focus_to_active_session(state, 20);
 }
 
 /// Apply one mousemove step of a splitter drag.
@@ -1620,14 +1775,15 @@ pub(crate) fn hit_test_pane_at(
     if rel_x < 0.0 || rel_y < 0.0 || rel_x > container_w || rel_y > container_h {
         return None;
     }
-    // Iterate visible panes. `visible_panes` returns container-relative
-    // rects (x, y, w, h) — same coordinate space as `rel_x`/`rel_y`.
-    for (idx, pane, (px, py, pw, ph)) in layout.visible_panes(container_w, container_h) {
-        if rel_x >= px && rel_x < px + pw && rel_y >= py && rel_y < py + ph {
-            return Some((idx, pane.session_id.clone()));
-        }
-    }
-    None
+    // Overlapping floating windows require z-aware hit testing. Grid layouts
+    // have deterministic index-based z values, preserving the old behavior.
+    layout
+        .visible_panes(container_w, container_h)
+        .filter(|(_, _, (px, py, pw, ph))| {
+            rel_x >= *px && rel_x < *px + *pw && rel_y >= *py && rel_y < *py + *ph
+        })
+        .max_by_key(|(idx, _, _)| layout.pane_z_index(*idx).unwrap_or(0))
+        .map(|(idx, pane, _)| (idx, pane.session_id.clone()))
 }
 
 /// Start a tab drag: set the `tab_drag` signal (with `dragging: false` —
@@ -1659,6 +1815,53 @@ pub(crate) fn start_tab_drag(
     install_tab_drag_js_listeners(start_x, start_y);
 }
 
+/// Open independent copies of `source_session_id` in every pane created by
+/// a self-drop expansion. Layout mutation happens first in the state layer;
+/// this runtime layer owns terminal creation, session registration, and
+/// spawning the SSH/shell task through the existing `open_connection` path.
+fn open_cloned_sessions_for_self_drop(
+    state: Signal<AppState>,
+    input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    source_session_id: &str,
+    first_pane_idx: usize,
+    pane_count: usize,
+) -> usize {
+    let conn = state.read().session_configs.get(source_session_id).cloned();
+    let Some(conn) = conn else {
+        tracing::warn!(
+            "[SPLIT-CLONE] source={} has no stored connection config; {} pane(s) remain empty",
+            &source_session_id[..source_session_id.len().min(8)],
+            pane_count
+        );
+        return 0;
+    };
+
+    if !matches!(
+        &conn.kind,
+        ConnectionKind::Ssh(_) | ConnectionKind::Shell(_)
+    ) {
+        tracing::warn!(
+            "[SPLIT-CLONE] source={} connection type is not supported for automatic cloning; {} pane(s) remain empty",
+            &source_session_id[..source_session_id.len().min(8)],
+            pane_count
+        );
+        return 0;
+    }
+
+    for pane_idx in first_pane_idx..first_pane_idx.saturating_add(pane_count) {
+        let new_session_id = open_connection(state, input_senders, conn.clone(), Some(pane_idx));
+        tracing::info!(
+            "[SPLIT-CLONE] source={} target_pane={} new_session={} connection={}",
+            &source_session_id[..source_session_id.len().min(8)],
+            pane_idx,
+            &new_session_id[..new_session_id.len().min(8)],
+            conn.name
+        );
+    }
+
+    pane_count
+}
+
 /// Finish a tab drag: do the final hit-test at the release position,
 /// call `execute_tab_drop_on_pane` (the single source of truth for drop
 /// dispatch), log the outcome, and restore focus if a new pane was
@@ -1677,6 +1880,7 @@ pub(crate) fn start_tab_drag(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn finish_tab_drag(
     mut state: Signal<AppState>,
+    input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
     mut tab_drag: Signal<Option<TabDragState>>,
     mut drag_over_pane: Signal<Option<usize>>,
     container_size: Signal<Option<(f64, f64)>>,
@@ -1743,6 +1947,25 @@ pub(crate) fn finish_tab_drag(
             &target_session,
         );
         match outcome {
+            TabDropOutcome::SelfDropExpanded {
+                first_pane_idx,
+                pane_count,
+            } => {
+                let opened = open_cloned_sessions_for_self_drop(
+                    state,
+                    input_senders,
+                    &dragged_sid,
+                    first_pane_idx,
+                    pane_count,
+                );
+                tracing::info!(
+                    "[TAB-DRAG] self-drop expanded layout: source={} panes={} opened={}",
+                    &dragged_sid[..dragged_sid.len().min(8)],
+                    pane_count,
+                    opened
+                );
+                restore_focus_to_active_session(state, 80);
+            }
             TabDropOutcome::SplitCreated { pane_idx }
             | TabDropOutcome::SplitFilledExisting { pane_idx } => {
                 tracing::info!(
@@ -1839,6 +2062,7 @@ pub(crate) fn finish_tab_drag(
 /// file and captures `state`/`input_senders` signals — moving it to a
 /// separate component module would create a circular dependency. Keeping
 /// `MultiPaneContainer` here lets it call `render_terminal_pane` directly.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn multi_pane_container(
     mut state: Signal<AppState>,
     input_senders: Signal<std::collections::HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
@@ -1847,6 +2071,7 @@ fn multi_pane_container(
     container_size: Signal<Option<(f64, f64)>>,
     split_drag: Signal<Option<SplitDragState>>,
     tab_drag: Signal<Option<TabDragState>>,
+    pane_move: Signal<Option<PaneMoveState>>,
 ) -> Element {
     // Container dimensions measured from the live DOM via a ResizeObserver
     // + polling loop (see `App`). Falls back to a 1200×800 default if the
@@ -1866,6 +2091,7 @@ fn multi_pane_container(
         .collect();
 
     let comparison_on = layout.comparison;
+    let layout_floating = layout.is_floating();
 
     // Pre-collect the (pane_idx, session_id, rect, drop_session_id,
     // border_style, pane_title) tuples as owned values. The move closures inside each
@@ -1875,8 +2101,8 @@ fn multi_pane_container(
     // drag-over-derived border style) here and destructure them in the for
     // pattern.
     //
-    // We use a 6-tuple: `idx` is `usize` (Copy), so the ondrop closure can
-    // capture it directly without a redundant clone. `session_id` is
+    // The tuple also carries stacking/chrome values for floating windows.
+    // `idx` is `usize` (Copy), so closures capture it without a clone. `session_id` is
     // consumed by the `key:` interpolation and `render_terminal_pane`, so a
     // second owned copy (`drop_session_id`) is needed for the move closure.
     // `border_style` is a `&'static str` (Copy) computed by reading
@@ -1886,8 +2112,8 @@ fn multi_pane_container(
     // `pane_title` is the session's display name, shown in the pane's
     // drag-handle title bar.
     //
-    // Each pane in the layout is BOTH a drag source (via the title bar's
-    // `draggable: true` + `ondragstart`) and a drop target: the user can
+    // Each pane is both a manual session-drag source (via its title text)
+    // and an HTML5 drop target: the user can
     // drag an open session from the tab bar OR from another pane's title
     // bar onto a pane (moves or swaps the session into that pane), or drag
     // a sidebar connection onto a pane (opens a new session in that pane).
@@ -1903,14 +2129,24 @@ fn multi_pane_container(
         &'static str,
         String,
         String,
+        u32,
+        &'static str,
     )> = visible
         .into_iter()
         .map(|(idx, sid, rect)| {
             let border = if drag_over_pane() == Some(idx) {
                 "border: 2px solid #7aa2f7; box-sizing: border-box;"
+            } else if layout_floating {
+                "border: 1px solid #414868; box-sizing: border-box;"
             } else {
                 "border: 2px solid transparent; box-sizing: border-box;"
             };
+            let window_chrome = if layout_floating {
+                "border-radius: 6px; box-shadow: 0 8px 24px rgba(0,0,0,0.45);"
+            } else {
+                ""
+            };
+            let z_index = layout.pane_z_index(idx).unwrap_or(1);
             // Look up the session's display name for the pane title bar.
             // An EMPTY session_id is an empty drop-zone pane (created by
             // the free-split gesture) — label it explicitly. Otherwise
@@ -1933,7 +2169,17 @@ fn multi_pane_container(
             // `key:` interpolation and `render_terminal_pane`). rsx!
             // can't hold `let` bindings in the for body, so we pre-clone.
             let drag_sid = sid.clone();
-            (idx, sid.clone(), rect, sid, border, title, drag_sid)
+            (
+                idx,
+                sid.clone(),
+                rect,
+                sid,
+                border,
+                title,
+                drag_sid,
+                z_index,
+                window_chrome,
+            )
         })
         .collect();
 
@@ -2019,11 +2265,11 @@ fn multi_pane_container(
             // highlight only changes when the dragged pane actually changes.
             // This aligns with the user's frequency-vs-feedback
             // preference: fewer re-renders over per-tick feedback.
-            for (idx, session_id, (x, y, w, h), drop_session_id, border_style, pane_title, drag_sid) in pane_items.into_iter() {
+            for (idx, session_id, (x, y, w, h), drop_session_id, border_style, pane_title, drag_sid, z_index, window_chrome) in pane_items.into_iter() {
                 div {
                     key: "pane-{idx}-{session_id}",
                     style: format!(
-                        "position: absolute; left: {x}px; top: {y}px; width: {w}px; height: {h}px; overflow: hidden; display: flex; flex-direction: column; {border}",
+                        "position: absolute; left: {x}px; top: {y}px; width: {w}px; height: {h}px; overflow: hidden; display: flex; flex-direction: column; z-index: {z_index}; {border} {window_chrome}",
                         x = x, y = y, w = w, h = h, border = border_style
                     ),
                     // `ondragover` must call prevent_default to signal
@@ -2086,6 +2332,25 @@ fn multi_pane_container(
                                 &drop_session_id,
                             );
                             match outcome {
+                                TabDropOutcome::SelfDropExpanded {
+                                    first_pane_idx,
+                                    pane_count,
+                                } => {
+                                    let opened = open_cloned_sessions_for_self_drop(
+                                        state,
+                                        input_senders,
+                                        &dragged_sid,
+                                        first_pane_idx,
+                                        pane_count,
+                                    );
+                                    tracing::info!(
+                                        "[DROP] self-drop expanded layout: source={} panes={} opened={}",
+                                        &dragged_sid[..dragged_sid.len().min(8)],
+                                        pane_count,
+                                        opened
+                                    );
+                                    restore_focus_to_active_session(state, 80);
+                                }
                                 TabDropOutcome::SplitCreated { pane_idx }
                                 | TabDropOutcome::SplitFilledExisting { pane_idx } => {
                                     tracing::info!(
@@ -2272,7 +2537,31 @@ fn multi_pane_container(
                                 );
                             }
                         },
-                        "{pane_title}"
+                        span {
+                            style: "display: inline-flex; align-items: center; justify-content: center; width: 18px; margin-left: -5px; margin-right: 5px; cursor: move; color: #7aa2f7; font-size: 13px;",
+                            title: "拖动小窗口",
+                            onmousedown: move |e: MouseEvent| {
+                                if e.trigger_button() == Some(MouseButton::Primary) {
+                                    e.prevent_default();
+                                    e.stop_propagation();
+                                    let c = e.client_coordinates();
+                                    start_pane_move(
+                                        state,
+                                        pane_move,
+                                        idx,
+                                        c.x,
+                                        c.y,
+                                        container_w,
+                                        container_h,
+                                    );
+                                }
+                            },
+                            "⠿"
+                        }
+                        span {
+                            style: "flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                            "{pane_title}"
+                        }
                     },
                     // Terminal content area: fills the remaining height
                     // below the title bar. Wrapped in a flex:1 div so the
@@ -2308,10 +2597,12 @@ fn multi_pane_container(
                 }
             }
 
-            // Vertical splitter bars between adjacent columns.
-            {render_col_splitters(&layout, container_w, state, split_drag)}
-            // Horizontal splitter bars between adjacent rows.
-            {render_row_splitters(&layout, container_h, state, split_drag)}
+            // Grid splitters are hidden after promotion to floating windows;
+            // each window then owns its position independently.
+            {(!layout_floating).then(|| rsx! {
+                {render_col_splitters(&layout, container_w, state, split_drag)}
+                {render_row_splitters(&layout, container_h, state, split_drag)}
+            })}
 
             // Drag-resize overlay: while a splitter drag is in progress,
             // render an invisible full-screen div that captures all
@@ -4524,7 +4815,7 @@ fn open_connection(
     input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
     conn: ConnectionConfig,
     target_pane_idx: Option<usize>,
-) {
+) -> String {
     let tab_id = uuid::Uuid::new_v4().to_string();
     create_terminal(tab_id.clone(), &mut state);
     // Remember the config so this session can be reconnected by pressing
@@ -4562,7 +4853,7 @@ fn open_connection(
             } else {
                 state.write().active_session = Some(tab_id.clone());
             }
-            start_ssh_connection(state, input_senders, tab_id, ssh_config.clone());
+            start_ssh_connection(state, input_senders, tab_id.clone(), ssh_config.clone());
         }
         ConnectionKind::Shell(shell_config) => {
             let msg = format!("\r\nStarting shell...\r\n");
@@ -4595,7 +4886,7 @@ fn open_connection(
             } else {
                 state.write().active_session = Some(tab_id.clone());
             }
-            start_shell_connection(state, input_senders, tab_id, shell_config.clone());
+            start_shell_connection(state, input_senders, tab_id.clone(), shell_config.clone());
         }
         _ => {
             let msg = format!("\r\nConnection type not yet supported\r\n");
@@ -4626,6 +4917,8 @@ fn open_connection(
             }
         }
     }
+
+    tab_id
 }
 
 /// Reconnect a disconnected session: tear down the dead PTY/senders, create a
@@ -4786,6 +5079,11 @@ pub fn App() -> Element {
     // fires normally.
     let mut tab_drag: Signal<Option<TabDragState>> = use_signal(|| None);
 
+    // Active freeform pane-window move. This is deliberately separate from
+    // `tab_drag`: the ⠿ handle moves the window, while the title text keeps
+    // the existing session move/swap/split gesture.
+    let pane_move: Signal<Option<PaneMoveState>> = use_signal(|| None);
+
     // Polling loop for the active splitter drag. Runs forever (the loop
     // sleeps when no drag is in progress). When `split_drag` is `Some`, polls
     // the JS global `window.__rusterm_drag_pos` (written by the document-level
@@ -4844,6 +5142,29 @@ pub fn App() -> Element {
                 }
             }
             // 16ms = ~60Hz. Fast enough for smooth dragging.
+            tokio::time::sleep(std::time::Duration::from_millis(16)).await;
+        }
+    });
+
+    // Polling loop for freeform pane-window movement. It uses its own JS
+    // globals so splitter resize and session drag state cannot interfere.
+    let _pane_move_poll = use_future(move || async move {
+        loop {
+            if pane_move().is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(32)).await;
+                continue;
+            }
+            match poll_pane_move_state().await {
+                Some((x, y, done)) => {
+                    apply_pane_move_step(state, pane_move, x, y);
+                    if done {
+                        tracing::info!("[PANE-MOVE] finished at x={x:.1} y={y:.1}");
+                        end_pane_move(state, pane_move);
+                        continue;
+                    }
+                }
+                None => tracing::debug!("[PANE-MOVE] poll returned no position; retrying"),
+            }
             tokio::time::sleep(std::time::Duration::from_millis(16)).await;
         }
     });
@@ -4911,6 +5232,7 @@ pub fn App() -> Element {
                             );
                             finish_tab_drag(
                                 state,
+                                input_senders,
                                 tab_drag,
                                 drag_over_pane,
                                 container_size,
@@ -5622,7 +5944,7 @@ pub fn App() -> Element {
                             // between panes to support drag-resize.
                             let layout = layout_snapshot.expect("is_multi implies layout exists");
                             rsx! {
-                                {multi_pane_container(state, input_senders, layout, drag_over_pane, container_size, split_drag, tab_drag)}
+                                {multi_pane_container(state, input_senders, layout, drag_over_pane, container_size, split_drag, tab_drag, pane_move)}
                             }
                         }
                     }}
@@ -6560,6 +6882,45 @@ mod prompt_tests {
     }
 }
 
+#[cfg(test)]
+mod pane_move_tests {
+    use super::{build_install_pane_move_script, parse_pane_move_poll_response};
+
+    #[test]
+    fn pane_move_script_uses_dedicated_capture_phase_globals() {
+        let script = build_install_pane_move_script(12.5, 34.0);
+        assert!(script.contains("window.__rusterm_pane_move_pos = '12.5,34'"));
+        assert!(script.contains("window.__rusterm_pane_move_done = false"));
+        assert!(script.contains("window._rusterm_pane_move_remove"));
+        assert!(script.contains("document.addEventListener('mousemove', moveHandler, true)"));
+        assert!(!script.contains("__rusterm_tab_drag_pos"));
+        assert!(!script.contains("__rusterm_drag_pos"));
+    }
+
+    #[test]
+    fn pane_move_script_records_release_and_restores_selection() {
+        let script = build_install_pane_move_script(1.0, 2.0);
+        assert!(script.contains("window.__rusterm_pane_move_pos = e.clientX + ',' + e.clientY"));
+        assert!(script.contains("window.__rusterm_pane_move_done = true"));
+        assert!(script.contains("document.body.style.webkitUserSelect = 'none'"));
+        assert!(script.contains("document.body.style.webkitUserSelect = ''"));
+    }
+
+    #[test]
+    fn pane_move_poll_parser_accepts_valid_response() {
+        assert_eq!(
+            parse_pane_move_poll_response("120.5,-8,1"),
+            Some((120.5, -8.0, true))
+        );
+    }
+
+    #[test]
+    fn pane_move_poll_parser_rejects_malformed_response() {
+        assert_eq!(parse_pane_move_poll_response("120,8"), None);
+        assert_eq!(parse_pane_move_poll_response("x,8,0"), None);
+    }
+}
+
 /// Tests for the splitter drag-resize signal flow.
 ///
 /// These tests cover the pure computation extracted into
@@ -7481,5 +7842,24 @@ mod tab_drag_tests {
         // The container's right edge (x=1200) is exclusive (rel_x > cw).
         let hit = hit_test_pane_at(1280.0, 400.0, 80.0, 60.0, 1200.0, 800.0, &layout);
         assert_eq!(hit, None);
+    }
+
+    #[test]
+    fn hit_test_overlapping_floating_windows_returns_frontmost_pane() {
+        let mut layout = PaneLayout::from_preset(
+            LayoutPreset::Split2H,
+            &["back".to_string(), "front".to_string()],
+        );
+        assert!(layout.enable_floating());
+        layout.panes[0].floating.as_mut().unwrap().x_frac = 0.2;
+        layout.panes[1].floating.as_mut().unwrap().x_frac = 0.2;
+        layout.panes[0].floating.as_mut().unwrap().y_frac = 0.2;
+        layout.panes[1].floating.as_mut().unwrap().y_frac = 0.2;
+        assert!(layout.bring_floating_pane_to_front(1));
+
+        assert_eq!(
+            hit_test_pane_at(300.0, 240.0, 0.0, 0.0, 1000.0, 800.0, &layout),
+            Some((1, "front".to_string()))
+        );
     }
 }
