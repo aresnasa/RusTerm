@@ -315,6 +315,45 @@ The `drag_over_pane` signal is shared between `single_pane_with_drop` and `multi
 - No re-entrant signal writes: `tab_drag.read()` borrow is dropped before `state.write()` in `finish_tab_drag`.
 - The poll `use_future` only executes a drop if `dragging == true` (preserves plain click-to-select).
 
+## Task 22 runtime bug: active-tab self-drop silently no-oped (FIXED 2026-07-19)
+
+**Symptom**: user dragged a tab into the terminal area — nothing happened, despite the whole manual mouse-drag chain working (422 tests passing).
+
+**Diagnosis via file logs** (`~/Library/Application Support/rusterm/logs/rusterm.log.*`, JSON lines, target `rusterm_ui::app`): 9 × `[TAB-DRAG] done flag detected ... finishing drag` entries proved mousedown → JS listeners → poll → `finish_tab_drag` all worked at runtime. But ZERO outcome logs (`created split`/`swapped`/`drop failed` are info/warn) followed — every drop fell into a then-debug-level silent branch. 4 release points were dead-center in the terminal area → hit-test must have hit pane 0 → the only possible branch was `NoOpSelfDrop`: **the user drags the ACTIVE tab (the natural gesture), the single-pane hit-test resolves to pane 0 which holds the active session itself → self-drop → silent no-op**.
+
+**Initial fix** (`state.rs::execute_tab_drop_on_pane` case 1): self-drop with NO layout for the active session applied `Split2H` and returned `SplitCreated { pane_idx: 1 }` (pane 0 keeps active session; pane 1 auto-fills next background tab via `apply_layout_preset`'s fill order, or stays empty `""`). Multi-pane self-drop was still `NoOpSelfDrop`.
+
+**Extended fix (2026-07-19, "自由分裂")**: self-drop in a MULTI-PANE layout now also grows the grid to the next larger preset (Split2H/Split2V → Grid4, Grid4 → Grid8), PRESERVING the existing pane arrangement (unlike `apply_layout_preset`, which re-fills all panes in tab order and would blow away manual rearrangements). Implementation: seed `PaneLayout::from_preset(next, &ids)` with the current panes' session ids in order (from_preset pads new slots with `""`), copy `comparison` flag, then auto-fill the new empty slots with background tabs not already placed (in tab order). Repeated drags thus freely create more sub-panes: 1→2→4→8. At Grid8 (8 panes) the self-drop is `NoOpSelfDrop` (max). `pane_idx` returned is the index of the first newly-created slot (for logging/focus). Layout preset inferred from pane count (NOT global `state.layout_preset` — layouts are per-tab). Existing test `execute_tab_drop_self_drop_is_noop` replaced with `execute_tab_drop_self_drop_multi_pane_grows_grid` (asserts growth + preservation). Added `execute_tab_drop_self_drop_growth_fills_new_slots_with_background_tabs` and `execute_tab_drop_repeated_self_drops_grow_until_grid8_then_noop`.
+
+**Empty-pane placeholder**: empty-session panes (drop-zones) now render a VISIBLE dashed-border placeholder ("拖拽标签页或侧栏连接到此处") instead of nothing. Title bar shows "空白窗格". Empty panes' title bar `onmousedown` won't start a tab drag (guard `!drag_sid.is_empty()`).
+
+**Log level change**: `finish_tab_drag`'s two silent branches (`self-drop no-op`, `release outside any pane`) upgraded from `tracing::debug!` to `tracing::info!` so future runtime diagnosis works at the default filter.
+
+**Tests**: workspace total = 427 (was 424). +1 net for the self-drop growth tests (replaced 1, added 3) and +1 for `tab_drag_install_script_suppresses_text_selection_and_restores_it`.
+
+## Drag-time text selection fix (2026-07-19)
+
+**Symptom**: "拖拽时文本被错误选中" — during a tab drag, page text (terminal content + tab labels) got blue-highlighted. moveHandler's `e.preventDefault()` is insufficient in WebKit because selection started on the mousedown (before moveHandler runs).
+
+**Fix (3 layers)**:
+1. **Static CSS** `user-select: none; -webkit-user-select: none;` on tab divs (tab_bar.rs) and pane title bars (multi_pane_container).
+2. **`e.prevent_default()` on tab/pane-title `onmousedown`** (primary button only) — blocks the native text-selection drag at the source. Safe for `onclick` (click still fires after a prevented mousedown per the HTML spec; splitter already uses this pattern).
+3. **JS-side body-level suppression** in `build_install_tab_drag_script`: on install set `document.body.style.webkitUserSelect = 'none'` (+ `userSelect`) and `window.getSelection().removeAllRanges()`; restore (`= ''`) and clear selection in the `_rusterm_tab_drag_remove` function AND in both Rust-side cleanup evals (finish_tab_drag's end-cleanup + _tab_drag_poll's click-cleanup). Defensive: redundant restores are idempotent.
+
+**Tests**: +1 `tab_drag_install_script_suppresses_text_selection_and_restores_it` (asserts both `webkitUserSelect = 'none'` set on install and `= ''` restored in remove fn).
+
+## Container-size measurement fix (2026-07-19, "窗口无法被填满")
+
+**Symptom**: panes didn't fill the window — both panes ended ~100-250px above the window bottom, full-width blank strip below. `container_size` was `None` → fallback `(1200, 800)` → panes sized 800 tall in a ~1060 tall container → bottom gap.
+
+**Root cause**: the ResizeObserver install ran ONCE at startup in `_container_measure` `use_future`, BEFORE `#terminal-content` existed (unlock screen / no session). The `if (!el || el._rusterm_ro) return;` guard silently bailed → observer never installed → `_rusterm_container_resize_pending` never set → poll returned `''` forever → `container_size` stuck at `None`.
+
+**Fix**: moved observer install INTO the per-tick poll script. Each 100ms tick: get `#terminal-content`; if missing return `''`; if no `_rusterm_ro` yet, install ResizeObserver + force `_rusterm_container_resize_pending = true` for an immediate measure; then if the flag is set, clear it and return `getBoundingClientRect` dimensions. The `el._rusterm_ro` guard still prevents re-install on the SAME element instance; a remounted element (fresh DOM instance, no `_rusterm_ro`) gets a fresh observer + forced measure. 100ms tick rate keeps the retry cheap.
+
+## Diagnosis tips (macOS)**:
+- Logs go to daily-rotating JSON files under `~/Library/Application Support/rusterm/logs/` (`rusterm-core::logging::init_logging`); default `EnvFilter` directive `rusterm=info` — launch with `RUST_LOG=rusterm_ui=debug` to see debug lines.
+- Browser MCP can't attach to WKWebView; CGEvent mouse simulation needs Accessibility trust (`AXIsProcessTrusted()` was false for the agent terminal) — file-log forensics is the practical runtime-diagnosis channel.
+
 ## Known Issues / Future Work
 
 - DuckDB `bundled` build is slow (~2min cold). Consider pre-built libduckdb for CI.

@@ -102,6 +102,8 @@ pub fn TabBar(
                                 white-space: nowrap;
                                 gap: 6px;
                                 position: relative;
+                                user-select: none;
+                                -webkit-user-select: none;
                             ",
                             onclick: move |_| {
                                 on_select.call(tab.id.clone());
@@ -113,6 +115,15 @@ pub fn TabBar(
                                 // right-click context menu) and shouldn't
                                 // initiate a drag.
                                 if e.trigger_button() == Some(MouseButton::Primary) {
+                                    // Prevent the browser from starting a
+                                    // native text-selection drag on this
+                                    // mousedown (the root cause of "page
+                                    // text gets blue-highlighted while
+                                    // dragging a tab"). preventDefault on
+                                    // mousedown does NOT cancel the
+                                    // subsequent click event, so
+                                    // click-to-select still works.
+                                    e.prevent_default();
                                     let c = e.client_coordinates();
                                     on_drag_start.call((
                                         tab_id_for_drag.clone(),

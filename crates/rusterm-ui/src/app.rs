@@ -1490,6 +1490,14 @@ pub(crate) fn build_install_tab_drag_script(initial_x: f64, initial_y: f64) -> S
             var r = el ? el.getBoundingClientRect() : {{ left: 0, top: 0 }};\n\
             window.__rusterm_tab_drag_container_left = r.left;\n\
             window.__rusterm_tab_drag_container_top = r.top;\n\
+            // Suppress text selection for the whole document during the\n\
+            // drag. moveHandler's preventDefault alone does NOT stop\n\
+            // WebKit from extending a selection that started on the\n\
+            // mousedown — disabling user-select on <body> does. The\n\
+            // remove function restores it.\n\
+            document.body.style.webkitUserSelect = 'none';\n\
+            document.body.style.userSelect = 'none';\n\
+            if (window.getSelection) {{ window.getSelection().removeAllRanges(); }}\n\
             var moveHandler = function(e) {{\n\
                 window.__rusterm_tab_drag_pos = e.clientX + ',' + e.clientY;\n\
                 e.preventDefault();\n\
@@ -1510,6 +1518,9 @@ pub(crate) fn build_install_tab_drag_script(initial_x: f64, initial_y: f64) -> S
             window._rusterm_tab_drag_remove = function() {{\n\
                 document.removeEventListener('mousemove', moveHandler, true);\n\
                 document.removeEventListener('mouseup', upHandler, true);\n\
+                document.body.style.webkitUserSelect = '';\n\
+                document.body.style.userSelect = '';\n\
+                if (window.getSelection) {{ window.getSelection().removeAllRanges(); }}\n\
             }};\n\
         }})()",
         x = initial_x,
@@ -1757,7 +1768,7 @@ pub(crate) fn finish_tab_drag(
                 );
             }
             TabDropOutcome::NoOpSelfDrop => {
-                tracing::debug!(
+                tracing::info!(
                     "[TAB-DRAG] self-drop no-op (session {})",
                     &dragged_sid[..dragged_sid.len().min(8)]
                 );
@@ -1773,7 +1784,7 @@ pub(crate) fn finish_tab_drag(
             }
         }
     } else {
-        tracing::debug!(
+        tracing::info!(
             "[TAB-DRAG] release outside any pane — no-op (session {})",
             &dragged_sid[..dragged_sid.len().min(8)]
         );
@@ -1791,6 +1802,8 @@ pub(crate) fn finish_tab_drag(
                 window.__rusterm_tab_drag_done = false;\n\
                 window.__rusterm_tab_drag_container_left = 0;\n\
                 window.__rusterm_tab_drag_container_top = 0;\n\
+                document.body.style.webkitUserSelect = '';\n\
+                document.body.style.userSelect = '';\n\
             })()",
         ).await;
     });
@@ -1899,16 +1912,21 @@ fn multi_pane_container(
                 "border: 2px solid transparent; box-sizing: border-box;"
             };
             // Look up the session's display name for the pane title bar.
-            // Falls back to the session id if the session was closed
-            // between the layout snapshot and this render (the renderer
-            // treats an empty session_id as "no pane here").
-            let title = state
-                .read()
-                .sessions
-                .iter()
-                .find(|t| t.id == sid)
-                .map(|t| t.name.clone())
-                .unwrap_or_else(|| sid.clone());
+            // An EMPTY session_id is an empty drop-zone pane (created by
+            // the free-split gesture) — label it explicitly. Otherwise
+            // fall back to the session id if the session was closed
+            // between the layout snapshot and this render.
+            let title = if sid.is_empty() {
+                "空白窗格".to_string()
+            } else {
+                state
+                    .read()
+                    .sessions
+                    .iter()
+                    .find(|t| t.id == sid)
+                    .map(|t| t.name.clone())
+                    .unwrap_or_else(|| sid.clone())
+            };
             // `drag_sid` is a second clone for the ondragstart closure
             // (the first clone `drop_session_id` is consumed by the
             // ondrop closure; the original `sid` is consumed by the
@@ -2212,6 +2230,7 @@ fn multi_pane_container(
                             color: #c0caf5;
                             cursor: grab;
                             user-select: none;
+                            -webkit-user-select: none;
                             flex-shrink: 0;
                             z-index: 10;
                         ",
@@ -2220,7 +2239,16 @@ fn multi_pane_container(
                             // Only start a drag on primary button (left
                             // click). Middle/right clicks have other
                             // semantics and shouldn't initiate a drag.
-                            if e.trigger_button() == Some(MouseButton::Primary) {
+                            // Empty drop-zone panes have no session to
+                            // drag.
+                            if e.trigger_button() == Some(MouseButton::Primary)
+                                && !drag_sid.is_empty()
+                            {
+                                // Stop the browser from starting a native
+                                // text-selection drag on this mousedown
+                                // (prevents page text getting highlighted
+                                // while dragging the pane title bar).
+                                e.prevent_default();
                                 e.stop_propagation();
                                 let c = e.client_coordinates();
                                 // Look up the session's display name for
@@ -2251,9 +2279,31 @@ fn multi_pane_container(
                     // title bar (above) stays at 18px and the terminal
                     // gets the rest. `position: relative` + `overflow:
                     // hidden` matches the single-pane path's container.
+                    //
+                    // An EMPTY session_id means this pane is a drop-zone
+                    // placeholder (created by the free-split gesture
+                    // before a session was assigned). Render a visible
+                    // hint instead of nothing — an invisible dead region
+                    // looked like "the window can't be filled".
                     div {
                         style: "flex: 1; position: relative; overflow: hidden; min-height: 0;",
-                        {render_terminal_pane(state, input_senders, session_id.clone())}
+                        if session_id.is_empty() {
+                            div {
+                                style: "
+                                    position: absolute; inset: 0;
+                                    display: flex; align-items: center; justify-content: center;
+                                    background: #16161e;
+                                    border: 1px dashed #3b4261;
+                                    color: #565f89;
+                                    font-size: 12px;
+                                    user-select: none;
+                                    -webkit-user-select: none;
+                                ",
+                                "拖拽标签页或侧栏连接到此处"
+                            }
+                        } else {
+                            {render_terminal_pane(state, input_senders, session_id.clone())}
+                        }
                     }
                 }
             }
@@ -4883,6 +4933,8 @@ pub fn App() -> Element {
                                         if (window._rusterm_tab_drag_remove) { window._rusterm_tab_drag_remove(); window._rusterm_tab_drag_remove = null; }\n\
                                         window.__rusterm_tab_drag_pos = '';\n\
                                         window.__rusterm_tab_drag_done = false;\n\
+                                        document.body.style.webkitUserSelect = '';\n\
+                                        document.body.style.userSelect = '';\n\
                                     })()",
                                 ).await;
                             });
@@ -4938,24 +4990,27 @@ pub fn App() -> Element {
     // flag and, if set, re-measures via `getBoundingClientRect` and
     // updates the signal. This mirrors the TerminalView resize loop.
     let _container_measure = use_future(move || async move {
-        // Install the observer first.
-        let observer_script = "(function() { const el = document.getElementById('terminal-content'); \
-             if (!el || el._rusterm_ro) return; \
-             el._rusterm_ro = new ResizeObserver(function() { el._rusterm_container_resize_pending = true; }); \
-             el._rusterm_ro.observe(el); })()";
-        let _ = dioxus::document::eval(observer_script).await;
-        // Force an initial measurement on the first tick so we don't wait
-        // 100ms for the first ResizeObserver callback.
-        let _ = dioxus::document::eval(
-            "(function() { const el = document.getElementById('terminal-content'); \
-             if (el) el._rusterm_container_resize_pending = true; })()",
-        )
-        .await;
+        // Observer installation happens INSIDE the poll loop (not once
+        // up-front). At startup `#terminal-content` may not exist yet —
+        // e.g. the unlock screen is showing, or no session is open — and
+        // a one-shot install would silently fail, leaving the dirty flag
+        // permanently unset and `container_size` stuck at `None` (the
+        // 1200×800 fallback → panes that don't fill the window, the
+        // "窗口无法被填满" bug). The per-tick script is idempotent: the
+        // `el._rusterm_ro` guard skips re-install on the SAME element,
+        // and a remounted element (fresh instance, no `_rusterm_ro`)
+        // gets a fresh observer + an immediate forced measure.
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             let result = dioxus::document::eval(
                 "return (function() { const el = document.getElementById('terminal-content'); \
-                 if (!el || !el._rusterm_container_resize_pending) return ''; \
+                 if (!el) return ''; \
+                 if (!el._rusterm_ro) { \
+                   el._rusterm_ro = new ResizeObserver(function() { el._rusterm_container_resize_pending = true; }); \
+                   el._rusterm_ro.observe(el); \
+                   el._rusterm_container_resize_pending = true; \
+                 } \
+                 if (!el._rusterm_container_resize_pending) return ''; \
                  el._rusterm_container_resize_pending = false; \
                  const r = el.getBoundingClientRect(); \
                  if (r.width <= 0 || r.height <= 0) return ''; \
@@ -7150,6 +7205,49 @@ mod tab_drag_tests {
              remove_call_pos={}, add_listener_pos={}",
             remove_call_pos,
             add_listener_pos
+        );
+    }
+
+    /// Issue: "拖拽时文本被错误选中" — during a tab drag, page text got
+    /// blue-highlighted. The install script must suppress text selection
+    /// document-wide for the duration of the drag, and the remove
+    /// function must restore it.
+    #[test]
+    fn tab_drag_install_script_suppresses_text_selection_and_restores_it() {
+        let script = build_install_tab_drag_script(100.0, 200.0);
+        // Install must disable text selection document-wide (WebKit
+        // ignores moveHandler's preventDefault for selections started
+        // on the mousedown) and clear any existing selection.
+        assert!(
+            script.contains("document.body.style.webkitUserSelect = 'none'"),
+            "install script must disable -webkit-user-select on body; got: {}",
+            script
+        );
+        assert!(
+            script.contains("document.body.style.userSelect = 'none'"),
+            "install script must disable user-select on body; got: {}",
+            script
+        );
+        assert!(
+            script.contains("window.getSelection().removeAllRanges()"),
+            "install script must clear any existing selection; got: {}",
+            script
+        );
+        // The remove function must RESTORE user-select (empty string =
+        // revert to stylesheet value).
+        let remove_fn_start = script
+            .find("window._rusterm_tab_drag_remove = function() {")
+            .unwrap();
+        let remove_fn_region = &script[remove_fn_start..];
+        assert!(
+            remove_fn_region.contains("document.body.style.webkitUserSelect = ''"),
+            "remove function must restore -webkit-user-select; got: {}",
+            script
+        );
+        assert!(
+            remove_fn_region.contains("document.body.style.userSelect = ''"),
+            "remove function must restore user-select; got: {}",
+            script
         );
     }
 
