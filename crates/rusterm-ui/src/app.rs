@@ -16,17 +16,20 @@ use rusterm_core::terminal::{Terminal, TerminalSize};
 
 use crate::components::AiPanel;
 use crate::components::ConnectionDialog;
+use crate::components::DangerousCommandDialog;
 use crate::components::MasterPasswordDialog;
 use crate::components::OneKeyManager;
+use crate::components::RestoreSessionDialog;
 use crate::components::Sidebar;
 use crate::components::TabBar;
 use crate::components::TerminalView;
 use crate::components::connection_dialog::NewConnectionForm;
 use crate::layout::PaneLayout;
 use crate::state::{
-    AppState, Modal, OneKeyMatch, OneKeyPopupState, SessionTab, TerminalEntry, UnlockState,
-    cycle_layout_preset, move_session_to_leftmost, resize_layout_col, resize_layout_row,
-    toggle_comparison_mode, toggle_pane_zoom,
+    AppState, Modal, OneKeyMatch, OneKeyPopupState, PendingDangerousCommand, SessionTab,
+    TerminalEntry, UnlockState, cycle_layout_preset, move_session_to_leftmost,
+    pane_index_for_active_session, resize_layout_col, resize_layout_row,
+    set_pane_session_for_active, swap_pane_sessions, toggle_comparison_mode, toggle_pane_zoom,
 };
 
 fn save_config(state: &Signal<AppState>) {
@@ -146,6 +149,53 @@ fn render_terminal_pane(
                             data.len(),
                             &data[..data.len().min(32)]
                         );
+                        // --- Dangerous-command protection (feature #17) ---
+                        // Before sending Enter to the PTY, run the current
+                        // input line through the safety checker. If the verdict
+                        // is `Warn`, DON'T send Enter — instead stash the
+                        // pending command + reason and show a confirmation
+                        // modal. The modal's "继续" button sends the original
+                        // Enter; "取消" discards it.
+                        //
+                        // We only check on Enter (not every keystroke) to
+                        // avoid false positives on partial input and to keep
+                        // the check cheap.
+                        //
+                        // Multi-line inputs (shell `\` continuations) are a
+                        // known limitation — we only see the current line. See
+                        // `command_safety.rs` docs for the trade-off.
+                        if is_enter {
+                            let line = {
+                                let terminals = state_for_cmd.read().terminals.clone();
+                                terminals
+                                    .get(&sid_clone)
+                                    .map(|h| h.lock().terminal.extract_current_line())
+                                    .unwrap_or_default()
+                            };
+                            let cmd = strip_prompt(line.trim()).to_string();
+                            if !cmd.is_empty() {
+                                let verdict = state_for_cmd.read().safety_checker.check(&cmd);
+                                if let rusterm_core::SafetyVerdict::Warn(reason) = verdict {
+                                    tracing::info!(
+                                        "[SAFETY] blocked dangerous command: session={} cmd={:?} reason={}",
+                                        &sid_clone[..sid_clone.len().min(8)],
+                                        cmd,
+                                        reason
+                                    );
+                                    state_for_cmd.write().pending_dangerous_command = Some(
+                                        PendingDangerousCommand {
+                                            command: cmd,
+                                            reason,
+                                            session_id: sid_clone.clone(),
+                                        }
+                                    );
+                                    // Return WITHOUT sending — the modal's
+                                    // "继续" button will re-send the Enter if
+                                    // the user confirms.
+                                    return;
+                                }
+                            }
+                        }
                         // Log input
                         {
                             let logs = state_for_cmd.read().session_logs.clone();
@@ -782,11 +832,44 @@ fn render_terminal_pane(
     }
 }
 
+/// State held while the user is drag-resizing a splitter bar. Set by the
+/// splitter's `onmousedown`; cleared by the document-level `mouseup` handler
+/// installed in `App`'s drag-poll future. The poll future reads
+/// `document._rusterm_split_drag_mouse` (kept current by a JS `mousemove`
+/// listener) on each tick and applies the delta to the active layout via
+/// `resize_layout_col` / `resize_layout_row`.
+///
+/// We use a polling approach (rather than per-event `eval` callbacks)
+/// because dioxus's `eval` bridge is async request/response — it can't
+/// deliver high-frequency mouse events synchronously. Polling at 16ms
+/// (~60fps) is smooth enough for splitter dragging and matches the
+/// existing `TerminalView` resize-poll pattern.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct SplitDragState {
+    /// `true` for a column splitter (vertical bar, drag adjusts column
+    /// widths), `false` for a row splitter (horizontal bar, drag adjusts
+    /// row heights).
+    is_col: bool,
+    /// Index of the column/row being resized (the left/top of the pair).
+    idx: usize,
+    /// Pixel position of the splitter bar at drag start. The current mouse
+    /// position is compared against this to compute the drag delta.
+    start_pos: f64,
+    /// Container extent (width for col drag, height for row drag) at drag
+    /// start, used to convert the pixel delta into a fractional delta.
+    container_extent: f64,
+    /// Last applied mouse position — used to detect when a new mousemove has
+    /// landed so we don't re-apply the same delta. JS writes the current
+    /// position to `document._rusterm_split_drag_mouse`; we read it, compare
+    /// to `last_applied_pos`, and skip if unchanged.
+    last_applied_pos: f64,
+}
+
 /// Multi-pane container: renders a `PaneLayout` as a grid of `TerminalView`
 /// panes positioned absolutely within a relative-positioned container. Each
 /// pane is sized according to the layout's per-row and per-column fractions.
 /// Splitter bars are rendered between adjacent panes so the user can
-/// click-resize them.
+/// drag-resize them smoothly.
 ///
 /// ## Cross-terminal comparison mode
 ///
@@ -806,17 +889,23 @@ fn render_terminal_pane(
 /// separate component module would create a circular dependency. Keeping
 /// `MultiPaneContainer` here lets it call `render_terminal_pane` directly.
 fn multi_pane_container(
-    state: Signal<AppState>,
+    mut state: Signal<AppState>,
     input_senders: Signal<std::collections::HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
     layout: PaneLayout,
+    mut drag_over_pane: Signal<Option<usize>>,
+    container_size: Signal<Option<(f64, f64)>>,
+    split_drag: Signal<Option<SplitDragState>>,
 ) -> Element {
-    // Default container dimensions. The actual CSS measurement happens
-    // inside each pane's TerminalView on_resize handler (which fires
-    // ~100ms after mount). These defaults are just for the initial
-    // splitter bar positions; once panes measure themselves, their
-    // on_resize updates the underlying Terminal model.
-    let container_w = 1200.0_f64;
-    let container_h = 800.0_f64;
+    // Container dimensions measured from the live DOM via a ResizeObserver
+    // + polling loop (see `App`). Falls back to a 1200×800 default if the
+    // measurement hasn't landed yet (e.g. on the very first frame after
+    // mount, before the ResizeObserver fires). The splitter bars and pane
+    // rects are computed from these dimensions, so they track the actual
+    // viewport at all times — fixing the prior bug where a 1200×800
+    // hardcode left panes clipped or with empty space when the window was
+    // a different size (the "显示分辨率不对" symptom). Once the observer
+    // fires (~1 frame after mount) the panes re-layout to the real size.
+    let (container_w, container_h) = container_size().unwrap_or((1200.0_f64, 800.0_f64));
 
     // Collect visible panes: (index, session_id, rect).
     let visible: Vec<(usize, String, (f64, f64, f64, f64))> = layout
@@ -825,6 +914,71 @@ fn multi_pane_container(
         .collect();
 
     let comparison_on = layout.comparison;
+
+    // Pre-collect the (pane_idx, session_id, rect, drop_session_id,
+    // border_style, pane_title) tuples as owned values. The move closures inside each
+    // pane's ondragover / ondrop / ondragstart handlers need to capture owned copies of
+    // the session_id — the rsx! `for` loop body can't contain `let`
+    // statements, so we pre-compute the owned clones (and the
+    // drag-over-derived border style) here and destructure them in the for
+    // pattern.
+    //
+    // We use a 6-tuple: `idx` is `usize` (Copy), so the ondrop closure can
+    // capture it directly without a redundant clone. `session_id` is
+    // consumed by the `key:` interpolation and `render_terminal_pane`, so a
+    // second owned copy (`drop_session_id`) is needed for the move closure.
+    // `border_style` is a `&'static str` (Copy) computed by reading
+    // `drag_over_pane()` once per pane during Vec construction — this read
+    // subscribes `App` to the signal, so any change triggers ONE re-render
+    // of `App` (which rebuilds this Vec with the new values).
+    // `pane_title` is the session's display name, shown in the pane's
+    // drag-handle title bar.
+    //
+    // Each pane in the layout is BOTH a drag source (via the title bar's
+    // `draggable: true` + `ondragstart`) and a drop target: the user can
+    // drag an open session from the tab bar OR from another pane's title
+    // bar onto a pane (moves or swaps the session into that pane), or drag
+    // a sidebar connection onto a pane (opens a new session in that pane).
+    // The drag source identifies itself via a custom MIME type in the
+    // DragEvent's DataTransfer:
+    //   - "application/x-rusterm-session-id"     → drag from tab bar or pane title
+    //   - "application/x-rusterm-connection-id"  → drag from sidebar
+    let pane_items: Vec<(
+        usize,
+        String,
+        (f64, f64, f64, f64),
+        String,
+        &'static str,
+        String,
+        String,
+    )> = visible
+        .into_iter()
+        .map(|(idx, sid, rect)| {
+            let border = if drag_over_pane() == Some(idx) {
+                "border: 2px solid #7aa2f7; box-sizing: border-box;"
+            } else {
+                "border: 2px solid transparent; box-sizing: border-box;"
+            };
+            // Look up the session's display name for the pane title bar.
+            // Falls back to the session id if the session was closed
+            // between the layout snapshot and this render (the renderer
+            // treats an empty session_id as "no pane here").
+            let title = state
+                .read()
+                .sessions
+                .iter()
+                .find(|t| t.id == sid)
+                .map(|t| t.name.clone())
+                .unwrap_or_else(|| sid.clone());
+            // `drag_sid` is a second clone for the ondragstart closure
+            // (the first clone `drop_session_id` is consumed by the
+            // ondrop closure; the original `sid` is consumed by the
+            // `key:` interpolation and `render_terminal_pane`). rsx!
+            // can't hold `let` bindings in the for body, so we pre-clone.
+            let drag_sid = sid.clone();
+            (idx, sid.clone(), rect, sid, border, title, drag_sid)
+        })
+        .collect();
 
     rsx! {
         div {
@@ -853,58 +1007,340 @@ fn multi_pane_container(
             })}
 
             // Render each pane in its computed rectangle.
-            for (idx, session_id, (x, y, w, h)) in &visible {
+            //
+            // PERF: `border_style` is pre-computed in `pane_items` by reading
+            // `drag_over_pane()` once per pane during Vec construction. This
+            // read subscribes `App` to the signal, so any change triggers
+            // ONE re-render of `App` (not per-tick). The Signal equality
+            // check prevents re-renders for no-op `set(Some(idx))` calls in
+            // the high-frequency `ondragover` (~60Hz) handler — the
+            // highlight only changes when the dragged pane actually changes.
+            // This aligns with the user's frequency-vs-feedback
+            // preference: fewer re-renders over per-tick feedback.
+            for (idx, session_id, (x, y, w, h), drop_session_id, border_style, pane_title, drag_sid) in pane_items.into_iter() {
                 div {
                     key: "pane-{idx}-{session_id}",
                     style: format!(
-                        "position: absolute; left: {x}px; top: {y}px; width: {w}px; height: {h}px; overflow: hidden;",
-                        x = x, y = y, w = w, h = h
+                        "position: absolute; left: {x}px; top: {y}px; width: {w}px; height: {h}px; overflow: hidden; display: flex; flex-direction: column; {border}",
+                        x = x, y = y, w = w, h = h, border = border_style
                     ),
-                    {render_terminal_pane(state, input_senders, session_id.clone())}
+                    // `ondragover` must call prevent_default to signal
+                    // that this element accepts drops. Without it, the
+                    // browser fires `ondrop` with an empty DataTransfer
+                    // (security restriction: drops without a dragover
+                    // prevent_default are blocked).
+                    //
+                    // PERF: we also set `drag_over_pane` here. The Signal
+                    // equality check makes this a no-op when the value is
+                    // already `Some(idx)`, so the high-frequency dragover
+                    // (~60Hz) does NOT trigger per-tick re-renders.
+                    ondragover: move |e: DragEvent| {
+                        e.prevent_default();
+                        e.data_transfer().set_drop_effect("move");
+                        drag_over_pane.set(Some(idx));
+                    },
+                    // `ondragenter` also needs prevent_default for
+                    // cross-browser compatibility (some browsers
+                    // require both dragenter AND dragover to be
+                    // cancelled to allow drop). We also set
+                    // `drag_over_pane` here — this is the event that
+                    // actually changes the highlight when the cursor
+                    // enters a new pane.
+                    ondragenter: move |e: DragEvent| {
+                        e.prevent_default();
+                        drag_over_pane.set(Some(idx));
+                    },
+                    ondrop: move |e: DragEvent| {
+                        e.prevent_default();
+                        // Clear the drag-over highlight immediately —
+                        // the drop has been processed, no need to wait
+                        // for the next dragenter elsewhere.
+                        drag_over_pane.set(None);
+                        let dt = e.data_transfer();
+                        // Check for the "drag from tab bar / pane title"
+                        // MIME type first — an open session is being moved
+                        // (either dragged from the tab bar or from another
+                        // pane's title bar — both use the same MIME type
+                        // since the semantic is identical: move/swap an
+                        // existing session into this pane).
+                        if let Some(dragged_sid) = dt.get_data("application/x-rusterm-session-id") {
+                            if dragged_sid.is_empty() {
+                                tracing::warn!("[DROP] empty session-id in drag data");
+                                return;
+                            }
+                            // If the user dropped the session onto its
+                            // own pane, it's a no-op.
+                            if dragged_sid == drop_session_id {
+                                tracing::debug!(
+                                    "[DROP] session {} dropped onto its own pane — no-op",
+                                    &dragged_sid[..dragged_sid.len().min(8)]
+                                );
+                                return;
+                            }
+                            // If the target pane is empty, move the
+                            // session there (and clear the source pane).
+                            // Otherwise, swap the two panes' sessions.
+                            if drop_session_id.is_empty() {
+                                // Find the source pane index, move the
+                                // session to the target pane, clear the
+                                // source.
+                                let src_pane = {
+                                    let s = state.read();
+                                    pane_index_for_active_session(&s, &dragged_sid)
+                                };
+                                if let Some(src_idx) = src_pane {
+                                    let mut s = state.write();
+                                    set_pane_session_for_active(
+                                        &mut s,
+                                        idx,
+                                        dragged_sid.clone(),
+                                    );
+                                    // Only clear the source pane if it's
+                                    // different from the target (which
+                                    // it always is here, but be
+                                    // defensive).
+                                    if src_idx != idx {
+                                        set_pane_session_for_active(&mut s, src_idx, String::new());
+                                    }
+                                    tracing::info!(
+                                        "[DROP] moved session {} from pane {} to pane {}",
+                                        &dragged_sid[..dragged_sid.len().min(8)],
+                                        src_idx,
+                                        idx
+                                    );
+                                } else {
+                                    // Source session isn't in any pane
+                                    // — just assign it to the target.
+                                    let mut s = state.write();
+                                    set_pane_session_for_active(
+                                        &mut s,
+                                        idx,
+                                        dragged_sid,
+                                    );
+                                }
+                            } else {
+                                // Target pane has a session — swap.
+                                let swapped = swap_pane_sessions(
+                                    &mut state.write(),
+                                    &dragged_sid,
+                                    &drop_session_id,
+                                );
+                                if swapped {
+                                    tracing::info!(
+                                        "[DROP] swapped session {} with pane {}'s session {}",
+                                        &dragged_sid[..dragged_sid.len().min(8)],
+                                        idx,
+                                        &drop_session_id[..drop_session_id.len().min(8)]
+                                    );
+                                } else {
+                                    tracing::warn!(
+                                        "[DROP] swap failed for session {} → pane {}",
+                                        &dragged_sid[..dragged_sid.len().min(8)],
+                                        idx
+                                    );
+                                }
+                            }
+                            return;
+                        }
+                        // Check for the "drag from sidebar" MIME type —
+                        // a connection is being opened in this pane.
+                        if let Some(conn_id) = dt.get_data("application/x-rusterm-connection-id") {
+                            if conn_id.is_empty() {
+                                tracing::warn!("[DROP] empty connection-id in drag data");
+                                return;
+                            }
+                            // Look up the connection config.
+                            let conn = state
+                                .read()
+                                .connections
+                                .iter()
+                                .find(|c| c.id == conn_id)
+                                .cloned();
+                            let Some(conn) = conn else {
+                                tracing::warn!(
+                                    "[DROP] connection id {} not found in state.connections",
+                                    &conn_id[..conn_id.len().min(8)]
+                                );
+                                return;
+                            };
+                            tracing::info!(
+                                "[DROP] opening connection {} ({:?}) in pane {}",
+                                &conn_id[..conn_id.len().min(8)],
+                                conn.name,
+                                idx
+                            );
+                            // Open the connection in this pane. The
+                            // `open_connection` helper handles creating
+                            // the terminal, pushing the session tab, and
+                            // assigning the new session_id to
+                            // pane `idx` via
+                            // `set_pane_session_for_active`.
+                            open_connection(
+                                state,
+                                input_senders,
+                                conn,
+                                Some(idx),
+                            );
+                            return;
+                        }
+                        // Unknown MIME type — log and ignore.
+                        tracing::debug!(
+                            "[DROP] pane {} received drop with no recognized MIME type",
+                            idx
+                        );
+                    },
+                    // Title bar / drag handle. The bar is the only
+                    // draggable part of the pane — the terminal content
+                    // below must stay non-draggable so text selection
+                    // and mouse clicks still work. `draggable: true`
+                    // on this bar is what initiates the pane-drag.
+                    div {
+                        style: "
+                            height: 18px;
+                            background: #1f2335;
+                            border-bottom: 1px solid #2a2b3d;
+                            display: flex;
+                            align-items: center;
+                            padding: 0 8px;
+                            font-size: 11px;
+                            color: #c0caf5;
+                            cursor: grab;
+                            user-select: none;
+                            flex-shrink: 0;
+                            z-index: 10;
+                        ",
+                        draggable: true,
+                        title: "Drag to move this session to another pane",
+                        ondragstart: move |e: DragEvent| {
+                            let dt = e.data_transfer();
+                            let _ = dt.set_data(
+                                "application/x-rusterm-session-id",
+                                &drag_sid,
+                            );
+                            dt.set_drop_effect("move");
+                            dt.set_effect_allowed("move");
+                            tracing::debug!(
+                                "[DRAG] pane drag started: session={:?}",
+                                &drag_sid[..drag_sid.len().min(8)]
+                            );
+                        },
+                        "{pane_title}"
+                    },
+                    // Terminal content area: fills the remaining height
+                    // below the title bar. Wrapped in a flex:1 div so the
+                    // title bar (above) stays at 18px and the terminal
+                    // gets the rest. `position: relative` + `overflow:
+                    // hidden` matches the single-pane path's container.
+                    div {
+                        style: "flex: 1; position: relative; overflow: hidden; min-height: 0;",
+                        {render_terminal_pane(state, input_senders, session_id.clone())}
+                    }
                 }
             }
 
             // Vertical splitter bars between adjacent columns.
-            {render_col_splitters(&layout, container_w, state)}
+            {render_col_splitters(&layout, container_w, state, split_drag)}
             // Horizontal splitter bars between adjacent rows.
-            {render_row_splitters(&layout, container_h, state)}
+            {render_row_splitters(&layout, container_h, state, split_drag)}
         }
     }
 }
 
-/// Render vertical splitter bars between adjacent columns. Click to grow
-/// the left column, right-click to shrink it (5% step).
+/// Render vertical splitter bars between adjacent columns. Drag the bar to
+/// resize the two columns it separates (smooth, continuous — not the prior
+/// 5%-step click). Right-click still does a 5% shrink for keyboard-free
+/// fine-tuning.
 fn render_col_splitters(
     layout: &PaneLayout,
     container_w: f64,
     mut state: Signal<AppState>,
+    mut split_drag: Signal<Option<SplitDragState>>,
 ) -> Element {
     let cols = layout.cols();
     if cols < 2 {
         return rsx! {};
     }
-    let mut boundaries = Vec::new();
-    let mut acc = 0.0_f64;
-    for (i, frac) in layout.col_fracs.iter().enumerate() {
-        if i > 0 {
-            boundaries.push(acc * container_w);
+    // Collect into an owned Vec of (col_idx, x_px) tuples. The `for` loop
+    // in rsx! can't contain `let` bindings (dioxus 0.7 macro
+    // limitation), so we pre-compute owned values here and destructure
+    // them in the pattern. `f64` is `Copy`, so this is cheap.
+    let boundaries: Vec<(usize, f64)> = {
+        let mut out = Vec::new();
+        let mut acc = 0.0_f64;
+        for (i, frac) in layout.col_fracs.iter().enumerate() {
+            if i > 0 {
+                out.push((i - 1, acc * container_w));
+            }
+            acc += frac;
         }
-        acc += frac;
-    }
+        out
+    };
     rsx! {
-        for (col_idx, x) in boundaries.iter().enumerate() {
+        for (col_idx, x_val) in boundaries.into_iter() {
             div {
                 key: "col-split-{col_idx}",
                 style: format!(
-                    "position: absolute; left: {x}px; top: 0; bottom: 0; width: 4px; \
-                     margin-left: -2px; cursor: col-resize; background: #2a2b3d; z-index: 50;",
-                    x = x
+                    "position: absolute; left: {x_val}px; top: 0; bottom: 0; width: 6px; \
+                     margin-left: -3px; cursor: col-resize; background: #2a2b3d; z-index: 50; \
+                     transition: background 0.1s;",
                 ),
-                onmousedown: move |_| {
-                    let delta = 0.05;
-                    if resize_layout_col(&mut state.write(), col_idx, delta) {
-                        tracing::info!("[LAYOUT] col {} grown by {:.2}", col_idx, delta);
+                // Begin a drag-resize. We capture the splitter's pixel
+                // position and the container width at drag start, then
+                // install document-level mousemove/mouseup listeners via
+                // `eval`. The mousemove listener writes the current
+                // clientX to `document._rusterm_split_drag_mouse`; the
+                // poll loop in `App` reads that and applies the delta.
+                // The mouseup listener clears the drag flag and the
+                // `split_drag` signal.
+                //
+                // `e.prevent_default()` is needed to stop the browser
+                // from initiating a text-selection drag (which would
+                // hijack the mousemove events and suppress our
+                // listener).
+                onmousedown: move |e: MouseEvent| {
+                    e.prevent_default();
+                    if container_w <= 0.0 {
+                        return;
                     }
+                    split_drag.set(Some(SplitDragState {
+                        is_col: true,
+                        idx: col_idx,
+                        start_pos: x_val,
+                        container_extent: container_w,
+                        last_applied_pos: x_val,
+                    }));
+                    // Install the document-level listeners. We write the
+                    // starting position immediately so the first poll
+                    // sees a valid value (otherwise the first ~16ms of
+                    // mousemove events would be lost).
+                    let script = "(function() { \
+                        document._rusterm_split_drag_mouse = null; \
+                        document._rusterm_split_drag_active = true; \
+                        document._rusterm_split_drag_axis = 'x'; \
+                        function onMove(ev) { \
+                            if (!document._rusterm_split_drag_active) return; \
+                            document._rusterm_split_drag_mouse = ev.clientX; \
+                        } \
+                        function onUp(ev) { \
+                            document._rusterm_split_drag_active = false; \
+                            document._rusterm_split_drag_mouse = null; \
+                            document.removeEventListener('mousemove', onMove); \
+                            document.removeEventListener('mouseup', onUp); \
+                            document.body.style.userSelect = ''; \
+                            document.body.style.cursor = ''; \
+                        } \
+                        document.body.style.userSelect = 'none'; \
+                        document.body.style.cursor = 'col-resize'; \
+                        document.addEventListener('mousemove', onMove); \
+                        document.addEventListener('mouseup', onUp); \
+                    })()";
+                    spawn(async move {
+                        let _ = dioxus::document::eval(script).await;
+                    });
+                    tracing::debug!(
+                        "[LAYOUT] col-split drag started: idx={} start_x={:.1} container_w={:.1}",
+                        col_idx, x_val, container_w
+                    );
                 },
                 oncontextmenu: move |e: MouseEvent| {
                     e.prevent_default();
@@ -913,18 +1349,20 @@ fn render_col_splitters(
                         tracing::info!("[LAYOUT] col {} shrunk by {:.2}", col_idx, -delta);
                     }
                 },
-                title: "Click to grow left column, right-click to shrink",
+                title: "Drag to resize columns, right-click to shrink left",
             }
         }
     }
 }
 
-/// Render horizontal splitter bars between adjacent rows. Click to grow
-/// the top row, right-click to shrink it (5% step).
+/// Render horizontal splitter bars between adjacent rows. Drag the bar to
+/// resize the two rows it separates (smooth, continuous). Right-click still
+/// does a 5% shrink.
 fn render_row_splitters(
     layout: &PaneLayout,
     container_h: f64,
     mut state: Signal<AppState>,
+    mut split_drag: Signal<Option<SplitDragState>>,
 ) -> Element {
     let rows = layout.rows();
     if rows < 2 {
@@ -938,20 +1376,62 @@ fn render_row_splitters(
         }
         acc += frac;
     }
+    // Collect into owned (row_idx, y_px) tuples — see the col-splitter
+    // comment for why.
+    let boundaries: Vec<(usize, f64)> = boundaries
+        .into_iter()
+        .enumerate()
+        .map(|(i, y)| (i, y))
+        .collect();
     rsx! {
-        for (row_idx, y) in boundaries.iter().enumerate() {
+        for (row_idx, y_val) in boundaries.into_iter() {
             div {
                 key: "row-split-{row_idx}",
                 style: format!(
-                    "position: absolute; top: {y}px; left: 0; right: 0; height: 4px; \
-                     margin-top: -2px; cursor: row-resize; background: #2a2b3d; z-index: 50;",
-                    y = y
+                    "position: absolute; top: {y_val}px; left: 0; right: 0; height: 6px; \
+                     margin-top: -3px; cursor: row-resize; background: #2a2b3d; z-index: 50; \
+                     transition: background 0.1s;",
                 ),
-                onmousedown: move |_| {
-                    let delta = 0.05;
-                    if resize_layout_row(&mut state.write(), row_idx, delta) {
-                        tracing::info!("[LAYOUT] row {} grown by {:.2}", row_idx, delta);
+                onmousedown: move |e: MouseEvent| {
+                    e.prevent_default();
+                    if container_h <= 0.0 {
+                        return;
                     }
+                    split_drag.set(Some(SplitDragState {
+                        is_col: false,
+                        idx: row_idx,
+                        start_pos: y_val,
+                        container_extent: container_h,
+                        last_applied_pos: y_val,
+                    }));
+                    let script = "(function() { \
+                        document._rusterm_split_drag_mouse = null; \
+                        document._rusterm_split_drag_active = true; \
+                        document._rusterm_split_drag_axis = 'y'; \
+                        function onMove(ev) { \
+                            if (!document._rusterm_split_drag_active) return; \
+                            document._rusterm_split_drag_mouse = ev.clientY; \
+                        } \
+                        function onUp(ev) { \
+                            document._rusterm_split_drag_active = false; \
+                            document._rusterm_split_drag_mouse = null; \
+                            document.removeEventListener('mousemove', onMove); \
+                            document.removeEventListener('mouseup', onUp); \
+                            document.body.style.userSelect = ''; \
+                            document.body.style.cursor = ''; \
+                        } \
+                        document.body.style.userSelect = 'none'; \
+                        document.body.style.cursor = 'row-resize'; \
+                        document.addEventListener('mousemove', onMove); \
+                        document.addEventListener('mouseup', onUp); \
+                    })()";
+                    spawn(async move {
+                        let _ = dioxus::document::eval(script).await;
+                    });
+                    tracing::debug!(
+                        "[LAYOUT] row-split drag started: idx={} start_y={:.1} container_h={:.1}",
+                        row_idx, y_val, container_h
+                    );
                 },
                 oncontextmenu: move |e: MouseEvent| {
                     e.prevent_default();
@@ -960,7 +1440,7 @@ fn render_row_splitters(
                         tracing::info!("[LAYOUT] row {} shrunk by {:.2}", row_idx, -delta);
                     }
                 },
-                title: "Click to grow top row, right-click to shrink",
+                title: "Drag to resize rows, right-click to shrink top",
             }
         }
     }
@@ -1291,9 +1771,17 @@ fn start_ssh_connection(
                     });
                 }
 
-                // Inject shell integration (OSC 133) so the shell reports each
-                // command's exit code. Additive (appends to precmd_functions /
-                // PROMPT_COMMAND) so it won't clobber the user's prompt.
+                // Inject shell integration (OSC 133 + OSC 7) so the shell
+                // reports each command's exit code AND its working directory.
+                // Additive (appends to precmd_functions / PROMPT_COMMAND) so it
+                // won't clobber the user's prompt.
+                //
+                // OSC 133;D — exit code (existing).
+                // OSC 7     — `file://<host><cwd>` (new); used by session-state
+                //             restore to know which dir to `cd` back to on
+                //             next launch. We never re-execute past commands,
+                //             only send a single `cd` per session on restore.
+                //
                 // NOTE: do NOT send a trailing Ctrl+L (0x0c) to hide the echoed
                 // setup line — Ctrl+L clears the WHOLE screen, which wipes the
                 // MOTD/session content into scrollback and leaves a blank
@@ -1302,7 +1790,7 @@ fn start_ssh_connection(
                 {
                     let integration_tx = session.input_tx.clone();
                     let int_sid = tab_id.clone();
-                    let mut setup: Vec<u8> = r#"__rusterm_precmd() { printf '\e]133;D;%s\e\\' "$?"; printf '\e]133;A\e\\'; }; if [ -n "$ZSH_VERSION" ]; then precmd_functions+=(__rusterm_precmd); elif [ -n "$BASH_VERSION" ]; then PROMPT_COMMAND="__rusterm_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"; fi"#.as_bytes().to_vec();
+                    let mut setup: Vec<u8> = r#"__rusterm_precmd() { printf '\e]133;D;%s\e\\' "$?"; printf '\e]133;A\e\\'; printf '\e]7;file://%s%s\e\\' "${HOSTNAME:-localhost}" "$PWD"; }; if [ -n "$ZSH_VERSION" ]; then precmd_functions+=(__rusterm_precmd); elif [ -n "$BASH_VERSION" ]; then PROMPT_COMMAND="__rusterm_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"; fi"#.as_bytes().to_vec();
                     setup.push(b'\n');
                     spawn(async move {
                         tokio::time::sleep(std::time::Duration::from_millis(400)).await;
@@ -1769,11 +2257,12 @@ fn start_ssh_connection(
                             }
                             let terminals = state.read().terminals.clone();
                             if let Some(handle) = terminals.get(&id) {
-                                let (render_result, exit_code) = {
+                                let (render_result, exit_code, new_cwd) = {
                                     let mut entry = handle.lock();
                                     (
                                         entry.process_and_render(&data),
                                         entry.terminal.take_exit_code(),
+                                        entry.terminal.cwd().map(|p| p.to_path_buf()),
                                     )
                                 };
                                 // Shell integration (OSC 133;D): DEFERRED RECORDING.
@@ -1946,6 +2435,16 @@ fn start_ssh_connection(
                                     if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
                                         tab.render_output = render_result;
                                         tab.version += 1;
+                                        // Mirror the shell's last-reported cwd (OSC 7)
+                                        // into the tab so the session-state save
+                                        // path can read it without taking the
+                                        // terminal lock. `None` means the shell
+                                        // hasn't reported one yet — leave the
+                                        // tab's cwd untouched in that case so we
+                                        // don't clobber a previous report.
+                                        if let Some(cwd) = &new_cwd {
+                                            tab.cwd = Some(cwd.to_string_lossy().into_owned());
+                                        }
                                     }
                                 }
                                 if let Some((cmd, db_id, hostname)) = committed {
@@ -2146,7 +2645,7 @@ fn start_shell_connection(
             {
                 let integration_tx = session.input_tx.clone();
                 let int_sid = tab_id.clone();
-                let mut setup: Vec<u8> = r#"__rusterm_precmd() { printf '\e]133;D;%s\e\\' "$?"; printf '\e]133;A\e\\'; }; if [ -n "$ZSH_VERSION" ]; then precmd_functions+=(__rusterm_precmd); elif [ -n "$BASH_VERSION" ]; then PROMPT_COMMAND="__rusterm_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"; fi"#.as_bytes().to_vec();
+                let mut setup: Vec<u8> = r#"__rusterm_precmd() { printf '\e]133;D;%s\e\\' "$?"; printf '\e]133;A\e\\'; printf '\e]7;file://%s%s\e\\' "${HOSTNAME:-localhost}" "$PWD"; }; if [ -n "$ZSH_VERSION" ]; then precmd_functions+=(__rusterm_precmd); elif [ -n "$BASH_VERSION" ]; then PROMPT_COMMAND="__rusterm_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"; fi"#.as_bytes().to_vec();
                 setup.push(b'\n');
                 spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
@@ -2214,11 +2713,12 @@ fn start_shell_connection(
                             }
                             let terminals = state.read().terminals.clone();
                             if let Some(handle) = terminals.get(&id) {
-                                let (render_result, exit_code) = {
+                                let (render_result, exit_code, new_cwd) = {
                                     let mut entry = handle.lock();
                                     (
                                         entry.process_and_render(&data),
                                         entry.terminal.take_exit_code(),
+                                        entry.terminal.cwd().map(|p| p.to_path_buf()),
                                     )
                                 };
                                 // Shell integration (OSC 133;D): DEFERRED RECORDING.
@@ -2361,6 +2861,16 @@ fn start_shell_connection(
                                     if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
                                         tab.render_output = render_result;
                                         tab.version += 1;
+                                        // Mirror the shell's last-reported cwd (OSC 7)
+                                        // into the tab so the session-state save
+                                        // path can read it without taking the
+                                        // terminal lock. `None` means the shell
+                                        // hasn't reported one yet — leave the
+                                        // tab's cwd untouched in that case so we
+                                        // don't clobber a previous report.
+                                        if let Some(cwd) = &new_cwd {
+                                            tab.cwd = Some(cwd.to_string_lossy().into_owned());
+                                        }
                                     }
                                 }
                                 if let Some((cmd, db_id, hostname)) = committed {
@@ -2651,10 +3161,384 @@ fn open_local_terminal(
         suggestion_visible: false,
         command_history: Vec::new(),
         hostname: Some("local".to_string()),
+        cwd: None,
     });
     state.write().active_session = Some(tab_id.clone());
 
     start_shell_connection(state, input_senders, tab_id, shell_config);
+}
+
+/// Restore sessions from a saved `SessionState` snapshot.
+///
+/// Called when the user picks "恢复" on the restore dialog. For each
+/// `PersistedSession` in the snapshot:
+///
+/// 1. Look up the matching `ConnectionConfig` by `connection_id` (for SSH/
+///    Telnet/Tcp) or build a default `ShellConfig` (for Shell).
+/// 2. Open the connection via the existing `open_connection` / `open_local_terminal`
+///    flow — this creates a new tab, terminal, and spawns the session task.
+/// 3. After the shell is ready (reuse the existing 400ms delay pattern from
+///    shell-integration injection), send a single `cd '<cwd>'\n` to the
+///    session's input sender. This is the ONLY command we send on restore —
+///    we NEVER re-execute any past command or script (the user explicitly
+///    asked us not to, to avoid destructive side effects).
+///
+/// Sessions where `cwd` is `None` (raw telnet/serial, or shell integration
+///    didn't take) skip the `cd` step — they just reconnect.
+///
+/// After all sessions are restored, we set `active_session` to the saved
+/// active session (if it exists) so the user lands on the tab they last
+/// had focused.
+fn restore_sessions(
+    mut state: Signal<AppState>,
+    input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    to_restore: rusterm_core::SessionState,
+) {
+    let saved_active = to_restore.active_session.clone();
+    let connections: Vec<ConnectionConfig> = state.read().connections.clone();
+
+    for ps in &to_restore.sessions {
+        match ps.kind {
+            SessionType::Shell => {
+                // Open a local shell tab. We can't pass `restore_cwd` through
+                // the existing flow, so we open the tab then send `cd` after
+                // the shell is ready.
+                let tab_id = uuid::Uuid::new_v4().to_string();
+                let shell_config = ShellConfig {
+                    command: None, // default = $SHELL
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    working_dir: None,
+                };
+                create_terminal(tab_id.clone(), &mut state);
+                state.write().session_configs.insert(
+                    tab_id.clone(),
+                    ConnectionConfig {
+                        id: tab_id.clone(),
+                        name: ps.name.clone(),
+                        kind: ConnectionKind::Shell(shell_config.clone()),
+                        group: None,
+                        tags: Vec::new(),
+                        onekey: false,
+                    },
+                );
+                let render_output = Default::default();
+                state.write().sessions.push(SessionTab {
+                    id: tab_id.clone(),
+                    name: ps.name.clone(),
+                    kind: SessionType::Shell,
+                    render_output,
+                    version: 1,
+                    suggestion: None,
+                    suggestions: Vec::new(),
+                    suggestion_selected: 0,
+                    suggestion_visible: false,
+                    command_history: ps.command_history_tail.clone(),
+                    hostname: Some("local".to_string()),
+                    cwd: None,
+                });
+                start_shell_connection(
+                    state.clone(),
+                    input_senders.clone(),
+                    tab_id.clone(),
+                    shell_config,
+                );
+                // Schedule the `cd <cwd>` send after the shell is ready.
+                if let Some(cwd) = &ps.cwd {
+                    schedule_cd_after_restore(
+                        state.clone(),
+                        input_senders.clone(),
+                        tab_id.clone(),
+                        cwd.clone(),
+                    );
+                }
+            }
+            SessionType::Ssh | SessionType::Telnet | SessionType::Tcp => {
+                // Look up the connection config by id (fall back to matching
+                // by name, then by hostname).
+                let conn = connections
+                    .iter()
+                    .find(|c| {
+                        c.id == ps.connection_id.as_deref().unwrap_or("") || c.name == ps.name
+                    })
+                    .cloned();
+                if let Some(conn) = conn {
+                    open_connection(state.clone(), input_senders.clone(), conn, None);
+                    // Find the tab we just created (it's the last one pushed).
+                    let tab_id = state
+                        .read()
+                        .sessions
+                        .last()
+                        .map(|t| t.id.clone())
+                        .unwrap_or_default();
+                    if !tab_id.is_empty() {
+                        // Pre-seed command history tail so suggestions work.
+                        let mut s = state.write();
+                        if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == tab_id) {
+                            tab.command_history = ps.command_history_tail.clone();
+                        }
+                    }
+                    if let Some(cwd) = &ps.cwd {
+                        schedule_cd_after_restore(
+                            state.clone(),
+                            input_senders.clone(),
+                            tab_id,
+                            cwd.clone(),
+                        );
+                    }
+                } else {
+                    tracing::warn!(
+                        "Could not find connection for restored session {:?} (id={:?}, name={:?}) — skipping",
+                        ps.kind,
+                        ps.connection_id,
+                        ps.name
+                    );
+                }
+            }
+            SessionType::Serial => {
+                // Serial sessions don't have a cwd to restore (no shell
+                // integration), and reconnecting to a serial port requires
+                // the port config which we don't persist here. Skip silently.
+                tracing::debug!(
+                    "Skipping serial session {:?} in restore (no cwd, no port config)",
+                    ps.name
+                );
+            }
+        }
+    }
+
+    // Set active session to the saved one (if it exists in the new tabs).
+    // We match by name since the new tab ids are fresh UUIDs.
+    if let Some(saved_active) = saved_active {
+        // The saved_active id was from the previous launch — it won't match
+        // any current tab. Instead, find the tab whose name matches the saved
+        // active session's name, or fall back to the last opened tab.
+        let saved_name = to_restore
+            .sessions
+            .iter()
+            .find(|s| s.id == saved_active)
+            .map(|s| s.name.clone());
+        let target_id = if let Some(name) = saved_name {
+            state
+                .read()
+                .sessions
+                .iter()
+                .find(|t| t.name == name)
+                .map(|t| t.id.clone())
+        } else {
+            None
+        };
+        state.write().active_session =
+            target_id.or_else(|| state.read().sessions.last().map(|t| t.id.clone()));
+    }
+}
+
+/// Schedule a `cd '<cwd>'\n` send to the session's input sender after a
+/// delay that's long enough for the shell to be ready (we piggyback on the
+/// existing 400ms shell-integration injection delay, then add a bit more
+/// so the `cd` arrives after the integration snippet).
+///
+/// The path is single-quoted to handle spaces and most special characters.
+/// Single quotes inside the path are escaped with the standard `'\'` trick
+/// (close quote, escaped quote, reopen quote).
+fn schedule_cd_after_restore(
+    state: Signal<AppState>,
+    input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    tab_id: String,
+    cwd: String,
+) {
+    spawn(async move {
+        // Wait for the shell to be ready. 800ms = the 400ms shell-integration
+        // injection delay + 400ms for the shell to process it and print the
+        // first prompt. This is a heuristic — if the shell is slow to start,
+        // the `cd` might arrive before the prompt and get echoed. Acceptable
+        // trade-off: the alternative (waiting for OSC 133;A prompt-start
+        // marker) would require plumbing the marker through the session task,
+        // which is a much larger change.
+        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+
+        // Build the `cd` command with proper quoting.
+        // Single-quote the path; escape any embedded single quotes with `'\''`.
+        let escaped = cwd.replace('\'', "'\\''");
+        let cmd = format!("cd '{}'\r", escaped);
+
+        let sender = input_senders.read().get(&tab_id).cloned();
+        if let Some(sender) = sender {
+            match sender.send(cmd.into_bytes()) {
+                Ok(()) => tracing::info!(
+                    "[RESTORE] sent `cd {}` to session {}",
+                    cwd,
+                    &tab_id[..tab_id.len().min(8)]
+                ),
+                Err(e) => tracing::warn!(
+                    "[RESTORE] failed to send `cd` to session {}: {}",
+                    &tab_id[..tab_id.len().min(8)],
+                    e
+                ),
+            }
+        } else {
+            tracing::warn!(
+                "[RESTORE] no input sender for session {} — shell may have died",
+                &tab_id[..tab_id.len().min(8)]
+            );
+        }
+        // Touch state to trigger a re-render so the cwd update (when OSC 7
+        // arrives from the shell after the `cd`) propagates to the tab.
+        // We don't need to write anything — just reading is enough to keep
+        // the signal alive in this async context.
+        let _ = state.read().sessions.len();
+    });
+}
+
+/// Save settings.json (specifically the `restore_disabled` flag) without
+/// touching connections or OneKeys. Used when the user picks "不再询问" on
+/// the restore dialog.
+fn save_settings(state: &Signal<AppState>) {
+    let cm = match state.read().config_manager.clone() {
+        Some(cm) => cm,
+        None => {
+            tracing::error!("ConfigManager not initialized, cannot save settings");
+            return;
+        }
+    };
+    let restore_disabled = state.read().restore_disabled;
+    if let Err(e) = cm.save_restore_disabled(restore_disabled) {
+        tracing::error!("Failed to save restore_disabled flag: {}", e);
+    }
+}
+
+/// Open a connection (SSH / Shell / etc.) as a new session tab.
+///
+/// This is the shared connection-opening helper used by:
+/// - The sidebar's `on_connect` handler (click a connection to open it).
+/// - The drag-and-drop drop handler on a pane (drag a sidebar connection
+///   onto a pane to open it in that pane).
+///
+/// ## The `target_pane_idx` parameter
+///
+/// - `None`: the new session is opened as a new active tab. This is the
+///   legacy "click to connect" flow — the new tab becomes active and the
+///   single-pane render path displays it.
+/// - `Some(pane_idx)`: the new session is opened AND its session_id is
+///   assigned to pane `pane_idx` in the active tab's layout (via
+///   `set_pane_session_for_active`). This is the drag-and-drop flow —
+///   the new session replaces whatever was displayed in the target pane.
+///   The new session's tab is still pushed to `state.sessions` (so it
+///   appears in the tab bar and can be dragged later), but
+///   `active_session` is NOT changed (the user's active tab stays as
+///   whatever they were looking at when they dragged).
+///
+/// If `target_pane_idx` is `Some` but there's no active layout (the
+/// user dragged onto a single-pane tab), the function falls back to
+/// the `None` path — opens a new active tab. This is the graceful
+/// degradation for "drag onto a pane that doesn't exist yet".
+fn open_connection(
+    mut state: Signal<AppState>,
+    input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    conn: ConnectionConfig,
+    target_pane_idx: Option<usize>,
+) {
+    let tab_id = uuid::Uuid::new_v4().to_string();
+    create_terminal(tab_id.clone(), &mut state);
+    // Remember the config so this session can be reconnected by pressing
+    // Enter after a disconnect.
+    state
+        .write()
+        .session_configs
+        .insert(tab_id.clone(), conn.clone());
+
+    match &conn.kind {
+        ConnectionKind::Ssh(ssh_config) => {
+            state.write().sessions.push(SessionTab {
+                id: tab_id.clone(),
+                name: conn.name.clone(),
+                kind: SessionType::Ssh,
+                render_output: Default::default(),
+                version: 0,
+                suggestion: None,
+                suggestions: Vec::new(),
+                suggestion_selected: 0,
+                suggestion_visible: false,
+                command_history: Vec::new(),
+                hostname: Some(ssh_config.host.clone()),
+                cwd: None,
+            });
+            // If a target pane was specified, assign the new session to
+            // that pane. Otherwise, make it the active session (legacy
+            // "click to connect" flow).
+            if let Some(idx) = target_pane_idx {
+                if !set_pane_session_for_active(&mut state.write(), idx, tab_id.clone()) {
+                    // No layout / out-of-range pane — fall back to
+                    // making the new session active.
+                    state.write().active_session = Some(tab_id.clone());
+                }
+            } else {
+                state.write().active_session = Some(tab_id.clone());
+            }
+            start_ssh_connection(state, input_senders, tab_id, ssh_config.clone());
+        }
+        ConnectionKind::Shell(shell_config) => {
+            let msg = format!("\r\nStarting shell...\r\n");
+            let render_output = {
+                let terminals = state.read().terminals.clone();
+                if let Some(handle) = terminals.get(&tab_id) {
+                    handle.lock().process_and_render(msg.as_bytes())
+                } else {
+                    Default::default()
+                }
+            };
+            state.write().sessions.push(SessionTab {
+                id: tab_id.clone(),
+                name: conn.name.clone(),
+                kind: SessionType::Shell,
+                render_output,
+                version: 1,
+                suggestion: None,
+                suggestions: Vec::new(),
+                suggestion_selected: 0,
+                suggestion_visible: false,
+                command_history: Vec::new(),
+                hostname: Some("local".to_string()),
+                cwd: None,
+            });
+            if let Some(idx) = target_pane_idx {
+                if !set_pane_session_for_active(&mut state.write(), idx, tab_id.clone()) {
+                    state.write().active_session = Some(tab_id.clone());
+                }
+            } else {
+                state.write().active_session = Some(tab_id.clone());
+            }
+            start_shell_connection(state, input_senders, tab_id, shell_config.clone());
+        }
+        _ => {
+            let msg = format!("\r\nConnection type not yet supported\r\n");
+            let terminals = state.read().terminals.clone();
+            if let Some(handle) = terminals.get(&tab_id) {
+                let render_result = handle.lock().process_and_render(msg.as_bytes());
+                state.write().sessions.push(SessionTab {
+                    id: tab_id.clone(),
+                    name: conn.name.clone(),
+                    kind: SessionType::Ssh,
+                    render_output: render_result,
+                    version: 1,
+                    suggestion: None,
+                    suggestions: Vec::new(),
+                    suggestion_selected: 0,
+                    suggestion_visible: false,
+                    command_history: Vec::new(),
+                    hostname: None,
+                    cwd: None,
+                });
+                if let Some(idx) = target_pane_idx {
+                    if !set_pane_session_for_active(&mut state.write(), idx, tab_id.clone()) {
+                        state.write().active_session = Some(tab_id.clone());
+                    }
+                } else {
+                    state.write().active_session = Some(tab_id.clone());
+                }
+            }
+        }
+    }
 }
 
 /// Reconnect a disconnected session: tear down the dead PTY/senders, create a
@@ -2729,6 +3613,180 @@ pub fn App() -> Element {
     // modal is rendered; the sidebar only triggers the request, the confirm
     // happens here so destructive actions can't be fired by a stray click.
     let mut delete_target: Signal<Option<ConnectionConfig>> = use_signal(|| None);
+
+    // Pane index currently being hovered by a drag operation, or `None` when
+    // no drag is in progress. Used by `multi_pane_container` to highlight the
+    // drop-target pane. Reads happen inside the pane `for` loop (subscribing
+    // `App` to the signal); writes happen in `ondragenter`/`ondragover`/`ondrop`.
+    //
+    // PERF: `Signal::set` performs an equality check before triggering a
+    // re-render, so calling `set(Some(idx))` when the value is already
+    // `Some(idx)` is a no-op. This lets us call `set` in the high-frequency
+    // `ondragover` handler (~60Hz) without causing per-tick re-renders — the
+    // highlight only changes when the dragged pane actually changes. This
+    // matches the user's "取舍分频性能" preference: fewer re-renders over
+    // per-tick feedback.
+    let drag_over_pane: Signal<Option<usize>> = use_signal(|| None);
+
+    // Measured pixel dimensions of the `#terminal-content` container (the
+    // flex:1 div that holds either the single active TerminalView or the
+    // multi-pane container). Updated by a ResizeObserver + 100ms polling
+    // loop below — the same pattern TerminalView uses to measure its own
+    // cell grid. This is what lets `multi_pane_container` lay panes out at
+    // the actual viewport size instead of the prior 1200×800 hardcode
+    // (which clipped panes or left empty space when the window was a
+    // different size — the "显示分辨率不对" symptom).
+    //
+    // `None` only on the very first frame (before the observer fires);
+    // `multi_pane_container` falls back to 1200×800 in that case so the
+    // first paint isn't blank.
+    let mut container_size: Signal<Option<(f64, f64)>> = use_signal(|| None);
+
+    // Active splitter-bar drag, if any. Set by the splitter's `onmousedown`;
+    // read by the drag-poll future below; cleared by the JS `mouseup` handler
+    // (which also sets `document._rusterm_split_drag_active = false`). The poll
+    // future detects the JS-side clear and mirrors it here.
+    //
+    // Why a signal + poll instead of per-event eval callbacks: dioxus's eval
+    // bridge is async request/response — it can't deliver high-frequency
+    // mousemove events synchronously. Polling at 16ms (~60fps) is smooth
+    // enough for splitter dragging and mirrors the TerminalView resize-poll
+    // pattern.
+    let mut split_drag: Signal<Option<SplitDragState>> = use_signal(|| None);
+
+    // Drag-poll loop: while a splitter drag is in progress, read the current
+    // mouse position from `document._rusterm_split_drag_mouse` (kept current
+    // by the JS `mousemove` listener installed in the splitter's
+    // `onmousedown`), compute the delta from the last applied position, and
+    // call `resize_layout_col` / `resize_layout_row` to apply it. The JS
+    // `mouseup` handler clears the drag flag; we detect that and clear the
+    // Rust-side signal to match.
+    //
+    // Poll cadence: 16ms (~60fps) only while a drag is in progress — when
+    // `split_drag` is `None` we `continue` immediately (after the sleep), so
+    // the loop is effectively idle between drags. This matches the existing
+    // TerminalView resize-poll pattern (100ms there, but splitter dragging
+    // benefits from higher cadence for smoothness).
+    let _split_drag_poll = use_future(move || async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(16)).await;
+            let Some(drag) = split_drag() else {
+                continue;
+            };
+            // Read the current mouse position + active flag from JS.
+            let result = dioxus::document::eval(
+                "(function() { \
+                    if (!document._rusterm_split_drag_active) return 'inactive'; \
+                    if (document._rusterm_split_drag_mouse === null || \
+                        document._rusterm_split_drag_mouse === undefined) return 'pending'; \
+                    return document._rusterm_split_drag_mouse.toFixed(2); \
+                })()",
+            )
+            .await;
+            let mut apply_delta: Option<f64> = None;
+            let mut drag_ended = false;
+            if let Ok(value) = result {
+                if let Some(s) = value.as_str() {
+                    if s == "inactive" {
+                        // JS-side mouseup fired — clear the signal.
+                        drag_ended = true;
+                    } else if s != "pending" {
+                        if let Ok(pos) = s.parse::<f64>() {
+                            if pos != drag.last_applied_pos {
+                                apply_delta = Some(pos);
+                            }
+                        }
+                    }
+                }
+            }
+            if drag_ended {
+                split_drag.set(None);
+                continue;
+            }
+            let Some(new_pos) = apply_delta else {
+                continue;
+            };
+            // Convert the pixel delta to a fractional delta and apply it.
+            // Positive delta (mouse moved right/down) grows the earlier
+            // column/row and shrinks the later one — matches the
+            // `resize_col`/`resize_row` contract.
+            let pixel_delta = new_pos - drag.last_applied_pos;
+            let frac_delta = if drag.container_extent > 0.0 {
+                pixel_delta / drag.container_extent
+            } else {
+                0.0
+            };
+            let applied = if drag.is_col {
+                resize_layout_col(&mut state.write(), drag.idx, frac_delta)
+            } else {
+                resize_layout_row(&mut state.write(), drag.idx, frac_delta)
+            };
+            if applied {
+                // Update `last_applied_pos` so we only fire on actual
+                // changes. We DON'T update `start_pos` — the delta is
+                // computed relative to the last applied position, not the
+                // drag origin, which gives smoother behavior when the
+                // minimum-frac guard rejects a delta (the next delta is
+                // computed from where the mouse actually is, not from
+                // where it would have been if the rejected delta had
+                // applied).
+                split_drag.set(Some(SplitDragState {
+                    last_applied_pos: new_pos,
+                    ..drag
+                }));
+            }
+        }
+    });
+
+    // ResizeObserver + polling loop for `#terminal-content`. We poll at
+    // 100ms instead of relying solely on ResizeObserver callbacks because
+    // dioxus's `eval` bridge is request/response — we can't get a
+    // synchronous callback from JS into Rust. The observer sets a dirty
+    // flag (`_rusterm_container_resize_pending`); the poll reads the
+    // flag and, if set, re-measures via `getBoundingClientRect` and
+    // updates the signal. This mirrors the TerminalView resize loop.
+    let _container_measure = use_future(move || async move {
+        // Install the observer first.
+        let observer_script = "(function() { const el = document.getElementById('terminal-content'); \
+             if (!el || el._rusterm_ro) return; \
+             el._rusterm_ro = new ResizeObserver(function() { el._rusterm_container_resize_pending = true; }); \
+             el._rusterm_ro.observe(el); })()";
+        let _ = dioxus::document::eval(observer_script).await;
+        // Force an initial measurement on the first tick so we don't wait
+        // 100ms for the first ResizeObserver callback.
+        let _ = dioxus::document::eval(
+            "(function() { const el = document.getElementById('terminal-content'); \
+             if (el) el._rusterm_container_resize_pending = true; })()",
+        )
+        .await;
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            let result = dioxus::document::eval(
+                "(function() { const el = document.getElementById('terminal-content'); \
+                 if (!el || !el._rusterm_container_resize_pending) return ''; \
+                 el._rusterm_container_resize_pending = false; \
+                 const r = el.getBoundingClientRect(); \
+                 if (r.width <= 0 || r.height <= 0) return ''; \
+                 return r.width.toFixed(2) + ',' + r.height.toFixed(2); })()",
+            )
+            .await;
+            if let Ok(value) = result {
+                if let Some(s) = value.as_str() {
+                    if s.is_empty() {
+                        continue;
+                    }
+                    let parts: Vec<&str> = s.split(',').collect();
+                    if parts.len() == 2 {
+                        if let (Ok(w), Ok(h)) = (parts[0].parse::<f64>(), parts[1].parse::<f64>()) {
+                            if w > 0.0 && h > 0.0 {
+                                container_size.set(Some((w, h)));
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    });
 
     // One-time startup: import local shell history (zsh/bash/fish/atuin) into
     // the SQLite DB so suggestions can draw from a single unified source.
@@ -2914,6 +3972,50 @@ pub fn App() -> Element {
         }
     });
 
+    // Periodically persist the session state (cwd of each tab, etc.) so the
+    // user can restore on next launch even if the app is killed without a
+    // graceful shutdown. 30s is a balance between not losing too much state
+    // and not hammering the disk with encrypted writes.
+    //
+    // We skip saving while:
+    // - The app is still locked (no master key available yet)
+    // - `restore_disabled` is true (user picked "不再询问" earlier)
+    // - There are no sessions open (nothing to save)
+    //
+    // The save itself is atomic (temp + rename) so concurrent saves from
+    // multiple sources (this loop + the close handler) can't corrupt the
+    // file — last writer wins, which is the correct behavior for a snapshot.
+    let state_for_save = state.clone();
+    let _session_state_save_future = use_future(move || async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+
+            let s = state_for_save.read();
+            if s.unlock_state != UnlockState::Unlocked {
+                continue;
+            }
+            if s.restore_disabled {
+                continue;
+            }
+            if s.sessions.is_empty() {
+                continue;
+            }
+            let Some(cm) = s.config_manager.as_ref() else {
+                continue;
+            };
+            let master_key = cm.master_key();
+            // Build the snapshot while holding the read lock, then release
+            // before encrypting+writing (encryption is CPU-bound, no need
+            // to hold the lock through it).
+            let snapshot = s.build_session_state(s.theme_name());
+            // Drop the read lock before the (CPU-bound) encrypt+write.
+            drop(s);
+            if let Err(e) = snapshot.save(&master_key) {
+                tracing::warn!("Failed to save session state: {}", e);
+            }
+        }
+    });
+
     // Master password unlock gate
     match state.read().unlock_state {
         UnlockState::Locked | UnlockState::FirstRun => {
@@ -2943,11 +4045,56 @@ pub fn App() -> Element {
                                     }
                                 };
                                 let mut s = state.write();
+                                // Load the persisted `restore_disabled` flag from
+                                // settings.json so we know whether to even
+                                // attempt loading `session_state.enc`.
+                                s.restore_disabled = cm.load_restore_disabled();
                                 s.config_manager = Some(cm);
                                 s.connections = connections;
                                 s.onekeys = onekeys;
                                 s.unlock_state = UnlockState::Unlocked;
                                 s.master_password_error = None;
+
+                                // Load saved session state (if any) and prepare
+                                // the restore-confirmation modal. We DON'T
+                                // restore here — the user gets to decide via the
+                                // modal (3 buttons: 恢复 / 跳过 / 不再询问).
+                                // If `restore_disabled` was already true (from
+                                // a previous "不再询问" choice that survived
+                                // because it's persisted in settings.json),
+                                // we skip the load entirely — no point in
+                                // decrypting a file we'll never restore from.
+                                if !s.restore_disabled {
+                                    if let Some(cm_ref) = s.config_manager.as_ref() {
+                                        let master_key = cm_ref.master_key();
+                                        match rusterm_core::SessionState::load(&master_key) {
+                                            Ok(Some(loaded)) => {
+                                                tracing::info!(
+                                                    "Loaded saved session state: {} sessions, saved at {}",
+                                                    loaded.sessions.len(),
+                                                    loaded.saved_at
+                                                );
+                                                s.restore_pending = Some(loaded);
+                                            }
+                                            Ok(None) => {
+                                                // First launch or no saved state — fine, nothing to restore.
+                                                tracing::debug!("No saved session state found");
+                                            }
+                                            Err(e) => {
+                                                // Corrupt/tampered/wrong key —
+                                                // log and continue without
+                                                // prompting. Better to silently
+                                                // skip than to nag the user
+                                                // about a corrupt file they
+                                                // can't do anything about.
+                                                tracing::warn!(
+                                                    "Failed to load saved session state (will skip restore): {}",
+                                                    e
+                                                );
+                                            }
+                                        }
+                                    }
+                                }
                             }
                             Err(e) => {
                                 let msg = if e.to_string().contains("Invalid") {
@@ -3044,78 +4191,13 @@ pub fn App() -> Element {
                     on_connect: move |id: String| {
                         let conn = state.read().connections.iter().find(|c| c.id == id).cloned();
                         if let Some(conn) = conn {
-                            let tab_id = uuid::Uuid::new_v4().to_string();
-                            create_terminal(tab_id.clone(), &mut state);
-                            // Remember the config so this session can be
-                            // reconnected by pressing Enter after a disconnect.
-                            state.write().session_configs.insert(tab_id.clone(), conn.clone());
-
-                            match &conn.kind {
-                                ConnectionKind::Ssh(ssh_config) => {
-                                    state.write().sessions.push(SessionTab {
-                                        id: tab_id.clone(),
-                                        name: conn.name.clone(),
-                                        kind: SessionType::Ssh,
-                                        render_output: Default::default(),
-                                        version: 0,
-                                        suggestion: None,
-                                        suggestions: Vec::new(),
-                                        suggestion_selected: 0,
-                                        suggestion_visible: false,
-                                        command_history: Vec::new(),
-                                        hostname: Some(ssh_config.host.clone()),
-                                    });
-                                    state.write().active_session = Some(tab_id.clone());
-                                    start_ssh_connection(state, input_senders, tab_id, ssh_config.clone());
-                                }
-                                ConnectionKind::Shell(shell_config) => {
-                                    let msg = format!("\r\nStarting shell...\r\n");
-                                    let render_output = {
-                                        let terminals = state.read().terminals.clone();
-                                        if let Some(handle) = terminals.get(&tab_id) {
-                                            handle.lock().process_and_render(msg.as_bytes())
-                                        } else {
-                                            Default::default()
-                                        }
-                                    };
-                                    state.write().sessions.push(SessionTab {
-                                        id: tab_id.clone(),
-                                        name: conn.name.clone(),
-                                        kind: SessionType::Shell,
-                                        render_output,
-                                        version: 1,
-                                        suggestion: None,
-                                        suggestions: Vec::new(),
-                                        suggestion_selected: 0,
-                                        suggestion_visible: false,
-                                        command_history: Vec::new(),
-                                        hostname: Some("local".to_string()),
-                                    });
-                                    state.write().active_session = Some(tab_id.clone());
-                                    start_shell_connection(state, input_senders, tab_id, shell_config.clone());
-                                }
-                                _ => {
-                                    let msg = format!("\r\nConnection type not yet supported\r\n");
-                                    let terminals = state.read().terminals.clone();
-                                    if let Some(handle) = terminals.get(&tab_id) {
-                                        let render_result = handle.lock().process_and_render(msg.as_bytes());
-                                        state.write().sessions.push(SessionTab {
-                                            id: tab_id.clone(),
-                                            name: conn.name.clone(),
-                                            kind: SessionType::Ssh,
-                                            render_output: render_result,
-                                            version: 1,
-                                            suggestion: None,
-                                            suggestions: Vec::new(),
-                                            suggestion_selected: 0,
-                                            suggestion_visible: false,
-                                            command_history: Vec::new(),
-                                            hostname: None,
-                                        });
-                                        state.write().active_session = Some(tab_id.clone());
-                                    }
-                                }
-                            }
+                            // `target_pane_idx: None` → open as a new
+                            // active tab (the legacy "click to connect"
+                            // flow). The drag-and-drop drop handler
+                            // calls `open_connection` with
+                            // `Some(pane_idx)` to open the connection
+                            // in a specific pane instead.
+                            open_connection(state, input_senders, conn, None);
                         }
                     },
                     on_new: move |_| {
@@ -3264,7 +4346,7 @@ pub fn App() -> Element {
                             // between panes to support drag-resize.
                             let layout = layout_snapshot.expect("is_multi implies layout exists");
                             rsx! {
-                                {multi_pane_container(state, input_senders, layout)}
+                                {multi_pane_container(state, input_senders, layout, drag_over_pane, container_size, split_drag)}
                             }
                         }
                     }}
@@ -3496,6 +4578,7 @@ pub fn App() -> Element {
                         suggestion_visible: false,
                         command_history: Vec::new(),
                         hostname: Some(ssh_config.host.clone()),
+                        cwd: None,
                     });
                     s.active_session = Some(config.id.clone());
                 }
@@ -3596,6 +4679,77 @@ pub fn App() -> Element {
                     }
                     state.write().onekeys = onekeys;
                     modal.set(Modal::None);
+                },
+            }
+        }
+
+        // ── Session-state restore dialog (feature #17) ─────────────────────
+        // Shown after unlock if `session_state.enc` was loaded successfully.
+        // Three actions (see `RestoreSessionDialog`):
+        //   恢复     → restore each session + `cd <last_cwd>`
+        //   跳过     → clear without restoring
+        //   不再询问 → clear + set `restore_disabled = true` (also deletes
+        //             the saved state file so we don't re-prompt)
+        //
+        // The restore action is non-destructive: we only reconnect sessions
+        // and send a single `cd` per session. We NEVER re-execute past
+        // commands or scripts — the user explicitly asked us not to.
+        if let Some(loaded) = state.read().restore_pending.clone() {
+            RestoreSessionDialog {
+                session_count: loaded.sessions.len(),
+                saved_at: loaded.saved_at.format("%Y-%m-%d %H:%M").to_string(),
+                on_restore: move |_| {
+                    // Take the pending state out so we don't re-show the dialog.
+                    let to_restore = state.write().restore_pending.take();
+                    if let Some(to_restore) = to_restore {
+                        restore_sessions(state, input_senders, to_restore);
+                    }
+                },
+                on_skip: move |_| {
+                    // Just clear the pending state — don't restore, don't
+                    // disable future prompts.
+                    state.write().restore_pending = None;
+                },
+                on_never_ask: move |_| {
+                    // Clear pending + disable future prompts + delete the
+                    // saved state file so we don't re-prompt on next launch
+                    // either.
+                    state.write().restore_pending = None;
+                    state.write().restore_disabled = true;
+                    if let Err(e) = rusterm_core::SessionState::delete() {
+                        tracing::warn!("Failed to delete session state file: {}", e);
+                    }
+                    // Persist the `restore_disabled` flag so it survives
+                    // across launches. We piggyback on the existing settings
+                    // save path (writes settings.json).
+                    save_settings(&state);
+                },
+            }
+        }
+
+        // ── Dangerous-command confirmation modal (feature #17 part 2) ────────
+        // Shown when the user presses Enter on a command the safety checker
+        // flagged. Two actions:
+        //   继续 → send the original Enter to the PTY
+        //   取消 → discard the Enter, keep the input line intact
+        if let Some(pending) = state.read().pending_dangerous_command.clone() {
+            DangerousCommandDialog {
+                command: pending.command.clone(),
+                reason: pending.reason.clone(),
+                on_proceed: move |_| {
+                    // User confirmed — send the original Enter to the PTY.
+                    let p = state.write().pending_dangerous_command.take();
+                    if let Some(p) = p {
+                        if let Some(sender) = input_senders.read().get(&p.session_id) {
+                            let _ = sender.send(b"\n".to_vec());
+                        }
+                    }
+                },
+                on_cancel: move |_| {
+                    // Discard the Enter — just clear the pending state. The
+                    // user's input line stays intact (we never sent the Enter),
+                    // so they can edit or backspace.
+                    state.write().pending_dangerous_command = None;
                 },
             }
         }

@@ -26,15 +26,17 @@ fn main() {
 
     // Parse SVG. The SVG has no <text> elements, so we can keep
     // default-features off (skips fontdb/fontconfig dependency).
-    let tree = usvg::Tree::from_str(&svg, &usvg::Options::default())
-        .expect("parse gemini-svg.svg");
+    let tree = usvg::Tree::from_str(&svg, &usvg::Options::default()).expect("parse gemini-svg.svg");
 
     // 512x512 matches the SVG's viewBox and gives crisp icons up to 256px
     // (the largest frame dioxus/tao requests on Windows).
     let mut pixmap = tiny_skia::Pixmap::new(512, 512).expect("alloc 512x512 pixmap");
 
-    resvg::render(&tree, tiny_skia::Transform::identity(), &mut pixmap.as_mut())
-        .expect("render SVG to pixmap");
+    resvg::render(
+        &tree,
+        tiny_skia::Transform::identity(),
+        &mut pixmap.as_mut(),
+    );
 
     let png = pixmap.encode_png().expect("encode PNG");
 

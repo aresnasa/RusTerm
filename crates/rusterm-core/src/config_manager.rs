@@ -238,6 +238,37 @@ impl ConfigManager {
             .collect()
     }
 
+    /// Read the `restore_disabled` flag from settings.json. Used on unlock to
+    /// decide whether to even attempt loading `session_state.enc` (no point
+    /// decrypting a file we'll never restore from).
+    pub fn load_restore_disabled(&self) -> bool {
+        self.read_persisted().restore_disabled
+    }
+
+    /// Persist the `restore_disabled` flag to settings.json. Used when the user
+    /// picks "不再询问" on the restore dialog — we set the flag so we never
+    /// prompt again (and stop saving session state entirely).
+    /// Preserves existing connections + OneKeys (read-modify-write).
+    pub fn save_restore_disabled(&self, restore_disabled: bool) -> Result<()> {
+        let existing = self.read_persisted();
+        let persisted = PersistedConfig {
+            version: CONFIG_VERSION,
+            connections: existing.connections,
+            onekeys: existing.onekeys,
+            master_password_hash: self.master_password_hash.clone(),
+            restore_disabled,
+        };
+
+        let json =
+            serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
+
+        let temp_path = self.config_path.with_extension("json.tmp");
+        fs::write(&temp_path, &json).context("Failed to write config file")?;
+        fs::rename(&temp_path, &self.config_path).context("Failed to rename temp config file")?;
+
+        Ok(())
+    }
+
     /// Expose the master key for use by other components that need to encrypt
     /// sensitive user data at rest (e.g. `SessionLog`). The key itself is
     /// never written to logs — see `Debug for ConfigManager` above, which
@@ -285,15 +316,16 @@ impl ConfigManager {
     pub fn save_connections(&self, connections: &[ConnectionConfig]) -> Result<()> {
         // Preserve existing OneKeys (read-modify-write) so saving connections
         // doesn't clobber the OneKey library.
-        let existing_onekeys = self.read_persisted().onekeys;
+        let existing = self.read_persisted();
         let persisted = PersistedConfig {
             version: CONFIG_VERSION,
             connections: connections
                 .iter()
                 .map(|c| self.encrypt_connection(c))
                 .collect::<Result<Vec<_>>>()?,
-            onekeys: existing_onekeys,
+            onekeys: existing.onekeys,
             master_password_hash: self.master_password_hash.clone(),
+            restore_disabled: existing.restore_disabled,
         };
 
         let json =
@@ -314,6 +346,7 @@ impl ConfigManager {
                 connections: vec![],
                 onekeys: vec![],
                 master_password_hash: None,
+                restore_disabled: false,
             };
         }
         fs::read_to_string(&self.config_path)
@@ -324,20 +357,22 @@ impl ConfigManager {
                 connections: vec![],
                 onekeys: vec![],
                 master_password_hash: None,
+                restore_disabled: false,
             })
     }
 
     /// Save the OneKey library. Preserves existing connections (read-modify-write).
     pub fn save_onekeys(&self, onekeys: &[OneKey]) -> Result<()> {
-        let existing_connections = self.read_persisted().connections;
+        let existing = self.read_persisted();
         let persisted = PersistedConfig {
             version: CONFIG_VERSION,
-            connections: existing_connections,
+            connections: existing.connections,
             onekeys: onekeys
                 .iter()
                 .map(|ok| self.encrypt_onekey(ok))
                 .collect::<Result<Vec<_>>>()?,
             master_password_hash: self.master_password_hash.clone(),
+            restore_disabled: existing.restore_disabled,
         };
 
         let json =

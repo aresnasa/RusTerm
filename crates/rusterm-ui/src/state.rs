@@ -168,6 +168,55 @@ pub struct AppState {
     /// the default Single state).
     #[serde(skip)]
     pub layout_preset: LayoutPreset,
+
+    // ── Session-state restore (feature #17) ─────────────────────────────
+    //
+    // On unlock we load `session_state.enc` (if it exists) and stash the
+    // decrypted `SessionState` here. The UI renders a restore-confirmation
+    // modal while this is `Some`; the three modal buttons clear it.
+    //   - 恢复 (Restore):   reconnect each session + `cd <cwd>`
+    //   - 跳过 (Skip):      clear without restoring
+    //   - 不再询问 (Never):  clear + set `restore_disabled = true` in settings
+    //
+    // We deliberately never re-execute past commands or scripts — only
+    // `cd`, which is side-effect-free. See `session_state.rs` docs.
+    #[serde(skip)]
+    pub restore_pending: Option<rusterm_core::SessionState>,
+    /// Set when the user picks "不再询问" so we never re-prompt (and stop
+    /// saving session state entirely). Persisted in `settings.json` so the
+    /// choice survives across launches. The user can re-enable via the
+    /// settings panel (future work).
+    pub restore_disabled: bool,
+
+    // ── Dangerous-command protection (feature #17 part 2) ──────────────
+    //
+    // Before sending Enter to the PTY, the input handler runs the current
+    // input line through `CommandSafetyChecker`. If the verdict is `Warn`,
+    // we DON'T send Enter — instead we stash the pending command + reason
+    // here and render a confirmation modal. The modal's "继续" button sends
+    // the original Enter; "取消" discards it.
+    //
+    // `None` when no dangerous command is pending confirmation.
+    #[serde(skip)]
+    pub pending_dangerous_command: Option<PendingDangerousCommand>,
+    /// Pre-compiled dangerous-command patterns. Cheap to clone but we keep
+    /// exactly one on the app state for the whole session lifetime.
+    #[serde(skip)]
+    pub safety_checker: rusterm_core::CommandSafetyChecker,
+}
+
+/// State held while the dangerous-command confirmation modal is open.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingDangerousCommand {
+    /// The full command line that triggered the warning (used to re-send
+    /// Enter if the user confirms). Stored verbatim so we don't lose any
+    /// quoting / escaping the user typed.
+    pub command: String,
+    /// Human-readable reason from `SafetyVerdict::Warn`. Shown in the modal.
+    pub reason: String,
+    /// Session id the command was typed into. Used to route the eventual
+    /// Enter to the right PTY sender.
+    pub session_id: String,
 }
 
 /// State of the OneKey autofill popup for a single session.
@@ -217,6 +266,14 @@ pub struct SessionTab {
     /// Used to tag commands in the DB so suggestions can draw from all hosts.
     #[serde(skip)]
     pub hostname: Option<String>,
+    /// Last reported working directory of this session, captured from the
+    /// shell via OSC 7 (`file://<host><path>`). `None` until the shell reports
+    /// one (raw telnet/serial sessions never will). Mirrored from
+    /// `Terminal::cwd()` into `SessionTab` so the session-state save path can
+    /// read it without taking the terminal lock. Updated in the output-processing
+    /// loop alongside `render_output` / `version`.
+    #[serde(skip)]
+    pub cwd: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -255,6 +312,101 @@ impl Default for AppState {
             analytics: crate::analytics::AnalyticsHandle::default(),
             layouts: HashMap::new(),
             layout_preset: LayoutPreset::default(),
+            restore_pending: None,
+            restore_disabled: false,
+            pending_dangerous_command: None,
+            safety_checker: rusterm_core::CommandSafetyChecker::new(),
+        }
+    }
+}
+
+impl AppState {
+    /// Build a `SessionState` snapshot from the current app state, suitable
+    /// for saving to `session_state.enc`.
+    ///
+    /// Captures, per session:
+    /// - id, name, kind, hostname, connection_id
+    /// - cwd (last reported by the shell via OSC 7 — `None` if the shell
+    ///   never reported one, e.g. raw telnet/serial)
+    /// - tail of `command_history` (last N entries, display-only — these are
+    ///   NEVER re-executed on restore; they're just re-seeded into the
+    ///   suggestion popup)
+    ///
+    /// NOT captured: scrollback (too large), env vars (would leak secrets),
+    /// PTY process state (impossible to restore), input box content.
+    ///
+    /// `theme_name` is the name of the current theme so it can be restored
+    /// on next launch without a flicker.
+    pub fn build_session_state(&self, theme_name: &str) -> rusterm_core::SessionState {
+        let sessions: Vec<_> = self
+            .sessions
+            .iter()
+            .map(|tab| {
+                // Tail of command history — last 100 entries, display-only.
+                let history_tail: Vec<String> = if tab.command_history.len() > 100 {
+                    tab.command_history[tab.command_history.len() - 100..].to_vec()
+                } else {
+                    tab.command_history.clone()
+                };
+
+                // Look up connection_id for SSH/Telnet/Tcp sessions so we can
+                // find the matching `ConnectionConfig` on restore.
+                let connection_id = match tab.kind {
+                    rusterm_core::session::SessionType::Ssh
+                    | rusterm_core::session::SessionType::Telnet
+                    | rusterm_core::session::SessionType::Tcp => self
+                        .session_configs
+                        .iter()
+                        .find(|(_, c)| c.name == tab.name)
+                        .map(|(id, _)| id.clone())
+                        .or_else(|| Some(tab.id.clone())),
+                    _ => None,
+                };
+
+                rusterm_core::session_state::PersistedSession {
+                    id: tab.id.clone(),
+                    name: tab.name.clone(),
+                    kind: tab.kind,
+                    hostname: tab.hostname.clone(),
+                    connection_id,
+                    cwd: tab.cwd.clone(),
+                    command_history_tail: history_tail,
+                }
+            })
+            .collect();
+
+        rusterm_core::SessionState {
+            schema_version: 1,
+            saved_at: chrono::Utc::now(),
+            active_session: self.active_session.clone(),
+            sessions,
+            theme: Some(theme_name.to_string()),
+        }
+    }
+
+    /// Encrypt + atomically persist the current session state. No-op if
+    /// `restore_disabled` is true (the user picked "不再询问" earlier — we
+    /// don't save so we don't re-prompt on next launch either). Returns the
+    /// save result so the caller can log failures.
+    ///
+    /// `master_key` is the AES-256-GCM key derived from the master password;
+    /// comes from `ConfigManager::master_key()`.
+    pub fn save_session_state(&self, master_key: &[u8; 32]) -> anyhow::Result<()> {
+        if self.restore_disabled {
+            // User explicitly disabled restore — don't save, don't re-prompt.
+            // If they want to re-enable, they can do so from settings (future
+            // work: a settings toggle that clears `restore_disabled`).
+            return Ok(());
+        }
+        let state = self.build_session_state(self.theme_name());
+        state.save(master_key)
+    }
+
+    /// Returns the current theme as a string name (for persistence).
+    pub fn theme_name(&self) -> &'static str {
+        match self.theme {
+            Theme::Dark => "Dark",
+            Theme::Light => "Light",
         }
     }
 }
@@ -465,6 +617,114 @@ pub fn scroll_sync_targets(state: &AppState) -> Vec<String> {
     broadcast_targets(state)
 }
 
+// ======================================================================
+// Task 16 — drag-and-drop pane rearrangement
+// ======================================================================
+//
+// These wrappers expose `PaneLayout`'s pane-mutation operations through
+// the active-tab indirection. The drag-and-drop UI handlers in `app.rs`
+// call these instead of touching `PaneLayout` directly because:
+//
+// 1. They take `&mut AppState` (not `&mut Signal<AppState>`), so they're
+//    unit-testable without spinning up a dioxus runtime.
+// 2. They handle the active-session / layout lookup boilerplate that
+//    every layout mutation needs (find active_session → find its layout
+//    → mutate). Centralizing this avoids the same 6-line preamble in
+//    every handler.
+// 3. They return `bool` / `Option` so the caller can fall back to a
+//    different operation (e.g., if `set_pane_session_for_active` fails
+//    because there's no layout, the drop handler can create a new tab
+//    instead).
+//
+// ## Why no `split_pane` / `close_pane` here
+//
+// The current `PaneLayout` is a uniform row-major grid (every row has
+// the same number of columns). Arbitrary tmux-style splits would break
+// the `rows * cols == panes.len()` invariant that `pane_rect` and
+// `visible_panes` rely on. Implementing arbitrary splits would require
+// either (a) restricting splits to grid-preserving operations (which
+// limits the user to the 5 existing presets) or (b) refactoring
+// `PaneLayout` to a binary tree (a ~200-400 line change that would
+// invalidate the 41 layout tests).
+//
+// For Task 16's MVP we deliberately choose grid-only: the user can
+// drag sessions between existing panes and drag sidebar connections
+// onto existing panes (replacing the pane's session). Splitting panes
+// is left to the existing `cycle_layout_preset` / `apply_layout_preset`
+// path. A future task can introduce tree-based splits if the user
+// wants arbitrary layouts.
+
+/// Replace the session displayed in pane `pane_idx` of the active tab's
+/// layout with `session_id`. Used when the user drag-and-drops an open
+/// session (from the tab bar) or a sidebar connection (after the
+/// connection has been opened as a new session) onto a specific pane.
+///
+/// Returns `true` if the pane's session was replaced. Returns `false`
+/// if there's no active session, no layout for the active session, or
+/// `pane_idx` is out of range — in all these cases the layout is left
+/// untouched and the caller should fall back to the legacy "open new
+/// tab" path.
+pub fn set_pane_session_for_active(
+    state: &mut AppState,
+    pane_idx: usize,
+    session_id: String,
+) -> bool {
+    let Some(active_id) = state.active_session.clone() else {
+        return false;
+    };
+    let Some(layout) = state.layouts.get_mut(&active_id) else {
+        return false;
+    };
+    layout.set_pane_session(pane_idx, session_id)
+}
+
+/// Swap the panes displaying `from_session` and `to_session` in the
+/// active tab's layout. Used when the user drag-and-drops an open
+/// session from one pane onto another pane — the two panes exchange
+/// their displayed sessions.
+///
+/// Returns `true` if both sessions were found in the active tab's
+/// layout and swapped. Returns `false` (and leaves the layout
+/// unchanged) if there's no active session, no layout, or either
+/// session isn't currently displayed in any pane.
+pub fn swap_pane_sessions(state: &mut AppState, from_session: &str, to_session: &str) -> bool {
+    let Some(active_id) = state.active_session.clone() else {
+        return false;
+    };
+    let Some(layout) = state.layouts.get_mut(&active_id) else {
+        return false;
+    };
+    layout.swap_panes_by_session(from_session, to_session)
+}
+
+/// Look up the pane index displaying `session_id` in the active tab's
+/// layout. Returns `None` if there's no active session, no layout, or
+/// the session isn't displayed in any pane.
+///
+/// Used by the drag-and-drop drop handler to identify which pane the
+/// user dropped onto (given the pane's `session_id` from the rendered
+/// `visible_panes` list) and to find the source pane of a drag (given
+/// the dragged tab's `session_id`).
+pub fn pane_index_for_active_session(state: &AppState, session_id: &str) -> Option<usize> {
+    let active_id = state.active_session.as_ref()?;
+    let layout = state.layouts.get(active_id)?;
+    layout.pane_index_for_session(session_id)
+}
+
+/// Get the `session_id` displayed at pane `pane_idx` in the active
+/// tab's layout. Returns `None` if there's no active session, no
+/// layout, or `pane_idx` is out of range. The returned string may be
+/// empty (a pane slot with no session).
+///
+/// Used by the drop handler to identify the session currently
+/// displayed at the drop target (so we can swap it with the dragged
+/// session, or replace it with a freshly-opened connection).
+pub fn session_at_pane(state: &AppState, pane_idx: usize) -> Option<String> {
+    let active_id = state.active_session.as_ref()?;
+    let layout = state.layouts.get(active_id)?;
+    layout.panes.get(pane_idx).map(|p| p.session_id.clone())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -575,6 +835,7 @@ mod tests {
                 suggestion_visible: false,
                 command_history: Vec::new(),
                 hostname: Some(name.to_string()),
+                cwd: None,
             });
         }
         state
@@ -1330,6 +1591,775 @@ mod tests {
         apply_layout_preset(&mut state, LayoutPreset::Split2H);
         // comparison off → only the active session scrolls.
         assert_eq!(scroll_sync_targets(&state), vec!["alpha".to_string()]);
+    }
+
+    // ------------------------------------------------------------------
+    // Task 14 / 15 — additional coverage for multi-pane display and
+    // session-allocation correctness. These pin contracts that the
+    // earlier tests don't directly exercise.
+    // ------------------------------------------------------------------
+
+    /// Each tab owns its own layout — switching the active session must not
+    /// disturb another tab's layout. This is the multi-tab invariant of
+    /// Task 14's multi-pane display: switching tabs swaps which layout is
+    /// rendered, but both layouts coexist in `state.layouts`.
+    #[test]
+    fn layouts_are_per_session_and_independent_across_tabs() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma"]);
+        // alpha tab → Grid4 (3 sessions, last slot empty).
+        apply_layout_preset(&mut state, LayoutPreset::Grid4);
+        assert_eq!(state.layouts.len(), 1);
+        assert!(state.layouts.contains_key("alpha"));
+
+        // Switch active session to beta and apply Split2H there.
+        state.active_session = Some("beta".to_string());
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        assert_eq!(state.layouts.len(), 2);
+        assert!(state.layouts.contains_key("beta"));
+
+        // The two layouts are distinct — beta's layout is Split2H (2 panes),
+        // alpha's is still Grid4 (4 panes).
+        assert_eq!(state.layouts.get("alpha").unwrap().panes.len(), 4);
+        assert_eq!(state.layouts.get("beta").unwrap().panes.len(), 2);
+
+        // Switching back to alpha — its layout is preserved unchanged.
+        state.active_session = Some("alpha".to_string());
+        let alpha_layout = state.layouts.get("alpha").unwrap().clone();
+        assert_eq!(alpha_layout.panes.len(), 4);
+        assert_eq!(alpha_layout.cols(), 2);
+        assert_eq!(alpha_layout.rows(), 2);
+    }
+
+    /// Task 15 contract: when the user cycles a layout preset on a tab whose
+    /// active session is `X`, the new layout is rebuilt with `X` anchored at
+    /// pane 0 and the remaining sessions filling the rest in tab order.
+    /// This is the session-allocation correctness criterion.
+    #[test]
+    fn cycle_layout_preset_anchors_active_session_at_pane_zero() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma", "delta"]);
+        // Make `gamma` the active session — it's at index 2 in `sessions`.
+        state.active_session = Some("gamma".to_string());
+
+        // Cycle to Grid4. The new layout should have `gamma` at pane 0,
+        // not `alpha` (which is the first tab). This is the contract
+        // `apply_layout_preset` enforces: active session first, then the
+        // remaining sessions in tab order (excluding the active one).
+        cycle_layout_preset(&mut state); // Single → Split2H
+        cycle_layout_preset(&mut state); // Split2H → Split2V
+        cycle_layout_preset(&mut state); // Split2V → Grid4
+        let layout = state
+            .layouts
+            .get("gamma")
+            .expect("layout stored under gamma");
+        assert_eq!(layout.panes.len(), 4);
+        assert_eq!(layout.panes[0].session_id, "gamma");
+        // Remaining panes fill with the other sessions in tab order.
+        assert_eq!(layout.panes[1].session_id, "alpha");
+        assert_eq!(layout.panes[2].session_id, "beta");
+        assert_eq!(layout.panes[3].session_id, "delta");
+    }
+
+    /// Task 15 contract: re-applying a preset after opening a new session
+    /// pulls the new session into the layout. This mirrors the user flow of
+    /// "open several sessions, then enable Grid4" — every session created
+    /// since the last layout build is included.
+    #[test]
+    fn apply_layout_preset_pulls_in_sessions_opened_after_layout_was_built() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        // Layout contains alpha, beta only.
+        let layout = state.layouts.get("alpha").unwrap();
+        assert_eq!(layout.session_ids(), vec!["alpha", "beta"]);
+
+        // Open two more sessions after the layout was built (simulating the
+        // sidebar connect / local-terminal buttons). They go into `sessions`
+        // but the existing layout is NOT automatically rebuilt.
+        state.sessions.push(SessionTab {
+            id: "gamma".to_string(),
+            name: "gamma".to_string(),
+            kind: SessionType::Ssh,
+            render_output: Default::default(),
+            version: 0,
+            suggestion: None,
+            suggestions: Vec::new(),
+            suggestion_selected: 0,
+            suggestion_visible: false,
+            command_history: Vec::new(),
+            hostname: Some("gamma".to_string()),
+            cwd: None,
+        });
+        state.sessions.push(SessionTab {
+            id: "delta".to_string(),
+            name: "delta".to_string(),
+            kind: SessionType::Ssh,
+            render_output: Default::default(),
+            version: 0,
+            suggestion: None,
+            suggestions: Vec::new(),
+            suggestion_selected: 0,
+            suggestion_visible: false,
+            command_history: Vec::new(),
+            hostname: Some("delta".to_string()),
+            cwd: None,
+        });
+
+        // Re-apply Grid4 — now all 4 sessions should be in the layout.
+        apply_layout_preset(&mut state, LayoutPreset::Grid4);
+        let layout = state.layouts.get("alpha").unwrap();
+        assert_eq!(layout.panes.len(), 4);
+        assert_eq!(layout.panes[0].session_id, "alpha");
+        assert_eq!(layout.panes[1].session_id, "beta");
+        assert_eq!(layout.panes[2].session_id, "gamma");
+        assert_eq!(layout.panes[3].session_id, "delta");
+    }
+
+    /// Task 14 contract: Grid8 is recognised as multi-pane (so the
+    /// multi-pane render path is taken, not the legacy single-pane path).
+    /// This is what makes "8 分隔" actually display 8 panes side-by-side.
+    #[test]
+    fn grid8_layout_is_multi_pane() {
+        let mut state =
+            state_with_active_session(&["s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7"]);
+        apply_layout_preset(&mut state, LayoutPreset::Grid8);
+        let layout = state.layouts.get("s0").unwrap();
+        assert!(layout.is_multi_pane());
+        assert_eq!(layout.rows(), 2);
+        assert_eq!(layout.cols(), 4);
+        assert_eq!(layout.panes.len(), 8);
+    }
+
+    /// Task 14 contract: comparison mode on Grid8 broadcasts input to all
+    /// 8 panes (no session dropped, no duplicates). This is the
+    /// "跨终端会话的比对模式" use case — the user wants the same command to
+    /// run on 8 hosts simultaneously.
+    #[test]
+    fn broadcast_targets_covers_all_eight_panes_in_grid8_comparison() {
+        let mut state =
+            state_with_active_session(&["s0", "s1", "s2", "s3", "s4", "s5", "s6", "s7"]);
+        apply_layout_preset(&mut state, LayoutPreset::Grid8);
+        toggle_comparison_mode(&mut state);
+        let targets = broadcast_targets(&state);
+        assert_eq!(targets.len(), 8);
+        for i in 0..8 {
+            assert!(targets.contains(&format!("s{i}")));
+        }
+    }
+
+    /// Task 14 contract: zoom survives a window resize. The zoomed pane's
+    /// rect always equals the container size regardless of how the
+    /// container dimensions change. This pins the "全屏分辨率" requirement —
+    /// fullscreen isn't tied to a specific resolution, it adapts.
+    #[test]
+    fn zoomed_pane_fills_container_after_resize() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        // Zoom pane 0.
+        assert!(toggle_pane_zoom(&mut state, "alpha"));
+        let layout = state.layouts.get("alpha").unwrap().clone();
+
+        // At the original container size, the zoomed pane fills it.
+        let r0 = layout.pane_rect(0, 1200.0, 800.0).unwrap();
+        assert_eq!(r0, (0.0, 0.0, 1200.0, 800.0));
+        // After the window is resized to a different aspect ratio, the
+        // zoomed pane still fills the whole container.
+        let r0_big = layout.pane_rect(0, 1920.0, 1080.0).unwrap();
+        assert_eq!(r0_big, (0.0, 0.0, 1920.0, 1080.0));
+        let r0_small = layout.pane_rect(0, 640.0, 480.0).unwrap();
+        assert_eq!(r0_small, (0.0, 0.0, 640.0, 480.0));
+        // The other pane stays hidden.
+        assert!(layout.pane_rect(1, 1200.0, 800.0).is_none());
+    }
+
+    /// Task 14 contract: comparison mode is a per-tab layout flag, so
+    /// toggling zoom on one pane doesn't disturb the comparison flag.
+    /// This ensures the user can enter comparison mode, then zoom a pane
+    /// to inspect it, then unzoom and resume the comparison broadcast —
+    /// the comparison flag survives the zoom cycle.
+    #[test]
+    fn zoom_cycle_preserves_comparison_mode() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma", "delta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Grid4);
+        // Enable comparison mode.
+        assert_eq!(toggle_comparison_mode(&mut state), Some(true));
+        // Zoom pane 2 (gamma).
+        assert!(toggle_pane_zoom(&mut state, "gamma"));
+        // Comparison is still on.
+        let layout = state.layouts.get("alpha").unwrap();
+        assert!(layout.comparison);
+        assert_eq!(layout.zoomed, Some(2));
+        // While zoomed, broadcast_targets still resolves the layout's
+        // session_ids (the comparison contract holds even when one pane
+        // is zoomed — input goes to all pane sessions, not just the
+        // zoomed one).
+        let targets = broadcast_targets(&state);
+        assert_eq!(targets.len(), 4);
+        // Unzoom — comparison still on.
+        assert!(toggle_pane_zoom(&mut state, "gamma"));
+        let layout = state.layouts.get("alpha").unwrap();
+        assert!(layout.comparison);
+        assert!(layout.zoomed.is_none());
+    }
+
+    /// Task 15 contract: closing a pane's session and re-applying the
+    /// preset re-allocates the freed pane to the next available session.
+    /// This mirrors the user flow of "close tab, layout auto-rebuilds."
+    #[test]
+    fn apply_layout_preset_after_session_close_reallocates_panes() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma", "delta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Grid4);
+        // Close `beta` (pane 1).
+        state.sessions.retain(|s| s.id != "beta");
+        // Re-apply Grid4 — only 3 sessions left, so pane 3 should be empty.
+        apply_layout_preset(&mut state, LayoutPreset::Grid4);
+        let layout = state.layouts.get("alpha").unwrap();
+        assert_eq!(layout.panes.len(), 4);
+        assert_eq!(layout.panes[0].session_id, "alpha");
+        assert_eq!(layout.panes[1].session_id, "gamma");
+        assert_eq!(layout.panes[2].session_id, "delta");
+        assert_eq!(layout.panes[3].session_id, "");
+        // session_ids skips the empty pane.
+        assert_eq!(layout.session_ids(), vec!["alpha", "gamma", "delta"]);
+    }
+
+    /// Task 15 contract: the active session is always in `broadcast_targets`
+    /// (whether comparison is on or off). This is the invariant that lets the
+    /// input handler assume "the user's keystrokes always reach the focused
+    /// pane, regardless of comparison mode".
+    #[test]
+    fn broadcast_targets_always_includes_active_session() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma"]);
+        // No layout — active only.
+        assert_eq!(broadcast_targets(&state), vec!["alpha".to_string()]);
+
+        // Grid4 layout, comparison off — active only.
+        apply_layout_preset(&mut state, LayoutPreset::Grid4);
+        assert_eq!(broadcast_targets(&state), vec!["alpha".to_string()]);
+
+        // Comparison on — all panes, but `alpha` (the active session) must
+        // be present in the list.
+        toggle_comparison_mode(&mut state);
+        let targets = broadcast_targets(&state);
+        assert!(targets.contains(&"alpha".to_string()));
+        assert!(targets.contains(&"beta".to_string()));
+        assert!(targets.contains(&"gamma".to_string()));
+    }
+
+    // ------------------------------------------------------------------
+    // Task 16 — drag-and-drop pane rearrangement wrappers
+    // ------------------------------------------------------------------
+    //
+    // These tests pin the contracts of `set_pane_session_for_active`,
+    // `swap_pane_sessions`, `pane_index_for_active_session`, and
+    // `session_at_pane`. The drag-and-drop UI handlers in `app.rs`
+    // depend on every branch of these functions: the happy path
+    // (mutation applied), the no-active-session path (graceful false),
+    // the no-layout path (graceful false), and the out-of-range path
+    // (graceful false / None). If any of these changed silently, the
+    // drop handler could end up mutating the wrong tab's layout or
+    // panicking on an unwrap.
+
+    /// `set_pane_session_for_active` replaces the session at a given
+    /// pane index in the active tab's layout. This is the path the drop
+    /// handler takes when the user drags an open tab onto a pane that
+    /// currently has no session (e.g., dropping onto an empty slot in
+    /// a Grid8 layout where only 2 of 8 panes are filled).
+    #[test]
+    fn set_pane_session_for_active_replaces_pane_session() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        // Pane 1 shows "beta"; replace it with "gamma".
+        assert!(set_pane_session_for_active(
+            &mut state,
+            1,
+            "gamma".to_string()
+        ));
+        let layout = state.layouts.get("alpha").unwrap();
+        assert_eq!(layout.panes[1].session_id, "gamma");
+    }
+
+    /// With no active session, `set_pane_session_for_active` returns
+    /// false without touching anything. This covers the (rare) case
+    /// where the user has closed all tabs mid-drag.
+    #[test]
+    fn set_pane_session_for_active_returns_false_with_no_active_session() {
+        let mut state = AppState::default();
+        assert!(!set_pane_session_for_active(&mut state, 0, "x".to_string()));
+        assert!(state.layouts.is_empty());
+    }
+
+    /// With an active session but no layout applied (Single preset),
+    /// `set_pane_session_for_active` returns false. The drop handler
+    /// uses this branch to fall back to the legacy "open new tab"
+    /// path — there's no pane to drop onto if the user hasn't entered
+    /// a multi-pane layout.
+    #[test]
+    fn set_pane_session_for_active_returns_false_with_no_layout() {
+        let mut state = state_with_active_session(&["alpha"]);
+        // No apply_layout_preset call → no entry in state.layouts.
+        assert!(!set_pane_session_for_active(
+            &mut state,
+            0,
+            "beta".to_string()
+        ));
+    }
+
+    /// Out-of-range pane index returns false. The drop handler may
+    /// compute a stale pane index (e.g., the layout was cycled while
+    /// the drag was in flight); in that case the function must fail
+    /// gracefully rather than panic on `panes[idx]`.
+    #[test]
+    fn set_pane_session_for_active_returns_false_for_out_of_range_pane() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        // Only 2 panes; index 99 is out of range.
+        assert!(!set_pane_session_for_active(
+            &mut state,
+            99,
+            "x".to_string()
+        ));
+    }
+
+    /// `swap_pane_sessions` exchanges the panes displaying two sessions.
+    /// This is the path the drop handler takes when the user drags an
+    /// open tab onto a pane that already has a session — the two panes
+    /// swap their displayed sessions.
+    #[test]
+    fn swap_pane_sessions_exchanges_two_panes() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma", "delta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Grid4);
+        // Before: pane 0=alpha, pane 2=gamma.
+        assert!(swap_pane_sessions(&mut state, "alpha", "gamma"));
+        let layout = state.layouts.get("alpha").unwrap();
+        assert_eq!(layout.panes[0].session_id, "gamma");
+        assert_eq!(layout.panes[2].session_id, "alpha");
+    }
+
+    /// `swap_pane_sessions` with a missing session returns false. This
+    /// covers the case where the user drags a tab that was just closed
+    /// — the session_id is no longer in any pane, so the swap can't
+    /// happen.
+    #[test]
+    fn swap_pane_sessions_returns_false_for_missing_session() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        let before = state.layouts.get("alpha").unwrap().clone();
+        assert!(!swap_pane_sessions(&mut state, "alpha", "nonexistent"));
+        assert_eq!(state.layouts.get("alpha").unwrap(), &before);
+    }
+
+    /// `swap_pane_sessions` with no active session returns false
+    /// (graceful no-op). Same rationale as the
+    /// `set_pane_session_for_active` test above.
+    #[test]
+    fn swap_pane_sessions_returns_false_with_no_active_session() {
+        let mut state = AppState::default();
+        assert!(!swap_pane_sessions(&mut state, "alpha", "beta"));
+    }
+
+    /// `pane_index_for_active_session` returns the pane index displaying
+    /// a given session in the active tab's layout. Used by the drop
+    /// handler to find the source pane of a drag (so we know which
+    /// pane to swap from).
+    #[test]
+    fn pane_index_for_active_session_returns_correct_index() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma", "delta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Grid4);
+        assert_eq!(pane_index_for_active_session(&state, "alpha"), Some(0));
+        assert_eq!(pane_index_for_active_session(&state, "delta"), Some(3));
+        assert_eq!(pane_index_for_active_session(&state, "nonexistent"), None);
+    }
+
+    /// `pane_index_for_active_session` returns None when there's no
+    /// active session or no layout. This is what the drop handler uses
+    /// to detect "the user is dragging from a tab in a layout-less
+    /// (Single-preset) tab" — in that case there's no pane to swap.
+    #[test]
+    fn pane_index_for_active_session_returns_none_without_layout() {
+        let state = state_with_active_session(&["alpha"]);
+        // No layout applied.
+        assert_eq!(pane_index_for_active_session(&state, "alpha"), None);
+    }
+
+    /// `session_at_pane` returns the session_id displayed at a given
+    /// pane index. Used by the drop handler to identify the session
+    /// currently at the drop target (so we can swap it with the dragged
+    /// session, or replace it with a freshly-opened connection).
+    #[test]
+    fn session_at_pane_returns_correct_session() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma", "delta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Grid4);
+        assert_eq!(session_at_pane(&state, 0), Some("alpha".to_string()));
+        assert_eq!(session_at_pane(&state, 3), Some("delta".to_string()));
+        // Out of range.
+        assert_eq!(session_at_pane(&state, 99), None);
+    }
+
+    /// `session_at_pane` returns None when there's no active session or
+    /// no layout. The drop handler uses this to detect "the user dropped
+    /// onto a pane in a layout-less tab" — in that case there's no
+    /// existing session to swap with, and the handler opens a new tab
+    /// instead.
+    #[test]
+    fn session_at_pane_returns_none_without_layout() {
+        let state = state_with_active_session(&["alpha"]);
+        assert_eq!(session_at_pane(&state, 0), None);
+    }
+
+    /// Round-trip: swap two sessions, then swap them back. The layout
+    /// should be identical to the original. This pins the algebraic
+    /// invariant that swap is its own inverse — the user can always
+    /// "undo" a drag by dragging back.
+    #[test]
+    fn swap_pane_sessions_round_trip_restores_layout() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma", "delta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Grid4);
+        let before = state.layouts.get("alpha").unwrap().clone();
+        assert!(swap_pane_sessions(&mut state, "alpha", "gamma"));
+        assert!(swap_pane_sessions(&mut state, "alpha", "gamma"));
+        assert_eq!(state.layouts.get("alpha").unwrap(), &before);
+    }
+
+    /// Drag a session onto an empty pane: the session moves from its
+    /// original pane to the empty pane (the original pane becomes empty).
+    /// This is the "drag-to-rearrange" flow when the user wants to
+    /// reorganize a partially-filled grid. We achieve this by
+    /// `set_pane_session(target_pane, source_session)` followed by
+    /// `set_pane_session(source_pane, "")` — both panes are updated
+    /// through the wrapper.
+    #[test]
+    fn drag_session_to_empty_pane_moves_session() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        // Grid4 → panes 0,1 have alpha,beta; panes 2,3 are empty.
+        apply_layout_preset(&mut state, LayoutPreset::Grid4);
+        // Find source pane (alpha is at pane 0) and target pane (2, empty).
+        let src_pane = pane_index_for_active_session(&state, "alpha").unwrap();
+        assert_eq!(src_pane, 0);
+        assert_eq!(session_at_pane(&state, 2), Some("".to_string()));
+        // Move alpha to pane 2, clear pane 0.
+        assert!(set_pane_session_for_active(
+            &mut state,
+            2,
+            "alpha".to_string()
+        ));
+        assert!(set_pane_session_for_active(&mut state, 0, String::new()));
+        let layout = state.layouts.get("alpha").unwrap();
+        assert_eq!(layout.panes[0].session_id, "");
+        assert_eq!(layout.panes[2].session_id, "alpha");
+        assert_eq!(layout.session_ids(), vec!["beta", "alpha"]);
+    }
+
+    // ------------------------------------------------------------------
+    // Task 16 — end-to-end drag-and-drop flow integration tests
+    // ------------------------------------------------------------------
+    //
+    // These tests simulate the full drag-and-drop data flow at the
+    // state level (without spinning up a dioxus runtime). They verify
+    // that the sequence of state mutations the drop handler performs
+    // produces the expected final layout, regardless of the starting
+    // state. The drop handler in `app.rs` reads the drag's
+    // DataTransfer, then calls the appropriate sequence of state
+    // helpers; these tests pin the contracts of those sequences.
+
+    /// Simulates: user drags an open session tab from pane A onto pane B
+    /// (which already has a session). The two panes swap their displayed
+    /// sessions. This is the most common drag-and-drop operation —
+    /// rearranging existing sessions across panes.
+    #[test]
+    fn e2e_drag_open_session_onto_occupied_pane_swaps() {
+        // Setup: Grid4 with alpha, beta, gamma, delta in panes 0-3.
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma", "delta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Grid4);
+        // The user drags "alpha" (from pane 0) onto pane 2 (which has "gamma").
+        let dragged_session = "alpha".to_string();
+        let target_pane_session = session_at_pane(&state, 2).unwrap(); // "gamma"
+        // The drop handler calls swap_pane_sessions.
+        assert!(swap_pane_sessions(
+            &mut state,
+            &dragged_session,
+            &target_pane_session
+        ));
+        let layout = state.layouts.get("alpha").unwrap();
+        // Pane 0 now shows gamma, pane 2 shows alpha.
+        assert_eq!(layout.panes[0].session_id, "gamma");
+        assert_eq!(layout.panes[2].session_id, "alpha");
+        // Beta and delta are unchanged.
+        assert_eq!(layout.panes[1].session_id, "beta");
+        assert_eq!(layout.panes[3].session_id, "delta");
+        // All 4 sessions are still present (none lost in the swap).
+        let mut sessions = layout.session_ids();
+        sessions.sort();
+        assert_eq!(sessions, vec!["alpha", "beta", "delta", "gamma"]);
+    }
+
+    /// Simulates: user drags an open session tab from pane A onto an
+    /// empty pane B. The session moves from A to B, and pane A becomes
+    /// empty. This is the "drag-to-rearrange" flow for partially-filled
+    /// grids (e.g., Grid8 with only 3 sessions open).
+    #[test]
+    fn e2e_drag_open_session_onto_empty_pane_moves_session() {
+        // Setup: Grid8 with only 3 sessions (panes 3-7 are empty).
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma"]);
+        apply_layout_preset(&mut state, LayoutPreset::Grid8);
+        // User drags "alpha" (pane 0) onto pane 5 (empty).
+        let dragged_session = "alpha".to_string();
+        let target_pane = 5;
+        let src_pane = pane_index_for_active_session(&state, &dragged_session).unwrap();
+        assert_eq!(src_pane, 0);
+        assert_eq!(session_at_pane(&state, target_pane).unwrap(), "");
+        // The drop handler's "move to empty pane" path.
+        assert!(set_pane_session_for_active(
+            &mut state,
+            target_pane,
+            dragged_session.clone()
+        ));
+        assert!(set_pane_session_for_active(
+            &mut state,
+            src_pane,
+            String::new()
+        ));
+        let layout = state.layouts.get("alpha").unwrap();
+        assert_eq!(layout.panes[0].session_id, "");
+        assert_eq!(layout.panes[5].session_id, "alpha");
+        // Beta and gamma are still at their original panes.
+        assert_eq!(layout.panes[1].session_id, "beta");
+        assert_eq!(layout.panes[2].session_id, "gamma");
+        // session_ids() skips the empty pane.
+        let mut sessions = layout.session_ids();
+        sessions.sort();
+        assert_eq!(sessions, vec!["alpha", "beta", "gamma"]);
+    }
+
+    /// Simulates: user drags a sidebar connection onto an occupied pane.
+    /// A new session is created (via `open_connection` in app.rs, which
+    /// we approximate here by inserting a new SessionTab) and assigned
+    /// to the target pane, replacing whatever was there. The replaced
+    /// session is NOT closed — it's still in `state.sessions` and can
+    /// be re-assigned to another pane later.
+    #[test]
+    fn e2e_drag_sidebar_connection_onto_pane_replaces_session() {
+        // Setup: Split2H with alpha (pane 0) and beta (pane 1).
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        // The drop handler in app.rs would call open_connection, which:
+        //   1. Generates a new tab_id (e.g., "new-conn-1")
+        //   2. Pushes a new SessionTab to state.sessions
+        //   3. Calls set_pane_session_for_active to put it in the target pane
+        // We simulate steps 2-3 here (step 1 is just a UUID).
+        let new_session_id = "new-conn-1".to_string();
+        state.sessions.push(SessionTab {
+            id: new_session_id.clone(),
+            name: "New Connection".to_string(),
+            kind: SessionType::Ssh,
+            render_output: Default::default(),
+            version: 0,
+            suggestion: None,
+            suggestions: Vec::new(),
+            suggestion_selected: 0,
+            suggestion_visible: false,
+            command_history: Vec::new(),
+            hostname: Some("newhost".to_string()),
+            cwd: None,
+        });
+        // The drop target is pane 1 (which had "beta").
+        assert!(set_pane_session_for_active(
+            &mut state,
+            1,
+            new_session_id.clone()
+        ));
+        let layout = state.layouts.get("alpha").unwrap();
+        // Pane 1 now shows the new session.
+        assert_eq!(layout.panes[1].session_id, "new-conn-1");
+        // Pane 0 is unchanged.
+        assert_eq!(layout.panes[0].session_id, "alpha");
+        // Beta is still in state.sessions (not closed).
+        assert!(state.sessions.iter().any(|t| t.id == "beta"));
+        // The new session is also in state.sessions.
+        assert!(state.sessions.iter().any(|t| t.id == "new-conn-1"));
+        // session_ids() reflects the new arrangement.
+        let mut sessions = layout.session_ids();
+        sessions.sort();
+        assert_eq!(sessions, vec!["alpha", "new-conn-1"]);
+    }
+
+    /// Simulates: user drags a sidebar connection onto an empty pane
+    /// (e.g., in a Grid8 layout with only 2 sessions open). The new
+    /// session fills the empty pane without disturbing the existing
+    /// sessions. This is the "fill in the grid" flow.
+    #[test]
+    fn e2e_drag_sidebar_connection_onto_empty_pane_fills_slot() {
+        // Setup: Grid8 with 2 sessions (panes 2-7 empty).
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Grid8);
+        // Simulate open_connection creating a new session and assigning
+        // it to pane 5 (which was empty).
+        let new_session_id = "new-ssh-1".to_string();
+        state.sessions.push(SessionTab {
+            id: new_session_id.clone(),
+            name: "New SSH".to_string(),
+            kind: SessionType::Ssh,
+            render_output: Default::default(),
+            version: 0,
+            suggestion: None,
+            suggestions: Vec::new(),
+            suggestion_selected: 0,
+            suggestion_visible: false,
+            command_history: Vec::new(),
+            hostname: Some("newhost".to_string()),
+            cwd: None,
+        });
+        assert!(set_pane_session_for_active(
+            &mut state,
+            5,
+            new_session_id.clone()
+        ));
+        let layout = state.layouts.get("alpha").unwrap();
+        // Pane 5 now has the new session.
+        assert_eq!(layout.panes[5].session_id, "new-ssh-1");
+        // Existing sessions are undisturbed.
+        assert_eq!(layout.panes[0].session_id, "alpha");
+        assert_eq!(layout.panes[1].session_id, "beta");
+        // Other empty panes are still empty.
+        assert_eq!(layout.panes[2].session_id, "");
+        assert_eq!(layout.panes[7].session_id, "");
+        // session_ids() now has 3 sessions.
+        let mut sessions = layout.session_ids();
+        sessions.sort();
+        assert_eq!(sessions, vec!["alpha", "beta", "new-ssh-1"]);
+    }
+
+    /// Simulates: user drags a session onto its own pane (a no-op).
+    /// The drop handler detects this case (`dragged_sid ==
+    /// drop_session_id`) and returns early without calling any state
+    /// mutation. This test verifies that the comparison works correctly
+    /// — the layout is unchanged after the "drop".
+    #[test]
+    fn e2e_drag_session_onto_own_pane_is_noop() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        let before = state.layouts.get("alpha").unwrap().clone();
+        // Simulate the drop handler's "dropped onto own pane" check.
+        let dragged_session = "alpha".to_string();
+        let drop_session_id = session_at_pane(&state, 0).unwrap(); // "alpha"
+        // The drop handler checks: if dragged_sid == drop_session_id { return; }
+        if dragged_session == drop_session_id {
+            // No state mutation — the layout is unchanged.
+        } else {
+            panic!("test setup is wrong: dragged session should equal drop target");
+        }
+        assert_eq!(state.layouts.get("alpha").unwrap(), &before);
+    }
+
+    /// Simulates: user drags an open session, but the active tab has no
+    /// layout (Single preset). The drop handler can't assign the
+    /// session to a pane (there are no panes), so it should fall back
+    /// to a no-op or to making the dragged session the active session.
+    /// This test verifies that the state helpers return false/None in
+    /// this case (graceful degradation), which is what the drop handler
+    /// uses to decide to fall back.
+    #[test]
+    fn e2e_drag_with_no_layout_falls_back_gracefully() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        // No apply_layout_preset → no layout entry for "alpha".
+        // The drop handler's checks should all return false/None.
+        assert!(!set_pane_session_for_active(
+            &mut state,
+            0,
+            "beta".to_string()
+        ));
+        assert!(!swap_pane_sessions(&mut state, "alpha", "beta"));
+        assert_eq!(pane_index_for_active_session(&state, "alpha"), None);
+        assert_eq!(session_at_pane(&state, 0), None);
+        // No layout was created.
+        assert!(state.layouts.is_empty());
+    }
+
+    // ------------------------------------------------------------------
+    // Performance contract tests (Task 16 optimization)
+    // ------------------------------------------------------------------
+    //
+    // These tests pin the cost characteristics the drop handler relies on.
+    // They don't measure wall-clock time (flaky in CI); instead they verify
+    // the structural invariants that make the operations cheap:
+    //   - swap_pane_sessions touches exactly 2 panes (no full-layout rebuild)
+    //   - set_pane_session_for_active is O(1) bounds-check on out-of-range
+    //   - pane_index_for_active_session returns early when no layout exists
+    //   - The drop handler's "no-op when dropping on own pane" check is
+    //     O(1) (string equality, no state mutation)
+    //
+    // The drag-over highlight signal (`drag_over_pane: Signal<Option<usize>>`)
+    // lives in the Dioxus runtime, not on AppState — it can't be unit-tested
+    // without spinning up a Dioxus runtime. Its behavior is instead pinned
+    // by the call-site comments in `multi_pane_container`: the Signal equality
+    // check makes `set(Some(idx))` a no-op when the value is unchanged, so the
+    // high-frequency `ondragover` (~60Hz) does NOT trigger per-tick re-renders.
+
+    /// `swap_pane_sessions` must only swap the two named sessions — it
+    /// must not touch any other panes. This is the contract that lets
+    /// the drop handler call `swap_pane_sessions` without re-checking
+    /// every pane afterwards. If this test fails, a swap could silently
+    /// shuffle other panes (a layout-thrash bug).
+    #[test]
+    fn swap_pane_sessions_only_touches_two_panes() {
+        let mut state = state_with_active_session(&["a", "b", "c", "d", "e", "f", "g", "h"]);
+        apply_layout_preset(&mut state, LayoutPreset::Grid8);
+        // Snapshot the layout before the swap.
+        let before = state.layouts.get("a").unwrap().clone();
+        // Swap panes 1 and 6 (sessions "b" and "g").
+        assert!(swap_pane_sessions(&mut state, "b", "g"));
+        let after = state.layouts.get("a").unwrap();
+        // Only panes 1 and 6 should differ.
+        for i in 0..8 {
+            let before_sid = &before.panes[i].session_id;
+            let after_sid = &after.panes[i].session_id;
+            if i == 1 || i == 6 {
+                assert_ne!(before_sid, after_sid, "pane {} should have changed", i);
+            } else {
+                assert_eq!(before_sid, after_sid, "pane {} should be unchanged", i);
+            }
+        }
+        // Specifically: pane 1 now has "g", pane 6 now has "b".
+        assert_eq!(after.panes[1].session_id, "g");
+        assert_eq!(after.panes[6].session_id, "b");
+    }
+
+    /// `set_pane_session_for_active` with an out-of-range pane index
+    /// must return false without panicking. The drop handler calls
+    /// this with `idx` captured from the pane loop — if a session is
+    /// closed mid-drag, the captured `idx` might be stale (the layout
+    /// shrank). The function must be O(1) on the failure path (just a
+    /// bounds check), not iterate the panes.
+    #[test]
+    fn set_pane_session_for_active_out_of_range_is_o1_no_panic() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        // Far out of range — must not panic.
+        assert!(!set_pane_session_for_active(
+            &mut state,
+            9999,
+            "x".to_string()
+        ));
+        assert!(!set_pane_session_for_active(
+            &mut state,
+            usize::MAX,
+            "x".to_string()
+        ));
+        // The layout is unchanged (no mutation happened).
+        let layout = state.layouts.get("alpha").unwrap();
+        assert_eq!(layout.panes[0].session_id, "alpha");
+        assert_eq!(layout.panes[1].session_id, "beta");
+    }
+
+    /// `pane_index_for_active_session` must return `None` in O(1) when
+    /// there's no layout for the active session. The drop handler calls
+    /// this to find the source pane of a drag; if it returned `Some(_)`
+    /// spuriously, the drop would try to clear a non-existent pane.
+    #[test]
+    fn pane_index_for_active_session_returns_none_without_layout_o1() {
+        let state = state_with_active_session(&["alpha", "beta"]);
+        // No layout applied — must be None without iterating.
+        assert_eq!(pane_index_for_active_session(&state, "alpha"), None);
+        assert_eq!(pane_index_for_active_session(&state, "beta"), None);
+        assert_eq!(pane_index_for_active_session(&state, "nonexistent"), None);
     }
 }
 

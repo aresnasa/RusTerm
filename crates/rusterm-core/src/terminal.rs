@@ -194,6 +194,12 @@ pub struct Terminal {
     last_exit_code: Option<i32>,
     // Set true when a new OSC 133;D arrives; cleared by take_exit_code().
     exit_code_dirty: bool,
+
+    // Working directory reported by the shell via OSC 7
+    // (`ESC ] 7 ; file://<host><path> ST`), used by the session-state restore
+    // feature to know which directory to `cd` back to on next launch. None
+    // until the shell reports one (raw telnet/serial shells never will).
+    cwd: Option<std::path::PathBuf>,
 }
 
 impl Terminal {
@@ -238,6 +244,7 @@ impl Terminal {
             tmux_session: None,
             last_exit_code: None,
             exit_code_dirty: false,
+            cwd: None,
         }
     }
 
@@ -253,6 +260,14 @@ impl Terminal {
     /// OSC 133;D (shell integration). None until the shell reports one.
     pub fn last_exit_code(&self) -> Option<i32> {
         self.last_exit_code
+    }
+
+    /// Returns the current working directory reported by the shell via OSC 7
+    /// (`file://<host><path>`). None until the shell reports one — raw telnet
+    /// and serial sessions never will. Used by the session-state restore
+    /// feature to `cd` back to this directory on next launch.
+    pub fn cwd(&self) -> Option<&std::path::Path> {
+        self.cwd.as_deref()
     }
 
     /// If a new exit code arrived since the last call (via OSC 133;D), return
@@ -272,6 +287,8 @@ impl Terminal {
         // VTE — vte's ansi::Handler doesn't expose OSC dispatch, so unknown OSCs
         // (like 133) are silently dropped by the Processor's Perform impl.
         self.scan_exit_codes(data);
+        // Extract OSC 7 cwd reports (shell integration) — same reason.
+        self.scan_cwd(data);
         parser.advance(self, data);
     }
 
@@ -318,6 +335,63 @@ impl Terminal {
                     }
                     // Skip past the consumed marker; continue scanning in case
                     // multiple exit codes arrive in one batch (last one wins).
+                    i = j;
+                    continue;
+                }
+            }
+            i += 1;
+        }
+    }
+
+    /// Scan raw output for OSC 7 working-directory reports
+    /// `ESC ] 7 ; file://<host><path> (BEL|ST)` and record the path.
+    ///
+    /// Same single-pass-over-ESC-byte approach as `scan_exit_codes`. The path
+    /// is everything after the optional `//<host>` authority up to the next BEL
+    /// (0x07) or ST (ESC `\`). Hostname is ignored — we only care about the
+    /// path. `file://localhost/path` and `file:///path` (empty host) both
+    /// resolve to `/path`.
+    ///
+    /// Used by the session-state restore feature: on next launch we send
+    /// `cd '<path>'` to the shell after it's ready, so the user lands in the
+    /// directory they were last working in.
+    fn scan_cwd(&mut self, data: &[u8]) {
+        // `ESC ] 7 ;`
+        const PREFIX: &[u8] = b"]7;";
+        let data_len = data.len();
+        let mut i = 0;
+        while i < data_len {
+            if data[i] == 0x1b {
+                // Need at least ESC + PREFIX bytes after this position.
+                if i + 1 + PREFIX.len() <= data_len && data[i + 1..i + 1 + PREFIX.len()] == *PREFIX
+                {
+                    // Skip optional leading `;` separator (some shells emit
+                    // `ESC ] 7 ; file://...` with a space, some without).
+                    let mut j = i + 1 + PREFIX.len();
+                    if j < data_len && data[j] == b';' {
+                        j += 1;
+                    }
+                    // Skip a single optional leading space.
+                    if j < data_len && data[j] == b' ' {
+                        j += 1;
+                    }
+
+                    // Read until BEL (0x07) or ST (ESC \).
+                    let payload_start = j;
+                    while j < data_len && data[j] != 0x07 {
+                        // ST = ESC \
+                        if data[j] == 0x1b && j + 1 < data_len && data[j + 1] == b'\\' {
+                            break;
+                        }
+                        j += 1;
+                    }
+                    let payload = &data[payload_start..j];
+
+                    if let Some(path) = parse_osc7_payload(payload) {
+                        self.cwd = Some(path);
+                    }
+
+                    // Skip past the consumed marker.
                     i = j;
                     continue;
                 }
@@ -1406,6 +1480,41 @@ impl Default for TerminalSize {
 
 use serde::{Deserialize, Serialize};
 
+/// Parse the payload of an OSC 7 sequence (everything between `ESC ] 7 ;` and
+/// the terminator) into a `PathBuf`.
+///
+/// Accepts `file://<host>/<path>`, `file:///path` (empty host), or a bare
+/// `/path` (lenient fallback for shells that don't emit the `file://` prefix
+/// consistently). The hostname is intentionally ignored — we only need the
+/// path for `cd` on restore, and the path is local to the shell that emitted
+/// it (for SSH sessions, that's the remote host's filesystem).
+///
+/// Returns `None` if the payload doesn't look like a path we can `cd` to
+/// (e.g. empty, or not starting with `/`).
+fn parse_osc7_payload(payload: &[u8]) -> Option<std::path::PathBuf> {
+    let s = std::str::from_utf8(payload).ok()?;
+    let path_str = if let Some(rest) = s.strip_prefix("file://") {
+        // `file://<host>/<path>` — skip past the host (everything up to the
+        // next `/`). `file://localhost/home` → `/home`.
+        // `file:///home` (empty host) → `/home`.
+        if let Some(slash) = rest.find('/') {
+            &rest[slash..]
+        } else {
+            // `file://host` with no path — not useful.
+            return None;
+        }
+    } else {
+        // Bare path (lenient fallback). Only accept if it starts with `/`.
+        s
+    };
+
+    if !path_str.starts_with('/') || path_str.is_empty() {
+        return None;
+    }
+
+    Some(std::path::PathBuf::from(path_str))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1536,5 +1645,92 @@ mod tests {
             );
         }
         assert!(term.scrollback_len() >= 2);
+    }
+
+    // ── OSC 7 cwd tracking ─────────────────────────────────────────────
+
+    #[test]
+    fn osc7_cwd_parsed_with_bel_terminator() {
+        let mut term = Terminal::new(TerminalSize::default());
+        let mut parser = vte::ansi::Processor::new();
+        // `ESC ] 7 ; file://localhost/home/user/projects BEL`
+        term.process(
+            b"\x1b]7;file://localhost/home/user/projects\x07",
+            &mut parser,
+        );
+        assert_eq!(
+            term.cwd(),
+            Some(std::path::Path::new("/home/user/projects"))
+        );
+    }
+
+    #[test]
+    fn osc7_cwd_parsed_with_st_terminator() {
+        let mut term = Terminal::new(TerminalSize::default());
+        let mut parser = vte::ansi::Processor::new();
+        // `ESC ] 7 ; file:///var/log ST` (ST = ESC \)
+        term.process(b"\x1b]7;file:///var/log\x1b\\", &mut parser);
+        assert_eq!(term.cwd(), Some(std::path::Path::new("/var/log")));
+    }
+
+    #[test]
+    fn osc7_cwd_among_output() {
+        let mut term = Terminal::new(TerminalSize::default());
+        let mut parser = vte::ansi::Processor::new();
+        // Marker embedded in normal output.
+        term.process(
+            b"user@host:~$ cd /tmp\r\n\x1b]7;file://localhost/tmp\x07user@host:/tmp$ ",
+            &mut parser,
+        );
+        assert_eq!(term.cwd(), Some(std::path::Path::new("/tmp")));
+    }
+
+    #[test]
+    fn osc7_cwd_none_until_first_report() {
+        let term = Terminal::new(TerminalSize::default());
+        assert_eq!(term.cwd(), None, "cwd must be None until shell reports it");
+    }
+
+    #[test]
+    fn osc7_cwd_updates_to_latest() {
+        let mut term = Terminal::new(TerminalSize::default());
+        let mut parser = vte::ansi::Processor::new();
+        term.process(b"\x1b]7;file://localhost/home/user\x07", &mut parser);
+        assert_eq!(term.cwd(), Some(std::path::Path::new("/home/user")));
+        // User cd's elsewhere — second OSC 7 overrides the first.
+        term.process(b"\x1b]7;file://localhost/etc\x07", &mut parser);
+        assert_eq!(term.cwd(), Some(std::path::Path::new("/etc")));
+    }
+
+    #[test]
+    fn parse_osc7_payload_with_host() {
+        let path = parse_osc7_payload(b"file://example.com/home/user");
+        assert_eq!(path, Some(std::path::PathBuf::from("/home/user")));
+    }
+
+    #[test]
+    fn parse_osc7_payload_empty_host() {
+        // `file:///path` (empty host)
+        let path = parse_osc7_payload(b"file:///var/log");
+        assert_eq!(path, Some(std::path::PathBuf::from("/var/log")));
+    }
+
+    #[test]
+    fn parse_osc7_payload_bare_path() {
+        // Lenient fallback: bare path with no file:// prefix.
+        let path = parse_osc7_payload(b"/tmp/work");
+        assert_eq!(path, Some(std::path::PathBuf::from("/tmp/work")));
+    }
+
+    #[test]
+    fn parse_osc7_payload_rejects_relative() {
+        // Bare relative paths are not useful — we can't `cd` to them reliably.
+        assert!(parse_osc7_payload(b"relative/path").is_none());
+    }
+
+    #[test]
+    fn parse_osc7_payload_rejects_host_only() {
+        // `file://localhost` with no path after the host — not useful.
+        assert!(parse_osc7_payload(b"file://localhost").is_none());
     }
 }

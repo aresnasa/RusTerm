@@ -54,9 +54,22 @@ pub fn TabBar(
                     let tab_id = tab.id.clone();
                     let tab_id2 = tab.id.clone();
 
-                    rsx! {
+                    // Clone the tab id for the dragstart handler. When
+                    // the user drags an open session tab, we stash its
+                    // session id in the DataTransfer under a custom
+                    // MIME type. The pane drop handler reads this to
+                    // know which open session to move/swap into the
+                    // target pane. We use a different MIME type than
+                    // the sidebar's "connection-id" so the drop
+                    // handler can distinguish "drag from tab bar"
+                    // (move existing session) from "drag from sidebar"
+                            // (open a new connection).
+                            let tab_id_for_drag = tab.id.clone();
+
+                            rsx! {
                         div {
                             key: "{tab.id}",
+                            draggable: true,
                             style: "
                                 display: flex;
                                 align-items: center;
@@ -75,6 +88,22 @@ pub fn TabBar(
                             },
                             onmouseenter: move |_| hover_tab.set(Some(tab_id2.clone())),
                             onmouseleave: move |_| hover_tab.set(None),
+                            ondragstart: move |e: DragEvent| {
+                                let dt = e.data_transfer();
+                                let _ = dt.set_data(
+                                    "application/x-rusterm-session-id",
+                                    &tab_id_for_drag,
+                                );
+                                // "move" indicates that dropping will
+                                // move the session from one pane to
+                                // another (rather than copying it).
+                                dt.set_drop_effect("move");
+                                dt.set_effect_allowed("move");
+                                tracing::debug!(
+                                    "[DRAG] tab drag started: session={:?}",
+                                    &tab_id_for_drag[..tab_id_for_drag.len().min(8)]
+                                );
+                            },
 
                             // Type indicator dot
                             span {

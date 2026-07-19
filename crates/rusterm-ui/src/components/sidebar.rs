@@ -303,9 +303,23 @@ fn ConnItem(
     let mut hovered = use_signal(|| false);
     let bg = if hovered() { "#24283b" } else { "transparent" };
 
+    // Clone the connection id for the dragstart handler. When the user
+    // starts dragging a sidebar item, we stash the connection id in the
+    // drag's DataTransfer under a custom MIME type. The drop handler on
+    // each pane reads this MIME type to know which connection to open.
+    // We use a custom MIME rather than text/plain so the drop handler
+    // can distinguish "dragging a sidebar connection" (open a new
+    // session in the target pane) from "dragging an open session tab"
+    // (move/swap the existing session into the target pane).
+    let id_for_drag = conn.id.clone();
+
     rsx! {
         div {
             class: "conn-item",
+            // `draggable=true` is what makes the element a drag source.
+            // Without it, ondragstart never fires (the browser treats
+            // the div as a non-draggable element).
+            draggable: true,
             style: "
                 padding: 6px 10px;
                 margin: 1px 4px;
@@ -326,6 +340,27 @@ fn ConnItem(
             oncontextmenu: move |e: MouseEvent| {
                 e.prevent_default();
                 context_menu.set(Some((id_for_ctx.clone(), e.client_coordinates().x, e.client_coordinates().y)));
+            },
+            ondragstart: move |e: DragEvent| {
+                // Stash the connection id in the drag's DataTransfer.
+                // The drop handler reads this to identify which
+                // connection to open in the target pane. We use a
+                // custom MIME type to distinguish "drag from sidebar"
+                // (open a new session) from "drag from tab bar" (move
+                // an existing session).
+                let dt = e.data_transfer();
+                let _ = dt.set_data("application/x-rusterm-connection-id", &id_for_drag);
+                // Set a friendly drag image effect — "copy" indicates
+                // that dropping will create something new (a new
+                // session in the target pane), which matches the
+                // semantics here.
+                dt.set_drop_effect("copy");
+                dt.set_effect_allowed("copy");
+                tracing::debug!(
+                    "[DRAG] sidebar connection drag started: id={:?} name={:?}",
+                    &id_for_drag[..id_for_drag.len().min(8)],
+                    conn.name
+                );
             },
 
             span {

@@ -1,17 +1,21 @@
+pub mod command_safety;
 pub mod config;
 pub mod config_manager;
 pub mod event;
 pub mod logging;
 pub mod session;
 pub mod session_log;
+pub mod session_state;
 pub mod terminal;
 pub mod window_state;
 
+pub use command_safety::{CommandSafetyChecker, SafetyVerdict};
 pub use config::{ConnectionConfig, HostConfig};
 pub use config_manager::ConfigManager;
 pub use event::{SessionEvent, TerminalEvent};
 pub use logging::{LogGuard, init_logging, log_dir, redact};
 pub use session::{Session, SessionId, SessionManager, SessionType};
 pub use session_log::SessionLog;
+pub use session_state::{MasterKey, PersistedSession, SessionState};
 pub use terminal::{Terminal, TerminalSize};
 pub use window_state::WindowState;

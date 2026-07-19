@@ -164,6 +164,12 @@ pub struct PersistedConfig {
     pub onekeys: Vec<PersistedOneKey>,
     #[serde(default)]
     pub master_password_hash: Option<String>,
+    /// Whether the user picked "不再询问" on the session-state restore dialog.
+    /// When true, we don't save session state and don't prompt on next launch.
+    /// The user can re-enable via settings (future work: a settings toggle).
+    /// Default false for backward compat — existing users get the prompt.
+    #[serde(default)]
+    pub restore_disabled: bool,
 }
 
 // --- OneKeys (ZOC-style Expect/Send auto-fill) ---
