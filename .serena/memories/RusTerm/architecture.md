@@ -49,7 +49,8 @@
 ## Tests
 
 - 325 tests pass (workspace, no features) as of 2026-07-19.
-- Breakdown: 136 in rusterm-ui (was 124 — added 6 performance contract tests for Task 16 optimization: 3 in layout.rs, 3 in state.rs), 53 layout tests (was 50 — added 3 perf contract tests), 95 in rusterm-core (was 39 — increased due to pre-existing uncommitted `scan_cwd`/`session_state`/`command_safety` work), 25 in rusterm-db, 19 in rusterm-ai, 16 in rusterm-crypto, 14 in rusterm-analytics, rest in other crates.
+- Breakdown: 142 in rusterm-ui (was 136 — added 6 tests for Task 19 drag-tab-to-split feature in state.rs), 53 layout tests, 95 in rusterm-core, 25 in rusterm-db, 19 in rusterm-ai, 16 in rusterm-crypto, 14 in rusterm-analytics, rest in other crates.
+- Total workspace test count is now 384 (was 383 after the state-level Task 19 fix; +1 for `drop_background_tab_creates_multi_pane_layout_from_single` which pins the render-path switch contract).
 - 2 tests intentionally ignored in rusterm-ssh (live SSH tests, gated by `RUSTERM_LIVE_SSH_TEST=1`).
 - 325 tests also pass with `--features rusterm-ui/analytics`.
 - Note: the uncommitted `scan_cwd`/`session_state`/`command_safety` work in rusterm-core added ~56 tests and a `cwd: Option<PathBuf>` field to `Terminal` (mirrored as `cwd: Option<String>` on `SessionTab`). All `SessionTab` initializers in test helpers include `cwd: None`. The production `SessionTab` initializers in `app.rs` (lines ~2860, ~2920, ~2957, ~2984, ~3785) also include `cwd: None`.
@@ -127,6 +128,192 @@
 - `assets/icon-template.svg` — pure-black macOS menu-bar template (per Apple HIG). Shield ring + `> _` prompt glyph.
 - `assets/icon-template.icns` — 4 sizes (16, 16@2x, 32, 32@2x).
 - `assets/icon-dark.svg`, `assets/icon-a.svg`, `assets/icon-b.svg` — older variants.
+
+## Splitter drag-resize fix (2026-07-19, REVISED)
+
+**Bug**: "分屏无法调整" (can't drag splitter bars to resize panes) + "分屏后无法输入" (can't type after splitting).
+
+**Prior failed approaches** (DO NOT REPEAT):
+1. ❌ Overlay with `onmousemove`/`onmouseup` — fails because implicit pointer capture routes events to the splitter (mousedown target), not the overlay.
+2. ❌ Splitter bar with `onmousemove`/`onmouseup` — fails because dioxus 0.7's desktop webview (WKWebView/webkitgtk/WebView2) does NOT reliably fire element-level mouse events during a button-held drag. Pointer-capture behavior is inconsistent across webviews.
+3. ❌ JS `eval` + `spawn`-installed document listeners — claimed broken by "missing `return` prefix" and "race between spawn and first mousemove". The actual root cause was never confirmed.
+
+**Current (working) fix** — document-level capture-phase listeners + polling `use_future`:
+
+The splitter bar carries ONLY `onmousedown`. When pressed:
+1. Sets `split_drag = Some(...)` (mounts a visual-only cursor overlay with `pointer-events: none`).
+2. Calls `install_split_drag_js_listeners(x, y)` which `eval`s a JS IIFE that:
+   - Initializes `window.__rusterm_drag_pos = 'x,y'` and `window.__rusterm_drag_done = false`.
+   - Removes any prior listeners (idempotent).
+   - Installs `moveHandler` (capture-phase `document.addEventListener('mousemove', ..., true)`) that writes `e.clientX,e.clientY` to `__rusterm_drag_pos` and calls `preventDefault()`.
+   - Installs `upHandler` (capture-phase `document.addEventListener('mouseup', ..., true)`) that sets `__rusterm_drag_done = true` and self-removes both listeners.
+   - Stores `window._rusterm_split_drag_remove` for `end_split_drag` to call.
+
+A polling `use_future` in `App` (named `_split_drag_poll`) loops forever:
+- When `split_drag` is `None`: sleeps 32ms, re-checks.
+- When `split_drag` is `Some`: calls `poll_split_drag_state()` (an `async fn` that `eval`s `"return (function() { ... })()"` to read `__rusterm_drag_pos` + `__rusterm_drag_done` as a string `"x,y,done"`).
+  - If `done == true`: calls `end_split_drag` (clears `split_drag`, spawns JS cleanup, restores focus). Loops back to idle (does NOT break — `use_future` only runs its closure once, so breaking would prevent subsequent drags).
+  - Else: calls `apply_split_drag_step(state, split_drag, pos)` where `pos` is `x` for col drag, `y` for row drag.
+- Sleeps 16ms (60Hz) between polls.
+
+**Why this works** (and prior approaches didn't):
+- Document-level capture-phase listeners ALWAYS fire, in every webview, regardless of pointer capture. They fire BEFORE element-level handlers, BEFORE pointer capture kicks in, and keep firing even when the cursor moves outside the original target.
+- The polling approach avoids needing JS→Rust callbacks (which dioxus 0.7 doesn't support well — `eval` is request/response only).
+- 16ms polling is fast enough for smooth dragging (60Hz, indistinguishable from native).
+- The `use_future` runs forever (never breaks), so subsequent drags work without re-mounting the component.
+
+**Focus restore after drag** (`end_split_drag` + `restore_focus_to_active_session`):
+- The splitter's `onmousedown` `prevent_default` prevents the splitter from receiving focus (correct), but nothing restored focus to the pane that had it before — so keystrokes went nowhere after the drag. Fix: `end_split_drag` calls `restore_focus_to_active_session(state, 20)` which `eval`s `document.getElementById('terminal-input-{sid}')?.focus()` after a 20ms delay (lets the overlay unmount commit).
+- Also called after `cycle_layout_preset` (100ms delay) — applying a new preset re-mounts panes, and the auto-focus `use_effect` in each pane's `TerminalView` may race.
+
+**Key helpers** (all in `app.rs`):
+- `SplitDragState { is_col, idx, container_extent, last_applied_pos }` — `last_applied_pos` is viewport-relative (matching `e.client_coordinates()` and JS `e.clientX`/`e.clientY`).
+- `build_install_split_drag_script(x, y) -> String` — pure function that builds the JS IIFE string (extracted for unit testing).
+- `install_split_drag_js_listeners(x, y)` — calls `build_install_split_drag_script` and `spawn`s the `eval`.
+- `parse_split_drag_poll_response(s) -> Option<(f64, f64, bool)>` — pure function that parses the `"x,y,done"` response (extracted for unit testing).
+- `poll_split_drag_state() -> Option<(f64, f64, bool)>` — async fn that `eval`s the poll script and calls `parse_split_drag_poll_response`.
+- `compute_split_drag_delta(&drag, pos) -> Option<f64>` — pure function, returns the fractional delta to apply (or `None` for no-op: duplicate event or zero container extent).
+- `apply_split_drag_step(state, split_drag, pos)` — wraps `compute_split_drag_delta` + `resize_layout_col`/`resize_layout_row` + `last_applied_pos` update.
+- `end_split_drag(state, split_drag)` — clears `split_drag`, spawns JS listener cleanup, restores focus.
+- `restore_focus_to_active_session(state, delay_ms)` — `eval`s the focus script after a delay.
+
+**Overlay** (in `multi_pane_container`):
+- VISUAL CURSOR INDICATOR ONLY. Has `pointer-events: none` so it never intercepts events.
+- Shows `col-resize`/`row-resize` cursor across the whole viewport during the drag.
+- Carries NO event handlers (the document-level JS listeners handle everything).
+
+**Splitter bar** (in `render_col_splitters`/`render_row_splitters`):
+- Width increased from 6px to 10px (easier to grab).
+- Carries ONLY `onmousedown` (sets `split_drag`, installs JS listeners) + `oncontextmenu` (5% shrink on right-click).
+- `onmousedown` calls `e.stop_propagation()` to prevent any parent handler from interfering.
+
+**Tests** (33 new in this revision, 18 JS-bridge-specific):
+- `app.rs::split_drag_tests` (8 tests, unchanged from prior revision): delta computation, viewport-coordinate fix, direction reversal, zero-extent guard, row drag, full drag sequence, focus-restore id format.
+- `app.rs::split_drag_js_tests` (18 NEW tests): JS install script structure (IIFE, document capture-phase listeners, preventDefault, self-remove on mouseup, remove function stored), poll response parsing (valid/empty/malformed/negative/integer coordinates, done flag format), round-trip format consistency.
+- `layout.rs::tests` (7 tests, unchanged): end-to-end mouse-drag simulations.
+
+**Total test count**: 377 (was 373 before this fix).
+
+## Multi-pane input routing fix (2026-07-19, Task 17/19)
+
+**Bug**: "除了第一个分屏外的其他终端会话都无法输入命令" — in multi-pane mode with comparison OFF, only pane 0 accepted commands; panes 1..N's keystrokes were silently routed to pane 0's PTY.
+
+**Root cause**: `render_terminal_pane`'s `on_input` handler (app.rs ~L206) used a buggy broadcast predicate:
+```rust
+let is_broadcast = broadcast_targets.len() > 1
+    || (broadcast_targets.len() == 1 && broadcast_targets[0] != sid_clone);
+```
+The second clause `(len == 1 && broadcast_targets[0] != sid_clone)` was intended to handle some edge case but actually broke non-comparison multi-pane input. Since `broadcast_targets` returns `[active_session]` when comparison is OFF, pane N (N>0) had `broadcast_targets[0] = active_session != sid_clone (pane_N_session)` → `is_broadcast = true` → keystrokes were sent to `broadcast_targets` (= `[active_session]` = pane 0's PTY) instead of `sid_clone` (pane N's own PTY).
+
+**Fix**: changed the predicate to `is_broadcast = broadcast_targets.len() > 1`. This is true ONLY when comparison is ON with 2+ non-empty pane sessions (the only case where `broadcast_targets` returns >1 entry). In all other cases, each pane sends to its own `sid_clone`.
+
+**Critical design insight**: `active_session` is a **tab pointer**, NOT a **focused-pane pointer**. Layouts are keyed by `active_session` in `state.layouts: HashMap<String, PaneLayout>` (see `App` render path at app.rs ~L4688: `state.read().layouts.get(sid)`). Changing `active_session` on pane click would break the layout lookup (the new `active_session` might not have a layout entry → `is_multi = false` → single-pane fallback). So clicking a pane does NOT update `active_session` — it only updates DOM focus via `onclick_focus` in terminal_view.rs (L1005). This is correct: `active_session` stays as the tab's session, and each pane routes its own input to its own PTY.
+
+**`onclick_focus` in terminal_view.rs (L1005-1016)**: only sets the local `focused` signal + calls `document.getElementById('terminal-input-{cid}')?.focus()`. Does NOT (and must not) update `active_session`. The auto-focus `use_effect` (L794-828) has a `document.activeElement` check to avoid multi-pane mount races — this is correct and should not be removed.
+
+**Tests** (4 new in `state.rs::tests`, all passing):
+- `non_comparison_multi_pane_input_routes_to_each_pane_own_session` — Split2H + comparison OFF → predicate false for all panes (the direct regression).
+- `after_drag_swap_panes_input_still_routes_to_own_session` — simulates drag-and-drop pane swap via `swap_pane_sessions`, verifies predicate still false after swap (covers the "drag session onto pane → new pane can accept input" flow at the state level).
+- `comparison_on_multi_pane_input_broadcasts_to_all_panes` — Grid4 + comparison ON → predicate true (pins that the fix didn't break synchronization).
+- `comparison_on_single_non_empty_pane_does_not_broadcast` — Grid4 + comparison ON + only 1 non-empty pane → predicate false (edge case: only one target anyway).
+
+**Why no dioxus-runtime test**: `on_input` is a closure inside `render_terminal_pane` which requires a Dioxus desktop runtime + webview to execute. The routing decision is purely a function of `broadcast_targets` (which IS unit-testable) + the `len > 1` predicate. The tests pin both: the `broadcast_targets` output for each scenario AND the corrected predicate. The actual DOM event flow (click pane → focus → keydown → on_input) is a webview concern that can't be unit-tested.
+
+## Drag tab from top bar to create split pane (Task 19, completed 2026-07-19; UI wiring fix 2026-07-19)
+
+**Goal**: dragging a session tab from the top tab bar onto a pane that already has a session should CREATE a new split pane for the dragged session (not just move/swap into existing panes). Previously, drag-drop only moved/swapped sessions between EXISTING panes — dropping a background tab (a session NOT in any pane) onto a filled pane silently failed because `swap_pane_sessions` looks up the source pane index and returns `false` when the source isn't in any pane.
+
+**Fix (state level)**: new state helper `drop_background_tab_to_create_split(state, dragged_sid, target_pane_idx) -> DropSplitOutcome` in `state.rs`. The drop handler in `app.rs` (`multi_pane_container`'s `ondrop`) now checks `pane_index_for_active_session(state, dragged_sid)` BEFORE attempting a swap:
+- If `Some(_)` → pane-to-pane drag → `swap_pane_sessions` (existing behavior).
+- If `None` → background-tab drag → `drop_background_tab_to_create_split` (new behavior).
+
+**Fix (UI wiring, 2026-07-19)** — THE KEY FIX that made the feature actually work in the running app:
+
+The state-level fix was correct but the UI drag-drop still didn't create a split. Root cause: the App render path (`app.rs` ~L4798) has TWO branches — `(Some(sid), true) → multi_pane_container` and `(Some(sid), false) → render_terminal_pane`. The drop handlers with `drop_background_tab_to_create_split` live ONLY in `multi_pane_container`. When the user has a single session with NO layout (the most common starting state — Single preset), the App takes the `(Some(sid), false)` branch and renders `render_terminal_pane`, which returns a bare `TerminalView` with NO drop handlers. Drops from the tab bar went nowhere.
+
+Fix: new helper `single_pane_with_drop(state, input_senders, render_sid, drag_over_pane)` in `app.rs` (~L849). Wraps `render_terminal_pane` in a `<div>` with `ondragover`/`ondragenter`/`ondrop` handlers that mirror `multi_pane_container`'s per-pane drop logic:
+- `application/x-rusterm-session-id` present → if `dragged_sid == render_sid`, no-op; else if `pane_index_for_active_session(state, dragged_sid).is_some()`, no-op (session is in a hidden pane of a zoomed layout — user should unzoom); else call `drop_background_tab_to_create_split(state, dragged_sid, 0)`.
+- `application/x-rusterm-connection-id` present → `open_connection(state, input_senders, conn, Some(0))` (falls back to making the new session active when there's no layout — acceptable).
+
+The `(Some(sid), false) =>` branch now calls `single_pane_with_drop(state, input_senders, render_sid, drag_over_pane)` instead of `render_terminal_pane` directly. After the drop creates a Split2H layout, the next render sees `is_multi = true` and switches to `multi_pane_container`, which has its own per-pane drop handlers for subsequent drags.
+
+The `drag_over_pane` signal is shared between `single_pane_with_drop` and `multi_pane_container` — the single-pane path uses `Some(0)` (the only pane) so the highlight border (`#7aa2f7`) is consistent across single-pane and multi-pane modes.
+
+**`drop_background_tab_to_create_split` strategy** (uniform-grid model, NOT a binary tree):
+1. No layout yet (Single preset) → apply `Split2H`, place dragged session in pane 1.
+2. Layout has an empty pane slot → fill it via `set_pane_session_for_active` (preset unchanged).
+3. No empty slots → cycle to next larger preset (`Single→Split2H`, `Split2H/Split2V→Grid4`, `Grid4→Grid8`). `apply_layout_preset` re-fills ALL panes from `state.sessions` in tab order — the dragged session is usually placed naturally. If not, manually place it in the first empty slot.
+4. Already at `Grid8` (max) → return `FallbackSwap` → caller attempts `swap_pane_sessions` (which will also fail silently since the source isn't in a pane, but the contract is documented).
+
+**`DropSplitOutcome` enum** (returned by the helper, lets the caller log/fall back):
+- `Created { pane_idx }` — new pane created (preset upgraded) and dragged session placed.
+- `FilledExisting { pane_idx }` — existing empty slot filled (preset unchanged).
+- `FallbackSwap` — at Grid8 max; caller should attempt swap.
+- `Failed` — no active session or unexpected state mutation failure.
+
+**CRITICAL invariants preserved**:
+- `active_session` is NOT updated (it's a tab pointer; the layout is keyed by it). Changing it would break the layout lookup.
+- `apply_layout_preset` re-fills ALL panes — any manual `set_pane_session_for_active` must come AFTER.
+- The multi-pane input routing fix (`is_broadcast = broadcast_targets.len() > 1`) is unaffected — the new pane's session is in `state.sessions` (it was dragged from the tab bar), so it has a PTY sender in `input_senders` already.
+- After creating a new pane, `restore_focus_to_active_session(state, 80)` is called to restore focus after the new pane's DOM commits.
+
+**Tests** (7 in `state.rs::tests`, all passing):
+- `drop_background_tab_creates_split_when_no_layout` — Single → Split2H, dragged session in pane 1.
+- `drop_background_tab_creates_multi_pane_layout_from_single` (NEW 2026-07-19) — pins that after the drop, `layout.is_multi_pane()` is true, which is what triggers the App render-path switch from `single_pane_with_drop` to `multi_pane_container`.
+- `drop_background_tab_fills_existing_empty_slot` — Grid4 with 1 empty slot → fills it, preset unchanged.
+- `drop_background_tab_cycles_split2h_to_grid4` — Split2H full → Grid4, dragged session placed.
+- `drop_background_tab_at_grid8_returns_fallback_swap` — Grid8 full → `FallbackSwap` (no mutation).
+- `drop_background_tab_returns_failed_with_no_active_session` — defensive contract.
+- `after_drop_background_tab_input_routes_to_each_pane_own_session` — after creating a split, the routing predicate is still false with comparison OFF (regression for the Task 17/19 input bug).
+
+**Why no dioxus-runtime test for `single_pane_with_drop`**: the wrapper is a dioxus `rsx!` function that requires a desktop runtime + webview to execute. Its drop logic mirrors `multi_pane_container`'s per-pane `ondrop` (which also can't be unit-tested for the same reason). The state-level helper IS unit-testable, and the `is_multi_pane()` contract test pins the render-path switch. The actual DOM event flow (drag tab → drop → state update → re-render → multi_pane_container) is a webview concern that can't be unit-tested.
+
+## Manual mouse-based tab drag (Task 22, replaces HTML5 DnD for tabs)
+
+**Why HTML5 DnD was abandoned for tabs**: HTML5 drag-and-drop (`draggable: true`, `ondragstart`, `ondrop`) was UNRELIABLE in dioxus 0.7's desktop webview (WKWebView on macOS, WebView2 on Windows, webkitgtk on Linux). Despite correct state-level logic (`drop_background_tab_to_create_split` — 6 passing tests) and correct UI wiring (`single_pane_with_drop` wrapper, multi-pane `ondrop` handlers), the user reported across tasks 17, 19, and 22 that dragging a tab onto a pane didn't create a split. The splitter drag-resize feature hit the SAME wall and was fixed by switching to document-level capture-phase JS listeners + polling (see the "Splitter drag-resize fix" section). Task 22 reworked tab drags to mirror that PROVEN pattern exactly.
+
+**What was replaced**:
+- `tab_bar.rs`: tab div's `draggable: true` + `ondragstart` REMOVED. Replaced with `onmousedown` (primary button only) that calls a new `on_drag_start: EventHandler<(String, String, f64, f64)>` prop (session_id, session_name, x, y). The close button got `onmousedown: stop_propagation` so closing a tab doesn't start a drag.
+- `multi_pane_container` pane title bar: `draggable: true` + `ondragstart` REMOVED. Replaced with `onmousedown` (primary button only) that calls `start_tab_drag`. The `multi_pane_container` signature gained a `tab_drag: Signal<Option<TabDragState>>` param.
+- `single_pane_with_drop` and `multi_pane_container` `ondrop` session-id branches: refactored to call the new `execute_tab_drop_on_pane` state function (dedup). These branches are now defensive fallbacks — the manual mouse-based system is the primary path. The connection-id branches (sidebar→pane, Task 16) remain HTML5-based and untouched.
+
+**What was added** (mirrors the splitter drag-resize fix structure exactly):
+- `TabDragState { session_id, session_name, start_x, start_y, cur_x, cur_y, dragging }` (`#[derive(Debug, Clone, PartialEq)]`) in `app.rs`.
+- `TAB_DRAG_THRESHOLD = 6.0` (CSS px) — minimum cursor displacement for a mousedown to promote to a drag.
+- `tab_drag_threshold_exceeded(start_x, start_y, cur_x, cur_y) -> bool` (Euclidean distance > threshold) — pure, tested.
+- `build_install_tab_drag_script(x, y) -> String` — pure fn, builds JS IIFE string (unit-tested). Uses SEPARATE global variable names from the splitter (`__rusterm_tab_drag_pos`, `__rusterm_tab_drag_done`, `_rusterm_tab_drag_remove`) so the two systems can't clobber each other. **KEY difference from the splitter's script**: the `upHandler` RECORDS the final mouse position (the splitter's `upHandler` only set the done flag — a tab drop needs the release coordinates for hit-testing). Also captures `#terminal-content`'s `getBoundingClientRect()` at install time into `__rusterm_tab_drag_container_left/top` (the polling loop reads these to convert viewport-relative cursor coords into container-relative coords for hit-testing).
+- `parse_tab_drag_poll_response(s) -> Option<(f64, f64, bool, f64, f64)>` — returns `(x, y, done, container_left, container_top)`; format `"x,y,done,left,top"` — pure, tested.
+- `poll_tab_drag_state() -> Option<(f64, f64, bool, f64, f64)>` — async fn `eval`s the poll script.
+- `install_tab_drag_js_listeners(x, y)` — `spawn`s the `eval`.
+- `start_tab_drag(tab_drag, session_id, session_name, x, y)` — sets signal (`dragging: false`) + installs JS listeners.
+- `hit_test_pane_at(cursor_x, cursor_y, container_left, container_top, container_w, container_h, layout: &PaneLayout) -> Option<(usize, String)>` — pure, tested. Iterates `layout.visible_panes(w, h)` (container-relative px rects); returns first pane containing the cursor. Caller handles single-pane path separately (cursor in container rect → `Some((0, render_sid))`).
+- `finish_tab_drag(state, tab_drag, drag_over_pane, container_size, final_x, final_y, container_left, container_top)` (annotated `#[allow(clippy::too_many_arguments)]`) — does final hit-test, calls `execute_tab_drop_on_pane`, logs outcome, calls `restore_focus_to_active_session(state, 80)` on `SplitCreated`/`SplitFilledExisting`, clears `tab_drag` + `drag_over_pane`, spawns JS cleanup, restores focus (20ms delay).
+- `_tab_drag_poll` `use_future` in `App` (mirrors `_split_drag_poll`): loops forever; idle 32ms sleep when `tab_drag` None; polls 16ms when Some. On each poll: updates `tab_drag`'s `cur_x`/`cur_y`; if `!dragging && threshold_exceeded` → `dragging = true`; if `done` → `finish_tab_drag` (only if `dragging` was true; else click cleanup); else if `dragging` → live hit-test → `drag_over_pane.set(target_idx)`. **NEVER breaks**.
+- Ghost element in `App` (after the `match` block, before `AiPanel`): when `tab_drag().dragging == true`, renders `div { position: fixed; left: {cur_x+12}px; top: {cur_y+14}px; pointer-events: none; z-index: 9999; background: #24283b; border: 1px solid #7aa2f7; padding: 4px 8px; border-radius: 4px; font-size: 12px; color: #c0caf5; box-shadow: 0 2px 8px rgba(0,0,0,0.4); } "{session_name}" }`.
+
+**Click vs drag**: `onmousedown` sets `tab_drag` with `dragging: false`. The poll loop watches the cursor; once it moves more than `TAB_DRAG_THRESHOLD` (6px) from the start, `dragging` becomes `true`. The drop is ONLY executed on `mouseup` if `dragging == true`. This preserves plain click-to-select: a mousedown with no significant mousemove is a click — the poll cleans up the signal and the tab's `onclick` fires normally. (The close button's `onmousedown: stop_propagation` ensures closing a tab doesn't start a drag.)
+
+**Single source of truth for drop dispatch**: `execute_tab_drop_on_pane(state, dragged_sid, target_pane_idx, target_pane_session) -> TabDropOutcome` in `state.rs`. Called by BOTH the manual mouse-based `finish_tab_drag` AND the (now-residual) HTML5 `ondrop` handlers in `single_pane_with_drop` / `multi_pane_container`. This deduplication keeps the dispatch logic in one unit-testable place — the UI layers just hand off `(dragged_sid, target_pane_idx, target_pane_session)`. Logic: (1) self-drop → `NoOpSelfDrop`; (2) target empty → move (clear source if any) / assign; (3) target non-empty + src in pane → swap; (3b) target non-empty + src NOT in pane → `drop_background_tab_to_create_split` (background tab → create split).
+
+**`TabDropOutcome` enum** (returned by `execute_tab_drop_on_pane`): `NoOpSelfDrop`, `MovedToEmptyPane { cleared_source_pane: Option<usize> }`, `AssignedToEmptyPane`, `Swapped`, `SwapFailed`, `SplitCreated { pane_idx }`, `SplitFilledExisting { pane_idx }`, `SplitFallbackSwapFailed`, `SplitFailed`.
+
+**Tests** (38 new total):
+- `state.rs::tests::execute_tab_drop_*` (7 new): self-drop no-op, pane-to-pane swap, background→create split, pane-to-empty move, background→empty assign, background→cycles preset, background→Grid8 fallback swap fails.
+- `app.rs::tab_drag_tests` (31 new): `tab_drag_threshold_exceeded` (4 — below/above/Euclidean/constant), `build_install_tab_drag_script` (8 — initializes pos, clears done, IIFE, capture-phase, stores remove fn, upHandler records position, captures container offset, removes prior listeners, separate globals from splitter), `parse_tab_drag_poll_response` (8 — valid in-progress/done, empty, too few/many fields, non-numeric, negative, integer, zero offset), `hit_test_pane_at` (8 — single pane, outside container left/above, Split2H left/right/boundary, Grid4 top-right/bottom-left, container right edge exclusive).
+
+**Total test count**: 422 (was 384 before Task 22). Clippy warnings: 62 (was 63 — actually reduced by 1 from dedup).
+
+**HTML5 DnD REMAINS for**: sidebar→pane connection drags (Task 16, untouched). The `application/x-rusterm-connection-id` MIME type and the `ondrop` connection-id branches in `single_pane_with_drop` / `multi_pane_container` are unchanged.
+
+**Critical invariants preserved**:
+- `active_session` is NOT updated on drop (it's a tab pointer; layouts are keyed by it).
+- `apply_layout_preset` re-fills ALL panes — manual `set_pane_session_for_active` must come AFTER (only relevant inside `drop_background_tab_to_create_split`).
+- The multi-pane input routing fix (`is_broadcast = broadcast_targets.len() > 1`) is unaffected.
+- The splitter drag-resize fix is untouched — the tab-drag system mirrors its structure but uses separate JS global names.
+- `_tab_drag_poll` `use_future` NEVER breaks (loops forever; idle 32ms sleep).
+- `upHandler` records final mouse position (unlike the splitter's `upHandler` — a tab drop needs the release coordinates for hit-testing).
+- No re-entrant signal writes: `tab_drag.read()` borrow is dropped before `state.write()` in `finish_tab_drag`.
+- The poll `use_future` only executes a drop if `dragging == true` (preserves plain click-to-select).
 
 ## Known Issues / Future Work
 

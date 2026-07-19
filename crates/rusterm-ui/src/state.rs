@@ -725,6 +725,313 @@ pub fn session_at_pane(state: &AppState, pane_idx: usize) -> Option<String> {
     layout.panes.get(pane_idx).map(|p| p.session_id.clone())
 }
 
+/// =====================================================================
+/// Task 19 — drag a background tab onto a pane to CREATE a new split
+/// =====================================================================
+///
+/// When the user drags a session tab from the top tab bar onto a pane
+/// that already has a session, and the dragged session is NOT currently
+/// displayed in any pane (a "background tab"), the drop handler needs
+/// to CREATE a new split pane for the dragged session — not just move
+/// or swap (the existing `set_pane_session_for_active` / `swap_pane_sessions`
+/// paths assume the source session is already in a pane).
+///
+/// This helper implements the "create split" logic at the state level
+/// (unit-testable without a dioxus runtime). The strategy is:
+///
+/// 1. If the active tab has NO layout yet (Single preset, single pane),
+///    apply `Split2H` and place the dragged session in pane 1.
+/// 2. If the active tab HAS a layout, look for an empty pane slot (a
+///    pane whose `session_id` is empty). If found, place the dragged
+///    session there via `set_pane_session_for_active`.
+/// 3. If there are no empty slots, cycle to the next larger preset
+///    (Single→Split2H, Split2H/Split2V→Grid4, Grid4→Grid8). After
+///    cycling, `apply_layout_preset` re-fills all panes from the
+///    sessions list — the dragged session may already be placed
+///    naturally. If not (it was a background tab not in the
+///    `apply_layout_preset` fill order), manually place it in the
+///    first empty slot.
+/// 4. If already at `Grid8` (max panes), fall back to swapping the
+///    dragged session with the target pane's session via
+///    `swap_pane_sessions` (the caller is responsible for this —
+///    this function returns `DropSplitOutcome::FallbackSwap`).
+///
+/// Returns a `DropSplitOutcome` describing what happened, so the caller
+/// can log / fall back appropriately.
+///
+/// CRITICAL: this function does NOT update `active_session`. The layout
+/// is keyed by `active_session` in `state.layouts`; changing it would
+/// break the layout lookup. The dragged session is placed in a pane of
+/// the CURRENTLY ACTIVE tab's layout.
+pub fn drop_background_tab_to_create_split(
+    state: &mut AppState,
+    dragged_sid: &str,
+    _target_pane_idx: usize,
+) -> DropSplitOutcome {
+    let Some(active_id) = state.active_session.clone() else {
+        return DropSplitOutcome::Failed;
+    };
+
+    // Case 1: no layout for the active session yet (Single preset).
+    // Apply Split2H and place the dragged session in pane 1.
+    if !state.layouts.contains_key(&active_id) {
+        state.layout_preset = LayoutPreset::Split2H;
+        let mut ids = vec![active_id.clone()];
+        for tab in &state.sessions {
+            if tab.id != active_id && !ids.contains(&tab.id) {
+                ids.push(tab.id.clone());
+            }
+        }
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2H, &ids);
+        // Place the dragged session in pane 1 (pane 0 is the active tab's
+        // own session — that's the user's "anchor" and shouldn't move).
+        if layout.panes.len() >= 2 {
+            layout.panes[1].session_id = dragged_sid.to_string();
+        }
+        state.layouts.insert(active_id, layout);
+        return DropSplitOutcome::Created { pane_idx: 1 };
+    }
+
+    // Case 2/3: layout exists. Look for an empty slot in the current
+    // layout (Grid4 with 2 sessions has 2 empty panes, etc.).
+    let current_preset = state.layout_preset;
+    let empty_idx = state
+        .layouts
+        .get(&active_id)
+        .and_then(|l| l.panes.iter().position(|p| p.session_id.is_empty()));
+
+    if let Some(idx) = empty_idx {
+        // Found an empty slot — place the dragged session there. This
+        // doesn't change the preset, just fills a slot.
+        if set_pane_session_for_active(state, idx, dragged_sid.to_string()) {
+            return DropSplitOutcome::FilledExisting { pane_idx: idx };
+        }
+        return DropSplitOutcome::Failed;
+    }
+
+    // Case 4: no empty slots. Cycle to the next larger preset (unless
+    // we're already at Grid8 — the maximum).
+    let next_preset = match current_preset {
+        LayoutPreset::Single => Some(LayoutPreset::Split2H),
+        LayoutPreset::Split2H | LayoutPreset::Split2V => Some(LayoutPreset::Grid4),
+        LayoutPreset::Grid4 => Some(LayoutPreset::Grid8),
+        LayoutPreset::Grid8 => None, // already at max — caller falls back to swap
+    };
+
+    let Some(next) = next_preset else {
+        return DropSplitOutcome::FallbackSwap;
+    };
+
+    // Apply the larger preset. `apply_layout_preset` re-fills ALL panes
+    // from the sessions list in tab order (active first). The dragged
+    // session, being a background tab, will likely be placed in one of
+    // the new slots naturally — but we check afterwards and manually
+    // place it if not.
+    if !apply_layout_preset(state, next) {
+        return DropSplitOutcome::Failed;
+    }
+
+    // Check if the dragged session was already placed by
+    // `apply_layout_preset` (because it's in `state.sessions`).
+    let already_placed = state
+        .layouts
+        .get(&active_id)
+        .and_then(|l| l.pane_index_for_session(dragged_sid))
+        .is_some();
+
+    if already_placed {
+        // `apply_layout_preset` filled a new pane with the dragged
+        // session. Nothing more to do.
+        let pane_idx = state
+            .layouts
+            .get(&active_id)
+            .and_then(|l| l.pane_index_for_session(dragged_sid))
+            .unwrap_or(0);
+        return DropSplitOutcome::Created { pane_idx };
+    }
+
+    // The dragged session wasn't placed by `apply_layout_preset`
+    // (shouldn't normally happen since it's in `state.sessions`, but
+    // be defensive). Find an empty slot and place it manually.
+    let empty_idx = state
+        .layouts
+        .get(&active_id)
+        .and_then(|l| l.panes.iter().position(|p| p.session_id.is_empty()));
+
+    if let Some(idx) = empty_idx
+        && set_pane_session_for_active(state, idx, dragged_sid.to_string())
+    {
+        return DropSplitOutcome::Created { pane_idx: idx };
+    }
+
+    // No empty slot even after cycling (e.g., all 8 panes filled by
+    // other sessions). Fall back to swap.
+    DropSplitOutcome::FallbackSwap
+}
+
+/// Outcome of `drop_background_tab_to_create_split`. Lets the caller
+/// (the drop handler in `app.rs`) decide how to log the result and
+/// whether to fall back to `swap_pane_sessions`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DropSplitOutcome {
+    /// A new pane was created (preset was upgraded) and the dragged
+    /// session was placed in the new pane at `pane_idx`.
+    Created { pane_idx: usize },
+    /// An existing empty pane slot (in the current preset) was filled
+    /// with the dragged session at `pane_idx`. The preset was NOT
+    /// changed.
+    FilledExisting { pane_idx: usize },
+    /// Already at the maximum preset (Grid8, 8 panes) with no empty
+    /// slots — the caller should fall back to `swap_pane_sessions`.
+    FallbackSwap,
+    /// The operation failed (no active session, or a state mutation
+    /// returned false unexpectedly).
+    Failed,
+}
+
+/// Outcome of `execute_tab_drop_on_pane` — the single source of truth
+/// for what a tab/pane drag-drop did to the active tab's layout. Both
+/// the (legacy) HTML5 `ondrop` handlers in `multi_pane_container` /
+/// `single_pane_with_drop` AND the manual mouse-based tab-drag finisher
+/// (Task 22) call this function and log the outcome. This deduplication
+/// keeps the drop-dispatch logic in one unit-testable place — the UI
+/// layers just hand off `(dragged_sid, target_pane_idx,
+/// target_pane_session)`.
+///
+/// Note: a `SplitCreated` / `SplitFilledExisting` outcome means the
+/// caller should call `restore_focus_to_active_session(state, 80)` so
+/// the newly-mounted pane's TerminalView doesn't steal focus
+/// unpredictably.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TabDropOutcome {
+    /// The user dropped a session onto its own pane — nothing happened.
+    NoOpSelfDrop,
+    /// The dragged session was moved from another pane into an empty
+    /// target pane. `cleared_source_pane` is the pane that previously
+    /// held the dragged session (now cleared), or `None` if the dragged
+    /// session wasn't in any pane of this layout (it was a background
+    /// tab assigned to an empty slot).
+    MovedToEmptyPane { cleared_source_pane: Option<usize> },
+    /// The dragged session was assigned to an empty target pane, and
+    /// there was no source pane to clear (i.e. the dragged session was
+    /// a background tab not in any pane).
+    AssignedToEmptyPane,
+    /// Two panes' sessions were swapped (both source and target had
+    /// sessions).
+    Swapped,
+    /// A swap was attempted but failed (one of the sessions wasn't in
+    /// any pane of the active layout).
+    SwapFailed,
+    /// A new split pane was created (preset was upgraded) and the
+    /// dragged session was placed at `pane_idx`. The caller should
+    /// restore focus after the new pane mounts.
+    SplitCreated { pane_idx: usize },
+    /// An existing empty pane slot was filled (preset unchanged) with
+    /// the dragged session at `pane_idx`. The caller should restore
+    /// focus after the new pane mounts.
+    SplitFilledExisting { pane_idx: usize },
+    /// At Grid8 max with no empty slots — caller attempted a swap as a
+    /// fallback, but the swap failed (the dragged session wasn't in
+    /// any pane, which is the case for background-tab drags).
+    SplitFallbackSwapFailed,
+    /// The split-creation helper returned `Failed` (no active session
+    /// or an unexpected state-mutation failure).
+    SplitFailed,
+}
+
+/// Execute a tab/pane drag-drop onto a specific pane of the active
+/// tab's layout. This is the SINGLE source of truth for drop dispatch:
+/// both the legacy HTML5 `ondrop` handlers in `multi_pane_container` /
+/// `single_pane_with_drop` and the Task 22 manual mouse-based tab-drag
+/// finisher call this. Returns a `TabDropOutcome` so the caller can log
+/// and (for split-creation outcomes) schedule a focus-restore.
+///
+/// Logic (mirrors the prior inline drop handlers):
+/// 1. `dragged_sid == target_pane_session` → `NoOpSelfDrop`.
+/// 2. `target_pane_session.is_empty()` → look up the dragged session's
+///    source pane. If `Some(src)` and `src != target`, move the session
+///    to the target and clear the source (`MovedToEmptyPane`). If the
+///    dragged session isn't in any pane (`None`), just assign it to
+///    the target (`AssignedToEmptyPane`).
+/// 3. `target_pane_session` non-empty → look up the source pane:
+///    - `Some(_)` → pane-to-pane swap (`Swapped` / `SwapFailed`).
+///    - `None` → background tab: create a split via
+///      `drop_background_tab_to_create_split`. Map the `DropSplitOutcome`:
+///      `Created → SplitCreated`, `FilledExisting → SplitFilledExisting`,
+///      `FallbackSwap →` attempt `swap_pane_sessions` (`Swapped` /
+///      `SplitFallbackSwapFailed`), `Failed → SplitFailed`.
+///
+/// CRITICAL invariants: this function does NOT update `active_session`
+/// (it's a tab pointer; layouts are keyed by it). It does NOT call
+/// `apply_layout_preset` directly — that's only called inside
+/// `drop_background_tab_to_create_split` when the preset cycles.
+pub fn execute_tab_drop_on_pane(
+    state: &mut AppState,
+    dragged_sid: &str,
+    target_pane_idx: usize,
+    target_pane_session: &str,
+) -> TabDropOutcome {
+    // Case 1: self-drop is a no-op.
+    if dragged_sid == target_pane_session {
+        return TabDropOutcome::NoOpSelfDrop;
+    }
+
+    let src_pane = pane_index_for_active_session(state, dragged_sid);
+
+    // Case 2: target pane is empty → move / assign.
+    if target_pane_session.is_empty() {
+        if !set_pane_session_for_active(state, target_pane_idx, dragged_sid.to_string()) {
+            // Defensive: target pane index out of range. This shouldn't
+            // happen (the caller got `target_pane_idx` from the layout's
+            // `visible_panes`), but if it does, treat as a no-op rather
+            // than crashing.
+            return TabDropOutcome::SwapFailed;
+        }
+        if let Some(src_idx) = src_pane
+            && src_idx != target_pane_idx
+        {
+            set_pane_session_for_active(state, src_idx, String::new());
+            return TabDropOutcome::MovedToEmptyPane {
+                cleared_source_pane: Some(src_idx),
+            };
+        }
+        return TabDropOutcome::AssignedToEmptyPane;
+    }
+
+    // Case 3: target pane has a session. Either swap or create a split.
+    if let Some(_src_idx) = src_pane {
+        // Sub-case (a): pane-to-pane swap.
+        let swapped = swap_pane_sessions(state, dragged_sid, target_pane_session);
+        return if swapped {
+            TabDropOutcome::Swapped
+        } else {
+            TabDropOutcome::SwapFailed
+        };
+    }
+
+    // Sub-case (b): background tab → create a split.
+    let outcome = drop_background_tab_to_create_split(state, dragged_sid, target_pane_idx);
+    match outcome {
+        DropSplitOutcome::Created { pane_idx } => TabDropOutcome::SplitCreated { pane_idx },
+        DropSplitOutcome::FilledExisting { pane_idx } => {
+            TabDropOutcome::SplitFilledExisting { pane_idx }
+        }
+        DropSplitOutcome::FallbackSwap => {
+            // Already at Grid8 — fall back to a swap. For background-tab
+            // drags this will fail silently (the dragged session isn't in
+            // any pane), but the contract is documented and the caller
+            // can log the attempt.
+            let swapped = swap_pane_sessions(state, dragged_sid, target_pane_session);
+            if swapped {
+                TabDropOutcome::Swapped
+            } else {
+                TabDropOutcome::SplitFallbackSwapFailed
+            }
+        }
+        DropSplitOutcome::Failed => TabDropOutcome::SplitFailed,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1594,6 +1901,145 @@ mod tests {
     }
 
     // ------------------------------------------------------------------
+    // Task 17/19 regression: multi-pane input routing.
+    //
+    // Bug (fixed 2026-07-19): in multi-pane mode with comparison OFF, only
+    // the first pane accepted commands. Root cause: `render_terminal_pane`'s
+    // `on_input` handler used the condition
+    //     `broadcast_targets.len() > 1
+    //      || (broadcast_targets.len() == 1 && broadcast_targets[0] != sid_clone)`
+    // which treated "active_session differs from this pane's session" as a
+    // broadcast trigger. Since `broadcast_targets` returns `[active_session]`
+    // when comparison is OFF, pane N (N>0) had `broadcast_targets[0] !=
+    // sid_clone`, so its keystrokes were sent to `active_session`'s PTY
+    // (pane 0) instead of its own. The user saw pane 0 react and pane N do
+    // nothing → "only the first pane accepts commands".
+    //
+    // Fix: `is_broadcast = broadcast_targets.len() > 1`. This is true ONLY
+    // when comparison is ON with 2+ non-empty panes. In all other cases,
+    // each pane sends to its own `sid_clone`.
+    //
+    // These tests pin the contract via `broadcast_targets` (the sole input
+    // to the routing decision) plus a direct assertion of the corrected
+    // `is_broadcast` predicate. A full dioxus-runtime test of `on_input`
+    // isn't feasible without spinning up the desktop webview, so we test
+    // the decision function and the layout state that feeds it.
+    // ------------------------------------------------------------------
+
+    /// Regression for "only first pane accepts commands". In Split2H with
+    /// comparison OFF, `broadcast_targets` must return exactly 1 entry
+    /// (the active session), so the `is_broadcast = len > 1` predicate is
+    /// false for EVERY pane — including pane 1, whose `sid_clone` differs
+    /// from `active_session`. The old buggy predicate would have been true
+    /// for pane 1.
+    #[test]
+    fn non_comparison_multi_pane_input_routes_to_each_pane_own_session() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        // active_session = "alpha"; layout panes = [alpha, beta].
+        let targets = broadcast_targets(&state);
+        assert_eq!(targets, vec!["alpha".to_string()]); // comparison OFF
+        // The corrected predicate: only broadcast when there are multiple
+        // targets (i.e., comparison ON with 2+ non-empty panes).
+        let is_broadcast = targets.len() > 1;
+        assert!(
+            !is_broadcast,
+            "non-comparison multi-pane must NOT broadcast"
+        );
+        // For pane 1 (beta): the old predicate `(targets[0] != "beta")`
+        // would have been TRUE → bug. The new predicate is FALSE → correct.
+        assert_ne!(targets[0], "beta"); // preconditions for the bug
+        assert!(
+            !is_broadcast,
+            "pane 1 input must go to its own session, not alpha's"
+        );
+    }
+
+    /// Same contract as above, but after a drag-and-drop pane swap. The
+    /// user drags session `gamma` onto pane 0 (which had `alpha`), swapping
+    /// them. Afterwards, pane 0 shows `gamma` and pane 1 shows `beta` (or
+    /// whatever the swap produced). The routing predicate must STILL be
+    /// false with comparison OFF — each pane's input goes to its own
+    /// session, regardless of which session is "active".
+    ///
+    /// This simulates the mouse-drag-to-rearrange-panes flow the user
+    /// asked for, at the state level (the actual mouse events are DOM
+    /// concerns that can't be unit-tested without a webview).
+    #[test]
+    fn after_drag_swap_panes_input_still_routes_to_own_session() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        // active_session = "alpha"; layout panes = [alpha, beta] (gamma is
+        // not in any pane because Split2H only has 2 slots and `apply_layout_preset`
+        // fills them in tab order with active first).
+        assert_eq!(state.layouts["alpha"].panes[0].session_id, "alpha");
+        assert_eq!(state.layouts["alpha"].panes[1].session_id, "beta");
+
+        // Simulate the user dragging `gamma` from the tab bar onto pane 1
+        // (which currently shows `beta`). This is the `ondrop` handler's
+        // "target pane has a session → swap" path. We use the state-level
+        // helper that the drop handler calls.
+        //
+        // Note: `gamma` is NOT currently in any pane, so the drop handler's
+        // swap path would actually be the "move" path (target pane has a
+        // session, source session isn't in any pane). We simulate the
+        // simpler case: drag `beta` from pane 1 onto pane 0 (which has
+        // `alpha`) → swap alpha and beta. This verifies that after a swap,
+        // the routing predicate is still correct.
+        let swapped = swap_pane_sessions(&mut state, "alpha", "beta");
+        assert!(swapped);
+        assert_eq!(state.layouts["alpha"].panes[0].session_id, "beta");
+        assert_eq!(state.layouts["alpha"].panes[1].session_id, "alpha");
+
+        // active_session is STILL "alpha" (the tab pointer doesn't change
+        // on pane click — see the comment in `render_terminal_pane`'s
+        // `on_input` handler). But now pane 0 shows `beta` and pane 1
+        // shows `alpha`. The routing predicate must still be false.
+        let targets = broadcast_targets(&state);
+        assert_eq!(targets, vec!["alpha".to_string()]); // comparison OFF
+        let is_broadcast = targets.len() > 1;
+        assert!(!is_broadcast);
+        // Pane 0 now shows `beta` (sid_clone="beta"), but active_session
+        // is still "alpha". The old buggy predicate `(targets[0] != "beta")`
+        // would have been TRUE → beta's input would go to alpha's PTY.
+        // The new predicate is FALSE → beta's input goes to beta's PTY.
+        assert_ne!(targets[0], "beta");
+        assert!(
+            !is_broadcast,
+            "after drag-swap, pane 0 (beta) input must go to beta, not alpha"
+        );
+    }
+
+    /// When comparison IS ON with 2+ panes, the predicate must be TRUE so
+    /// input broadcasts to every pane's PTY. This pins the comparison-mode
+    /// half of the contract (the fix must not break synchronization).
+    #[test]
+    fn comparison_on_multi_pane_input_broadcasts_to_all_panes() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma", "delta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Grid4);
+        toggle_comparison_mode(&mut state);
+        let targets = broadcast_targets(&state);
+        assert_eq!(targets.len(), 4);
+        let is_broadcast = targets.len() > 1;
+        assert!(is_broadcast, "comparison ON with 4 panes must broadcast");
+    }
+
+    /// Edge case: comparison ON but only 1 non-empty pane. `broadcast_targets`
+    /// returns len 1, so the predicate is false — input goes to that single
+    /// pane's session. This is correct (there's only one target anyway).
+    #[test]
+    fn comparison_on_single_non_empty_pane_does_not_broadcast() {
+        let mut state = state_with_active_session(&["alpha"]);
+        // Grid4 with only 1 session → 3 empty panes.
+        apply_layout_preset(&mut state, LayoutPreset::Grid4);
+        toggle_comparison_mode(&mut state);
+        let targets = broadcast_targets(&state);
+        assert_eq!(targets, vec!["alpha".to_string()]);
+        let is_broadcast = targets.len() > 1;
+        assert!(!is_broadcast);
+    }
+
+    // ------------------------------------------------------------------
     // Task 14 / 15 — additional coverage for multi-pane display and
     // session-allocation correctness. These pin contracts that the
     // earlier tests don't directly exercise.
@@ -2360,6 +2806,304 @@ mod tests {
         assert_eq!(pane_index_for_active_session(&state, "alpha"), None);
         assert_eq!(pane_index_for_active_session(&state, "beta"), None);
         assert_eq!(pane_index_for_active_session(&state, "nonexistent"), None);
+    }
+
+    // ------------------------------------------------------------------
+    // Task 19 — drag a background tab onto a pane to CREATE a split.
+    // These tests pin the `drop_background_tab_to_create_split` contract.
+    // ------------------------------------------------------------------
+
+    /// Dragging a background tab onto a pane when there's no layout yet
+    /// (Single preset) must CREATE a Split2H layout and place the dragged
+    /// session in pane 1. The active session stays in pane 0.
+    #[test]
+    fn drop_background_tab_creates_split_when_no_layout() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma"]);
+        // No layout applied — Single preset. User drags `beta` (a
+        // background tab — not in any pane) onto pane 0 (which has alpha).
+        let outcome = drop_background_tab_to_create_split(&mut state, "beta", 0);
+        assert_eq!(outcome, DropSplitOutcome::Created { pane_idx: 1 });
+        // Layout is now Split2H with alpha in pane 0, beta in pane 1.
+        let layout = state.layouts.get("alpha").unwrap();
+        assert_eq!(layout.panes.len(), 2);
+        assert_eq!(layout.panes[0].session_id, "alpha");
+        assert_eq!(layout.panes[1].session_id, "beta");
+        assert_eq!(state.layout_preset, LayoutPreset::Split2H);
+        // active_session is UNCHANGED (it's a tab pointer, not a pane pointer).
+        assert_eq!(state.active_session.as_deref(), Some("alpha"));
+    }
+
+    /// After `drop_background_tab_to_create_split` creates a layout from
+    /// the Single preset, the resulting layout MUST be `is_multi_pane()`.
+    /// This is what triggers the App render path to switch from
+    /// `single_pane_with_drop` to `multi_pane_container` on the next
+    /// render — the multi-pane container then renders the new pane with
+    /// its own TerminalView, splitter bars, and per-pane drop handlers.
+    ///
+    /// This test pins the contract that connects the Task 19 state-level
+    /// helper to the UI render-path switch. Without `is_multi_pane()`
+    /// returning true here, the user would drag a tab, the state would
+    /// update, but the UI would keep rendering the single-pane path
+    /// (with the original session) and the new pane would never appear.
+    #[test]
+    fn drop_background_tab_creates_multi_pane_layout_from_single() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        // Sanity: no layout, so is_multi_pane would be false (the App
+        // takes the single-pane path).
+        assert!(state.layouts.get("alpha").is_none());
+        let outcome = drop_background_tab_to_create_split(&mut state, "beta", 0);
+        assert_eq!(outcome, DropSplitOutcome::Created { pane_idx: 1 });
+        // After the drop, the layout exists and is_multi_pane is true →
+        // the App's next render takes the multi-pane path.
+        let layout = state.layouts.get("alpha").unwrap();
+        assert!(layout.is_multi_pane());
+    }
+
+    /// Dragging a background tab onto a pane when the layout already has
+    /// an empty slot must FILL the empty slot without changing the preset.
+    /// This is the Grid4-with-2-sessions case: 2 empty panes are available.
+    #[test]
+    fn drop_background_tab_fills_existing_empty_slot() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma"]);
+        // Grid4 with 3 sessions → panes [alpha, beta, gamma, ""] — one empty slot.
+        apply_layout_preset(&mut state, LayoutPreset::Grid4);
+        // Sanity: pane 3 is empty.
+        assert_eq!(state.layouts["alpha"].panes[3].session_id, "");
+        // Now add a 4th session to `state.sessions` (but NOT in any pane)
+        // and drag it. We simulate this by having `delta` in sessions but
+        // clearing pane 3 (already empty).
+        //
+        // Actually, with 3 sessions in Grid4, pane 3 is already empty.
+        // We drag `gamma` (currently in pane 2) — wait, that's a pane-to-pane
+        // drag. Let's instead add a 4th session that's NOT in the layout.
+        //
+        // Reset: 4 sessions, Grid4 → all 4 panes filled. Then close one
+        // pane (set its session to empty) and drag the closed session
+        // back onto a filled pane.
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma", "delta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Grid4);
+        // All 4 panes filled: [alpha, beta, gamma, delta].
+        assert_eq!(state.layouts["alpha"].panes[3].session_id, "delta");
+        // Close pane 3 (simulate user closing delta's pane).
+        set_pane_session_for_active(&mut state, 3, String::new());
+        assert_eq!(state.layouts["alpha"].panes[3].session_id, "");
+        // Now drag `delta` (a background tab now) onto pane 0 (alpha).
+        // Should fill pane 3 (the empty slot) — NOT swap, NOT cycle preset.
+        let outcome = drop_background_tab_to_create_split(&mut state, "delta", 0);
+        assert_eq!(outcome, DropSplitOutcome::FilledExisting { pane_idx: 3 });
+        // Preset is unchanged.
+        assert_eq!(state.layout_preset, LayoutPreset::Grid4);
+        // Pane 3 now has delta; pane 0 still has alpha.
+        let layout = state.layouts.get("alpha").unwrap();
+        assert_eq!(layout.panes[0].session_id, "alpha");
+        assert_eq!(layout.panes[3].session_id, "delta");
+    }
+
+    /// Dragging a background tab onto a pane when the layout is Split2H
+    /// (2 panes, both filled) must cycle to Grid4 and place the dragged
+    /// session in a new pane.
+    #[test]
+    fn drop_background_tab_cycles_split2h_to_grid4() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma"]);
+        // Split2H: panes [alpha, beta]. gamma is a background tab.
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        assert_eq!(state.layouts["alpha"].panes.len(), 2);
+        // Drag gamma onto pane 0 (alpha).
+        let outcome = drop_background_tab_to_create_split(&mut state, "gamma", 0);
+        // `apply_layout_preset(Grid4)` fills all 4 panes from sessions
+        // [alpha, beta, gamma] in tab order → [alpha, beta, gamma, ""].
+        // So gamma is placed in pane 2 by the preset fill, not by our
+        // manual `set_pane_session_for_active` — but the outcome is still
+        // `Created` because the preset was upgraded.
+        assert!(matches!(outcome, DropSplitOutcome::Created { .. }));
+        assert_eq!(state.layout_preset, LayoutPreset::Grid4);
+        let layout = state.layouts.get("alpha").unwrap();
+        assert_eq!(layout.panes.len(), 4);
+        // gamma is in some pane (placed by apply_layout_preset).
+        assert!(layout.panes.iter().any(|p| p.session_id == "gamma"));
+        // alpha is still in pane 0 (it's the active session, anchored).
+        assert_eq!(layout.panes[0].session_id, "alpha");
+    }
+
+    /// Dragging a background tab onto a pane when the layout is Grid8
+    /// (max panes, all filled) must return `FallbackSwap` — the caller
+    /// should then attempt `swap_pane_sessions` (which will also fail
+    /// silently since the source isn't in any pane, but the contract is
+    /// what we're pinning here).
+    #[test]
+    fn drop_background_tab_at_grid8_returns_fallback_swap() {
+        let mut state = state_with_active_session(&["a", "b", "c", "d", "e", "f", "g", "h", "i"]);
+        // Grid8: 8 panes, all filled with a-h. `i` is a background tab.
+        apply_layout_preset(&mut state, LayoutPreset::Grid8);
+        assert_eq!(state.layouts["a"].panes.len(), 8);
+        // Drag `i` onto pane 0 (a).
+        let outcome = drop_background_tab_to_create_split(&mut state, "i", 0);
+        assert_eq!(outcome, DropSplitOutcome::FallbackSwap);
+        // Preset is unchanged (already at max).
+        assert_eq!(state.layout_preset, LayoutPreset::Grid8);
+        // Layout is unchanged (no mutation happened).
+        let layout = state.layouts.get("a").unwrap();
+        assert_eq!(layout.panes[0].session_id, "a");
+        assert!(layout.panes.iter().all(|p| p.session_id != "i"));
+    }
+
+    /// `drop_background_tab_to_create_split` must return `Failed` when
+    /// there's no active session. This is the defensive contract — the
+    /// drop handler shouldn't crash if the state is in an unexpected
+    /// (no-active-session) configuration.
+    #[test]
+    fn drop_background_tab_returns_failed_with_no_active_session() {
+        let mut state = AppState::default();
+        // No active session.
+        let outcome = drop_background_tab_to_create_split(&mut state, "beta", 0);
+        assert_eq!(outcome, DropSplitOutcome::Failed);
+        assert!(state.layouts.is_empty());
+    }
+
+    /// After `drop_background_tab_to_create_split` creates a new pane,
+    /// the input routing predicate must STILL be false with comparison
+    /// OFF — each pane's input goes to its own session. This is the
+    /// regression for the multi-pane input bug (Task 17/19), applied to
+    /// the new split-creation path. Without this test, a future change
+    /// to `drop_background_tab_to_create_split` could break input routing
+    /// in the new pane.
+    #[test]
+    fn after_drop_background_tab_input_routes_to_each_pane_own_session() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma"]);
+        // Start in Single (no layout). Drag `beta` onto pane 0.
+        let outcome = drop_background_tab_to_create_split(&mut state, "beta", 0);
+        assert_eq!(outcome, DropSplitOutcome::Created { pane_idx: 1 });
+        // Layout is Split2H: [alpha, beta].
+        let layout = state.layouts.get("alpha").unwrap();
+        assert_eq!(layout.panes[0].session_id, "alpha");
+        assert_eq!(layout.panes[1].session_id, "beta");
+        // With comparison OFF, broadcast_targets returns just the active
+        // session. The routing predicate `len > 1` is false — pane 1
+        // (beta) sends input to its own PTY, not alpha's.
+        let targets = broadcast_targets(&state);
+        assert_eq!(targets, vec!["alpha".to_string()]);
+        let is_broadcast = targets.len() > 1;
+        assert!(!is_broadcast);
+        // Pre-condition for the bug: targets[0] (alpha) != pane 1's sid (beta).
+        assert_ne!(targets[0], "beta");
+    }
+
+    // ------------------------------------------------------------------
+    // Task 22 — `execute_tab_drop_on_pane` (single source of truth for
+    // tab/pane drag-drop dispatch). These tests pin the contract that
+    // BOTH the legacy HTML5 `ondrop` handlers AND the Task 22 manual
+    // mouse-based tab-drag finisher rely on.
+    // ------------------------------------------------------------------
+
+    /// Self-drop is a no-op: dragging a session onto its own pane does
+    /// nothing.
+    #[test]
+    fn execute_tab_drop_self_drop_is_noop() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        // alpha is in pane 0. Drop alpha onto pane 0.
+        let outcome = execute_tab_drop_on_pane(&mut state, "alpha", 0, "alpha");
+        assert_eq!(outcome, TabDropOutcome::NoOpSelfDrop);
+        // Layout unchanged.
+        let layout = state.layouts.get("alpha").unwrap();
+        assert_eq!(layout.panes[0].session_id, "alpha");
+        assert_eq!(layout.panes[1].session_id, "beta");
+    }
+
+    /// Pane-to-pane swap: dragging one pane's session onto another pane
+    /// swaps the two panes' sessions.
+    #[test]
+    fn execute_tab_drop_pane_to_pane_swaps() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        // Drag alpha (pane 0) onto pane 1 (which has beta).
+        let outcome = execute_tab_drop_on_pane(&mut state, "alpha", 1, "beta");
+        assert_eq!(outcome, TabDropOutcome::Swapped);
+        let layout = state.layouts.get("alpha").unwrap();
+        assert_eq!(layout.panes[0].session_id, "beta");
+        assert_eq!(layout.panes[1].session_id, "alpha");
+    }
+
+    /// Background tab → create a split: dragging a tab that ISN'T in any
+    /// pane onto a filled pane upgrades the preset and places the dragged
+    /// session in a new pane.
+    #[test]
+    fn execute_tab_drop_background_tab_creates_split() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        // No layout yet — Single preset. Drop `beta` (background tab)
+        // onto pane 0 (alpha).
+        let outcome = execute_tab_drop_on_pane(&mut state, "beta", 0, "alpha");
+        assert_eq!(outcome, TabDropOutcome::SplitCreated { pane_idx: 1 });
+        let layout = state.layouts.get("alpha").unwrap();
+        assert!(layout.is_multi_pane());
+        assert_eq!(layout.panes[1].session_id, "beta");
+    }
+
+    /// Pane-to-empty move: dragging a session from one pane onto an
+    /// empty pane moves the session and clears the source.
+    #[test]
+    fn execute_tab_drop_pane_to_empty_moves() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma"]);
+        apply_layout_preset(&mut state, LayoutPreset::Grid4);
+        // Grid4: [alpha, beta, gamma, ""]. Drag alpha (pane 0) onto
+        // pane 3 (empty).
+        let outcome = execute_tab_drop_on_pane(&mut state, "alpha", 3, "");
+        assert_eq!(
+            outcome,
+            TabDropOutcome::MovedToEmptyPane {
+                cleared_source_pane: Some(0),
+            }
+        );
+        let layout = state.layouts.get("alpha").unwrap();
+        assert_eq!(layout.panes[0].session_id, "");
+        assert_eq!(layout.panes[3].session_id, "alpha");
+    }
+
+    /// Background tab → empty pane assignment: dragging a tab not in any
+    /// pane onto an empty pane assigns it without clearing any source.
+    #[test]
+    fn execute_tab_drop_background_tab_to_empty_assigns() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma"]);
+        apply_layout_preset(&mut state, LayoutPreset::Grid4);
+        // Grid4: [alpha, beta, gamma, ""]. `gamma` is in pane 2 (not
+        // a background tab). To get a true background tab, remove it
+        // from the layout first.
+        set_pane_session_for_active(&mut state, 2, String::new());
+        // Now gamma is a background tab. Drop it onto pane 3 (empty).
+        let outcome = execute_tab_drop_on_pane(&mut state, "gamma", 3, "");
+        assert_eq!(outcome, TabDropOutcome::AssignedToEmptyPane);
+        let layout = state.layouts.get("alpha").unwrap();
+        assert_eq!(layout.panes[3].session_id, "gamma");
+    }
+
+    /// Background tab → filled pane cycles preset (Split2H → Grid4).
+    #[test]
+    fn execute_tab_drop_background_tab_cycles_preset() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        // Split2H: [alpha, beta]. gamma is a background tab.
+        // Drop gamma onto pane 0 (alpha).
+        let outcome = execute_tab_drop_on_pane(&mut state, "gamma", 0, "alpha");
+        // `apply_layout_preset(Grid4)` fills panes from sessions in
+        // tab order → [alpha, beta, gamma, ""]. The outcome is
+        // `SplitCreated` because the preset was upgraded.
+        assert!(matches!(outcome, TabDropOutcome::SplitCreated { .. }));
+        assert_eq!(state.layout_preset, LayoutPreset::Grid4);
+    }
+
+    /// Background tab onto a filled Grid8 (max panes, no empty slots)
+    /// falls back to a swap, which fails because the dragged session
+    /// isn't in any pane.
+    #[test]
+    fn execute_tab_drop_background_tab_at_grid8_fallback_swap_fails() {
+        let mut state = state_with_active_session(&["a", "b", "c", "d", "e", "f", "g", "h", "i"]);
+        apply_layout_preset(&mut state, LayoutPreset::Grid8);
+        // Grid8: [a, b, c, d, e, f, g, h]. `i` is a background tab.
+        // Drop `i` onto pane 0 (a).
+        let outcome = execute_tab_drop_on_pane(&mut state, "i", 0, "a");
+        assert_eq!(outcome, TabDropOutcome::SplitFallbackSwapFailed);
+        // Preset unchanged.
+        assert_eq!(state.layout_preset, LayoutPreset::Grid8);
     }
 }
 

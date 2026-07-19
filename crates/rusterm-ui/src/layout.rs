@@ -1422,4 +1422,553 @@ mod tests {
             "rejected resize must not modify fracs"
         );
     }
+
+    // ------------------------------------------------------------------
+    // Mouse-drag simulation tests (feature #17 task: 模拟用户使用鼠标挪动会话分屏)
+    //
+    // These tests simulate the user dragging a splitter bar with the mouse.
+    // The drag-resize overlay's `onmousemove` handler computes a fractional
+    // delta from the pixel delta between the current mouse position and the
+    // last-applied position, then calls `resize_layout_col`/`resize_layout_row`.
+    // These tests verify that sequence of small deltas produces the same
+    // result as a single large delta — which is the correctness criterion
+    // for the drag-resize feature.
+    //
+    // The tests are pure-Rust (no dioxus runtime) because the delta
+    // computation is a pure function of the mouse position and the layout
+    // state. The overlay's `onmousemove` handler is just a thin wrapper
+    // around `resize_layout_col`/`resize_layout_row`.
+    // ------------------------------------------------------------------
+
+    /// Simulate a smooth col-splitter drag: the user clicks the splitter at
+    /// x=500 (the boundary between two 500px columns in a 1000px container),
+    /// then drags rightward in 10px increments to x=600. After each
+    /// mousemove, the overlay computes `pixel_delta = current_x -
+    /// last_applied_x`, converts to `frac_delta = pixel_delta /
+    /// container_w`, and calls `resize_col(0, frac_delta)`. The final col
+    /// fracs should match a single drag from x=500 to x=600 (delta=0.1).
+    #[test]
+    fn drag_col_splitter_rightward_in_small_increments() {
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        let container_w = 1000.0_f64;
+        // Splitter starts at x=500 (boundary between col 0 and col 1).
+        let mut last_applied_x = 500.0_f64;
+        // Simulate 10 mousemove events, each 10px rightward.
+        for step in 1..=10 {
+            let current_x = 500.0 + (step as f64) * 10.0;
+            let pixel_delta = current_x - last_applied_x;
+            let frac_delta = pixel_delta / container_w;
+            assert!(layout.resize_col(0, frac_delta));
+            last_applied_x = current_x;
+        }
+        // After 10 steps of +0.01 each, col 0 should be 0.6, col 1 should be 0.4.
+        assert!((layout.col_fracs[0] - 0.6).abs() < 1e-9);
+        assert!((layout.col_fracs[1] - 0.4).abs() < 1e-9);
+        // The splitter is now at x = 0.6 * 1000 = 600.
+        let r0 = layout.pane_rect(0, container_w, 800.0).unwrap();
+        let r1 = layout.pane_rect(1, container_w, 800.0).unwrap();
+        assert!((r0.2 - 600.0).abs() < 1e-6); // col 0 width
+        assert!((r1.0 - 600.0).abs() < 1e-6); // col 1 x
+    }
+
+    /// Simulate a smooth col-splitter drag leftward: the user drags from
+    /// x=500 to x=400 in 10px increments. This shrinks col 0 and grows col 1.
+    #[test]
+    fn drag_col_splitter_leftward_in_small_increments() {
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        let container_w = 1000.0_f64;
+        let mut last_applied_x = 500.0_f64;
+        for step in 1..=10 {
+            let current_x = 500.0 - (step as f64) * 10.0;
+            let pixel_delta = current_x - last_applied_x;
+            let frac_delta = pixel_delta / container_w;
+            assert!(layout.resize_col(0, frac_delta));
+            last_applied_x = current_x;
+        }
+        assert!((layout.col_fracs[0] - 0.4).abs() < 1e-9);
+        assert!((layout.col_fracs[1] - 0.6).abs() < 1e-9);
+    }
+
+    /// Simulate a row-splitter drag downward: the user drags from y=400 to
+    /// y=500 in 10px increments (container height 800). This grows row 0 and
+    /// shrinks row 1.
+    #[test]
+    fn drag_row_splitter_downward_in_small_increments() {
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2V, &sids(2));
+        let container_h = 800.0_f64;
+        let mut last_applied_y = 400.0_f64;
+        for step in 1..=10 {
+            let current_y = 400.0 + (step as f64) * 10.0;
+            let pixel_delta = current_y - last_applied_y;
+            let frac_delta = pixel_delta / container_h;
+            assert!(layout.resize_row(0, frac_delta));
+            last_applied_y = current_y;
+        }
+        // 10 steps of +0.0125 each = +0.125 total. Row 0: 0.5 + 0.125 = 0.625.
+        assert!((layout.row_fracs[0] - 0.625).abs() < 1e-9);
+        assert!((layout.row_fracs[1] - 0.375).abs() < 1e-9);
+    }
+
+    /// Simulate a drag that hits the MIN_PANE_FRAC clamp: the user drags the
+    /// col splitter all the way to the right, trying to shrink col 1 below
+    /// 10%. The resize should be rejected at the clamp boundary, and further
+    /// mousemove events beyond the boundary should be no-ops.
+    #[test]
+    fn drag_col_splitter_clamps_at_min_pane_frac() {
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        let container_w = 1000.0_f64;
+        // Drag rightward in 10px steps. Col 1 starts at 0.5; MIN_PANE_FRAC is
+        // 0.1, so we can shrink col 1 by at most 0.4 (40 steps of 0.01 each).
+        // Due to floating-point accumulation, the 40th step may push col 1
+        // just below 0.1 and be rejected — this is the correct clamping
+        // behaviour. We accept either 39 or 40 successful steps.
+        let mut last_applied_x = 500.0_f64;
+        let mut successful_steps = 0;
+        for step in 1..=40 {
+            let current_x = 500.0 + (step as f64) * 10.0;
+            let pixel_delta = current_x - last_applied_x;
+            let frac_delta = pixel_delta / container_w;
+            if layout.resize_col(0, frac_delta) {
+                successful_steps += 1;
+                last_applied_x = current_x;
+            }
+        }
+        // Either 39 or 40 steps succeeded (depending on float rounding).
+        assert!(
+            successful_steps >= 39,
+            "expected at least 39 successful steps, got {}",
+            successful_steps
+        );
+        // Col 0 should be at least 0.89 (39 steps) or 0.90 (40 steps).
+        assert!(layout.col_fracs[0] >= 0.89);
+        assert!(layout.col_fracs[0] <= 0.91);
+        // Col 1 should be at or just above MIN_PANE_FRAC.
+        assert!(layout.col_fracs[1] >= MIN_PANE_FRAC - 1e-9);
+        assert!(layout.col_fracs[1] <= MIN_PANE_FRAC + 0.02);
+        // Now try a much larger delta that would clearly violate the clamp.
+        // This must be rejected.
+        let before = layout.col_fracs.clone();
+        assert!(!layout.resize_col(0, 0.5));
+        assert_eq!(
+            layout.col_fracs, before,
+            "rejected resize must not modify fracs"
+        );
+    }
+
+    /// Simulate a drag with back-and-forth motion: the user drags right, then
+    /// left, then right again. The net effect should be the sum of all deltas
+    /// (with clamping at the boundaries). This verifies that the
+    /// `last_applied_pos` tracking correctly handles direction changes.
+    #[test]
+    fn drag_col_splitter_back_and_forth() {
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        let container_w = 1000.0_f64;
+        let mut last_applied_x = 500.0_f64;
+        // Drag right to x=600 (+0.1).
+        for step in 1..=10 {
+            let current_x = 500.0 + (step as f64) * 10.0;
+            let pixel_delta = current_x - last_applied_x;
+            let frac_delta = pixel_delta / container_w;
+            layout.resize_col(0, frac_delta);
+            last_applied_x = current_x;
+        }
+        assert!((layout.col_fracs[0] - 0.6).abs() < 1e-9);
+        // Drag left back to x=500 (-0.1).
+        for step in 1..=10 {
+            let current_x = 600.0 - (step as f64) * 10.0;
+            let pixel_delta = current_x - last_applied_x;
+            let frac_delta = pixel_delta / container_w;
+            layout.resize_col(0, frac_delta);
+            last_applied_x = current_x;
+        }
+        assert!((layout.col_fracs[0] - 0.5).abs() < 1e-9);
+        // Drag right to x=550 (+0.05).
+        for step in 1..=5 {
+            let current_x = 500.0 + (step as f64) * 10.0;
+            let pixel_delta = current_x - last_applied_x;
+            let frac_delta = pixel_delta / container_w;
+            layout.resize_col(0, frac_delta);
+            last_applied_x = current_x;
+        }
+        assert!((layout.col_fracs[0] - 0.55).abs() < 1e-9);
+    }
+
+    /// Simulate a drag on a Grid4 layout: the user drags the col splitter
+    /// between the two columns. Both rows' columns should resize together
+    /// (because `resize_col` operates on the column fractions, which are
+    /// shared across all rows in the current layout model).
+    #[test]
+    fn drag_col_splitter_in_grid4() {
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Grid4, &sids(4));
+        let container_w = 1000.0_f64;
+        // Drag the col splitter from x=500 to x=600 (+0.1).
+        let mut last_applied_x = 500.0_f64;
+        for step in 1..=10 {
+            let current_x = 500.0 + (step as f64) * 10.0;
+            let pixel_delta = current_x - last_applied_x;
+            let frac_delta = pixel_delta / container_w;
+            layout.resize_col(0, frac_delta);
+            last_applied_x = current_x;
+        }
+        // Col 0 should be 0.6, col 1 should be 0.4.
+        assert!((layout.col_fracs[0] - 0.6).abs() < 1e-9);
+        assert!((layout.col_fracs[1] - 0.4).abs() < 1e-9);
+        // All 4 panes should reflect the new column widths.
+        let r0 = layout.pane_rect(0, container_w, 800.0).unwrap();
+        let r1 = layout.pane_rect(1, container_w, 800.0).unwrap();
+        assert!((r0.2 - 600.0).abs() < 1e-6); // pane 0 width
+        assert!((r1.0 - 600.0).abs() < 1e-6); // pane 1 x
+    }
+
+    /// Simulate a drag on a Grid4 layout: the user drags the row splitter
+    /// between the two rows. Both columns' rows should resize together.
+    #[test]
+    fn drag_row_splitter_in_grid4() {
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Grid4, &sids(4));
+        let container_h = 800.0_f64;
+        // Drag the row splitter from y=400 to y=500 (+0.125).
+        let mut last_applied_y = 400.0_f64;
+        for step in 1..=10 {
+            let current_y = 400.0 + (step as f64) * 10.0;
+            let pixel_delta = current_y - last_applied_y;
+            let frac_delta = pixel_delta / container_h;
+            layout.resize_row(0, frac_delta);
+            last_applied_y = current_y;
+        }
+        // Row 0 should be 0.625, row 1 should be 0.375.
+        assert!((layout.row_fracs[0] - 0.625).abs() < 1e-9);
+        assert!((layout.row_fracs[1] - 0.375).abs() < 1e-9);
+    }
+
+    /// Simulate a drag where the mouse moves very slowly (1px per mousemove).
+    /// This verifies that tiny deltas accumulate correctly without floating-
+    /// point drift. 100 steps of 1px each should equal one step of 100px.
+    #[test]
+    fn drag_col_splitter_1px_increments_no_drift() {
+        let mut layout_a = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        let mut layout_b = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        let container_w = 1000.0_f64;
+        // layout_a: 100 steps of 1px each.
+        let mut last_a = 500.0_f64;
+        for step in 1..=100 {
+            let current_x = 500.0 + (step as f64) * 1.0;
+            let pixel_delta = current_x - last_a;
+            let frac_delta = pixel_delta / container_w;
+            layout_a.resize_col(0, frac_delta);
+            last_a = current_x;
+        }
+        // layout_b: one step of 100px.
+        layout_b.resize_col(0, 100.0 / container_w);
+        // Both should have col_fracs[0] = 0.6.
+        assert!((layout_a.col_fracs[0] - layout_b.col_fracs[0]).abs() < 1e-9);
+        assert!((layout_a.col_fracs[1] - layout_b.col_fracs[1]).abs() < 1e-9);
+    }
+
+    /// Simulate a drag where the mouse moves very fast (100px per mousemove).
+    /// This verifies that large deltas are applied correctly. 1 step of 100px
+    /// should equal 10 steps of 10px.
+    #[test]
+    fn drag_col_splitter_100px_increments() {
+        let mut layout_a = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        let mut layout_b = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        let container_w = 1000.0_f64;
+        // layout_a: 1 step of 100px.
+        layout_a.resize_col(0, 100.0 / container_w);
+        // layout_b: 10 steps of 10px.
+        let mut last_b = 500.0_f64;
+        for step in 1..=10 {
+            let current_x = 500.0 + (step as f64) * 10.0;
+            let pixel_delta = current_x - last_b;
+            let frac_delta = pixel_delta / container_w;
+            layout_b.resize_col(0, frac_delta);
+            last_b = current_x;
+        }
+        assert!((layout_a.col_fracs[0] - layout_b.col_fracs[0]).abs() < 1e-9);
+    }
+
+    /// Simulate a drag with zero container width (defensive: shouldn't happen
+    /// in practice, but the overlay's `onmousemove` guards against it). The
+    /// resize should be a no-op (frac_delta = 0).
+    #[test]
+    fn drag_col_splitter_zero_container_width_no_op() {
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        let before = layout.col_fracs.clone();
+        let container_w = 0.0_f64;
+        let pixel_delta = 100.0_f64;
+        let frac_delta = if container_w > 0.0 {
+            pixel_delta / container_w
+        } else {
+            0.0
+        };
+        // frac_delta is 0, so resize_col is a no-op (0.5 + 0 = 0.5, no change).
+        let applied = layout.resize_col(0, frac_delta);
+        // resize_col returns true if the delta was applied (even if 0).
+        // But the fracs should be unchanged.
+        assert_eq!(layout.col_fracs, before);
+        let _ = applied; // don't assert on `applied` — implementation-defined for 0 delta.
+    }
+
+    // ------------------------------------------------------------------
+    // Full mouse-drag simulation tests (mousedown → mousemove × N → mouseup)
+    //
+    // These tests simulate the COMPLETE splitter drag sequence using the
+    // actual `compute_split_drag_delta` function from `app.rs` (the pure
+    // function that decides, given the drag state and a new viewport
+    // position, what fractional delta to apply) COMBINED with the actual
+    // `PaneLayout::resize_col`/`resize_row` calls. This is the closest we
+    // can get to an end-to-end test without a live dioxus runtime — it
+    // verifies that the signal-flow logic (delta computation +
+    // last_applied_pos tracking + resize call) produces correct layouts.
+    //
+    // Why these tests exist: the prior `drag_*_splitter_*` tests above
+    // hard-code the delta computation (e.g. `pixel_delta / container_w`)
+    // which means they'd pass even if `compute_split_drag_delta` had a bug
+    // (e.g. used container-relative coordinates instead of viewport-
+    // relative, causing an initial jump). These tests use the ACTUAL
+    // delta-computation function, so they catch such bugs.
+    // ------------------------------------------------------------------
+
+    /// Simulate a full col-splitter drag: mousedown at viewport-x=700 (with
+    /// sidebar offset of 200px, so splitter is at container-x=500), 10
+    /// mousemoves of 10px each rightward, then mouseup. The final layout
+    /// should have col 0 = 0.6, col 1 = 0.4 — same as a direct +0.1 resize.
+    ///
+    /// The viewport-coordinate offset (700 vs 500) is the key thing this
+    /// tests: if `compute_split_drag_delta` used container-relative
+    /// coordinates, the first mousemove would jump by 200px (the sidebar
+    /// width) and the final layout would be wrong.
+    #[test]
+    fn full_drag_col_splitter_rightward_with_viewport_offset() {
+        use crate::app::{SplitDragState, compute_split_drag_delta};
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        let container_w = 1000.0_f64;
+        // Splitter at container-x=500, but viewport-x=700 (sidebar 200px).
+        let mut drag = SplitDragState {
+            is_col: true,
+            idx: 0,
+            container_extent: container_w,
+            last_applied_pos: 700.0, // viewport-relative
+        };
+        // Simulate 10 mousemoves, each 10px rightward in viewport space.
+        for step in 1..=10u32 {
+            let pos = 700.0 + (step as f64) * 10.0;
+            if let Some(frac_delta) = compute_split_drag_delta(&drag, pos) {
+                assert!(layout.resize_col(0, frac_delta));
+                drag.last_applied_pos = pos;
+            } else {
+                panic!("step {}: expected a delta, got None", step);
+            }
+        }
+        // After 10 steps of +0.01 each, col 0 should be 0.6, col 1 should be 0.4.
+        assert!(
+            (layout.col_fracs[0] - 0.6).abs() < 1e-9,
+            "col 0 should be 0.6, got {} — if it's 0.6+, the drag is using\n\
+             container-relative coordinates and jumping by the sidebar width",
+            layout.col_fracs[0]
+        );
+        assert!((layout.col_fracs[1] - 0.4).abs() < 1e-9);
+    }
+
+    /// Simulate a full row-splitter drag with viewport offset: mousedown at
+    /// viewport-y=500 (tab bar 100px + splitter at container-y=400), 8
+    /// mousemoves of 10px each downward, then mouseup. Final layout should
+    /// have row 0 = 0.6, row 1 = 0.4.
+    #[test]
+    fn full_drag_row_splitter_downward_with_viewport_offset() {
+        use crate::app::{SplitDragState, compute_split_drag_delta};
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2V, &sids(2));
+        let container_h = 800.0_f64;
+        let mut drag = SplitDragState {
+            is_col: false,
+            idx: 0,
+            container_extent: container_h,
+            last_applied_pos: 500.0, // viewport-relative (tab bar 100 + container 400)
+        };
+        for step in 1..=8u32 {
+            let pos = 500.0 + (step as f64) * 10.0;
+            if let Some(frac_delta) = compute_split_drag_delta(&drag, pos) {
+                assert!(layout.resize_row(0, frac_delta));
+                drag.last_applied_pos = pos;
+            } else {
+                panic!("step {}: expected a delta, got None", step);
+            }
+        }
+        // 8 steps of +0.0125 each = +0.1 total. Row 0: 0.5 + 0.1 = 0.6.
+        assert!(
+            (layout.row_fracs[0] - 0.6).abs() < 1e-9,
+            "row 0 should be 0.6, got {}",
+            layout.row_fracs[0]
+        );
+        assert!((layout.row_fracs[1] - 0.4).abs() < 1e-9);
+    }
+
+    /// Simulate a drag with clamping: drag the col splitter all the way to
+    /// the right edge (trying to shrink col 1 below MIN_PANE_FRAC). The
+    /// resize should be rejected at the clamp boundary, and further
+    /// mousemoves beyond the boundary should still compute deltas but the
+    /// layout should not change (resize_col returns false, so
+    /// last_applied_pos is NOT updated — this is what prevents the growing
+    /// gap between mouse and splitter when clamped).
+    #[test]
+    fn full_drag_col_splitter_clamps_at_min_pane_frac() {
+        use crate::app::{SplitDragState, compute_split_drag_delta};
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        let container_w = 1000.0_f64;
+        let mut drag = SplitDragState {
+            is_col: true,
+            idx: 0,
+            container_extent: container_w,
+            last_applied_pos: 700.0, // viewport-relative
+        };
+        // Drag rightward: 700 → 1100 (400px = 0.4 frac, which would shrink
+        // col 1 from 0.5 to 0.1 — exactly at MIN_PANE_FRAC).
+        for step in 1..=40u32 {
+            let pos = 700.0 + (step as f64) * 10.0;
+            if let Some(frac_delta) = compute_split_drag_delta(&drag, pos) {
+                if layout.resize_col(0, frac_delta) {
+                    drag.last_applied_pos = pos;
+                }
+                // If resize was rejected, last_applied_pos is NOT updated —
+                // subsequent deltas will be larger (catching up), which is
+                // the desired behavior.
+            }
+        }
+        // Col 0 should be at or near 0.9 (col 1 at MIN_PANE_FRAC = 0.1).
+        assert!(
+            layout.col_fracs[0] >= 0.89,
+            "col 0 should be ≥0.89 (clamped), got {}",
+            layout.col_fracs[0]
+        );
+        assert!(
+            layout.col_fracs[0] <= 0.91,
+            "col 0 should be ≤0.91 (clamped), got {}",
+            layout.col_fracs[0]
+        );
+        assert!(layout.col_fracs[1] >= MIN_PANE_FRAC - 1e-9);
+    }
+
+    /// Simulate a drag with direction reversal: rightward, then leftward,
+    /// then rightward again. The final layout should match a direct resize
+    /// of the net delta.
+    #[test]
+    fn full_drag_col_splitter_back_and_forth() {
+        use crate::app::{SplitDragState, compute_split_drag_delta};
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        let container_w = 1000.0_f64;
+        let mut drag = SplitDragState {
+            is_col: true,
+            idx: 0,
+            container_extent: container_w,
+            last_applied_pos: 700.0,
+        };
+        // Rightward: 700 → 800 (+0.1).
+        for step in 1..=10u32 {
+            let pos = 700.0 + (step as f64) * 10.0;
+            let frac = compute_split_drag_delta(&drag, pos).unwrap();
+            layout.resize_col(0, frac);
+            drag.last_applied_pos = pos;
+        }
+        assert!((layout.col_fracs[0] - 0.6).abs() < 1e-9);
+        // Leftward: 800 → 700 (-0.1).
+        for step in 1..=10u32 {
+            let pos = 800.0 - (step as f64) * 10.0;
+            let frac = compute_split_drag_delta(&drag, pos).unwrap();
+            layout.resize_col(0, frac);
+            drag.last_applied_pos = pos;
+        }
+        assert!((layout.col_fracs[0] - 0.5).abs() < 1e-9);
+        // Rightward: 700 → 750 (+0.05).
+        for step in 1..=5u32 {
+            let pos = 700.0 + (step as f64) * 10.0;
+            let frac = compute_split_drag_delta(&drag, pos).unwrap();
+            layout.resize_col(0, frac);
+            drag.last_applied_pos = pos;
+        }
+        assert!((layout.col_fracs[0] - 0.55).abs() < 1e-9);
+    }
+
+    /// Simulate a drag on a Grid4 layout: dragging the col splitter between
+    /// the two columns should resize both rows' columns (because col_fracs
+    /// are shared across all rows in the current layout model).
+    #[test]
+    fn full_drag_col_splitter_in_grid4_with_viewport_offset() {
+        use crate::app::{SplitDragState, compute_split_drag_delta};
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Grid4, &sids(4));
+        let container_w = 1000.0_f64;
+        let mut drag = SplitDragState {
+            is_col: true,
+            idx: 0,
+            container_extent: container_w,
+            last_applied_pos: 700.0, // viewport-relative (sidebar 200 + splitter 500)
+        };
+        for step in 1..=10u32 {
+            let pos = 700.0 + (step as f64) * 10.0;
+            let frac = compute_split_drag_delta(&drag, pos).unwrap();
+            layout.resize_col(0, frac);
+            drag.last_applied_pos = pos;
+        }
+        assert!((layout.col_fracs[0] - 0.6).abs() < 1e-9);
+        assert!((layout.col_fracs[1] - 0.4).abs() < 1e-9);
+        // All 4 panes reflect the new column widths.
+        let r0 = layout.pane_rect(0, container_w, 800.0).unwrap();
+        assert!((r0.2 - 600.0).abs() < 1e-6); // pane 0 width = 600px
+    }
+
+    /// Simulate a drag where the mouse moves very slowly (1px per mousemove)
+    /// — verifies tiny deltas accumulate without floating-point drift.
+    /// 100 steps of 1px each should produce the same result as 1 step of 100px.
+    #[test]
+    fn full_drag_col_splitter_1px_increments_no_drift() {
+        use crate::app::{SplitDragState, compute_split_drag_delta};
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        let container_w = 1000.0_f64;
+        let mut drag = SplitDragState {
+            is_col: true,
+            idx: 0,
+            container_extent: container_w,
+            last_applied_pos: 700.0,
+        };
+        for step in 1..=100u32 {
+            let pos = 700.0 + (step as f64) * 1.0;
+            let frac = compute_split_drag_delta(&drag, pos).unwrap();
+            layout.resize_col(0, frac);
+            drag.last_applied_pos = pos;
+        }
+        // 100 steps of 1px each = 100px = 0.1 frac. Col 0: 0.5 + 0.1 = 0.6.
+        assert!((layout.col_fracs[0] - 0.6).abs() < 1e-9);
+    }
+
+    /// Simulate a drag where the mouse moves very fast (100px in one jump).
+    /// A single mousemove of 100px should produce the same result as 10
+    /// mousemoves of 10px each.
+    #[test]
+    fn full_drag_col_splitter_100px_jump() {
+        use crate::app::{SplitDragState, compute_split_drag_delta};
+        let mut layout_a = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        let mut layout_b = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        let container_w = 1000.0_f64;
+        // layout_a: 1 mousemove of 100px.
+        let mut drag_a = SplitDragState {
+            is_col: true,
+            idx: 0,
+            container_extent: container_w,
+            last_applied_pos: 700.0,
+        };
+        let frac = compute_split_drag_delta(&drag_a, 800.0).unwrap();
+        layout_a.resize_col(0, frac);
+        // layout_b: 10 mousemoves of 10px each.
+        let mut drag_b = SplitDragState {
+            is_col: true,
+            idx: 0,
+            container_extent: container_w,
+            last_applied_pos: 700.0,
+        };
+        for step in 1..=10u32 {
+            let pos = 700.0 + (step as f64) * 10.0;
+            let frac = compute_split_drag_delta(&drag_b, pos).unwrap();
+            layout_b.resize_col(0, frac);
+            drag_b.last_applied_pos = pos;
+        }
+        assert!((layout_a.col_fracs[0] - layout_b.col_fracs[0]).abs() < 1e-9);
+    }
 }

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use dioxus::html::input_data::MouseButton;
 use dioxus::prelude::*;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
@@ -27,9 +28,9 @@ use crate::components::connection_dialog::NewConnectionForm;
 use crate::layout::PaneLayout;
 use crate::state::{
     AppState, Modal, OneKeyMatch, OneKeyPopupState, PendingDangerousCommand, SessionTab,
-    TerminalEntry, UnlockState, cycle_layout_preset, move_session_to_leftmost,
-    pane_index_for_active_session, resize_layout_col, resize_layout_row,
-    set_pane_session_for_active, swap_pane_sessions, toggle_comparison_mode, toggle_pane_zoom,
+    TabDropOutcome, TerminalEntry, UnlockState, cycle_layout_preset, execute_tab_drop_on_pane,
+    move_session_to_leftmost, resize_layout_col, resize_layout_row, set_pane_session_for_active,
+    toggle_comparison_mode, toggle_pane_zoom,
 };
 
 fn save_config(state: &Signal<AppState>) {
@@ -211,11 +212,25 @@ fn render_terminal_pane(
                         // watch the outputs side-by-side.
                         //
                         // When comparison is OFF (or no layout exists),
-                        // input only goes to this pane's session — the
-                        // legacy non-broadcast path.
+                        // input only goes to THIS pane's own session —
+                        // each pane is independent. We deliberately do NOT
+                        // consult `active_session` here: in multi-pane mode
+                        // `active_session` is the *tab* pointer (the layout
+                        // is keyed by it in `state.layouts`), NOT the
+                        // focused-pane pointer. Routing pane N's keystrokes
+                        // to `active_session` would send them to pane 0's
+                        // PTY, which is the bug where "only the first pane
+                        // accepts commands".
+                        //
+                        // `broadcast_targets` returns >1 entry only when
+                        // comparison is ON AND there are 2+ non-empty pane
+                        // sessions — that's the sole condition for
+                        // broadcasting. When comparison is OFF it returns
+                        // exactly `[active_session]` (len 1), so we fall
+                        // through to the per-pane path and send to
+                        // `sid_clone` (this pane's own session).
                         let broadcast_targets = crate::state::broadcast_targets(&state_for_cmd.read());
-                        let is_broadcast = broadcast_targets.len() > 1
-                            || (broadcast_targets.len() == 1 && broadcast_targets[0] != sid_clone);
+                        let is_broadcast = broadcast_targets.len() > 1;
                         if is_broadcast {
                             tracing::info!(
                                 "[INPUT] comparison mode ON — broadcasting to {} sessions",
@@ -832,37 +847,960 @@ fn render_terminal_pane(
     }
 }
 
-/// State held while the user is drag-resizing a splitter bar. Set by the
-/// splitter's `onmousedown`; cleared by the document-level `mouseup` handler
-/// installed in `App`'s drag-poll future. The poll future reads
-/// `document._rusterm_split_drag_mouse` (kept current by a JS `mousemove`
-/// listener) on each tick and applies the delta to the active layout via
-/// `resize_layout_col` / `resize_layout_row`.
+/// Wrap the single-pane `render_terminal_pane` output in a `<div>` that
+/// carries drag-over / drop handlers. This is what makes "drag a background
+/// tab from the top tab bar onto the active pane to create a split" work
+/// when the active tab has NO layout yet (the Single preset, single-pane
+/// render path).
 ///
-/// We use a polling approach (rather than per-event `eval` callbacks)
-/// because dioxus's `eval` bridge is async request/response — it can't
-/// deliver high-frequency mouse events synchronously. Polling at 16ms
-/// (~60fps) is smooth enough for splitter dragging and matches the
-/// existing `TerminalView` resize-poll pattern.
+/// Without this wrapper, the single-pane path (`render_terminal_pane`)
+/// renders a bare `TerminalView` with no drop handlers — drops from the
+/// tab bar go nowhere. The multi-pane path (`multi_pane_container`) has
+/// its own per-pane drop handlers, but those only exist when a layout is
+/// already applied. This wrapper closes the gap for the Single preset.
+///
+/// Drop logic (mirrors `multi_pane_container`'s pane `ondrop`):
+///
+/// 1. `application/x-rusterm-session-id` present (drag from tab bar):
+///    - If `dragged_sid == render_sid` (dropped onto its own pane), no-op.
+///    - Otherwise, the dragged session is a background tab not in any
+///      pane → call `drop_background_tab_to_create_split(state,
+///      dragged_sid, 0)`. The helper creates a Split2H layout with the
+///      dragged session in pane 1 (or fills an empty slot / cycles to a
+///      larger preset if a layout already exists). After this, the next
+///      render takes the multi-pane path (`is_multi_pane == true`),
+///      which has its own per-pane drop handlers for subsequent drags.
+///
+/// 2. `application/x-rusterm-connection-id` present (drag from sidebar):
+///    - Open the connection in pane 0 via `open_connection(state,
+///      input_senders, conn, Some(0))`. With no layout, `open_connection`
+///      falls back to making the new session active (legacy behaviour).
+///      This is acceptable: the user can then drag the previous tab back
+///      to create a split if desired.
+///
+/// `drag_over_pane` is set to `Some(0)` on drag-over/enter and `None` on
+/// drop, mirroring the multi-pane container's highlight logic. The border
+/// highlight uses the same `#7aa2f7` colour so the visual feedback is
+/// consistent across single-pane and multi-pane modes.
+fn single_pane_with_drop(
+    mut state: Signal<AppState>,
+    input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    render_sid: String,
+    mut drag_over_pane: Signal<Option<usize>>,
+) -> Element {
+    // The session id rendered in this pane, cloned for the drop closure.
+    let drop_session_id = render_sid.clone();
+    let border_style = if drag_over_pane() == Some(0) {
+        "border: 2px solid #7aa2f7; box-sizing: border-box;"
+    } else {
+        "border: 2px solid transparent; box-sizing: border-box;"
+    };
+    rsx! {
+        div {
+            key: "single-pane-{render_sid}",
+            style: format!(
+                "position: absolute; left: 0; top: 0; right: 0; bottom: 0; overflow: hidden; display: flex; flex-direction: column; {border_style}"
+            ),
+            // `ondragover` must call prevent_default to signal that this
+            // element accepts drops. Without it the browser blocks the
+            // drop and fires `ondrop` with an empty DataTransfer.
+            ondragover: move |e: DragEvent| {
+                e.prevent_default();
+                e.data_transfer().set_drop_effect("move");
+                drag_over_pane.set(Some(0));
+            },
+            // `ondragenter` also needs prevent_default for cross-browser
+            // compatibility (some browsers require both dragenter AND
+            // dragover to be cancelled to allow drop).
+            ondragenter: move |e: DragEvent| {
+                e.prevent_default();
+                drag_over_pane.set(Some(0));
+            },
+            ondrop: move |e: DragEvent| {
+                e.prevent_default();
+                drag_over_pane.set(None);
+                let dt = e.data_transfer();
+                // Check for the "drag from tab bar / pane title" MIME
+                // type first — an open session is being moved.
+                //
+                // NOTE (Task 22): tabs no longer use HTML5 DnD (the
+                // manual mouse-based system handles tab/pane title
+                // drags via `finish_tab_drag` → `execute_tab_drop_on_pane`).
+                // This branch is retained as a defensive fallback for
+                // any residual HTML5 drag that might fire (e.g. if a
+                // future change re-enables `draggable: true` on a pane).
+                // It calls the same `execute_tab_drop_on_pane` that the
+                // manual system uses, so the dispatch logic is identical.
+                if let Some(dragged_sid) = dt.get_data("application/x-rusterm-session-id") {
+                    if dragged_sid.is_empty() {
+                        tracing::warn!("[DROP-SINGLE] empty session-id in drag data");
+                        return;
+                    }
+                    let outcome = execute_tab_drop_on_pane(
+                        &mut state.write(),
+                        &dragged_sid,
+                        0,
+                        &drop_session_id,
+                    );
+                    match outcome {
+                        TabDropOutcome::SplitCreated { pane_idx }
+                        | TabDropOutcome::SplitFilledExisting { pane_idx } => {
+                            tracing::info!(
+                                "[DROP-SINGLE] created split: session {} placed in pane {} (outcome={:?})",
+                                &dragged_sid[..dragged_sid.len().min(8)],
+                                pane_idx,
+                                outcome
+                            );
+                            restore_focus_to_active_session(state, 80);
+                        }
+                        TabDropOutcome::Swapped
+                        | TabDropOutcome::MovedToEmptyPane { .. }
+                        | TabDropOutcome::AssignedToEmptyPane => {
+                            tracing::info!(
+                                "[DROP-SINGLE] {} (session {})",
+                                match outcome {
+                                    TabDropOutcome::Swapped => "swapped panes",
+                                    TabDropOutcome::MovedToEmptyPane { .. } => "moved to empty pane",
+                                    TabDropOutcome::AssignedToEmptyPane => "assigned to empty pane",
+                                    _ => "?",
+                                },
+                                &dragged_sid[..dragged_sid.len().min(8)]
+                            );
+                        }
+                        TabDropOutcome::NoOpSelfDrop => {
+                            tracing::debug!(
+                                "[DROP-SINGLE] session {} dropped onto its own pane — no-op",
+                                &dragged_sid[..dragged_sid.len().min(8)]
+                            );
+                        }
+                        TabDropOutcome::SwapFailed
+                        | TabDropOutcome::SplitFallbackSwapFailed
+                        | TabDropOutcome::SplitFailed => {
+                            tracing::warn!(
+                                "[DROP-SINGLE] drop failed (outcome={:?}, session {})",
+                                outcome,
+                                &dragged_sid[..dragged_sid.len().min(8)]
+                            );
+                        }
+                    }
+                    return;
+                }
+                // Check for the "drag from sidebar" MIME type — a
+                // connection is being opened in this pane.
+                if let Some(conn_id) = dt.get_data("application/x-rusterm-connection-id") {
+                    if conn_id.is_empty() {
+                        tracing::warn!("[DROP-SINGLE] empty connection-id in drag data");
+                        return;
+                    }
+                    let conn = state
+                        .read()
+                        .connections
+                        .iter()
+                        .find(|c| c.id == conn_id)
+                        .cloned();
+                    let Some(conn) = conn else {
+                        tracing::warn!(
+                            "[DROP-SINGLE] connection id {} not found in state.connections",
+                            &conn_id[..conn_id.len().min(8)]
+                        );
+                        return;
+                    };
+                    tracing::info!(
+                        "[DROP-SINGLE] opening connection {} ({:?}) in single pane",
+                        &conn_id[..conn_id.len().min(8)],
+                        conn.name
+                    );
+                    // With no layout, `open_connection` falls back to
+                    // making the new session active. This is acceptable
+                    // for the single-pane path.
+                    open_connection(state, input_senders, conn, Some(0));
+                    return;
+                }
+                tracing::debug!("[DROP-SINGLE] received drop with no recognized MIME type");
+            },
+            {render_terminal_pane(state, input_senders, render_sid)}
+        }
+    }
+}
+
+/// State held while the user is drag-resizing a splitter bar. Set by the
+/// splitter's `onmousedown` (in `render_col_splitters` /
+/// `render_row_splitters`); read and updated by the splitter's own
+/// `onmousemove` handler (mouse-capture routes subsequent mousemove events
+/// to the element that received mousedown — the splitter bar itself, NOT
+/// an overlay); cleared by the splitter's `onmouseup`.
+///
+/// ## Why on the splitter, not an overlay
+///
+/// The prior design rendered an invisible full-screen overlay
+/// (`position: fixed; inset: 0; z-index: 9999`) and put `onmousemove`/
+/// `onmouseup` on it. That did NOT work: when the user presses the mouse
+/// button on the splitter, the browser enters implicit pointer capture —
+/// all subsequent `mousemove`/`mouseup` events are dispatched to the
+/// element that received the `mousedown` (the splitter), regardless of
+/// where the cursor is or what overlays are stacked above it. The overlay
+/// never received the events, so the drag never resized anything and the
+/// drag state was never cleared (the splitter had no `onmouseup` handler).
+/// That's the root cause of "分屏无法调整".
+///
+/// Fix: put `onmousemove`/`onmouseup` on the splitter itself. The overlay
+/// is kept as a defensive backstop in case a platform's webview doesn't
+/// implement implicit capture (rare), but the splitter is the primary
+/// event target.
+///
+/// ## Coordinate system
+///
+/// `last_applied_pos` is stored in **viewport-relative** coordinates
+/// (matching `e.client_coordinates()`) — NOT container-relative. The
+/// splitter bar's `x_val`/`y_val` is container-relative (relative to
+/// `#multi-pane-container`), but `client_coordinates()` is viewport-
+/// relative. If we initialized `last_applied_pos` to the container-relative
+/// splitter position, the first `onmousemove` would compute a delta equal
+/// to the container's viewport offset (sidebar width + tab bar height),
+/// causing a large initial jump. By capturing the viewport-relative mouse
+/// position at `onmousedown` time and storing THAT as `last_applied_pos`,
+/// every subsequent delta is correctly computed in viewport space.
 #[derive(Debug, Clone, Copy, PartialEq)]
-struct SplitDragState {
+pub(crate) struct SplitDragState {
+    /// Index of the column/row being resized (the left/top of the pair).
+    pub(crate) idx: usize,
+    /// Container extent (width for col drag, height for row drag) at drag
+    /// start, used to convert the pixel delta into a fractional delta.
+    pub(crate) container_extent: f64,
+    /// Last mouse position (viewport-relative, matching
+    /// `e.client_coordinates()`) we applied a delta for. `onmousemove`
+    /// reads the current mouse position, computes `pos - last_applied_pos`,
+    /// applies that delta, then updates `last_applied_pos` to `pos`.
+    /// Skipping when `pos == last_applied_pos` avoids redundant layout
+    /// writes for duplicate mousemove events.
+    pub(crate) last_applied_pos: f64,
     /// `true` for a column splitter (vertical bar, drag adjusts column
     /// widths), `false` for a row splitter (horizontal bar, drag adjusts
     /// row heights).
-    is_col: bool,
-    /// Index of the column/row being resized (the left/top of the pair).
-    idx: usize,
-    /// Pixel position of the splitter bar at drag start. The current mouse
-    /// position is compared against this to compute the drag delta.
-    start_pos: f64,
-    /// Container extent (width for col drag, height for row drag) at drag
-    /// start, used to convert the pixel delta into a fractional delta.
-    container_extent: f64,
-    /// Last applied mouse position — used to detect when a new mousemove has
-    /// landed so we don't re-apply the same delta. JS writes the current
-    /// position to `document._rusterm_split_drag_mouse`; we read it, compare
-    /// to `last_applied_pos`, and skip if unchanged.
-    last_applied_pos: f64,
+    pub(crate) is_col: bool,
+}
+
+/// Apply one mousemove step of a splitter drag.
+///
+/// Given the current `split_drag` state and the new viewport-relative
+/// mouse position (from `e.client_coordinates()`), compute the pixel and
+/// fractional delta, call `resize_layout_col`/`resize_layout_row`, and if
+/// the resize was applied (i.e. not rejected by the min-frac guard),
+/// update `last_applied_pos` to the new position.
+///
+/// This is the shared core used by BOTH the splitter bar's `onmousemove`
+/// (the primary path, since implicit pointer capture routes events to the
+/// element that received `mousedown`) and the defensive overlay's
+/// `onmousemove` (in case a platform's webview doesn't implement implicit
+/// capture).
+///
+/// No-op (returns without writing) if `split_drag` is `None` or the new
+/// position equals `last_applied_pos` (suppresses duplicate events).
+fn apply_split_drag_step(
+    mut state: Signal<AppState>,
+    mut split_drag: Signal<Option<SplitDragState>>,
+    pos: f64,
+) {
+    let Some(drag) = split_drag() else {
+        return;
+    };
+    let Some(frac_delta) = compute_split_drag_delta(&drag, pos) else {
+        return;
+    };
+    let applied = if drag.is_col {
+        resize_layout_col(&mut state.write(), drag.idx, frac_delta)
+    } else {
+        resize_layout_row(&mut state.write(), drag.idx, frac_delta)
+    };
+    if applied {
+        split_drag.set(Some(SplitDragState {
+            last_applied_pos: pos,
+            ..drag
+        }));
+    }
+}
+
+/// Pure computation for one splitter drag step. Given the current
+/// `SplitDragState` and a new viewport-relative mouse position, return:
+///  - `None` if the drag should be a no-op (pos equals `last_applied_pos`,
+///    or the container extent is zero so the fractional delta would be 0).
+///  - `Some(frac_delta)` otherwise — the fractional delta to feed to
+///    `resize_layout_col`/`resize_layout_row`.
+///
+/// Extracted as a pure function so it can be unit-tested without the
+/// dioxus runtime. The signal-mutating `apply_split_drag_step` is just a
+/// thin wrapper around this + the resize call + the `last_applied_pos`
+/// update.
+///
+/// Note: this does NOT mutate `drag` — the caller is responsible for
+/// updating `last_applied_pos` to `pos` after a successful resize (so that
+/// rejected deltas — when the min-frac guard kicks in — don't accumulate
+/// a growing gap between the mouse and the splitter bar).
+pub(crate) fn compute_split_drag_delta(drag: &SplitDragState, pos: f64) -> Option<f64> {
+    if pos == drag.last_applied_pos {
+        return None;
+    }
+    if drag.container_extent <= 0.0 {
+        return None;
+    }
+    let pixel_delta = pos - drag.last_applied_pos;
+    Some(pixel_delta / drag.container_extent)
+}
+
+/// End a splitter drag and restore focus to the active session's input div.
+///
+/// Called from the polling `use_future` when it detects the JS-side
+/// `window.__rusterm_drag_done` flag is set (the user released the mouse
+/// button, captured by the document-level `mouseup` listener installed in
+/// `install_split_drag_js_listeners`). Clears `split_drag` (unmounting the
+/// overlay if it was mounted), removes the JS listeners, then explicitly
+/// re-focuses the active session's terminal input div.
+///
+/// Why re-focus here: the splitter's `onmousedown` called `prevent_default()`,
+/// which prevents the splitter bar from receiving focus. That's correct (we
+/// don't want focus on the splitter bar), but it means the previously-focused
+/// pane's input div has lost focus during the drag and nothing restores it
+/// after `mouseup`. Without this restore, the user finishes dragging and
+/// keystrokes go nowhere — the "分屏后无法输入" bug. We restore to the
+/// ACTIVE session (not the previously-focused pane) because `active_session`
+/// is the source of truth for which pane the user is currently working in,
+/// and it's possible the drag was on a splitter adjacent to a non-active pane.
+fn end_split_drag(state: Signal<AppState>, mut split_drag: Signal<Option<SplitDragState>>) {
+    if split_drag().is_some() {
+        tracing::info!("[OVERLAY] end_split_drag clearing split_drag");
+        split_drag.set(None);
+    }
+    // Remove the JS-side document-level listeners so subsequent mouse moves
+    // (e.g. after the drag is done) don't keep writing to the global variable.
+    // This is idempotent — if no listeners are installed, the script is a no-op.
+    spawn(async move {
+        let _ = dioxus::document::eval(
+            "(function() {\n\
+                if (window._rusterm_split_drag_remove) { window._rusterm_split_drag_remove(); window._rusterm_split_drag_remove = null; }\n\
+                window.__rusterm_drag_pos = '';\n\
+                window.__rusterm_drag_done = false;\n\
+            })()",
+        ).await;
+    });
+    // Restore focus to the active session's input div. See `restore_focus_to_active_session`
+    // for why this is needed (the short version: the splitter's `onmousedown`
+    // `prevent_default` prevented focus from landing on the splitter, but
+    // nothing restored it to the pane that had it before — so keystrokes
+    // went nowhere after the drag ended).
+    restore_focus_to_active_session(state, 20);
+}
+
+/// Build the JS script that installs document-level capture-phase
+/// `mousemove`/`mouseup` listeners for splitter drag-resize. The script:
+///
+///  1. Initializes `window.__rusterm_drag_pos` to the starting mouse
+///     position (so the first poll doesn't compute a delta from an
+///     empty string).
+///  2. Clears `window.__rusterm_drag_done`.
+///  3. Removes any previously-installed listeners (idempotent — if no
+///     listeners are installed, the prior-remove is a no-op).
+///  4. Installs `moveHandler` (capture-phase `mousemove` listener) that
+///     writes `e.clientX,e.clientY` to `__rusterm_drag_pos`.
+///  5. Installs `upHandler` (capture-phase `mouseup` listener) that sets
+///     `__rusterm_drag_done = true` and removes itself (so subsequent
+///     mousemoves after the drag don't keep firing).
+///  6. Stores a `_rusterm_split_drag_remove` function on `window` so
+///     `end_split_drag` can remove the listeners later.
+///
+/// Extracted as a pure function (separate from `install_split_drag_js_listeners`)
+/// so the script string can be unit-tested without a dioxus runtime — we
+/// verify the script contains the expected setup steps and that the initial
+/// position is correctly interpolated.
+pub(crate) fn build_install_split_drag_script(initial_x: f64, initial_y: f64) -> String {
+    format!(
+        "(function() {{\n\
+            window.__rusterm_drag_pos = '{x},{y}';\n\
+            window.__rusterm_drag_done = false;\n\
+            if (window._rusterm_split_drag_remove) {{ window._rusterm_split_drag_remove(); }}\n\
+            var moveHandler = function(e) {{\n\
+                window.__rusterm_drag_pos = e.clientX + ',' + e.clientY;\n\
+                e.preventDefault();\n\
+            }};\n\
+            var upHandler = function(e) {{\n\
+                window.__rusterm_drag_pos = e.clientX + ',' + e.clientY;\n\
+                window.__rusterm_drag_done = true;\n\
+                e.preventDefault();\n\
+                if (window._rusterm_split_drag_remove) {{ window._rusterm_split_drag_remove(); window._rusterm_split_drag_remove = null; }}\n\
+            }};\n\
+            document.addEventListener('mousemove', moveHandler, true);\n\
+            document.addEventListener('mouseup', upHandler, true);\n\
+            window._rusterm_split_drag_remove = function() {{\n\
+                document.removeEventListener('mousemove', moveHandler, true);\n\
+                document.removeEventListener('mouseup', upHandler, true);\n\
+            }};\n\
+        }})()",
+        x = initial_x,
+        y = initial_y,
+    )
+}
+
+/// Install document-level capture-phase `mousemove`/`mouseup` listeners that
+/// write the current mouse position (viewport-relative) and a "done" flag to
+/// global JS variables. A polling `use_future` in `App` reads these variables
+/// every ~16ms and applies the drag delta.
+///
+/// ## Why document-level capture-phase listeners
+///
+/// The prior approach relied on `onmousemove`/`onmouseup` handlers attached
+/// to either the splitter bar or a full-viewport overlay div. In dioxus 0.7's
+/// desktop webview (WKWebView on macOS, webkitgtk on Linux, WebView2 on
+/// Windows) this DOES NOT WORK reliably: implicit pointer capture either
+/// isn't implemented or fires events at the wrong element, so the splitter's
+/// `onmousemove` never fires during a drag (button held down), and the
+/// overlay's `onmousemove` either doesn't fire or fires against a stale
+/// element reference after dioxus re-renders.
+///
+/// Document-level listeners with `useCapture: true` are the GUARANTEED-correct
+/// way to intercept mouse events during a drag in any webview. They fire
+/// BEFORE any element-level handlers, BEFORE pointer capture kicks in, and
+/// they keep firing even when the cursor moves outside the original target.
+/// This is the same technique used by libraries like react-dnd's backend.
+///
+/// ## Why JS globals + polling (instead of a JS→Rust callback)
+///
+/// Dioxus 0.7's `eval` bridge is request/response — there's no way for JS to
+/// push an event into Rust synchronously. The cleanest workaround is to have
+/// the JS listeners write to `window.__rusterm_drag_pos` and
+/// `window.__rusterm_drag_done`, and have a Rust `use_future` poll those
+/// variables every 16ms (60Hz). 16ms is fast enough for smooth dragging (the
+/// eye can't distinguish finer granularity) and slow enough to avoid flooding
+/// the dioxus runtime with eval round-trips.
+///
+/// ## Why this is fire-and-forget (no `return` prefix)
+///
+/// We don't need a return value from the install script — we just need the
+/// listeners to be attached synchronously. `eval` without `return` runs the
+/// script and resolves with `null`. The script is structured as an IIFE so it
+/// executes immediately when the webview's JS engine processes it.
+///
+/// ## Race safety
+///
+/// The install script runs synchronously in the webview's JS event loop. The
+/// next native mousemove event (which is what we care about) can't fire until
+/// the current event handler (onmousedown) returns and the JS engine is idle.
+/// Since `eval` dispatches the script to run on the JS engine's queue, and
+/// the JS engine processes its queue before pumping new native events, the
+/// listeners WILL be installed before any mousemove fires. This eliminates
+/// the race that the prior `spawn`-based installer had.
+fn install_split_drag_js_listeners(initial_x: f64, initial_y: f64) {
+    let script = build_install_split_drag_script(initial_x, initial_y);
+    // Fire-and-forget: we don't need the return value. The script runs
+    // synchronously on the JS engine's queue, which processes before the
+    // next native mousemove event.
+    spawn(async move {
+        let _ = dioxus::document::eval(&script).await;
+    });
+}
+
+/// Parse the response from `poll_split_drag_state`'s `eval` call. The JS
+/// returns a string like `"123.4,567.8,0"` (x, y, done-flag) or `""` if the
+/// globals aren't set. Returns:
+///  - `None` if the string is empty or malformed (defensive against a stale
+///    `split_drag` signal after the listeners were already removed).
+///  - `Some((x, y, done))` where `done` is true if the user released the
+///    mouse button.
+///
+/// Extracted as a pure function so the parsing can be unit-tested without
+/// a dioxus runtime.
+pub(crate) fn parse_split_drag_poll_response(s: &str) -> Option<(f64, f64, bool)> {
+    if s.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = s.split(',').collect();
+    if parts.len() != 3 {
+        return None;
+    }
+    let x = parts[0].parse::<f64>().ok()?;
+    let y = parts[1].parse::<f64>().ok()?;
+    let done = parts[2] == "1";
+    Some((x, y, done))
+}
+
+/// Read the current mouse position and "done" flag from the JS globals set
+/// by `install_split_drag_js_listeners`. Returns:
+///  - `None` if the globals aren't set (shouldn't happen during a drag, but
+///    defensive against a stale `split_drag` signal after the listeners were
+///    already removed).
+///  - `Some((x, y, done))` where `done` is true if the user released the
+///    mouse button.
+///
+/// The JS global `__rusterm_drag_pos` is a string like "123.4,567.8"
+/// (viewport-relative clientX,clientY). `__rusterm_drag_done` is a boolean.
+async fn poll_split_drag_state() -> Option<(f64, f64, bool)> {
+    let result = dioxus::document::eval(
+        "return (function() {\n\
+            var pos = window.__rusterm_drag_pos || '';\n\
+            if (!pos) return '';\n\
+            var done = window.__rusterm_drag_done ? '1' : '0';\n\
+            return pos + ',' + done;\n\
+        })()",
+    )
+    .await
+    .ok()?;
+    let s = result.as_str()?;
+    parse_split_drag_poll_response(s)
+}
+
+/// Restore keyboard focus to the active session's terminal input div.
+///
+/// Called after operations that disrupt focus:
+///  - Splitter drag end (`end_split_drag`): the splitter's `onmousedown`
+///    `prevent_default` prevented focus from landing on the splitter, but
+///    nothing restored it to the pane that had it before — so keystrokes
+///    went nowhere after the drag ended. This is the root cause of
+///    "分屏后无法输入".
+///  - Layout preset cycle (hotkey Cmd/Ctrl+Shift+L or toolbar click):
+///    applying a new preset re-mounts panes, and the auto-focus `use_effect`
+///    in each pane's `TerminalView` may race — the last-mounted pane wins
+///    focus, which may not be the active session. Explicitly restoring
+///    focus to the active session here ensures the user lands on the pane
+///    they expect.
+///
+/// `delay_ms` is the delay before the focus call. The delay lets the
+/// re-render from the triggering operation (split_drag clear, layout
+/// preset change) commit — the terminal input div may not be mounted yet
+/// if we call `eval` immediately. 20ms is enough for one frame at 60Hz
+/// (~16ms) plus a safety margin. For layout preset changes we use a longer
+/// delay (100ms) because the re-mount is heavier (multiple panes
+/// re-render, each with their own `onmounted` JS eval).
+///
+/// The `eval` is fire-and-forget — if the element isn't mounted yet
+/// (rare: the active session's pane might have been swapped out during
+/// a drag-and-drop rearrangement), the `?.focus()` is a no-op.
+fn restore_focus_to_active_session(state: Signal<AppState>, delay_ms: u64) {
+    let active_sid = state.read().active_session.clone();
+    if let Some(sid) = active_sid {
+        spawn(async move {
+            tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
+            let script = format!("document.getElementById('terminal-input-{sid}')?.focus()");
+            let _ = dioxus::document::eval(&script).await;
+            tracing::info!("[FOCUS] restored focus to terminal-input-{sid}");
+        });
+    }
+}
+
+/// State held while the user is drag-and-dropping a session TAB (from
+/// the top tab bar) or a pane TITLE BAR onto another pane to rearrange /
+/// create splits. Set by the tab's / pane title's `onmousedown`; updated
+/// and cleared by the polling `use_future` (`_tab_drag_poll`) in `App`.
+///
+/// ## Why manual mouse-based drag (Task 22) instead of HTML5 DnD
+///
+/// HTML5 drag-and-drop (`draggable: true`, `ondragstart`, `ondrop`) was
+/// the prior mechanism for tab/pane drags (Tasks 17/19/22 prior
+/// attempts). It's UNRELIABLE in dioxus 0.7's desktop webview
+/// (WKWebView on macOS, WebView2 on Windows, webkitgtk on Linux): drops
+/// sometimes don't fire, `DataTransfer` data sometimes comes back empty,
+/// and the native drag ghost sometimes eats the release event. The
+/// splitter drag-resize feature hit the SAME wall and was fixed by
+/// switching to document-level capture-phase JS listeners + polling
+/// (see the "Splitter drag-resize fix" section in the architecture
+/// memory). This tab-drag system mirrors that PROVEN pattern exactly.
+///
+/// HTML5 DnD REMAINS for sidebar→pane connection drags (Task 16) — that
+/// feature has no user complaints and the connection-id MIME type is
+/// untouched.
+///
+/// ## Coordinate system
+///
+/// `start_x`/`start_y`/`cur_x`/`cur_y` are VIEWPORT-RELATIVE (matching
+/// `e.client_coordinates()` and JS `e.clientX`/`e.clientY`). The polling
+/// `use_future` reads `window.__rusterm_tab_drag_pos` (set by the JS
+/// listeners) and `window.__rusterm_tab_drag_done`, and updates `cur_x`/
+/// `cur_y` from them.
+///
+/// ## `dragging` flag (click vs drag)
+///
+/// `onmousedown` sets `tab_drag` with `dragging: false`. The polling
+/// loop watches the cursor; once it moves more than `DRAG_THRESHOLD`
+/// pixels from `start_x`/`start_y`, `dragging` becomes `true`. The drop
+/// is ONLY executed on `mouseup` if `dragging == true`. This preserves
+/// plain click-to-select: a mousedown with no significant mousemove is
+/// a click, not a drag — the polling loop cleans up the signal and the
+/// tab's `onclick` fires normally.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct TabDragState {
+    /// The session id being dragged (from the tab bar or pane title).
+    pub(crate) session_id: String,
+    /// Display name of the dragged session (shown in the ghost element).
+    pub(crate) session_name: String,
+    /// Viewport-relative mouse position at drag start.
+    pub(crate) start_x: f64,
+    pub(crate) start_y: f64,
+    /// Latest viewport-relative mouse position (updated by the polling
+    /// loop from `window.__rusterm_tab_drag_pos`).
+    pub(crate) cur_x: f64,
+    pub(crate) cur_y: f64,
+    /// `true` once the cursor has moved past `DRAG_THRESHOLD` from the
+    /// start position. The drop is only executed on `mouseup` if this is
+    /// `true` — otherwise it's a click and the signal is just cleaned up.
+    pub(crate) dragging: bool,
+}
+
+/// Minimum cursor displacement (in CSS pixels) for a mousedown to be
+/// promoted to a drag. 6px is large enough to absorb jitter from a
+/// non-moving click but small enough that any deliberate drag passes.
+pub(crate) const TAB_DRAG_THRESHOLD: f64 = 6.0;
+
+/// Pure check: has the cursor moved past the drag threshold from the
+/// start position? Extracted as a pure function so it can be unit-tested
+/// without a dioxus runtime.
+pub(crate) fn tab_drag_threshold_exceeded(
+    start_x: f64,
+    start_y: f64,
+    cur_x: f64,
+    cur_y: f64,
+) -> bool {
+    let dx = cur_x - start_x;
+    let dy = cur_y - start_y;
+    (dx * dx + dy * dy).sqrt() > TAB_DRAG_THRESHOLD
+}
+
+/// Build the JS script that installs document-level capture-phase
+/// `mousemove`/`mouseup` listeners for a tab drag. Mirrors
+/// `build_install_split_drag_script` exactly, but uses SEPARATE global
+/// variable names (`__rusterm_tab_drag_pos`, `__rusterm_tab_drag_done`,
+/// `_rusterm_tab_drag_remove`) so a tab drag and a splitter drag can't
+/// clobber each other's state.
+///
+/// CRITICAL difference from the splitter version: the `upHandler` here
+/// RECORDS the final mouse position (the splitter's `upHandler` didn't —
+/// the splitter only needed the done flag, but a tab drop needs the
+/// release coordinates for hit-testing).
+///
+/// The script also captures the `#terminal-content` container's
+/// `getBoundingClientRect()` at install time and stashes it in
+/// `__rusterm_tab_drag_container_left/top`. The polling loop reads these
+/// to convert viewport-relative cursor coordinates into container-
+/// relative coordinates for hit-testing. (We capture at install time
+/// rather than on every poll to avoid a `getBoundingClientRect` call
+/// per poll — the container doesn't move during a drag.)
+pub(crate) fn build_install_tab_drag_script(initial_x: f64, initial_y: f64) -> String {
+    format!(
+        "(function() {{\n\
+            window.__rusterm_tab_drag_pos = '{x},{y}';\n\
+            window.__rusterm_tab_drag_done = false;\n\
+            if (window._rusterm_tab_drag_remove) {{ window._rusterm_tab_drag_remove(); }}\n\
+            var el = document.getElementById('terminal-content');\n\
+            var r = el ? el.getBoundingClientRect() : {{ left: 0, top: 0 }};\n\
+            window.__rusterm_tab_drag_container_left = r.left;\n\
+            window.__rusterm_tab_drag_container_top = r.top;\n\
+            var moveHandler = function(e) {{\n\
+                window.__rusterm_tab_drag_pos = e.clientX + ',' + e.clientY;\n\
+                e.preventDefault();\n\
+            }};\n\
+            var upHandler = function(e) {{\n\
+                window.__rusterm_tab_drag_pos = e.clientX + ',' + e.clientY;\n\
+                window.__rusterm_tab_drag_done = true;\n\
+                // NOTE: do NOT call e.preventDefault() here. Calling\n\
+                // preventDefault on mouseup can cancel the subsequent\n\
+                // click event on some webviews, which would break the\n\
+                // tab's onclick (click-to-select). The moveHandler\n\
+                // calls preventDefault to suppress text selection\n\
+                // during the drag, but the upHandler doesn't need it.\n\
+                if (window._rusterm_tab_drag_remove) {{ window._rusterm_tab_drag_remove(); window._rusterm_tab_drag_remove = null; }}\n\
+            }};\n\
+            document.addEventListener('mousemove', moveHandler, true);\n\
+            document.addEventListener('mouseup', upHandler, true);\n\
+            window._rusterm_tab_drag_remove = function() {{\n\
+                document.removeEventListener('mousemove', moveHandler, true);\n\
+                document.removeEventListener('mouseup', upHandler, true);\n\
+            }};\n\
+        }})()",
+        x = initial_x,
+        y = initial_y,
+    )
+}
+
+/// Install the document-level capture-phase `mousemove`/`mouseup`
+/// listeners for a tab drag. Fire-and-forget — the script runs
+/// synchronously on the JS engine's queue before the next native
+/// mousemove event (see `install_split_drag_js_listeners` for the same
+/// reasoning).
+pub(crate) fn install_tab_drag_js_listeners(initial_x: f64, initial_y: f64) {
+    let script = build_install_tab_drag_script(initial_x, initial_y);
+    spawn(async move {
+        let _ = dioxus::document::eval(&script).await;
+    });
+}
+
+/// Parse the response from `poll_tab_drag_state`'s `eval` call. The JS
+/// returns a string like `"123.4,567.8,0,80.0,60.0"`
+/// (x, y, done-flag, container_left, container_top) or `""` if the
+/// globals aren't set.
+///
+/// Returns `None` if the string is empty or malformed (defensive
+/// against a stale `tab_drag` signal after the listeners were already
+/// removed). Extracted as a pure function so the parsing can be
+/// unit-tested without a dioxus runtime.
+pub(crate) fn parse_tab_drag_poll_response(s: &str) -> Option<(f64, f64, bool, f64, f64)> {
+    if s.is_empty() {
+        return None;
+    }
+    let parts: Vec<&str> = s.split(',').collect();
+    if parts.len() != 5 {
+        return None;
+    }
+    let x = parts[0].parse::<f64>().ok()?;
+    let y = parts[1].parse::<f64>().ok()?;
+    let done = parts[2] == "1";
+    let container_left = parts[3].parse::<f64>().ok()?;
+    let container_top = parts[4].parse::<f64>().ok()?;
+    Some((x, y, done, container_left, container_top))
+}
+
+/// Read the current mouse position, "done" flag, and container offset
+/// from the JS globals set by `install_tab_drag_js_listeners`. Returns
+/// `None` if the globals aren't set (defensive against a stale
+/// `tab_drag` signal after the listeners were already removed).
+async fn poll_tab_drag_state() -> Option<(f64, f64, bool, f64, f64)> {
+    let result = dioxus::document::eval(
+        "return (function() {\n\
+            var pos = window.__rusterm_tab_drag_pos || '';\n\
+            if (!pos) return '';\n\
+            var done = window.__rusterm_tab_drag_done ? '1' : '0';\n\
+            var left = window.__rusterm_tab_drag_container_left || 0;\n\
+            var top = window.__rusterm_tab_drag_container_top || 0;\n\
+            return pos + ',' + done + ',' + left + ',' + top;\n\
+        })()",
+    )
+    .await
+    .ok()?;
+    let s = result.as_str()?;
+    parse_tab_drag_poll_response(s)
+}
+
+/// Pure hit-test: given the cursor's viewport-relative position, the
+/// `#terminal-content` container's viewport offset, the container's
+/// size, and the active layout, return the pane index (and its session
+/// id) under the cursor — or `None` if the cursor is outside the
+/// container or outside all visible panes.
+///
+/// For a SINGLE-pane layout (or no layout — the caller handles that
+/// case by passing a synthetic 1-pane layout), the cursor is in the
+/// pane iff it's anywhere inside the container rect.
+///
+/// For a MULTI-pane layout, iterate `layout.visible_panes(w, h)`
+/// (which yields container-relative px rects) and return the first pane
+/// whose viewport-relative rect contains the cursor.
+///
+/// Extracted as a pure function so the hit-test can be unit-tested
+/// without a dioxus runtime. The caller is responsible for the
+/// single-pane special-case (cursor in container rect →
+/// `Some((0, render_sid))`) — see `finish_tab_drag`.
+pub(crate) fn hit_test_pane_at(
+    cursor_x: f64,
+    cursor_y: f64,
+    container_left: f64,
+    container_top: f64,
+    container_w: f64,
+    container_h: f64,
+    layout: &PaneLayout,
+) -> Option<(usize, String)> {
+    // Container-relative cursor coordinates.
+    let rel_x = cursor_x - container_left;
+    let rel_y = cursor_y - container_top;
+    // Outside the container entirely.
+    if rel_x < 0.0 || rel_y < 0.0 || rel_x > container_w || rel_y > container_h {
+        return None;
+    }
+    // Iterate visible panes. `visible_panes` returns container-relative
+    // rects (x, y, w, h) — same coordinate space as `rel_x`/`rel_y`.
+    for (idx, pane, (px, py, pw, ph)) in layout.visible_panes(container_w, container_h) {
+        if rel_x >= px && rel_x < px + pw && rel_y >= py && rel_y < py + ph {
+            return Some((idx, pane.session_id.clone()));
+        }
+    }
+    None
+}
+
+/// Start a tab drag: set the `tab_drag` signal (with `dragging: false` —
+/// the polling loop promotes it to `true` once the cursor crosses the
+/// threshold) and install the document-level JS listeners.
+///
+/// Called from the tab bar's `onmousedown` (in `tab_bar.rs`, threaded
+/// through `TabBar`'s `on_drag_start` prop) and from the pane title
+/// bar's `onmousedown` (in `multi_pane_container`).
+///
+/// The session name is included so the polling loop can render a ghost
+/// element showing the dragged session's name following the cursor.
+pub(crate) fn start_tab_drag(
+    mut tab_drag: Signal<Option<TabDragState>>,
+    session_id: String,
+    session_name: String,
+    start_x: f64,
+    start_y: f64,
+) {
+    tab_drag.set(Some(TabDragState {
+        session_id,
+        session_name,
+        start_x,
+        start_y,
+        cur_x: start_x,
+        cur_y: start_y,
+        dragging: false,
+    }));
+    install_tab_drag_js_listeners(start_x, start_y);
+}
+
+/// Finish a tab drag: do the final hit-test at the release position,
+/// call `execute_tab_drop_on_pane` (the single source of truth for drop
+/// dispatch), log the outcome, and restore focus if a new pane was
+/// created. Clears `tab_drag` and `drag_over_pane`.
+///
+/// Called from the polling `use_future` when it detects the JS-side
+/// `__rusterm_tab_drag_done` flag is set AND `dragging == true`. If
+/// `dragging == false` (the user mousedowned but didn't move — a
+/// click), this function is NOT called; the polling loop just cleans
+/// up the signal.
+///
+/// Single-pane special case: when there's no layout for the active
+/// session (Single preset), the cursor is in pane 0 iff it's anywhere
+/// inside the `#terminal-content` container. We synthesize a 1-pane hit
+/// in that case.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn finish_tab_drag(
+    mut state: Signal<AppState>,
+    mut tab_drag: Signal<Option<TabDragState>>,
+    mut drag_over_pane: Signal<Option<usize>>,
+    container_size: Signal<Option<(f64, f64)>>,
+    final_x: f64,
+    final_y: f64,
+    container_left: f64,
+    container_top: f64,
+) {
+    // Read the drag state. Clone the session_id out so we can release
+    // the borrow before mutating `state` below (avoids holding a
+    // `tab_drag.read()` guard across a `state.write()`).
+    let drag_opt = tab_drag();
+    let Some(drag) = drag_opt else {
+        // Already cleared — nothing to do.
+        drag_over_pane.set(None);
+        return;
+    };
+    let dragged_sid = drag.session_id.clone();
+
+    // Compute the hit-test target.
+    //
+    // The layout we care about is the ACTIVE tab's layout (layouts are
+    // keyed by `active_session`, NOT by `dragged_sid` — the dragged
+    // session may be a background tab with no layout of its own).
+    let active_id = state.read().active_session.clone();
+    let active_layout = active_id
+        .as_ref()
+        .and_then(|aid| state.read().layouts.get(aid).cloned());
+
+    let (container_w, container_h) = container_size().unwrap_or((1200.0, 800.0));
+
+    // Determine the target pane via hit-test.
+    let hit = if let Some(layout) = active_layout.as_ref() {
+        // Multi-pane (or single-pane-but-layout-exists) path: use the
+        // pure hit-test helper.
+        hit_test_pane_at(
+            final_x,
+            final_y,
+            container_left,
+            container_top,
+            container_w,
+            container_h,
+            layout,
+        )
+    } else {
+        // No layout for the active session (Single preset, single
+        // pane). The cursor is in pane 0 iff it's inside the container.
+        let rel_x = final_x - container_left;
+        let rel_y = final_y - container_top;
+        if rel_x >= 0.0 && rel_y >= 0.0 && rel_x <= container_w && rel_y <= container_h {
+            // Pane 0 holds the active session.
+            Some((0usize, active_id.clone().unwrap_or_default()))
+        } else {
+            None
+        }
+    };
+
+    // Apply the drop if we hit a pane.
+    if let Some((target_idx, target_session)) = hit {
+        let outcome = execute_tab_drop_on_pane(
+            &mut state.write(),
+            &dragged_sid,
+            target_idx,
+            &target_session,
+        );
+        match outcome {
+            TabDropOutcome::SplitCreated { pane_idx }
+            | TabDropOutcome::SplitFilledExisting { pane_idx } => {
+                tracing::info!(
+                    "[TAB-DRAG] created split: session {} placed in pane {} (outcome={:?})",
+                    &dragged_sid[..dragged_sid.len().min(8)],
+                    pane_idx,
+                    outcome
+                );
+                restore_focus_to_active_session(state, 80);
+            }
+            TabDropOutcome::Swapped
+            | TabDropOutcome::MovedToEmptyPane { .. }
+            | TabDropOutcome::AssignedToEmptyPane => {
+                tracing::info!(
+                    "[TAB-DRAG] {} (session {})",
+                    match outcome {
+                        TabDropOutcome::Swapped => "swapped panes",
+                        TabDropOutcome::MovedToEmptyPane { .. } => "moved to empty pane",
+                        TabDropOutcome::AssignedToEmptyPane => "assigned to empty pane",
+                        _ => "?",
+                    },
+                    &dragged_sid[..dragged_sid.len().min(8)]
+                );
+            }
+            TabDropOutcome::NoOpSelfDrop => {
+                tracing::debug!(
+                    "[TAB-DRAG] self-drop no-op (session {})",
+                    &dragged_sid[..dragged_sid.len().min(8)]
+                );
+            }
+            TabDropOutcome::SwapFailed
+            | TabDropOutcome::SplitFallbackSwapFailed
+            | TabDropOutcome::SplitFailed => {
+                tracing::warn!(
+                    "[TAB-DRAG] drop failed (outcome={:?}, session {})",
+                    outcome,
+                    &dragged_sid[..dragged_sid.len().min(8)]
+                );
+            }
+        }
+    } else {
+        tracing::debug!(
+            "[TAB-DRAG] release outside any pane — no-op (session {})",
+            &dragged_sid[..dragged_sid.len().min(8)]
+        );
+    }
+
+    // Clear the drag state and the drop-target highlight.
+    tab_drag.set(None);
+    drag_over_pane.set(None);
+    // Clean up the JS-side globals + listeners (idempotent).
+    spawn(async move {
+        let _ = dioxus::document::eval(
+            "(function() {\n\
+                if (window._rusterm_tab_drag_remove) { window._rusterm_tab_drag_remove(); window._rusterm_tab_drag_remove = null; }\n\
+                window.__rusterm_tab_drag_pos = '';\n\
+                window.__rusterm_tab_drag_done = false;\n\
+                window.__rusterm_tab_drag_container_left = 0;\n\
+                window.__rusterm_tab_drag_container_top = 0;\n\
+            })()",
+        ).await;
+    });
+    // Restore focus to the active session (the drag's `onmousedown`
+    // `prevent_default` prevented focus from landing on the tab, but
+    // nothing restored it to the pane that had it before — same root
+    // cause as the splitter drag's focus issue).
+    restore_focus_to_active_session(state, 20);
+    // `active_id` is read for the single-pane fallback hit-test above.
+    let _ = active_id;
 }
 
 /// Multi-pane container: renders a `PaneLayout` as a grid of `TerminalView`
@@ -895,6 +1833,7 @@ fn multi_pane_container(
     mut drag_over_pane: Signal<Option<usize>>,
     container_size: Signal<Option<(f64, f64)>>,
     split_drag: Signal<Option<SplitDragState>>,
+    tab_drag: Signal<Option<TabDragState>>,
 ) -> Element {
     // Container dimensions measured from the live DOM via a ResizeObserver
     // + polling loop (see `App`). Falls back to a 1200×800 default if the
@@ -980,6 +1919,51 @@ fn multi_pane_container(
         })
         .collect();
 
+    // Drag-resize overlay: VISUAL CURSOR INDICATOR ONLY. The actual
+    // drag-resize mouse events are handled by document-level capture-phase
+    // listeners installed via `install_split_drag_js_listeners` (see the
+    // splitter's `onmousedown`). The polling `use_future` in `App` reads
+    // the mouse position from `window.__rusterm_drag_pos` and applies the
+    // delta.
+    //
+    // The overlay exists ONLY to show the col-resize / row-resize cursor
+    // across the whole viewport during the drag (so the user gets
+    // consistent cursor feedback even when the cursor is far from the
+    // splitter bar). It carries NO event handlers — `pointer-events: none`
+    // makes it transparent to mouse input, so it never interferes with
+    // the document-level listeners.
+    //
+    // Pre-computed as an `Element` because `rsx!` doesn't allow `let`
+    // bindings as direct children (dioxus 0.7 macro limitation — same
+    // reason `pane_items` is pre-computed above).
+    let drag_overlay: Element = match split_drag() {
+        Some(drag) => {
+            tracing::info!("[OVERLAY] rendered visible overlay drag={:?}", drag);
+            let cursor = if drag.is_col {
+                "col-resize"
+            } else {
+                "row-resize"
+            };
+            // `key:` must be a format string (dioxus 0.7 `rsx!` macro
+            // rule) — a bare literal is rejected. We don't need the
+            // value, just the format-placeholder to satisfy the macro.
+            let _key_idx = drag.idx;
+            rsx! {
+                div {
+                    key: "split-drag-overlay-{_key_idx}",
+                    style: format!(
+                        "position: fixed; left: 0; top: 0; right: 0; bottom: 0; \
+                         z-index: 9999; cursor: {cursor}; \
+                         background: transparent; \
+                         pointer-events: none; \
+                         user-select: none; -webkit-user-select: none;",
+                    ),
+                }
+            }
+        }
+        None => rsx! {},
+    };
+
     rsx! {
         div {
             id: "multi-pane-container",
@@ -1063,78 +2047,83 @@ fn multi_pane_container(
                         // pane's title bar — both use the same MIME type
                         // since the semantic is identical: move/swap an
                         // existing session into this pane).
+                        //
+                        // NOTE (Task 22): tabs and pane title bars no longer
+                        // use HTML5 DnD (the manual mouse-based system
+                        // handles those drags via `finish_tab_drag` →
+                        // `execute_tab_drop_on_pane`). This branch is
+                        // retained as a defensive fallback for any residual
+                        // HTML5 drag that might fire. It calls the same
+                        // `execute_tab_drop_on_pane` that the manual system
+                        // uses, so the dispatch logic is identical.
                         if let Some(dragged_sid) = dt.get_data("application/x-rusterm-session-id") {
                             if dragged_sid.is_empty() {
                                 tracing::warn!("[DROP] empty session-id in drag data");
                                 return;
                             }
-                            // If the user dropped the session onto its
-                            // own pane, it's a no-op.
-                            if dragged_sid == drop_session_id {
-                                tracing::debug!(
-                                    "[DROP] session {} dropped onto its own pane — no-op",
-                                    &dragged_sid[..dragged_sid.len().min(8)]
-                                );
-                                return;
-                            }
-                            // If the target pane is empty, move the
-                            // session there (and clear the source pane).
-                            // Otherwise, swap the two panes' sessions.
-                            if drop_session_id.is_empty() {
-                                // Find the source pane index, move the
-                                // session to the target pane, clear the
-                                // source.
-                                let src_pane = {
-                                    let s = state.read();
-                                    pane_index_for_active_session(&s, &dragged_sid)
-                                };
-                                if let Some(src_idx) = src_pane {
-                                    let mut s = state.write();
-                                    set_pane_session_for_active(
-                                        &mut s,
-                                        idx,
-                                        dragged_sid.clone(),
-                                    );
-                                    // Only clear the source pane if it's
-                                    // different from the target (which
-                                    // it always is here, but be
-                                    // defensive).
-                                    if src_idx != idx {
-                                        set_pane_session_for_active(&mut s, src_idx, String::new());
-                                    }
+                            let outcome = execute_tab_drop_on_pane(
+                                &mut state.write(),
+                                &dragged_sid,
+                                idx,
+                                &drop_session_id,
+                            );
+                            match outcome {
+                                TabDropOutcome::SplitCreated { pane_idx }
+                                | TabDropOutcome::SplitFilledExisting { pane_idx } => {
                                     tracing::info!(
-                                        "[DROP] moved session {} from pane {} to pane {}",
+                                        "[DROP] created split: session {} placed in pane {} (outcome={:?})",
                                         &dragged_sid[..dragged_sid.len().min(8)],
-                                        src_idx,
-                                        idx
+                                        pane_idx,
+                                        outcome
                                     );
-                                } else {
-                                    // Source session isn't in any pane
-                                    // — just assign it to the target.
-                                    let mut s = state.write();
-                                    set_pane_session_for_active(
-                                        &mut s,
-                                        idx,
-                                        dragged_sid,
-                                    );
+                                    restore_focus_to_active_session(state, 80);
                                 }
-                            } else {
-                                // Target pane has a session — swap.
-                                let swapped = swap_pane_sessions(
-                                    &mut state.write(),
-                                    &dragged_sid,
-                                    &drop_session_id,
-                                );
-                                if swapped {
+                                TabDropOutcome::Swapped => {
                                     tracing::info!(
                                         "[DROP] swapped session {} with pane {}'s session {}",
                                         &dragged_sid[..dragged_sid.len().min(8)],
                                         idx,
                                         &drop_session_id[..drop_session_id.len().min(8)]
                                     );
-                                } else {
+                                }
+                                TabDropOutcome::MovedToEmptyPane { cleared_source_pane: Some(src) } => {
+                                    tracing::info!(
+                                        "[DROP] moved session {} from pane {} to pane {}",
+                                        &dragged_sid[..dragged_sid.len().min(8)],
+                                        src,
+                                        idx
+                                    );
+                                }
+                                TabDropOutcome::MovedToEmptyPane { cleared_source_pane: None }
+                                | TabDropOutcome::AssignedToEmptyPane => {
+                                    tracing::info!(
+                                        "[DROP] assigned session {} to empty pane {}",
+                                        &dragged_sid[..dragged_sid.len().min(8)],
+                                        idx
+                                    );
+                                }
+                                TabDropOutcome::NoOpSelfDrop => {
+                                    tracing::debug!(
+                                        "[DROP] session {} dropped onto its own pane — no-op",
+                                        &dragged_sid[..dragged_sid.len().min(8)]
+                                    );
+                                }
+                                TabDropOutcome::SwapFailed => {
                                     tracing::warn!(
                                         "[DROP] swap failed for session {} → pane {}",
+                                        &dragged_sid[..dragged_sid.len().min(8)],
+                                        idx
+                                    );
+                                }
+                                TabDropOutcome::SplitFallbackSwapFailed => {
+                                    tracing::warn!(
+                                        "[DROP] Grid8 full and swap failed — session {} not placed",
+                                        &dragged_sid[..dragged_sid.len().min(8)]
+                                    );
+                                }
+                                TabDropOutcome::SplitFailed => {
+                                    tracing::warn!(
+                                        "[DROP] create-split failed for session {} → pane {}",
                                         &dragged_sid[..dragged_sid.len().min(8)],
                                         idx
                                     );
@@ -1190,10 +2179,27 @@ fn multi_pane_container(
                         );
                     },
                     // Title bar / drag handle. The bar is the only
-                    // draggable part of the pane — the terminal content
-                    // below must stay non-draggable so text selection
-                    // and mouse clicks still work. `draggable: true`
-                    // on this bar is what initiates the pane-drag.
+                    // part of the pane that initiates a tab drag — the
+                    // terminal content below must stay non-draggable so
+                    // text selection and mouse clicks still work.
+                    //
+                    // Task 22: replaced the prior HTML5 `draggable: true`
+                    // + `ondragstart` (which was unreliable in dioxus
+                    // 0.7's desktop webview) with a manual mouse-based
+                    // drag system mirroring the splitter drag-resize fix.
+                    // `onmousedown` (primary button) calls
+                    // `start_tab_drag`, which sets the `tab_drag` signal
+                    // and installs document-level capture-phase JS
+                    // listeners. The polling `use_future` in `App`
+                    // takes over from there.
+                    //
+                    // Plain click-to-select still works: `onmousedown`
+                    // sets `tab_drag` with `dragging: false`; the
+                    // polling loop only executes a drop if the cursor
+                    // crossed the threshold (i.e. it became a real
+                    // drag). The title bar has no `onclick` of its own,
+                    // so a click on it is a no-op (the pane's terminal
+                    // content area has its own focus handler).
                     div {
                         style: "
                             height: 18px;
@@ -1209,20 +2215,34 @@ fn multi_pane_container(
                             flex-shrink: 0;
                             z-index: 10;
                         ",
-                        draggable: true,
                         title: "Drag to move this session to another pane",
-                        ondragstart: move |e: DragEvent| {
-                            let dt = e.data_transfer();
-                            let _ = dt.set_data(
-                                "application/x-rusterm-session-id",
-                                &drag_sid,
-                            );
-                            dt.set_drop_effect("move");
-                            dt.set_effect_allowed("move");
-                            tracing::debug!(
-                                "[DRAG] pane drag started: session={:?}",
-                                &drag_sid[..drag_sid.len().min(8)]
-                            );
+                        onmousedown: move |e: MouseEvent| {
+                            // Only start a drag on primary button (left
+                            // click). Middle/right clicks have other
+                            // semantics and shouldn't initiate a drag.
+                            if e.trigger_button() == Some(MouseButton::Primary) {
+                                e.stop_propagation();
+                                let c = e.client_coordinates();
+                                // Look up the session's display name for
+                                // the ghost element. Falls back to the
+                                // session id if the session was closed
+                                // between the layout snapshot and this
+                                // mousedown (defensive).
+                                let ghost_name = state
+                                    .read()
+                                    .sessions
+                                    .iter()
+                                    .find(|t| t.id == drag_sid)
+                                    .map(|t| t.name.clone())
+                                    .unwrap_or_else(|| drag_sid.clone());
+                                start_tab_drag(
+                                    tab_drag,
+                                    drag_sid.clone(),
+                                    ghost_name,
+                                    c.x,
+                                    c.y,
+                                );
+                            }
                         },
                         "{pane_title}"
                     },
@@ -1242,6 +2262,32 @@ fn multi_pane_container(
             {render_col_splitters(&layout, container_w, state, split_drag)}
             // Horizontal splitter bars between adjacent rows.
             {render_row_splitters(&layout, container_h, state, split_drag)}
+
+            // Drag-resize overlay: while a splitter drag is in progress,
+            // render an invisible full-screen div that captures all
+            // mouse events. This replaces the prior JS-listener +
+            // `eval`-poll approach (which was broken by a missing
+            // `return` prefix in the eval string and a race between
+            // `spawn`-installed listeners and the first mousemove).
+            //
+            // The overlay sits above everything (z-index: 9999) with
+            // `position: fixed; inset: 0`, so any mousemove anywhere
+            // in the window routes to its `onmousemove` handler — no
+            // document-level JS listeners needed. `onmouseup` ends the
+            // drag. `user-select: none` prevents text selection during
+            // the drag.
+            //
+            // We read `split_drag()` fresh inside `onmousemove` (not
+            // the `drag` captured at render time) so that rapid
+            // mousemove events between frames all see the latest
+            // `last_applied_pos` — dioxus's `Signal::set` updates the
+            // underlying value synchronously, even though the
+            // re-render is batched. Without this, multiple mousemove
+            // events in the same frame would each compute the delta
+            // from the same stale `last_applied_pos` and apply it
+            // multiple times (e.g. 5x for 5 events = 5x the intended
+            // resize).
+            {drag_overlay}
         }
     }
 }
@@ -1250,6 +2296,26 @@ fn multi_pane_container(
 /// resize the two columns it separates (smooth, continuous — not the prior
 /// 5%-step click). Right-click still does a 5% shrink for keyboard-free
 /// fine-tuning.
+///
+/// ## Drag-resize mechanism
+///
+/// The splitter bar carries ONLY `onmousedown`. When the user presses the
+/// mouse button, we:
+///  1. Set `split_drag = Some(...)` so the overlay mounts (visual cursor).
+///  2. Call `install_split_drag_js_listeners` to attach document-level
+///     capture-phase `mousemove`/`mouseup` listeners. These listeners write
+///     the mouse position to `window.__rusterm_drag_pos` and set
+///     `window.__rusterm_drag_done = true` on mouseup.
+///
+/// A polling `use_future` in `App` reads those globals every 16ms and calls
+/// `apply_split_drag_step` to apply the delta.
+///
+/// We do NOT attach `onmousemove`/`onmouseup` to the splitter bar itself —
+/// dioxus 0.7's desktop webview doesn't reliably fire element-level mouse
+/// events during a button-held drag (pointer capture behavior is inconsistent
+/// across WKWebView/webkitgtk/WebView2). Document-level capture-phase
+/// listeners are the only mechanism that works reliably. See
+/// `install_split_drag_js_listeners` for the full rationale.
 fn render_col_splitters(
     layout: &PaneLayout,
     container_w: f64,
@@ -1280,67 +2346,51 @@ fn render_col_splitters(
             div {
                 key: "col-split-{col_idx}",
                 style: format!(
-                    "position: absolute; left: {x_val}px; top: 0; bottom: 0; width: 6px; \
-                     margin-left: -3px; cursor: col-resize; background: #2a2b3d; z-index: 50; \
-                     transition: background 0.1s;",
+                    "position: absolute; left: {x_val}px; top: 0; bottom: 0; width: 10px; \
+                     margin-left: -5px; cursor: col-resize; background: #2a2b3d; z-index: 50; \
+                     transition: background 0.1s; user-select: none;",
                 ),
-                // Begin a drag-resize. We capture the splitter's pixel
-                // position and the container width at drag start, then
-                // install document-level mousemove/mouseup listeners via
-                // `eval`. The mousemove listener writes the current
-                // clientX to `document._rusterm_split_drag_mouse`; the
-                // poll loop in `App` reads that and applies the delta.
-                // The mouseup listener clears the drag flag and the
-                // `split_drag` signal.
+                // Begin a drag-resize. We capture the viewport-relative mouse
+                // position (NOT the container-relative splitter position) as
+                // `last_applied_pos` — see `SplitDragState`'s doc comment for
+                // why viewport space matters for delta computation.
                 //
-                // `e.prevent_default()` is needed to stop the browser
-                // from initiating a text-selection drag (which would
-                // hijack the mousemove events and suppress our
-                // listener).
+                // `e.prevent_default()` is needed to stop the browser from
+                // initiating a text-selection drag (which would hijack
+                // subsequent mousemove events) AND to prevent the splitter
+                // bar from receiving focus (we want focus to stay on the
+                // terminal pane the user was typing in).
+                //
+                // We then install document-level capture-phase listeners
+                // (see `install_split_drag_js_listeners`) — these are the
+                // ONLY reliable way to intercept mousemove during a
+                // button-held drag in dioxus 0.7's desktop webview.
                 onmousedown: move |e: MouseEvent| {
                     e.prevent_default();
+                    e.stop_propagation();
                     if container_w <= 0.0 {
                         return;
                     }
+                    // Viewport-relative mouse position at drag start.
+                    let start_client_x = e.client_coordinates().x;
+                    let start_client_y = e.client_coordinates().y;
                     split_drag.set(Some(SplitDragState {
                         is_col: true,
                         idx: col_idx,
-                        start_pos: x_val,
                         container_extent: container_w,
-                        last_applied_pos: x_val,
+                        last_applied_pos: start_client_x,
                     }));
-                    // Install the document-level listeners. We write the
-                    // starting position immediately so the first poll
-                    // sees a valid value (otherwise the first ~16ms of
-                    // mousemove events would be lost).
-                    let script = "(function() { \
-                        document._rusterm_split_drag_mouse = null; \
-                        document._rusterm_split_drag_active = true; \
-                        document._rusterm_split_drag_axis = 'x'; \
-                        function onMove(ev) { \
-                            if (!document._rusterm_split_drag_active) return; \
-                            document._rusterm_split_drag_mouse = ev.clientX; \
-                        } \
-                        function onUp(ev) { \
-                            document._rusterm_split_drag_active = false; \
-                            document._rusterm_split_drag_mouse = null; \
-                            document.removeEventListener('mousemove', onMove); \
-                            document.removeEventListener('mouseup', onUp); \
-                            document.body.style.userSelect = ''; \
-                            document.body.style.cursor = ''; \
-                        } \
-                        document.body.style.userSelect = 'none'; \
-                        document.body.style.cursor = 'col-resize'; \
-                        document.addEventListener('mousemove', onMove); \
-                        document.addEventListener('mouseup', onUp); \
-                    })()";
-                    spawn(async move {
-                        let _ = dioxus::document::eval(script).await;
-                    });
-                    tracing::debug!(
-                        "[LAYOUT] col-split drag started: idx={} start_x={:.1} container_w={:.1}",
-                        col_idx, x_val, container_w
+                    tracing::info!(
+                        "[LAYOUT] col-split drag started: idx={} splitter_x={:.1} client_x={:.1} container_w={:.1}",
+                        col_idx, x_val, start_client_x, container_w
                     );
+                    // Install document-level capture-phase listeners. These
+                    // fire on every mousemove/mouseup during the drag,
+                    // regardless of where the cursor is or which element is
+                    // under it. The polling use_future in App reads the
+                    // position from `window.__rusterm_drag_pos` and applies
+                    // the delta.
+                    install_split_drag_js_listeners(start_client_x, start_client_y);
                 },
                 oncontextmenu: move |e: MouseEvent| {
                     e.prevent_default();
@@ -1358,6 +2408,10 @@ fn render_col_splitters(
 /// Render horizontal splitter bars between adjacent rows. Drag the bar to
 /// resize the two rows it separates (smooth, continuous). Right-click still
 /// does a 5% shrink.
+///
+/// See `render_col_splitters` for the drag-resize mechanism rationale
+/// (splitter carries only `onmousedown`; document-level capture-phase
+/// listeners installed via JS `eval` handle `mousemove`/`mouseup`).
 fn render_row_splitters(
     layout: &PaneLayout,
     container_h: f64,
@@ -1388,50 +2442,33 @@ fn render_row_splitters(
             div {
                 key: "row-split-{row_idx}",
                 style: format!(
-                    "position: absolute; top: {y_val}px; left: 0; right: 0; height: 6px; \
-                     margin-top: -3px; cursor: row-resize; background: #2a2b3d; z-index: 50; \
-                     transition: background 0.1s;",
+                    "position: absolute; top: {y_val}px; left: 0; right: 0; height: 10px; \
+                     margin-top: -5px; cursor: row-resize; background: #2a2b3d; z-index: 50; \
+                     transition: background 0.1s; user-select: none;",
                 ),
                 onmousedown: move |e: MouseEvent| {
                     e.prevent_default();
+                    e.stop_propagation();
                     if container_h <= 0.0 {
                         return;
                     }
+                    // Viewport-relative mouse position at drag start.
+                    let start_client_x = e.client_coordinates().x;
+                    let start_client_y = e.client_coordinates().y;
                     split_drag.set(Some(SplitDragState {
                         is_col: false,
                         idx: row_idx,
-                        start_pos: y_val,
                         container_extent: container_h,
-                        last_applied_pos: y_val,
+                        last_applied_pos: start_client_y,
                     }));
-                    let script = "(function() { \
-                        document._rusterm_split_drag_mouse = null; \
-                        document._rusterm_split_drag_active = true; \
-                        document._rusterm_split_drag_axis = 'y'; \
-                        function onMove(ev) { \
-                            if (!document._rusterm_split_drag_active) return; \
-                            document._rusterm_split_drag_mouse = ev.clientY; \
-                        } \
-                        function onUp(ev) { \
-                            document._rusterm_split_drag_active = false; \
-                            document._rusterm_split_drag_mouse = null; \
-                            document.removeEventListener('mousemove', onMove); \
-                            document.removeEventListener('mouseup', onUp); \
-                            document.body.style.userSelect = ''; \
-                            document.body.style.cursor = ''; \
-                        } \
-                        document.body.style.userSelect = 'none'; \
-                        document.body.style.cursor = 'row-resize'; \
-                        document.addEventListener('mousemove', onMove); \
-                        document.addEventListener('mouseup', onUp); \
-                    })()";
-                    spawn(async move {
-                        let _ = dioxus::document::eval(script).await;
-                    });
-                    tracing::debug!(
-                        "[LAYOUT] row-split drag started: idx={} start_y={:.1} container_h={:.1}",
-                        row_idx, y_val, container_h
+                    tracing::info!(
+                        "[LAYOUT] row-split drag started: idx={} splitter_y={:.1} client_y={:.1} container_h={:.1}",
+                        row_idx, y_val, start_client_y, container_h
                     );
+                    // Install document-level capture-phase listeners — see
+                    // `install_split_drag_js_listeners` for why this is the
+                    // only reliable mechanism in dioxus 0.7's desktop webview.
+                    install_split_drag_js_listeners(start_client_x, start_client_y);
                 },
                 oncontextmenu: move |e: MouseEvent| {
                     e.prevent_default();
@@ -3626,7 +4663,7 @@ pub fn App() -> Element {
     // highlight only changes when the dragged pane actually changes. This
     // matches the user's "取舍分频性能" preference: fewer re-renders over
     // per-tick feedback.
-    let drag_over_pane: Signal<Option<usize>> = use_signal(|| None);
+    let mut drag_over_pane: Signal<Option<usize>> = use_signal(|| None);
 
     // Measured pixel dimensions of the `#terminal-content` container (the
     // flex:1 div that holds either the single active TerminalView or the
@@ -3642,99 +4679,254 @@ pub fn App() -> Element {
     // first paint isn't blank.
     let mut container_size: Signal<Option<(f64, f64)>> = use_signal(|| None);
 
-    // Active splitter-bar drag, if any. Set by the splitter's `onmousedown`;
-    // read by the drag-poll future below; cleared by the JS `mouseup` handler
-    // (which also sets `document._rusterm_split_drag_active = false`). The poll
-    // future detects the JS-side clear and mirrors it here.
+    // Active splitter-bar drag, if any. Set by the splitter's `onmousedown`
+    // (in `render_col_splitters` / `render_row_splitters`); read by the
+    // drag-resize overlay rendered in `multi_pane_container` (a visual-only
+    // cursor indicator with `pointer-events: none`); cleared by
+    // `end_split_drag` when the polling `use_future` below detects the
+    // JS-side `window.__rusterm_drag_done` flag.
     //
-    // Why a signal + poll instead of per-event eval callbacks: dioxus's eval
-    // bridge is async request/response — it can't deliver high-frequency
-    // mousemove events synchronously. Polling at 16ms (~60fps) is smooth
-    // enough for splitter dragging and mirrors the TerminalView resize-poll
-    // pattern.
-    let mut split_drag: Signal<Option<SplitDragState>> = use_signal(|| None);
+    // ## Drag mechanism
+    //
+    // The splitter's `onmousedown` sets this signal AND calls
+    // `install_split_drag_js_listeners` to attach document-level
+    // capture-phase `mousemove`/`mouseup` listeners. Those listeners write
+    // the current mouse position to `window.__rusterm_drag_pos` and set
+    // `window.__rusterm_drag_done = true` on mouseup. The polling
+    // `use_future` (`_split_drag_poll` below) reads those globals every
+    // 16ms and calls `apply_split_drag_step` to apply the delta.
+    //
+    // Why this design: dioxus 0.7's desktop webview doesn't reliably fire
+    // element-level `onmousemove`/`onmouseup` during a button-held drag
+    // (pointer-capture behavior is inconsistent across WKWebView/webkitgtk/
+    // WebView2). Document-level capture-phase listeners are the only
+    // mechanism that works reliably.
+    let split_drag: Signal<Option<SplitDragState>> = use_signal(|| None);
 
-    // Drag-poll loop: while a splitter drag is in progress, read the current
-    // mouse position from `document._rusterm_split_drag_mouse` (kept current
-    // by the JS `mousemove` listener installed in the splitter's
-    // `onmousedown`), compute the delta from the last applied position, and
-    // call `resize_layout_col` / `resize_layout_row` to apply it. The JS
-    // `mouseup` handler clears the drag flag; we detect that and clear the
-    // Rust-side signal to match.
+    // Active tab/pane drag (Task 22). Set by the tab bar's `onmousedown`
+    // (via `on_drag_start` → `start_tab_drag`) or by a pane title bar's
+    // `onmousedown`; read and updated by the polling `use_future`
+    // (`_tab_drag_poll` below); cleared by `finish_tab_drag` when the
+    // polling loop detects the JS-side `__rusterm_tab_drag_done` flag.
     //
-    // Poll cadence: 16ms (~60fps) only while a drag is in progress — when
-    // `split_drag` is `None` we `continue` immediately (after the sleep), so
-    // the loop is effectively idle between drags. This matches the existing
-    // TerminalView resize-poll pattern (100ms there, but splitter dragging
-    // benefits from higher cadence for smoothness).
+    // ## Why manual mouse-based drag (replacing HTML5 DnD for tabs)
+    //
+    // HTML5 drag-and-drop (`draggable: true`, `ondragstart`, `ondrop`)
+    // was UNRELIABLE in dioxus 0.7's desktop webview (drops sometimes
+    // didn't fire, DataTransfer data sometimes came back empty, the
+    // native drag ghost sometimes ate the release event). The splitter
+    // drag-resize feature hit the SAME wall and was fixed by switching
+    // to document-level capture-phase JS listeners + polling (see the
+    // "Splitter drag-resize fix" section in the architecture memory).
+    // This tab-drag system mirrors that PROVEN pattern exactly.
+    //
+    // HTML5 DnD REMAINS for sidebar→pane connection drags (Task 16) —
+    // that feature has no user complaints and the connection-id MIME
+    // type is untouched.
+    //
+    // ## Click vs drag
+    //
+    // `onmousedown` sets `tab_drag` with `dragging: false`. The polling
+    // loop watches the cursor; once it moves more than
+    // `TAB_DRAG_THRESHOLD` pixels from the start position, `dragging`
+    // becomes `true`. The drop is ONLY executed on `mouseup` if
+    // `dragging == true`. This preserves plain click-to-select: a
+    // mousedown with no significant mousemove is a click, not a drag —
+    // the polling loop cleans up the signal and the tab's `onclick`
+    // fires normally.
+    let mut tab_drag: Signal<Option<TabDragState>> = use_signal(|| None);
+
+    // Polling loop for the active splitter drag. Runs forever (the loop
+    // sleeps when no drag is in progress). When `split_drag` is `Some`, polls
+    // the JS global `window.__rusterm_drag_pos` (written by the document-level
+    // capture-phase listeners installed in `install_split_drag_js_listeners`)
+    // every 16ms and applies the delta via `apply_split_drag_step`. When the
+    // JS-side `window.__rusterm_drag_done` flag is set (user released the mouse
+    // button), calls `end_split_drag` to clear the drag state and restore
+    // focus.
+    //
+    // 16ms is fast enough for smooth dragging (the eye can't distinguish
+    // finer granularity) and slow enough to avoid flooding the dioxus runtime
+    // with eval round-trips. The eval is a single round-trip per poll,
+    // returning a string like "123.4,567.8,0" (x, y, done-flag).
+    //
+    // The loop NEVER breaks — after a drag ends, it goes back to the idle
+    // polling state (32ms sleep) so subsequent drags are handled. `use_future`
+    // only runs its closure once on mount, so breaking would prevent all
+    // future drags from being polled.
     let _split_drag_poll = use_future(move || async move {
+        // Loop forever. When idle (no drag), sleep 32ms and re-check. When
+        // a drag is active, poll JS every 16ms.
         loop {
-            tokio::time::sleep(std::time::Duration::from_millis(16)).await;
-            let Some(drag) = split_drag() else {
+            if split_drag().is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(32)).await;
                 continue;
-            };
-            // Read the current mouse position + active flag from JS.
-            let result = dioxus::document::eval(
-                "(function() { \
-                    if (!document._rusterm_split_drag_active) return 'inactive'; \
-                    if (document._rusterm_split_drag_mouse === null || \
-                        document._rusterm_split_drag_mouse === undefined) return 'pending'; \
-                    return document._rusterm_split_drag_mouse.toFixed(2); \
-                })()",
-            )
-            .await;
-            let mut apply_delta: Option<f64> = None;
-            let mut drag_ended = false;
-            if let Ok(value) = result {
-                if let Some(s) = value.as_str() {
-                    if s == "inactive" {
-                        // JS-side mouseup fired — clear the signal.
-                        drag_ended = true;
-                    } else if s != "pending" {
-                        if let Ok(pos) = s.parse::<f64>() {
-                            if pos != drag.last_applied_pos {
-                                apply_delta = Some(pos);
-                            }
-                        }
+            }
+            // Read the JS-side mouse position + done flag.
+            match poll_split_drag_state().await {
+                Some((x, y, done)) => {
+                    let drag_opt = split_drag();
+                    let Some(drag) = drag_opt else {
+                        // Drag was cleared between the check above and now —
+                        // go back to idle polling.
+                        continue;
+                    };
+                    if done {
+                        tracing::info!(
+                            "[LAYOUT] drag done flag detected (x={:.1}, y={:.1}); ending drag",
+                            x,
+                            y
+                        );
+                        end_split_drag(state, split_drag);
+                        // Loop back to idle — do NOT break, or subsequent
+                        // drags wouldn't be polled.
+                        continue;
                     }
+                    // Apply the drag step. Use the appropriate coordinate
+                    // (x for col drag, y for row drag).
+                    let pos = if drag.is_col { x } else { y };
+                    apply_split_drag_step(state, split_drag, pos);
+                }
+                None => {
+                    // JS globals not set yet (listener install may still be
+                    // in-flight). Sleep a bit and retry.
+                    tracing::debug!("[LAYOUT] poll_split_drag_state returned None; retrying");
                 }
             }
-            if drag_ended {
-                split_drag.set(None);
+            // 16ms = ~60Hz. Fast enough for smooth dragging.
+            tokio::time::sleep(std::time::Duration::from_millis(16)).await;
+        }
+    });
+
+    // Polling loop for the active tab/pane drag (Task 22). Mirrors
+    // `_split_drag_poll` exactly but reads `__rusterm_tab_drag_pos` /
+    // `__rusterm_tab_drag_done` instead of the splitter globals. Runs
+    // forever — when idle (no drag), sleeps 32ms and re-checks. When a
+    // drag is active, polls JS every 16ms.
+    //
+    // The loop:
+    //  1. If `tab_drag` is `None`: sleep 32ms, continue.
+    //  2. Poll `poll_tab_drag_state()` → `(x, y, done, left, top)`.
+    //  3. Update `tab_drag`'s `cur_x`/`cur_y`. If `!dragging` and the
+    //     cursor has crossed the threshold, set `dragging = true`.
+    //  4. If `done` (user released the mouse button):
+    //     - If `dragging == true`: call `finish_tab_drag` (hit-test +
+    //       `execute_tab_drop_on_pane` + focus restore + cleanup).
+    //     - Else (it was a click, not a drag): just clean up the signal.
+    //       The tab's `onclick` fires normally.
+    //  5. Else if `dragging`: live hit-test → `drag_over_pane.set(idx)`
+    //     for drop-zone highlight.
+    //  6. Sleep 16ms.
+    //
+    // NEVER breaks — `use_future` only runs its closure once on mount,
+    // so breaking would prevent all future drags from being polled.
+    let _tab_drag_poll = use_future(move || async move {
+        loop {
+            if tab_drag().is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(32)).await;
                 continue;
             }
-            let Some(new_pos) = apply_delta else {
-                continue;
-            };
-            // Convert the pixel delta to a fractional delta and apply it.
-            // Positive delta (mouse moved right/down) grows the earlier
-            // column/row and shrinks the later one — matches the
-            // `resize_col`/`resize_row` contract.
-            let pixel_delta = new_pos - drag.last_applied_pos;
-            let frac_delta = if drag.container_extent > 0.0 {
-                pixel_delta / drag.container_extent
-            } else {
-                0.0
-            };
-            let applied = if drag.is_col {
-                resize_layout_col(&mut state.write(), drag.idx, frac_delta)
-            } else {
-                resize_layout_row(&mut state.write(), drag.idx, frac_delta)
-            };
-            if applied {
-                // Update `last_applied_pos` so we only fire on actual
-                // changes. We DON'T update `start_pos` — the delta is
-                // computed relative to the last applied position, not the
-                // drag origin, which gives smoother behavior when the
-                // minimum-frac guard rejects a delta (the next delta is
-                // computed from where the mouse actually is, not from
-                // where it would have been if the rejected delta had
-                // applied).
-                split_drag.set(Some(SplitDragState {
-                    last_applied_pos: new_pos,
-                    ..drag
-                }));
+            // Read the JS-side mouse position + done flag + container offset.
+            match poll_tab_drag_state().await {
+                Some((x, y, done, left, top)) => {
+                    let drag_opt = tab_drag();
+                    let Some(drag) = drag_opt else {
+                        // Drag was cleared between the check above and now —
+                        // go back to idle polling.
+                        continue;
+                    };
+                    // Promote to `dragging: true` if the cursor has
+                    // crossed the threshold. This is what distinguishes
+                    // a click (no drag) from a real drag.
+                    let now_dragging = drag.dragging
+                        || tab_drag_threshold_exceeded(drag.start_x, drag.start_y, x, y);
+                    // Update the drag state with the new cursor position
+                    // (and possibly the promoted `dragging` flag). Drop
+                    // the borrow before any `state.write()` below to
+                    // avoid re-entrant signal writes.
+                    if now_dragging != drag.dragging || x != drag.cur_x || y != drag.cur_y {
+                        tab_drag.set(Some(TabDragState {
+                            cur_x: x,
+                            cur_y: y,
+                            dragging: now_dragging,
+                            ..drag
+                        }));
+                    }
+                    if done {
+                        if now_dragging {
+                            tracing::info!(
+                                "[TAB-DRAG] done flag detected (x={:.1}, y={:.1}); finishing drag",
+                                x,
+                                y
+                            );
+                            finish_tab_drag(
+                                state,
+                                tab_drag,
+                                drag_over_pane,
+                                container_size,
+                                x,
+                                y,
+                                left,
+                                top,
+                            );
+                        } else {
+                            // It was a click, not a drag. Clean up the
+                            // signal WITHOUT executing a drop. The tab's
+                            // `onclick` fires normally.
+                            tracing::debug!("[TAB-DRAG] mousedown-without-drag cleanup (click)");
+                            tab_drag.set(None);
+                            drag_over_pane.set(None);
+                            // Clean up the JS-side globals.
+                            spawn(async move {
+                                let _ = dioxus::document::eval(
+                                    "(function() {\n\
+                                        if (window._rusterm_tab_drag_remove) { window._rusterm_tab_drag_remove(); window._rusterm_tab_drag_remove = null; }\n\
+                                        window.__rusterm_tab_drag_pos = '';\n\
+                                        window.__rusterm_tab_drag_done = false;\n\
+                                    })()",
+                                ).await;
+                            });
+                        }
+                        // Loop back to idle — do NOT break, or subsequent
+                        // drags wouldn't be polled.
+                        continue;
+                    }
+                    // Live hit-test for drop-zone highlight (only when
+                    // actually dragging — a click doesn't highlight).
+                    if now_dragging {
+                        let (cw, ch) = container_size().unwrap_or((1200.0, 800.0));
+                        let active_layout = state
+                            .read()
+                            .active_session
+                            .as_ref()
+                            .and_then(|aid| state.read().layouts.get(aid).cloned());
+                        let hit = if let Some(layout) = active_layout.as_ref() {
+                            hit_test_pane_at(x, y, left, top, cw, ch, layout).map(|(idx, _)| idx)
+                        } else {
+                            // No layout — single pane. Cursor in container
+                            // rect → pane 0.
+                            let rel_x = x - left;
+                            let rel_y = y - top;
+                            if rel_x >= 0.0 && rel_y >= 0.0 && rel_x <= cw && rel_y <= ch {
+                                Some(0usize)
+                            } else {
+                                None
+                            }
+                        };
+                        // `Signal::set` is a no-op if the value is
+                        // unchanged, so this is cheap when the cursor
+                        // stays in the same pane.
+                        drag_over_pane.set(hit);
+                    }
+                }
+                None => {
+                    // JS globals not set yet (listener install may still
+                    // be in-flight). Sleep a bit and retry.
+                    tracing::debug!("[TAB-DRAG] poll_tab_drag_state returned None; retrying");
+                }
             }
+            // 16ms = ~60Hz. Fast enough for smooth dragging.
+            tokio::time::sleep(std::time::Duration::from_millis(16)).await;
         }
     });
 
@@ -3762,7 +4954,7 @@ pub fn App() -> Element {
         loop {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             let result = dioxus::document::eval(
-                "(function() { const el = document.getElementById('terminal-content'); \
+                "return (function() { const el = document.getElementById('terminal-content'); \
                  if (!el || !el._rusterm_container_resize_pending) return ''; \
                  el._rusterm_container_resize_pending = false; \
                  const r = el.getBoundingClientRect(); \
@@ -4163,6 +5355,14 @@ pub fn App() -> Element {
                             if let Some(p) = next {
                                 tracing::info!("[LAYOUT] hotkey cycled to {:?}", p);
                             }
+                            // Restore focus to the active session's input div.
+                            // Applying a new preset re-mounts panes, and the
+                            // auto-focus `use_effect` in each pane's
+                            // `TerminalView` may race — the last-mounted pane
+                            // wins focus, which may not be the active session.
+                            // This explicit restore ensures the user lands on
+                            // the pane they expect (the active one).
+                            restore_focus_to_active_session(state, 100);
                         }
                         // Cmd/Ctrl+Shift+C → toggle comparison mode.
                         if s.eq_ignore_ascii_case("c") {
@@ -4285,6 +5485,19 @@ pub fn App() -> Element {
                             state.write().active_session = first_id;
                         }
                     },
+                    // Task 22: manual mouse-based tab drag. The tab's
+                    // `onmousedown` (with primary button) calls this
+                    // handler, which hands off to `start_tab_drag`.
+                    // `start_tab_drag` sets the `tab_drag` signal (with
+                    // `dragging: false`) and installs the document-level
+                    // JS listeners. The polling `use_future`
+                    // (`_tab_drag_poll`) takes over from there — it
+                    // promotes `dragging` to `true` once the cursor
+                    // crosses the threshold, highlights the drop-target
+                    // pane, and calls `finish_tab_drag` on `mouseup`.
+                    on_drag_start: move |(sid, name, x, y): (String, String, f64, f64)| {
+                        start_tab_drag(tab_drag, sid, name, x, y);
+                    },
                 }
 
                 // Terminal content
@@ -4333,11 +5546,19 @@ pub fn App() -> Element {
                             // zoom mode actually work: the user's active tab
                             // is `sid`, but the visible content is the zoomed
                             // pane's session.
+                            //
+                            // We wrap `render_terminal_pane` in
+                            // `single_pane_with_drop` so that drag-drop from
+                            // the tab bar / sidebar still works in the
+                            // single-pane path (Task 19: drag a background
+                            // tab onto the active pane to create a split).
+                            // Without the wrapper, drops go nowhere because
+                            // `render_terminal_pane` has no drop handlers.
                             let render_sid = layout_snapshot.as_ref()
                                 .and_then(|l| l.zoomed)
                                 .and_then(|idx| layout_snapshot.as_ref()?.panes.get(idx).map(|p| p.session_id.clone()))
                                 .unwrap_or(sid);
-                            render_terminal_pane(state, input_senders, render_sid)
+                            single_pane_with_drop(state, input_senders, render_sid, drag_over_pane)
                         }
                         (Some(_sid), true) => {
                             // Multi-pane path: iterate over visible panes and
@@ -4346,10 +5567,44 @@ pub fn App() -> Element {
                             // between panes to support drag-resize.
                             let layout = layout_snapshot.expect("is_multi implies layout exists");
                             rsx! {
-                                {multi_pane_container(state, input_senders, layout, drag_over_pane, container_size, split_drag)}
+                                {multi_pane_container(state, input_senders, layout, drag_over_pane, container_size, split_drag, tab_drag)}
                             }
                         }
                     }}
+
+                    // Task 22: tab-drag ghost element. While a tab drag is
+                    // active AND the cursor has crossed the threshold (i.e.
+                    // it's a real drag, not a click), render a small floating
+                    // div following the cursor showing the dragged session's
+                    // name. `pointer-events: none` so it never intercepts
+                    // mouse events (the document-level JS listeners handle
+                    // those). Sits at z-index 9999 so it's above panes and
+                    // splitters.
+                    {tab_drag().map(|drag| {
+                        if !drag.dragging {
+                            return rsx! {};
+                        }
+                        let ghost_x = drag.cur_x + 12.0;
+                        let ghost_y = drag.cur_y + 14.0;
+                        let ghost_name = drag.session_name.clone();
+                        rsx! {
+                            div {
+                                key: "tab-drag-ghost-{ghost_x}-{ghost_y}",
+                                style: format!(
+                                    "position: fixed; left: {ghost_x}px; top: {ghost_y}px; \
+                                     pointer-events: none; z-index: 9999; \
+                                     background: #24283b; border: 1px solid #7aa2f7; \
+                                     padding: 4px 8px; border-radius: 4px; \
+                                     font-size: 12px; color: #c0caf5; \
+                                     box-shadow: 0 2px 8px rgba(0,0,0,0.4); \
+                                     user-select: none; -webkit-user-select: none;",
+                                    ghost_x = ghost_x,
+                                    ghost_y = ghost_y,
+                                ),
+                                "{ghost_name}"
+                            }
+                        }
+                    })}
 
                     // AI panel overlay
                     AiPanel {
@@ -4440,6 +5695,10 @@ pub fn App() -> Element {
                                 if let Some(p) = next {
                                     tracing::info!("[LAYOUT] cycled to {:?}", p);
                                 }
+                                // Restore focus to the active session's input
+                                // div after layout preset change — see the
+                                // hotkey handler above for why.
+                                restore_focus_to_active_session(state, 100);
                             },
                             title: "Cycle pane layout (1 → 2H → 2V → 4 → 8 → 1)",
                             "Layout: {layout_label(state.read().layout_preset)}"
@@ -5243,5 +6502,886 @@ mod prompt_tests {
     fn custom_prompt_with_bare_greater_than() {
         // Python REPL, custom PS1="> ", mysql, etc.
         assert_eq!(strip_prompt("> SELECT 1"), "SELECT 1");
+    }
+}
+
+/// Tests for the splitter drag-resize signal flow.
+///
+/// These tests cover the pure computation extracted into
+/// `compute_split_drag_delta` — the function that decides, given the current
+/// drag state and a new viewport-relative mouse position, whether to apply
+/// a resize step and what fractional delta to apply. The full signal flow
+/// (`apply_split_drag_step` mutating `Signal<Option<SplitDragState>>` and
+/// calling `resize_layout_col`/`resize_layout_row`) requires the dioxus
+/// runtime and a live `AppState`, so it's exercised end-to-end via the
+/// `drag_*_splitter_*` tests in `layout.rs` (which verify the resize math
+/// + clamping behaviour that this function feeds into).
+///
+/// What these tests verify that the layout tests don't:
+///  - The viewport-coordinate fix: `last_applied_pos` is viewport-relative
+///    (matching `e.client_coordinates()`), NOT container-relative. A drag
+///    that starts at viewport-x=700 (because the sidebar is 200px wide and
+///    the splitter is at container-x=500) must compute deltas from 700, not
+///    from 500 — otherwise the first mousemove would jump by 200px.
+///  - The duplicate-event suppression: `pos == last_applied_pos` returns
+///    `None` (no-op), so duplicate mousemove events between frames don't
+///    cause redundant layout writes.
+///  - The zero-extent guard: if `container_extent` is 0 (shouldn't happen
+///    in practice but the overlay guards against it), the function returns
+///    `None` rather than dividing by zero.
+///  - Direction change: a drag that reverses direction (rightward then
+///    leftward) produces deltas with the correct sign.
+#[cfg(test)]
+mod split_drag_tests {
+    use super::{SplitDragState, compute_split_drag_delta};
+
+    /// A col drag started at viewport-x=700 (sidebar 200px + splitter at
+    /// container-x=500). The first mousemove is also at viewport-x=700 —
+    /// must be a no-op (None) to suppress duplicate events.
+    #[test]
+    fn duplicate_mousemove_is_noop() {
+        let drag = SplitDragState {
+            is_col: true,
+            idx: 0,
+            container_extent: 1000.0,
+            last_applied_pos: 700.0,
+        };
+        assert_eq!(compute_split_drag_delta(&drag, 700.0), None);
+    }
+
+    /// A col drag started at viewport-x=700. The first real mousemove is at
+    /// viewport-x=710 (10px rightward). With container_w=1000, the
+    /// fractional delta should be +0.01.
+    #[test]
+    fn first_mousemove_computes_correct_delta() {
+        let drag = SplitDragState {
+            is_col: true,
+            idx: 0,
+            container_extent: 1000.0,
+            last_applied_pos: 700.0,
+        };
+        assert_eq!(compute_split_drag_delta(&drag, 710.0), Some(0.01));
+    }
+
+    /// Viewport-coordinate fix: if the drag started at viewport-x=700
+    /// (because the sidebar is 200px wide and the splitter is at
+    /// container-x=500), the first mousemove at viewport-x=710 must
+    /// compute delta from 700 (not from 500). This is the regression test
+    /// for the prior bug where `last_applied_pos` was initialized to the
+    /// container-relative splitter position, causing a 200px initial jump.
+    #[test]
+    fn viewport_coordinate_no_initial_jump() {
+        let drag = SplitDragState {
+            is_col: true,
+            idx: 0,
+            container_extent: 1000.0,
+            // Viewport-relative start, NOT container-relative (500).
+            last_applied_pos: 700.0,
+        };
+        // 10px rightward in viewport space.
+        let delta = compute_split_drag_delta(&drag, 710.0).unwrap();
+        assert!(
+            (delta - 0.01).abs() < 1e-9,
+            "expected +0.01 delta, got {} — if this is +0.21, the drag is\n\
+             using container-relative coordinates and jumping by the sidebar\n\
+             width on the first mousemove",
+            delta
+        );
+    }
+
+    /// Direction reversal: drag rightward, then leftward. The delta sign
+    /// must flip correctly.
+    #[test]
+    fn direction_reversal_flips_delta_sign() {
+        let mut drag = SplitDragState {
+            is_col: true,
+            idx: 0,
+            container_extent: 1000.0,
+            last_applied_pos: 700.0,
+        };
+        // Rightward: 700 → 710 → 720.
+        assert_eq!(compute_split_drag_delta(&drag, 710.0), Some(0.01));
+        drag.last_applied_pos = 710.0;
+        assert_eq!(compute_split_drag_delta(&drag, 720.0), Some(0.01));
+        drag.last_applied_pos = 720.0;
+        // Leftward: 720 → 710.
+        assert_eq!(compute_split_drag_delta(&drag, 710.0), Some(-0.01));
+    }
+
+    /// Zero container extent: must return None (not panic with divide-by-zero).
+    #[test]
+    fn zero_container_extent_is_noop() {
+        let drag = SplitDragState {
+            is_col: true,
+            idx: 0,
+            container_extent: 0.0,
+            last_applied_pos: 700.0,
+        };
+        assert_eq!(compute_split_drag_delta(&drag, 710.0), None);
+    }
+
+    /// Row drag: same logic but with viewport-y coordinates.
+    #[test]
+    fn row_drag_computes_delta() {
+        let drag = SplitDragState {
+            is_col: false,
+            idx: 0,
+            container_extent: 800.0,
+            last_applied_pos: 500.0,
+        };
+        // 10px downward in viewport space.
+        assert_eq!(compute_split_drag_delta(&drag, 510.0), Some(0.0125));
+    }
+
+    /// A full drag sequence: mousedown at viewport-x=700, 5 mousemoves of
+    /// 10px each rightward, then mouseup. Each step's delta should be +0.01
+    /// and `last_applied_pos` should track the current position. The
+    /// cumulative fractional delta is +0.05 (5 * 0.01).
+    ///
+    /// This mirrors the `drag_col_splitter_rightward_in_small_increments`
+    /// test in `layout.rs` but exercises the viewport-coordinate path
+    /// explicitly.
+    #[test]
+    fn full_drag_sequence_viewport_coordinates() {
+        let mut drag = SplitDragState {
+            is_col: true,
+            idx: 0,
+            container_extent: 1000.0,
+            last_applied_pos: 700.0,
+        };
+        let mut total_frac = 0.0_f64;
+        for step in 1..=5 {
+            let pos = 700.0 + (step as f64) * 10.0;
+            let frac = compute_split_drag_delta(&drag, pos).unwrap();
+            assert!(
+                (frac - 0.01).abs() < 1e-9,
+                "step {}: expected +0.01 delta, got {}",
+                step,
+                frac
+            );
+            total_frac += frac;
+            drag.last_applied_pos = pos;
+        }
+        assert!(
+            (total_frac - 0.05).abs() < 1e-9,
+            "cumulative delta should be +0.05, got {}",
+            total_frac
+        );
+    }
+
+    /// Verify that `end_split_drag`'s focus-restore script targets the
+    /// `terminal-input-{session_id}` element. We can't run the spawn'd
+    /// future in a unit test (no dioxus runtime), but we can verify the
+    /// element-id convention by checking that the format string the
+    /// terminal renders matches what `end_split_drag` would look up.
+    ///
+    /// This is a regression guard for the "分屏后无法输入" bug: if either
+    /// side of the contract changes (the terminal input div's id OR the
+    /// focus-restore script's id format), this test fails.
+    #[test]
+    fn focus_restore_script_targets_correct_element_id() {
+        // The id format the terminal input div uses (see terminal_view.rs).
+        let session_id = "abc-123";
+        let terminal_input_id = format!("terminal-input-{}", session_id);
+        // The id format `end_split_drag` looks up.
+        let focus_script = format!(
+            "document.getElementById('terminal-input-{}')?.focus()",
+            session_id
+        );
+        assert!(
+            focus_script.contains(&terminal_input_id),
+            "focus script `{}` does not look up `{}` — the splitter drag\n\
+             end-handler and the terminal input div use different id formats,\n\
+             so focus restore after drag will silently fail (the element won't\n\
+             be found). This is the root cause of \"分屏后无法输入\".",
+            focus_script,
+            terminal_input_id
+        );
+    }
+}
+
+/// Tests for the JS-bridge-based splitter drag-resize mechanism.
+///
+/// These tests verify the pure string-building and string-parsing functions
+/// that the JS bridge uses (`build_install_split_drag_script` and
+/// `parse_split_drag_poll_response`). The full async flow
+/// (`install_split_drag_js_listeners` → `poll_split_drag_state` →
+/// `apply_split_drag_step`) requires the dioxus runtime and a live webview,
+/// so it's not unit-tested here — the pure functions are the parts most
+/// likely to silently break (a typo in the JS script would install broken
+/// listeners; a parse bug would mis-read mouse positions).
+#[cfg(test)]
+mod split_drag_js_tests {
+    use super::{build_install_split_drag_script, parse_split_drag_poll_response};
+
+    /// The install script must initialize `__rusterm_drag_pos` to the starting
+    /// mouse position. If this is missing, the first poll would read an empty
+    /// string and the first delta would be wrong.
+    #[test]
+    fn install_script_initializes_drag_pos() {
+        let script = build_install_split_drag_script(123.4, 567.8);
+        assert!(
+            script.contains("window.__rusterm_drag_pos = '123.4,567.8'"),
+            "install script must initialize __rusterm_drag_pos to the starting\n\
+             mouse position; got: {}",
+            script
+        );
+    }
+
+    /// The install script must clear `__rusterm_drag_done` at startup so a
+    /// stale `true` from a prior drag doesn't immediately end the new drag.
+    #[test]
+    fn install_script_clears_done_flag() {
+        let script = build_install_split_drag_script(100.0, 200.0);
+        assert!(
+            script.contains("window.__rusterm_drag_done = false"),
+            "install script must clear __rusterm_drag_done at startup; got: {}",
+            script
+        );
+    }
+
+    /// The install script must attach BOTH `mousemove` and `mouseup` listeners
+    /// at the DOCUMENT level with `useCapture: true`. Element-level listeners
+    /// don't fire reliably during a button-held drag in dioxus 0.7's desktop
+    /// webview — this is the root cause of the prior fix failures.
+    #[test]
+    fn install_script_uses_document_capture_phase() {
+        let script = build_install_split_drag_script(100.0, 200.0);
+        assert!(
+            script.contains("document.addEventListener('mousemove', moveHandler, true)"),
+            "install script must use document.addEventListener with capture=true\n\
+             for mousemove; got: {}",
+            script
+        );
+        assert!(
+            script.contains("document.addEventListener('mouseup', upHandler, true)"),
+            "install script must use document.addEventListener with capture=true\n\
+             for mouseup; got: {}",
+            script
+        );
+    }
+
+    /// The install script must set `__rusterm_drag_done = true` on mouseup.
+    /// This is how the polling use_future knows to call `end_split_drag`.
+    #[test]
+    fn install_script_sets_done_on_mouseup() {
+        let script = build_install_split_drag_script(100.0, 200.0);
+        assert!(
+            script.contains("window.__rusterm_drag_done = true"),
+            "install script's upHandler must set __rusterm_drag_done = true;\n\
+             got: {}",
+            script
+        );
+    }
+
+    /// The install script must store a `_rusterm_split_drag_remove` function
+    /// so `end_split_drag` can clean up the listeners after the drag ends.
+    /// Without this, listeners would leak across drags.
+    #[test]
+    fn install_script_stores_remove_function() {
+        let script = build_install_split_drag_script(100.0, 200.0);
+        assert!(
+            script.contains("window._rusterm_split_drag_remove = function"),
+            "install script must store _rusterm_split_drag_remove; got: {}",
+            script
+        );
+        assert!(
+            script.contains("document.removeEventListener('mousemove'")
+                && script.contains("document.removeEventListener('mouseup'"),
+            "_rusterm_split_drag_remove must remove both listeners; got: {}",
+            script
+        );
+    }
+
+    /// The install script must be an IIFE (immediately-invoked function
+    /// expression) so the listeners attach synchronously when `eval` dispatches
+    /// the script. If the script just defines a function without calling it,
+    /// the listeners would never attach.
+    #[test]
+    fn install_script_is_iife() {
+        let script = build_install_split_drag_script(100.0, 200.0);
+        assert!(
+            script.starts_with("(function() {"),
+            "install script must start with an IIFE opening; got: {}",
+            script
+        );
+        // The script must end with the IIFE invocation `})()` — but we
+        // can't put that literal in a format string (the `}` would close
+        // the format), so we check for the components separately.
+        let trimmed = script.trim_end();
+        assert!(
+            trimmed.ends_with(")()"),
+            "install script must end with `)()` (the IIFE invocation); got: {}",
+            script
+        );
+        assert!(
+            trimmed.contains("})"),
+            "install script must contain close-paren-brace (closing the function body); got: {}",
+            script
+        );
+    }
+
+    /// The install script must call `preventDefault()` on mousemove and
+    /// mouseup to stop the browser from initiating text selection or other
+    /// default actions during the drag.
+    #[test]
+    fn install_script_prevents_default() {
+        let script = build_install_split_drag_script(100.0, 200.0);
+        // Two preventDefault calls — one in moveHandler, one in upHandler.
+        let count = script.matches("e.preventDefault()").count();
+        assert_eq!(
+            count, 2,
+            "install script must call preventDefault in both moveHandler and\n\
+             upHandler; found {} calls; got: {}",
+            count, script
+        );
+    }
+
+    /// The install script must call `_rusterm_split_drag_remove()` from the
+    /// upHandler so the listeners remove themselves on mouseup (not just rely
+    /// on `end_split_drag`'s separate cleanup spawn). This ensures no stale
+    /// mousemove events fire after the drag ends.
+    #[test]
+    fn install_script_self_removes_on_mouseup() {
+        let script = build_install_split_drag_script(100.0, 200.0);
+        assert!(
+            script.contains("if (window._rusterm_split_drag_remove) { window._rusterm_split_drag_remove(); window._rusterm_split_drag_remove = null; }"),
+            "upHandler must call _rusterm_split_drag_remove and null it out;\n\
+             got: {}",
+            script
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // parse_split_drag_poll_response tests
+    // ------------------------------------------------------------------
+
+    /// Normal case: parse a valid "x,y,0" response (drag in progress).
+    #[test]
+    fn parse_valid_in_progress_response() {
+        let result = parse_split_drag_poll_response("123.4,567.8,0").unwrap();
+        assert_eq!(result, (123.4, 567.8, false));
+    }
+
+    /// Normal case: parse a valid "x,y,1" response (drag done).
+    #[test]
+    fn parse_valid_done_response() {
+        let result = parse_split_drag_poll_response("100.0,200.0,1").unwrap();
+        assert_eq!(result, (100.0, 200.0, true));
+    }
+
+    /// Empty string: returns None (no globals set yet).
+    #[test]
+    fn parse_empty_returns_none() {
+        assert_eq!(parse_split_drag_poll_response(""), None);
+    }
+
+    /// Malformed: only 2 parts (missing done flag). Returns None.
+    #[test]
+    fn parse_missing_done_flag_returns_none() {
+        assert_eq!(parse_split_drag_poll_response("100.0,200.0"), None);
+    }
+
+    /// Malformed: non-numeric x. Returns None.
+    #[test]
+    fn parse_non_numeric_x_returns_none() {
+        assert_eq!(parse_split_drag_poll_response("abc,200.0,0"), None);
+    }
+
+    /// Malformed: non-numeric y. Returns None.
+    #[test]
+    fn parse_non_numeric_y_returns_none() {
+        assert_eq!(parse_split_drag_poll_response("100.0,xyz,0"), None);
+    }
+
+    /// Edge case: negative coordinates (mouse outside viewport top-left).
+    /// Should parse correctly — the math handles negative deltas.
+    #[test]
+    fn parse_negative_coordinates() {
+        let result = parse_split_drag_poll_response("-10.5,-20.0,0").unwrap();
+        assert_eq!(result, (-10.5, -20.0, false));
+    }
+
+    /// Edge case: integer coordinates (no decimal point). Should parse.
+    #[test]
+    fn parse_integer_coordinates() {
+        let result = parse_split_drag_poll_response("100,200,0").unwrap();
+        assert_eq!(result, (100.0, 200.0, false));
+    }
+
+    /// Edge case: done flag is "1" (true). Other truthy strings like
+    /// "true" should NOT be treated as true — only "1" counts. This is
+    /// a contract guard: if the JS side ever changes the format, this test
+    /// fails loudly.
+    #[test]
+    fn parse_done_flag_only_accepts_one() {
+        assert_eq!(
+            parse_split_drag_poll_response("100.0,200.0,true"),
+            Some((100.0, 200.0, false)),
+            "parse_split_drag_poll_response should only treat '1' as true"
+        );
+    }
+
+    /// Round-trip: build an install script, verify it initializes the globals
+    /// to the expected values, then verify the poll-response parser correctly
+    /// parses a response that the JS would produce. This is a sanity check
+    /// that the two halves of the bridge agree on the data format.
+    #[test]
+    fn js_bridge_round_trip_format_consistency() {
+        // The install script initializes __rusterm_drag_pos to "x,y" (no done flag).
+        let script = build_install_split_drag_script(500.0, 300.0);
+        assert!(
+            script.contains("'500,300'"),
+            "install script must initialize __rusterm_drag_pos to '500,300'\n\
+             (matching the x,y format the poll parser expects); got: {}",
+            script
+        );
+        // The poll parser expects "x,y,done" — three comma-separated parts.
+        // The install script's format "x,y" (two parts) is what the JS writes
+        // to __rusterm_drag_pos; the poll JS appends ",done" to make three.
+        let parsed = parse_split_drag_poll_response("500,300,0").unwrap();
+        assert_eq!(parsed, (500.0, 300.0, false));
+    }
+}
+
+/// Task 22 — tests for the manual mouse-based tab drag system. Mirrors
+/// `split_drag_js_tests` in structure: the pure helpers
+/// (`tab_drag_threshold_exceeded`, `build_install_tab_drag_script`,
+/// `parse_tab_drag_poll_response`, `hit_test_pane_at`) are unit-tested
+/// without a dioxus runtime. The signal-mutating wrappers
+/// (`start_tab_drag`, `finish_tab_drag`, `install_tab_drag_js_listeners`,
+/// `poll_tab_drag_state`) can't be unit-tested (they require the desktop
+/// runtime + webview).
+#[cfg(test)]
+mod tab_drag_tests {
+    use super::{
+        TAB_DRAG_THRESHOLD, build_install_tab_drag_script, hit_test_pane_at,
+        parse_tab_drag_poll_response, tab_drag_threshold_exceeded,
+    };
+    use crate::layout::{LayoutPreset, PaneLayout};
+
+    // ------------------------------------------------------------------
+    // tab_drag_threshold_exceeded tests
+    // ------------------------------------------------------------------
+
+    /// A mousemove below the threshold (within ~5px of the start) is
+    /// NOT a drag — it's a click with jitter.
+    #[test]
+    fn threshold_below_is_not_a_drag() {
+        // 5px right, 0px down — distance 5px < TAB_DRAG_THRESHOLD (6.0).
+        assert!(!tab_drag_threshold_exceeded(100.0, 100.0, 105.0, 100.0));
+    }
+
+    /// A mousemove above the threshold (>6px from the start) IS a drag.
+    #[test]
+    fn threshold_above_is_a_drag() {
+        // 7px right, 0px down — distance 7px > TAB_DRAG_THRESHOLD (6.0).
+        assert!(tab_drag_threshold_exceeded(100.0, 100.0, 107.0, 100.0));
+    }
+
+    /// The threshold is EUCLIDEAN (diagonal counts).
+    #[test]
+    fn threshold_is_euclidean() {
+        // 4px right + 4px down = sqrt(32) ≈ 5.66px < 6.0 → not a drag.
+        assert!(!tab_drag_threshold_exceeded(100.0, 100.0, 104.0, 104.0));
+        // 5px right + 5px down = sqrt(50) ≈ 7.07px > 6.0 → drag.
+        assert!(tab_drag_threshold_exceeded(100.0, 100.0, 105.0, 105.0));
+    }
+
+    /// The threshold constant is exactly 6.0 (sanity).
+    #[test]
+    fn threshold_constant_is_six() {
+        assert_eq!(TAB_DRAG_THRESHOLD, 6.0);
+    }
+
+    // ------------------------------------------------------------------
+    // build_install_tab_drag_script tests
+    // ------------------------------------------------------------------
+
+    /// The install script must initialize `__rusterm_tab_drag_pos` to the
+    /// starting mouse position. If this is missing, the first poll would
+    /// read an empty string and the threshold check would be wrong.
+    #[test]
+    fn tab_drag_install_script_initializes_pos() {
+        let script = build_install_tab_drag_script(123.4, 567.8);
+        assert!(
+            script.contains("window.__rusterm_tab_drag_pos = '123.4,567.8'"),
+            "install script must initialize __rusterm_tab_drag_pos to '123.4,567.8'; got: {}",
+            script
+        );
+    }
+
+    /// The install script must clear the `__rusterm_tab_drag_done` flag
+    /// at install time. Without this, a stale `done=true` from a prior
+    /// drag would make the polling loop think the drag is already over.
+    #[test]
+    fn tab_drag_install_script_clears_done_flag() {
+        let script = build_install_tab_drag_script(100.0, 200.0);
+        assert!(
+            script.contains("window.__rusterm_tab_drag_done = false"),
+            "install script must clear __rusterm_tab_drag_done; got: {}",
+            script
+        );
+    }
+
+    /// The install script must be an IIFE (immediately-invoked function
+    /// expression) so it runs synchronously when `eval` dispatches it.
+    #[test]
+    fn tab_drag_install_script_is_iife() {
+        let script = build_install_tab_drag_script(100.0, 200.0);
+        assert!(
+            script.starts_with("(function() {"),
+            "install script must be an IIFE starting with '(function() {{'; got: {}",
+            script
+        );
+        assert!(
+            script.trim_end().ends_with("})()"),
+            "install script must end with '}}()'; got: {}",
+            script
+        );
+    }
+
+    /// The install script must use CAPTURE-PHASE document listeners
+    /// (third arg `true` to `addEventListener`). This is the same
+    /// pattern as the splitter drag and is the ONLY mechanism that
+    /// works reliably in dioxus 0.7's desktop webview.
+    #[test]
+    fn tab_drag_install_script_uses_capture_phase() {
+        let script = build_install_tab_drag_script(100.0, 200.0);
+        assert!(
+            script.contains("document.addEventListener('mousemove', moveHandler, true)"),
+            "install script must use capture-phase mousemove listener; got: {}",
+            script
+        );
+        assert!(
+            script.contains("document.addEventListener('mouseup', upHandler, true)"),
+            "install script must use capture-phase mouseup listener; got: {}",
+            script
+        );
+    }
+
+    /// The install script must store a `_rusterm_tab_drag_remove` function
+    /// on `window` so `finish_tab_drag` can remove the listeners later
+    /// (idempotent cleanup).
+    #[test]
+    fn tab_drag_install_script_stores_remove_function() {
+        let script = build_install_tab_drag_script(100.0, 200.0);
+        assert!(
+            script.contains("window._rusterm_tab_drag_remove = function() {"),
+            "install script must store _rusterm_tab_drag_remove; got: {}",
+            script
+        );
+        assert!(
+            script.contains("document.removeEventListener('mousemove', moveHandler, true)"),
+            "remove function must remove mousemove listener; got: {}",
+            script
+        );
+    }
+
+    /// The install script's `upHandler` must RECORD THE FINAL MOUSE
+    /// POSITION (not just set the done flag). This is the KEY difference
+    /// from the splitter drag's `upHandler` — a tab drop needs the release
+    /// coordinates for hit-testing. Without this, the polling loop would
+    /// hit-test the second-to-last mousemove position, missing the final
+    /// release point.
+    #[test]
+    fn tab_drag_install_script_uphandler_records_position() {
+        let script = build_install_tab_drag_script(100.0, 200.0);
+        // The upHandler must write to __rusterm_tab_drag_pos BEFORE
+        // setting done=true. (Otherwise the poll that reads done=true
+        // would hit-test a stale position.)
+        let up_handler_start = script.find("var upHandler = function(e)").unwrap();
+        let up_handler_region = &script[up_handler_start..];
+        let up_handler_end = up_handler_region
+            .find("};\n")
+            .or_else(|| up_handler_region.find("};\r\n"))
+            .unwrap_or(up_handler_region.len());
+        let up_handler = &up_handler_region[..up_handler_end];
+        assert!(
+            up_handler.contains("window.__rusterm_tab_drag_pos = e.clientX + ',' + e.clientY;"),
+            "upHandler must record final mouse position; got: {}",
+            up_handler
+        );
+        assert!(
+            up_handler.contains("window.__rusterm_tab_drag_done = true"),
+            "upHandler must set done flag; got: {}",
+            up_handler
+        );
+    }
+
+    /// The install script must capture the `#terminal-content` container's
+    /// `getBoundingClientRect()` at install time and stash it in
+    /// `__rusterm_tab_drag_container_left/top`. The polling loop reads
+    /// these to convert viewport-relative cursor coordinates into
+    /// container-relative coordinates for hit-testing.
+    #[test]
+    fn tab_drag_install_script_captures_container_offset() {
+        let script = build_install_tab_drag_script(100.0, 200.0);
+        assert!(
+            script.contains("document.getElementById('terminal-content')"),
+            "install script must look up #terminal-content; got: {}",
+            script
+        );
+        assert!(
+            script.contains("window.__rusterm_tab_drag_container_left = r.left"),
+            "install script must capture container left; got: {}",
+            script
+        );
+        assert!(
+            script.contains("window.__rusterm_tab_drag_container_top = r.top"),
+            "install script must capture container top; got: {}",
+            script
+        );
+    }
+
+    /// The install script must remove any previously-installed listeners
+    /// BEFORE installing new ones (idempotent — prevents double-install
+    /// if a drag is somehow started while another is still active).
+    #[test]
+    fn tab_drag_install_script_removes_prior_listeners() {
+        let script = build_install_tab_drag_script(100.0, 200.0);
+        let remove_call_pos = script.find("if (window._rusterm_tab_drag_remove)").unwrap();
+        let add_listener_pos = script
+            .find("document.addEventListener('mousemove'")
+            .unwrap();
+        assert!(
+            remove_call_pos < add_listener_pos,
+            "install script must remove prior listeners BEFORE adding new ones; \
+             remove_call_pos={}, add_listener_pos={}",
+            remove_call_pos,
+            add_listener_pos
+        );
+    }
+
+    /// The install script must NOT clobber the SPLITTER drag's globals
+    /// (`__rusterm_drag_pos`, `__rusterm_drag_done`). The two systems
+    /// use SEPARATE global variable names so they can't interfere.
+    #[test]
+    fn tab_drag_install_script_uses_separate_globals_from_splitter() {
+        let script = build_install_tab_drag_script(100.0, 200.0);
+        // Must NOT touch the splitter's globals.
+        assert!(
+            !script.contains("__rusterm_drag_pos"),
+            "tab drag script must NOT touch splitter's __rusterm_drag_pos; got: {}",
+            script
+        );
+        assert!(
+            !script.contains("__rusterm_drag_done"),
+            "tab drag script must NOT touch splitter's __rusterm_drag_done; got: {}",
+            script
+        );
+        assert!(
+            !script.contains("_rusterm_split_drag_remove"),
+            "tab drag script must NOT touch splitter's _rusterm_split_drag_remove; got: {}",
+            script
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // parse_tab_drag_poll_response tests
+    // ------------------------------------------------------------------
+
+    /// A valid in-progress response (done=0) parses correctly.
+    #[test]
+    fn tab_drag_parse_valid_in_progress_response() {
+        // x, y, done, container_left, container_top
+        let result = parse_tab_drag_poll_response("123.4,567.8,0,80.0,60.0").unwrap();
+        assert_eq!(result, (123.4, 567.8, false, 80.0, 60.0));
+    }
+
+    /// A valid done response (done=1) parses correctly.
+    #[test]
+    fn tab_drag_parse_valid_done_response() {
+        let result = parse_tab_drag_poll_response("100.0,200.0,1,80.0,60.0").unwrap();
+        assert_eq!(result, (100.0, 200.0, true, 80.0, 60.0));
+    }
+
+    /// An empty response (globals not set yet) returns `None`.
+    #[test]
+    fn tab_drag_parse_empty_returns_none() {
+        assert_eq!(parse_tab_drag_poll_response(""), None);
+    }
+
+    /// A response with too few fields returns `None` (defensive against
+    /// a stale `tab_drag` signal after the listeners were removed).
+    #[test]
+    fn tab_drag_parse_too_few_fields_returns_none() {
+        // Only x, y, done — missing container_left/top.
+        assert_eq!(parse_tab_drag_poll_response("100.0,200.0,0"), None);
+        // Only x, y.
+        assert_eq!(parse_tab_drag_poll_response("100.0,200.0"), None);
+        // Only x.
+        assert_eq!(parse_tab_drag_poll_response("100.0"), None);
+    }
+
+    /// A response with too many fields returns `None` (defensive).
+    #[test]
+    fn tab_drag_parse_too_many_fields_returns_none() {
+        assert_eq!(parse_tab_drag_poll_response("1,2,3,4,5,6"), None);
+    }
+
+    /// A response with non-numeric coordinates returns `None`.
+    #[test]
+    fn tab_drag_parse_non_numeric_returns_none() {
+        assert_eq!(parse_tab_drag_poll_response("abc,def,0,80,60"), None);
+        assert_eq!(parse_tab_drag_poll_response("100.0,def,0,80,60"), None);
+    }
+
+    /// A response with negative coordinates parses correctly (the
+    /// cursor CAN be at negative viewport coordinates if the user
+    /// drags outside the window — the JS listeners keep firing).
+    #[test]
+    fn tab_drag_parse_negative_coordinates() {
+        let result = parse_tab_drag_poll_response("-50.0,-100.0,0,80.0,60.0").unwrap();
+        assert_eq!(result, (-50.0, -100.0, false, 80.0, 60.0));
+    }
+
+    /// A response with integer coordinates (no decimal point) parses
+    /// correctly — `f64::parse` handles both.
+    #[test]
+    fn tab_drag_parse_integer_coordinates() {
+        let result = parse_tab_drag_poll_response("100,200,0,80,60").unwrap();
+        assert_eq!(result, (100.0, 200.0, false, 80.0, 60.0));
+    }
+
+    /// A response with zero container offset parses correctly (e.g.,
+    /// if `#terminal-content` is at the viewport origin).
+    #[test]
+    fn tab_drag_parse_zero_container_offset() {
+        let result = parse_tab_drag_poll_response("100.0,200.0,0,0,0").unwrap();
+        assert_eq!(result, (100.0, 200.0, false, 0.0, 0.0));
+    }
+
+    // ------------------------------------------------------------------
+    // hit_test_pane_at tests
+    // ------------------------------------------------------------------
+
+    /// Cursor inside the container's only pane returns pane 0.
+    #[test]
+    fn hit_test_single_pane_returns_pane_zero() {
+        let layout = PaneLayout::from_preset(LayoutPreset::Single, &["alpha".to_string()]);
+        // Container at viewport (80, 60), size 1200x800. Cursor at
+        // viewport (640, 400) → container-relative (560, 340) → pane 0.
+        let hit = hit_test_pane_at(640.0, 400.0, 80.0, 60.0, 1200.0, 800.0, &layout);
+        assert_eq!(hit, Some((0, "alpha".to_string())));
+    }
+
+    /// Cursor outside the container (left of it) returns `None`.
+    #[test]
+    fn hit_test_outside_container_left_returns_none() {
+        let layout = PaneLayout::from_preset(LayoutPreset::Single, &["alpha".to_string()]);
+        // Container at viewport (80, 60). Cursor at (50, 400) is LEFT
+        // of the container (rel_x = -30).
+        let hit = hit_test_pane_at(50.0, 400.0, 80.0, 60.0, 1200.0, 800.0, &layout);
+        assert_eq!(hit, None);
+    }
+
+    /// Cursor outside the container (above it) returns `None`.
+    #[test]
+    fn hit_test_outside_container_above_returns_none() {
+        let layout = PaneLayout::from_preset(LayoutPreset::Single, &["alpha".to_string()]);
+        let hit = hit_test_pane_at(640.0, 30.0, 80.0, 60.0, 1200.0, 800.0, &layout);
+        assert_eq!(hit, None);
+    }
+
+    /// Cursor in the LEFT pane of a Split2H layout returns pane 0.
+    #[test]
+    fn hit_test_split2h_left_pane() {
+        let layout = PaneLayout::from_preset(
+            LayoutPreset::Split2H,
+            &["alpha".to_string(), "beta".to_string()],
+        );
+        // Container at (80, 60), size 1200x800. Split2H splits
+        // horizontally: pane 0 is left half (x: 0-600), pane 1 is
+        // right half (x: 600-1200). Cursor at viewport (340, 400) →
+        // container-relative (260, 340) → pane 0 (alpha).
+        let hit = hit_test_pane_at(340.0, 400.0, 80.0, 60.0, 1200.0, 800.0, &layout);
+        assert_eq!(hit, Some((0, "alpha".to_string())));
+    }
+
+    /// Cursor in the RIGHT pane of a Split2H layout returns pane 1.
+    #[test]
+    fn hit_test_split2h_right_pane() {
+        let layout = PaneLayout::from_preset(
+            LayoutPreset::Split2H,
+            &["alpha".to_string(), "beta".to_string()],
+        );
+        // Cursor at viewport (940, 400) → container-relative (860, 340)
+        // → pane 1 (beta).
+        let hit = hit_test_pane_at(940.0, 400.0, 80.0, 60.0, 1200.0, 800.0, &layout);
+        assert_eq!(hit, Some((1, "beta".to_string())));
+    }
+
+    /// Cursor on the EXACT boundary between two Split2H panes (x=600)
+    /// is treated as inside pane 1 (the right pane) because the hit-test
+    /// uses `rel_x >= px && rel_x < px + pw` — the left edge is inclusive,
+    /// the right edge is exclusive. This matches CSS's pixel-grid model.
+    #[test]
+    fn hit_test_split2h_boundary_goes_to_right_pane() {
+        let layout = PaneLayout::from_preset(
+            LayoutPreset::Split2H,
+            &["alpha".to_string(), "beta".to_string()],
+        );
+        // Cursor at viewport (680, 400) → container-relative (600, 340).
+        // Pane 0 spans [0, 600); pane 1 spans [600, 1200). x=600 → pane 1.
+        let hit = hit_test_pane_at(680.0, 400.0, 80.0, 60.0, 1200.0, 800.0, &layout);
+        assert_eq!(hit, Some((1, "beta".to_string())));
+    }
+
+    /// Cursor in a SPECIFIC pane of a Grid4 layout (top-right).
+    #[test]
+    fn hit_test_grid4_top_right_pane() {
+        let layout = PaneLayout::from_preset(
+            LayoutPreset::Grid4,
+            &[
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+            ],
+        );
+        // Grid4: 2x2. Pane 0 (a) top-left [0-600, 0-400],
+        // pane 1 (b) top-right [600-1200, 0-400],
+        // pane 2 (c) bottom-left [0-600, 400-800],
+        // pane 3 (d) bottom-right [600-1200, 400-800].
+        // Cursor at viewport (940, 200) → container-relative (860, 140)
+        // → pane 1 (b).
+        let hit = hit_test_pane_at(940.0, 200.0, 80.0, 60.0, 1200.0, 800.0, &layout);
+        assert_eq!(hit, Some((1, "b".to_string())));
+    }
+
+    /// Cursor in the BOTTOM-LEFT pane of a Grid4 layout.
+    #[test]
+    fn hit_test_grid4_bottom_left_pane() {
+        let layout = PaneLayout::from_preset(
+            LayoutPreset::Grid4,
+            &[
+                "a".to_string(),
+                "b".to_string(),
+                "c".to_string(),
+                "d".to_string(),
+            ],
+        );
+        // Cursor at viewport (340, 600) → container-relative (260, 540)
+        // → pane 2 (c).
+        let hit = hit_test_pane_at(340.0, 600.0, 80.0, 60.0, 1200.0, 800.0, &layout);
+        assert_eq!(hit, Some((2, "c".to_string())));
+    }
+
+    /// Cursor OUTSIDE all panes but INSIDE the container returns `None`.
+    /// In a Grid4 (which fills the container completely), this shouldn't
+    /// happen — but in a Split2H with the cursor exactly at the container's
+    /// right edge (x=1200, which is EXCLUSIVE), it would. Verify the
+    /// exclusive-right-edge behavior.
+    #[test]
+    fn hit_test_container_right_edge_is_exclusive() {
+        let layout = PaneLayout::from_preset(
+            LayoutPreset::Split2H,
+            &["alpha".to_string(), "beta".to_string()],
+        );
+        // Cursor at viewport (1280, 400) → container-relative (1200, 340).
+        // The container's right edge (x=1200) is exclusive (rel_x > cw).
+        let hit = hit_test_pane_at(1280.0, 400.0, 80.0, 60.0, 1200.0, 800.0, &layout);
+        assert_eq!(hit, None);
     }
 }

@@ -1,7 +1,12 @@
 use dioxus::prelude::*;
 
-use rusterm_core::session::SessionType;
 use crate::state::SessionTab;
+use rusterm_core::session::SessionType;
+
+// `MouseButton` lives in `dioxus::html::input_data` (not re-exported by
+// `dioxus::prelude::*`). Used by the tab's `onmousedown` handler to
+// filter for primary-button (left-click) drags only.
+use dioxus::html::input_data::MouseButton;
 
 fn session_type_color(kind: &SessionType) -> &'static str {
     match kind {
@@ -29,6 +34,20 @@ pub fn TabBar(
     active: Option<String>,
     on_select: EventHandler<String>,
     on_close: EventHandler<String>,
+    /// Manual mouse-based tab drag (Task 22). Fired on `mousedown` with
+    /// the primary button. The handler receives
+    /// `(session_id, session_name, client_x, client_y)` — the parent
+    /// (`App`) calls `start_tab_drag` to install the document-level JS
+    /// listeners + set the `tab_drag` signal. The polling `use_future`
+    /// in `App` takes over from there.
+    ///
+    /// Replaces the prior HTML5 `draggable: true` / `ondragstart` wiring
+    /// (Tasks 17/19), which was unreliable in dioxus 0.7's desktop
+    /// webview. Plain click-to-select still works: `onmousedown` sets
+    /// `tab_drag` with `dragging: false`; the polling loop only executes
+    /// a drop if the cursor crossed the threshold (i.e. it became a
+    /// real drag); `onclick` fires normally for non-drag clicks.
+    on_drag_start: EventHandler<(String, String, f64, f64)>,
 ) -> Element {
     let mut hover_tab = use_signal(|| None::<String>);
 
@@ -54,22 +73,23 @@ pub fn TabBar(
                     let tab_id = tab.id.clone();
                     let tab_id2 = tab.id.clone();
 
-                    // Clone the tab id for the dragstart handler. When
-                    // the user drags an open session tab, we stash its
-                    // session id in the DataTransfer under a custom
-                    // MIME type. The pane drop handler reads this to
-                    // know which open session to move/swap into the
-                    // target pane. We use a different MIME type than
-                    // the sidebar's "connection-id" so the drop
-                    // handler can distinguish "drag from tab bar"
-                    // (move existing session) from "drag from sidebar"
-                            // (open a new connection).
-                            let tab_id_for_drag = tab.id.clone();
+                    // Clone the tab id + name for the mousedown handler.
+                    // When the user presses the primary mouse button on
+                    // a tab, we hand off (session_id, session_name, x, y)
+                    // to the parent (`App`), which calls `start_tab_drag`
+                    // to set the `tab_drag` signal and install the
+                    // document-level JS listeners. The polling
+                    // `use_future` in `App` takes over from there.
+                    //
+                    // We do NOT set `draggable: true` — that would start
+                    // a native HTML5 drag alongside the manual system,
+                    // producing two ghosts and double-executing drops.
+                    let tab_id_for_drag = tab.id.clone();
+                    let tab_name_for_drag = tab.name.clone();
 
-                            rsx! {
+                    rsx! {
                         div {
                             key: "{tab.id}",
-                            draggable: true,
                             style: "
                                 display: flex;
                                 align-items: center;
@@ -86,24 +106,24 @@ pub fn TabBar(
                             onclick: move |_| {
                                 on_select.call(tab.id.clone());
                             },
+                            onmousedown: move |e: MouseEvent| {
+                                // Only start a drag on primary button
+                                // (left click). Middle/right clicks have
+                                // other semantics (middle-click close,
+                                // right-click context menu) and shouldn't
+                                // initiate a drag.
+                                if e.trigger_button() == Some(MouseButton::Primary) {
+                                    let c = e.client_coordinates();
+                                    on_drag_start.call((
+                                        tab_id_for_drag.clone(),
+                                        tab_name_for_drag.clone(),
+                                        c.x,
+                                        c.y,
+                                    ));
+                                }
+                            },
                             onmouseenter: move |_| hover_tab.set(Some(tab_id2.clone())),
                             onmouseleave: move |_| hover_tab.set(None),
-                            ondragstart: move |e: DragEvent| {
-                                let dt = e.data_transfer();
-                                let _ = dt.set_data(
-                                    "application/x-rusterm-session-id",
-                                    &tab_id_for_drag,
-                                );
-                                // "move" indicates that dropping will
-                                // move the session from one pane to
-                                // another (rather than copying it).
-                                dt.set_drop_effect("move");
-                                dt.set_effect_allowed("move");
-                                tracing::debug!(
-                                    "[DRAG] tab drag started: session={:?}",
-                                    &tab_id_for_drag[..tab_id_for_drag.len().min(8)]
-                                );
-                            },
 
                             // Type indicator dot
                             span {
@@ -129,6 +149,13 @@ pub fn TabBar(
                                         line-height: 1;
                                         flex-shrink: 0;
                                     ",
+                                    // Stop propagation on mousedown so the
+                                    // tab's `onmousedown` (which starts a
+                                    // drag) doesn't fire when the user is
+                                    // trying to close the tab.
+                                    onmousedown: move |e: MouseEvent| {
+                                        e.stop_propagation();
+                                    },
                                     onclick: move |e| {
                                         e.stop_propagation();
                                         on_close.call(tab_id.clone());

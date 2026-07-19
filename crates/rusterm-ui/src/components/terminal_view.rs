@@ -459,6 +459,7 @@ pub fn TerminalView(
     let current_disconnected = disconnected;
 
     let closure_suggestions = current_suggestions.clone();
+    let sid_for_keydown_log = session_id.clone();
     let handle_keydown = move |e: KeyboardEvent| {
         let key = e.key();
         let code = e.code();
@@ -467,6 +468,16 @@ pub fn TerminalView(
         let alt = mods.alt();
         let meta = mods.meta();
         let shift = mods.shift();
+        tracing::info!(
+            "[KEYDOWN] session={:?} key={:?} code={:?} ctrl={} alt={} meta={} shift={}",
+            &sid_for_keydown_log[..sid_for_keydown_log.len().min(8)],
+            key,
+            code,
+            ctrl,
+            alt,
+            meta,
+            shift
+        );
 
         if meta {
             return;
@@ -783,26 +794,66 @@ pub fn TerminalView(
     use_effect(move || {
         let focus_sid = sid_for_focus.clone();
         let cid = format!("terminal-input-{focus_sid}");
+        tracing::info!(
+            "[AUTOFOCUS] use_effect mounted for session={:?}",
+            &focus_sid[..focus_sid.len().min(8)]
+        );
         spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            let _ =
-                dioxus::document::eval(&format!("document.getElementById('{cid}')?.focus()")).await;
+            // Defensive: only focus if no other terminal-input-* element is
+            // already focused. This prevents multi-pane mount races where
+            // each TerminalView's use_effect fires and they all try to grab
+            // focus, with the last one winning (which may not be the active
+            // pane). By checking first, we ensure only the first-mounted
+            // pane grabs focus — which, in the split-from-single case, is
+            // the existing (active) pane.
+            //
+            // The check uses `document.activeElement` and matches by id
+            // prefix `terminal-input-` so any already-focused terminal input
+            // suppresses the auto-focus.
+            let check_and_focus = format!(
+                "return (function() {{
+                    const active = document.activeElement;
+                    if (active && active.id && active.id.indexOf('terminal-input-') === 0) {{
+                        return 'already-focused:' + active.id;
+                    }}
+                    const el = document.getElementById('{cid}');
+                    if (el) {{ el.focus(); return 'focused'; }}
+                    return 'not-found';
+                }})()"
+            );
+            let result = dioxus::document::eval(&check_and_focus).await;
+            tracing::info!("[AUTOFOCUS] check_and_focus #{} result={:?}", &cid, result);
         });
     });
 
     let sid_for_window_focus = session_id.clone();
     use_effect(move || {
         let cid = format!("terminal-input-{sid_for_window_focus}");
+        // Use a per-session global key on `window` (NOT on the element) so
+        // that re-mounts (which create a NEW element with the same id) can
+        // still find and remove the previous handlers. The prior approach
+        // stored handlers on `el._windowFocusHandler`, but when the element
+        // is replaced by dioxus on re-mount, the new element doesn't have
+        // the old handlers — so `removeEventListener` was a no-op and the
+        // old handlers leaked, piling up on every layout change. After N
+        // layout changes there'd be N stale focus handlers all trying to
+        // focus a removed element — causing focus races and lost input.
+        let handler_key = format!("_rusterm_focus_handler_{sid_for_window_focus}");
         let script = format!(
             r#"
             (function() {{
-                const el = document.getElementById('{cid}');
-                if (!el) return;
-                if (el._windowFocusHandler) {{
-                    window.removeEventListener('focus', el._windowFocusHandler);
-                    window.removeEventListener('blur', el._windowBlurHandler);
+                // Remove previous handlers for this session if they exist.
+                if (window['{handler_key}_focus']) {{
+                    window.removeEventListener('focus', window['{handler_key}_focus']);
+                    window.removeEventListener('blur', window['{handler_key}_blur']);
+                    delete window['{handler_key}_focus'];
+                    delete window['{handler_key}_blur'];
                 }}
-                el._windowFocusHandler = function() {{
+                const cid = '{cid}';
+                const focusHandler = function() {{
+                    const el = document.getElementById(cid);
+                    if (!el) return;
                     const active = document.activeElement;
                     const isInteractive = active && (
                         active.tagName === 'INPUT' || active.tagName === 'BUTTON' ||
@@ -811,13 +862,17 @@ pub fn TerminalView(
                     );
                     if (!isInteractive) el.focus();
                 }};
-                el._windowBlurHandler = function() {{
+                const blurHandler = function() {{
+                    const el = document.getElementById(cid);
+                    if (!el) return;
                     if (document.activeElement === el) el.blur();
                 }};
-                window.addEventListener('focus', el._windowFocusHandler);
-                window.addEventListener('blur', el._windowBlurHandler);
+                window['{handler_key}_focus'] = focusHandler;
+                window['{handler_key}_blur'] = blurHandler;
+                window.addEventListener('focus', focusHandler);
+                window.addEventListener('blur', blurHandler);
             }})()
-        "#
+            "#
         );
         spawn(async move {
             let _ = dioxus::document::eval(&script).await;
@@ -948,12 +1003,41 @@ pub fn TerminalView(
 
     let focus_container_id = container_id.clone();
     let onclick_focus = move |_| {
+        tracing::info!(
+            "[FOCUS] onclick_focus fired for session={:?}",
+            &focus_container_id[..focus_container_id.len().min(20)]
+        );
         focused.set(true);
         let cid = focus_container_id.clone();
         spawn(async move {
             let _ =
                 dioxus::document::eval(&format!("document.getElementById('{cid}')?.focus()")).await;
         });
+    };
+
+    // Right-click handler. We always prevent the browser's native context
+    // menu — the terminal owns right-click for its own affordances. When the
+    // session is disconnected, right-click triggers reconnect (mirrors the
+    // Enter-to-reconnect path in `handle_keydown`). When the session is live,
+    // right-click is silently swallowed; we intentionally do NOT show a
+    // custom menu here, because the existing copy/paste shortcuts
+    // (Ctrl+Shift+C / Ctrl+Shift+V) cover the common case and adding a popup
+    // would steal focus from the terminal input.
+    let reconnect_sid = session_id.clone();
+    let oncontextmenu_reconnect = move |e: MouseEvent| {
+        e.prevent_default();
+        if current_disconnected {
+            tracing::info!(
+                "[RECONNECT] right-click triggered for session={:?}",
+                &reconnect_sid[..reconnect_sid.len().min(8)]
+            );
+            on_reconnect.call(());
+        } else {
+            tracing::debug!(
+                "[RECONNECT] right-click ignored (session {:?} is live)",
+                &reconnect_sid[..reconnect_sid.len().min(8)]
+            );
+        }
     };
 
     // Gutter width is based on the STABLE maximum line number (scrollback
@@ -1063,6 +1147,7 @@ pub fn TerminalView(
             },
             tabindex: "0",
             onclick: onclick_focus,
+            oncontextmenu: oncontextmenu_reconnect,
             onfocus: move |_| focused.set(true),
             onblur: move |_| focused.set(false),
             onkeydown: handle_keydown,
