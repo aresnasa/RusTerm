@@ -85,27 +85,12 @@ impl ConfigManager {
     }
 
     fn resolve_config_path() -> Result<PathBuf> {
-        // 1. Override via environment variable
-        if let Ok(dir) = std::env::var("RUSTERM_CONFIG_DIR") {
-            let path = PathBuf::from(dir);
-            fs::create_dir_all(&path)
-                .context("Failed to create config dir from RUSTERM_CONFIG_DIR")?;
-            return Ok(path.join(CONFIG_FILE_NAME));
-        }
-
-        // 2. Next to the binary (primary location)
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(parent) = exe.parent() {
-                return Ok(parent.join(CONFIG_FILE_NAME));
-            }
-        }
-
-        // 3. Fallback: platform config dir
-        let config_dir = dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("rusterm");
-        fs::create_dir_all(&config_dir).context("Failed to create config dir")?;
-        Ok(config_dir.join(CONFIG_FILE_NAME))
+        // Delegate to the centralised path resolver. See
+        // `rusterm_core::paths` for the full resolution order and the
+        // rationale (short version: platform config dir is now the
+        // primary location so `cargo clean` doesn't wipe the user's
+        // saved connections during development).
+        crate::paths::resolve_config_file_path(CONFIG_FILE_NAME)
     }
 
     fn resolve_master_key() -> Result<[u8; 32]> {

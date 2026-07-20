@@ -3,6 +3,7 @@ pub mod config;
 pub mod config_manager;
 pub mod event;
 pub mod logging;
+pub mod paths;
 pub mod session;
 pub mod session_log;
 pub mod session_state;

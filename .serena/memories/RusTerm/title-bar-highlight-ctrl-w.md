@@ -535,3 +535,165 @@ let pane_actions = if sid.is_empty() {
 - `cargo test -p rusterm-ui --lib` → 331 passed
 - `cargo test -p rusterm-core --lib` → 100 passed
 - `git diff --check HEAD` → clean
+
+## `cargo run` warning cleanup (2026-07-20, follow-up)
+
+### Goal
+
+User pasted `cargo run` output showing two categories of warnings and asked to fix them:
+1. `warning: rusterm-app@0.1.0: Generated app icon PNG: ...` (3 lines from build.rs)
+2. `warning: the following packages contain code that will be rejected by a future version of Rust: block v0.1.6` (future-incompat lint)
+
+### Root causes
+
+- **App icon warnings**: `crates/rusterm-app/build.rs` emitted 3 `println!("cargo:warning=...")` lines for status logging (PNG/SVG/icns generation). These show up as `warning:` in cargo output despite being purely informational.
+- **`block v0.1.6` future-incompat**: The crate declares `enum Class { }` (uninhabited) and then `static _NSConcreteStackBlock: Class;` — an uninhabited static. Rust issue #74840 phases this out. `block` is unmaintained (last release 2018) and pulled in transitively via `cocoa v0.26.1` → `dioxus-desktop v0.7.9` → `dioxus v0.7.9`, so we can't upgrade it directly.
+
+### Fixes
+
+#### 1. Vendored `block` crate with minimal patch
+
+Created `third_party/block/` (copy of `block-0.1.6` from cargo registry) and added a `[patch.crates-io]` entry in the workspace `Cargo.toml`:
+
+```toml
+[patch.crates-io]
+block = { path = "third_party/block" }
+```
+
+Minimal source changes in `third_party/block/src/lib.rs`:
+- Replaced `enum Class { }` (uninhabited) with:
+  ```rust
+  #[repr(C)]
+  struct Class {
+      _opaque: [u8; 0],
+  }
+  ```
+  `Class` is only ever used as `*const Class` (pointer for identity comparison in `BlockBase.isa`), so a zero-sized inhabited struct with defined layout is semantically equivalent and silences both the `uninhabited_static` lint AND the `improper_ctypes` lint (which `PhantomData<()>`-only structs would trip).
+- Fixed two macro-generated deprecation warnings: `unsafe extern fn` → `unsafe extern "C" fn` in `block_args_impl!` and `concrete_block_impl!` macros (the original code predated Rust 2024's `unsafe_extern_blocks` requirement).
+
+#### 2. Build script status messages silenced
+
+In `crates/rusterm-app/build.rs`, replaced:
+```rust
+println!("cargo:warning=Generated app icon PNG: ...");
+```
+with:
+```rust
+eprintln!("[rusterm-app] generated app icon PNG: ...");
+```
+
+`eprintln!` writes to stderr (captured by cargo into `target/debug/build/<hash>/stderr` for diagnostics) but does NOT appear as a `warning:` line in the build summary. Status messages are still available if needed via `cat target/debug/build/rusterm-app-*/stderr`.
+
+### Validation
+
+- `cargo clean && cargo build --workspace` → clean, ZERO warnings, ZERO errors
+- `cargo build --workspace 2>&1 | grep -E "^warning:|^error:"` → no output (clean)
+- `cargo test -p rusterm-ui --lib` → 331 passed
+- `cargo test -p rusterm-core --lib` → 100 passed
+- App icon files still generated correctly:
+  - `target/debug/build/rusterm-app-*/out/icon.png` (63410 bytes)
+  - `target/debug/build/rusterm-app-*/out/assets/gemini-svg.svg` (4506 bytes)
+  - `target/debug/build/rusterm-app-*/out/AppIcon.icns` (285028 bytes)
+- `git status` → clean (changes auto-committed in `684a1aa`)
+
+### Pitfalls / gotchas
+
+- **Don't use `enum Class { }` (empty enum)** — uninhabited static triggers future-incompat lint #74840.
+- **Don't use `struct Class(PhantomData<()>)`** — even with `#[repr(transparent)]`, the `improper_ctypes` lint rejects `PhantomData`-only types in `extern "C"` blocks.
+- **`#[repr(C)] struct Class { _opaque: [u8; 0] }` is the right fix** — zero-sized, FFI-safe, defined layout, doesn't trip either lint.
+- **`cargo:warning=` is for actual warnings, not status logging** — use `eprintln!` for status messages that should appear in stderr but not in the warning summary.
+- **`[patch.crates-io]` requires the patched crate to have the same name+version** as the original. Our `third_party/block/Cargo.toml` keeps `name = "block"` and `version = "0.1.6"` to match.
+- **The patch is workspace-wide** — `[patch.crates-io]` in the workspace `Cargo.toml` applies to ALL workspace members and ALL transitive deps. There's no way to patch for just one consumer.
+
+## Session config local-reading + config path stability (2026-07-20)
+
+### Goal
+
+User asked: "配置会话时支持读取本地配置，这里可以提示相关路径而不是让用户必须输入，改造相关函数。本地配置需要存到一个默认位置，比如加目录的~/.config/rusterm/下，在 cargo clean 时不要删除已有的.config目录"
+
+Two related asks:
+1. The SSH connection dialog should read `~/.ssh/config` and `~/.ssh/id_*` and offer autocomplete suggestions + auto-fill instead of forcing the user to type everything.
+2. The app's own config (`settings.json`, `session_state.json`, `window_state.json`) should live at a stable platform location (`~/.config/rusterm/` on Linux, `~/Library/Application Support/rusterm/` on macOS) that survives `cargo clean`, NOT next to the binary (which gets wiped by `cargo clean` during development).
+
+### 1. New `rusterm-ssh::ssh_config` module
+
+`crates/rusterm-ssh/src/ssh_config.rs` (980 lines, 30 unit tests). Reads the user's local OpenSSH config and exposes a small, well-typed surface for the UI.
+
+**Public API** (re-exported from `rusterm-ssh`):
+- `list_ssh_config_hosts() -> Vec<SshHostSuggestion>` — parse `~/.ssh/config` (or `list_ssh_config_hosts_at(path)` for an arbitrary path) and return one `SshHostSuggestion` per `Host` directive with a **literal** alias (wildcards like `*` or `*.example.com` are skipped — they're pattern matchers, not selectable autocomplete entries). Multi-host `Host a b c` directives expand to one suggestion per alias.
+- `list_identity_files() -> Vec<String>` (or `list_identity_files_at(dir)`) — scan `~/.ssh/` for `id_*` private keys, returning **absolute** paths (tilde expanded). Excludes `.pub` files, `config`, `known_hosts`, `authorized_keys`, `environment`. Sorted lexically by filename for a stable suggestion list.
+- `lookup_host(alias, path) -> Option<ResolvedHost>` — two-step lookup: (1) check our own `list_ssh_config_hosts` to confirm the alias is a literal `Host` entry (returns `None` if not — we don't want to clobber the user's in-progress form with `russh-config`'s default values for a host that isn't in the config); (2) defer to `russh-config`'s `parse_path`/`parse_home` for the authoritative resolution (handles `Include`, `Match`, percent tokens). Returns `ResolvedHost { host, port, user, identity_file, proxy_jump }`.
+- `resolved_host_to_auth(&ResolvedHost) -> SshAuth` — convert to the `SshAuth` variant the rest of the codebase expects. `Some(identity_file)` → `SshAuth::Key { private_key_path, passphrase: None }`; `None` → `SshAuth::Agent` (OpenSSH convention: no `IdentityFile` means consult the agent).
+- `parse_ssh_config_text(contents) -> Vec<SshHostSuggestion>` — pure parser (no I/O), exposed for unit testing. Handles comments (full-line `#`/`;` and inline ` #`), case-insensitive keywords, tab/space indentation, multi-host directives, wildcard filtering, `IdentityFile` tilde expansion, `ProxyJump`. The first `IdentityFile` in a block wins (OpenSSH tries them in order). Unknown directives (Compression, ForwardAgent, etc.) are silently skipped.
+- `default_ssh_config_path() -> Option<PathBuf>` / `default_ssh_dir() -> Option<PathBuf>` — resolved paths for the UI hint display.
+- `is_wildcard_pattern(alias) -> bool`, `is_identity_file(name) -> bool`, `expand_tilde(path, home) -> String` — pure helpers, each unit-tested.
+
+**Why we don't use `russh-config` for `list_ssh_config_hosts`**: `russh-config`'s public API is `parse(file, host) -> Config` — it queries a single host by name. The `SshConfig` struct (with the parsed entries list) is private, so we can't iterate all `Host` directives through `russh-config`'s API. We do a minimal hand-parse for the list-all-hosts use case, and defer to `russh-config`'s proper parser for the single-host lookup via `lookup_host`.
+
+**Why `lookup_host` checks our own list first**: `russh-config`'s `parse_path` *always* returns a `Config` — it folds over all matching `Host` entries and returns `HostConfig::default()` (all `None`) when nothing matches. That means `parse_path("not-in-config", ...)` succeeds with `port=22` and `user=current_user`, which would clobber the user's in-progress form input with defaults. We use our own parser to detect "is this alias literally in the config?" and only then defer to `russh-config` for the full resolution.
+
+### 2. `ConnectionDialog` UI wiring
+
+`crates/rusterm-ui/src/components/connection_dialog.rs` (+117 lines). The dialog now:
+
+- Loads `host_suggestions: Signal<Vec<SshHostSuggestion>>` and `identity_suggestions: Signal<Vec<String>>` ONCE on first mount via `use_signal(list_ssh_config_hosts)` / `use_signal(list_identity_files)`. Synchronous I/O is fine here because both reads are tiny (one small text file + one directory listing), tolerant of missing files (return empty Vec), and happen only when the dialog opens (not at app startup). `use_resource` would add async overhead + a loading state for no benefit.
+- Renders a `<datalist id="ssh-host-list">` under the Host input with one `<option value="{alias}">` per `~/.ssh/config` host alias. The input's `list: "ssh-host-list"` attribute links them, enabling the browser's native autocomplete dropdown.
+- Renders a `<datalist id="ssh-identity-list">` under the Private Key Path input (shown only when auth_type == "key") with one `<option value="{path}">` per `~/.ssh/id_*` file.
+- Path hints below each input: "提示：从 {config_path} 读取到 {N} 个主机配置" and "提示：从 ~/.ssh/ 找到 {N} 个私钥文件". Only shown when the suggestion list is non-empty (so a fresh install with no `~/.ssh/config` sees no clutter).
+- Host input's `onchange` (NOT `oninput` — fires on blur or datalist selection, not every keystroke): calls `lookup_host(alias, None)`. If `Some(resolved)`, fills `host` (resolved HostName or alias), `port`, `username`, and either `key_path`+`auth_type="key"` (if `IdentityFile` set) or `auth_type="agent"` (OpenSSH convention when no `IdentityFile`).
+
+### 3. New `rusterm-core::paths` module + config path stability
+
+`crates/rusterm-core/src/paths.rs` (260 lines, 7 unit tests). Centralises the "where does the config file live?" logic that was previously duplicated across `config_manager.rs`, `session_state.rs`, and `window_state.rs`.
+
+**Old resolution order** (all 3 files had a copy):
+1. `RUSTERM_CONFIG_DIR` env var
+2. **Next to the binary** (primary) — `<exe_dir>/settings.json`
+3. Platform config dir fallback
+
+**Problem**: during development, the binary lives under `target/debug/` (or `target/release/`), and `cargo clean` deletes the entire `target/` tree — taking the user's saved connections, master password hash, window state, and session state with it.
+
+**New resolution order** (`paths::resolve_config_file_path(filename)`):
+1. `RUSTERM_CONFIG_DIR` env var (unchanged — test/config override hook)
+2. **Platform config dir** (`~/.config/rusterm/` on Linux, `~/Library/Application Support/rusterm/` on macOS, `%APPDATA%\rusterm\` on Windows) — the new primary location. Stable across `cargo clean`, follows platform conventions.
+3. **Auto-migrate from "next to the binary"** — if the platform dir doesn't have the file but the binary's directory does (a legacy install or a pre-this-change dev build), we move the file to the platform dir. One-shot: after the migration, the platform dir has the file and the binary-dir copy is gone. `fs::rename` first (atomic on same filesystem); falls back to `fs::copy` + `fs::remove_file` if rename fails (cross-filesystem, e.g. binary on a mounted volume). Migration errors are logged at `tracing::warn!`/`tracing::info!` and don't fail the path resolution — the worst case is the file stays in the binary dir and the caller treats the platform path as "first launch".
+4. **Binary-dir fallback** — only if the platform config dir can't be determined (very rare: `HOME` unset on Unix, corrupt OS profile on Windows). Keeps a portable / USB-stick install working as a last resort.
+5. **Last-resort: `./<filename>`** — only if BOTH `dirs::config_dir()` returns `None` AND `std::env::current_exe()` fails. Should never happen in practice; a relative path is better than crashing on startup.
+
+**Refactored callers**:
+- `config_manager.rs::resolve_config_path()` → `crate::paths::resolve_config_file_path(CONFIG_FILE_NAME)` (1-line body now).
+- `session_state.rs::resolve_path()` → `crate::paths::resolve_config_file_path(FILE_NAME)`.
+- `window_state.rs::resolve_path()` → `crate::paths::resolve_config_file_path(WINDOW_STATE_FILE_NAME)`.
+
+**Public helpers** for future "open config folder" UI actions:
+- `app_config_dir() -> Option<PathBuf>` — the platform config dir + `rusterm` subdir.
+- `platform_config_dir() -> Option<PathBuf>` — thin wrapper around `dirs::config_dir()`.
+- `APP_CONFIG_SUBDIR = "rusterm"` — the subdir name constant.
+
+### Tests
+
+- `rusterm-ssh::ssh_config::tests` — 30 tests: parse empty/comments/blanks/wildcards/multi-host/negated-wildcard/inline-comments/hash-in-value/case-insensitive/invalid-port/proxy-jump/first-identity-file-wins; list-at-nonexistent-file/list-at-reads-file; identity-file-detection/list-skips-pub-and-non-id/list-nonexistent-dir; expand-tilde-with/without-home; wildcard-detection; lookup-host-missing-file/missing-alias/resolves-simple-block/falls-back-to-alias; resolved-to-auth-with/without-identity-file; real-world-config-with-comments-and-unknown-directives; duplicate-host-aliases; indented-and-tab-separated; strips-inline-comments; keeps-hash-when-no-preceding-whitespace.
+- `rusterm-core::paths::tests` — 7 tests: env-var-override-highest-priority; env-var-creates-directory-if-missing; app-config-dir-returns-platform-plus-subdir; resolve-returns-path-with-filename; migrate-noop-if-target-exists; migrate-noop-if-source-missing; app-config-subdir-is-rusterm.
+- Total workspace: 564 tests passing (was 557 before this pass). +30 ssh_config + 7 paths = +37 net.
+
+### Validation
+
+- nightly rustfmt on all touched files
+- `cargo build --workspace` → 0 warnings, 0 errors
+- `cargo test --workspace` → 564 passed, 0 failed
+- `cargo clippy -p rusterm-ssh --lib` → 0 new warnings (1 pre-existing in `client.rs` line 210)
+- `cargo clippy -p rusterm-ui --lib` → 0 warnings in `connection_dialog.rs` or `ssh_config.rs` (104 pre-existing in other files)
+- `git diff --check HEAD` → clean
+
+### Pitfalls / gotchas
+
+- **`use_signal` initializer runs synchronously on first mount** — don't put slow I/O there. `~/.ssh/config` is a tiny file (usually <10KB) and `~/.ssh/` has <20 files; the directory listing is fast. If we ever needed to scan a huge directory, switch to `use_resource` (async) + a loading spinner.
+- **`lookup_host` does TWO parses** — first our minimal hand-parse (to check if the alias is literal), then `russh-config`'s full parse. This is wasteful but the file is tiny and `onchange` fires once per blur (not per keystroke), so it's fine. A future optimisation could cache the parsed entries in a `OnceCell`, but that'd complicate the API for negligible gain.
+- **`onchange` fires on blur AND on datalist selection** — both are correct triggers for auto-fill. Don't switch to `oninput` (fires per keystroke) — that would interrupt typing as the auto-fill clobbers mid-typed values.
+- **Auto-fill clobbers user-typed port/user/identity_file when the host matches a config alias** — this is intentional. If the user picks an alias from the dropdown, they want the config's values. They can edit the fields after auto-fill if they want to override.
+- **`russh-config`'s `parse_path` always returns `Ok(Config)`** (with default values when nothing matches) — that's why `lookup_host` checks our own list first. Don't "simplify" `lookup_host` by removing the pre-check; it'd reintroduce the "typing any host clobbers the form with defaults" bug.
+- **Rust 2024 made `std::env::set_var`/`remove_var` unsafe** — the `paths::tests` module wraps them in `unsafe { ... }` blocks with a SAFETY comment. Single-threaded tests make this sound.
+- **`fs::rename` is atomic on the same filesystem but fails cross-filesystem** — the migration code falls back to `fs::copy` + `fs::remove_file` when rename fails. Don't remove the fallback (a binary on a mounted volume + config on the root volume is a real scenario for portable installs).
+- **The migration is one-shot per file** — after the first run, the platform dir has the file and the binary dir doesn't, so the migration's `if !target_path.exists()` guard short-circuits. Don't add a "migrate every time" loop — it'd be a no-op after the first run and would waste I/O.
+- **`APP_CONFIG_SUBDIR = "rusterm"` is constant across platforms** — don't try to "localise" it (e.g. `RusTerm` with capital letters on macOS). The lowercase form matches the existing `dirs::config_dir().join("rusterm")` calls that were already in the codebase, and changing it would break existing installs.
+- **The connection dialog's `<datalist>` uses fixed IDs `"ssh-host-list"` and `"ssh-identity-list"`** — if the dialog is ever rendered twice simultaneously (it isn't — it's a singleton modal), the IDs would collide and the browser would link both inputs to the same datalist. Not a problem now, but worth knowing if the dialog ever becomes a multi-instance component.

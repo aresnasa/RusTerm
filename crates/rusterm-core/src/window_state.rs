@@ -58,21 +58,7 @@ impl WindowState {
     /// per-machine data, so e.g. a portable install on a USB stick carries its
     /// window state with it.
     pub fn resolve_path() -> Result<PathBuf> {
-        if let Ok(dir) = std::env::var("RUSTERM_CONFIG_DIR") {
-            let path = PathBuf::from(dir);
-            std::fs::create_dir_all(&path).ok();
-            return Ok(path.join(WINDOW_STATE_FILE_NAME));
-        }
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(parent) = exe.parent() {
-                return Ok(parent.join(WINDOW_STATE_FILE_NAME));
-            }
-        }
-        let config_dir = dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("rusterm");
-        std::fs::create_dir_all(&config_dir).ok();
-        Ok(config_dir.join(WINDOW_STATE_FILE_NAME))
+        crate::paths::resolve_config_file_path(WINDOW_STATE_FILE_NAME)
     }
 
     /// Load the saved window state. Returns `None` if the file doesn't exist

@@ -1,6 +1,10 @@
 use dioxus::prelude::*;
 
 use rusterm_core::config::{ConnectionConfig, ConnectionKind, SshAuth};
+use rusterm_ssh::{
+    SshHostSuggestion, default_ssh_config_path, list_identity_files, list_ssh_config_hosts,
+    lookup_host,
+};
 
 #[derive(Debug, Clone, Default)]
 pub struct NewConnectionForm {
@@ -104,6 +108,25 @@ pub fn ConnectionDialog(
     // re-render loop.
     let mut seeded_id = use_signal(String::new);
 
+    // Local SSH config + identity-file suggestions, loaded ONCE on first
+    // mount. We read `~/.ssh/config` and `~/.ssh/` synchronously here
+    // because (a) both reads are tiny (one small text file + one
+    // directory listing), (b) they're tolerant of missing files (return
+    // empty Vec), and (c) `use_signal` only invokes its initializer on
+    // first mount, so the I/O happens exactly once per dialog lifetime.
+    // The dialog itself isn't mounted until the user opens it, so this
+    // I/O doesn't happen at app startup.
+    //
+    // We use `use_signal` (not `use_resource`) because the reads are
+    // synchronous and fast — `use_resource` would add async overhead
+    // and a loading state for no benefit.
+    let host_suggestions: Signal<Vec<SshHostSuggestion>> = use_signal(list_ssh_config_hosts);
+    let identity_suggestions: Signal<Vec<String>> = use_signal(list_identity_files);
+    // The resolved `~/.ssh/config` path (for display in the UI hint).
+    // Computed once on mount.
+    let ssh_config_path_display: Signal<Option<String>> =
+        use_signal(|| default_ssh_config_path().map(|p| p.to_string_lossy().into_owned()));
+
     if !visible {
         return rsx! {};
     }
@@ -186,8 +209,79 @@ pub fn ConnectionDialog(
                                 style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                                 r#type: "text",
                                 placeholder: "192.168.1.1",
+                                // `list` attribute links this input to the
+                                // `<datalist id=\"ssh-host-list\">` below, enabling
+                                // the browser's native autocomplete dropdown.
+                                list: "ssh-host-list",
                                 value: "{form().host}",
                                 oninput: move |e| form.write().host = e.value(),
+                                // Auto-fill from `~/.ssh/config` when the user
+                                // picks (or types a complete match for) a
+                                // configured host alias. `onchange` fires on
+                                // blur or when the user selects a datalist
+                                // suggestion — NOT on every keystroke, so we
+                                // don't interrupt typing.
+                                onchange: move |e| {
+                                    let alias = e.value();
+                                    if let Some(resolved) = lookup_host(&alias, None) {
+                                        let mut f = form.write();
+                                        // Only overwrite fields that the
+                                        // config actually specifies — leave
+                                        // user-typed values alone for fields
+                                        // the config doesn't set.
+                                        // `lookup_host` returns resolved
+                                        // values for user/port/identity_file
+                                        // (with sane defaults when the
+                                        // config doesn't set them), so we
+                                        // always fill those.
+                                        f.host = resolved.host;
+                                        f.port = resolved.port.to_string();
+                                        f.username = resolved.user;
+                                        if let Some(id_path) = resolved.identity_file {
+                                            f.key_path = id_path;
+                                            f.auth_type = "key".to_string();
+                                        } else {
+                                            // No IdentityFile in the config —
+                                            // fall back to agent auth (the
+                                            // OpenSSH convention when no
+                                            // IdentityFile is specified).
+                                            f.auth_type = "agent".to_string();
+                                        }
+                                    }
+                                },
+                            }
+                            // Path hint: tells the user where the suggestions
+                            // come from (so they know to edit `~/.ssh/config`
+                            // if a host is missing). Only shown when the
+                            // config file exists / is readable.
+                            {(ssh_config_path_display().is_some() && !host_suggestions().is_empty()).then(|| rsx! {
+                                div {
+                                    style: "font-size: 11px; color: #565f89; margin-top: 2px;",
+                                    "提示：从 {ssh_config_path_display().as_deref().unwrap_or(\"~/.ssh/config\")} 读取到 {host_suggestions().len()} 个主机配置"
+                                }
+                            })}
+                            // Datalist of host aliases from `~/.ssh/config`.
+                            // The browser renders these as a native dropdown
+                            // under the input as the user types. We include
+                            // both the alias AND the resolved hostname (if
+                            // set) as the value, so the user can see what
+                            // they're picking. The `value` attribute is what
+                            // gets filled into the input on selection; the
+                            // text content is what's shown in the dropdown.
+                            datalist {
+                                id: "ssh-host-list",
+                                for suggestion in host_suggestions().iter() {
+                                    option {
+                                        // `value` is what gets filled into
+                                        // the input on selection. We use
+                                        // the alias (not the resolved
+                                        // hostname) because the user wants
+                                        // to type/pick the alias, and the
+                                        // `onchange` handler resolves it
+                                        // via `lookup_host`.
+                                        value: "{suggestion.alias}",
+                                    }
+                                }
                             }
                         }
                         div {
@@ -280,8 +374,31 @@ pub fn ConnectionDialog(
                                     style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                                     r#type: "text",
                                     placeholder: "~/.ssh/id_rsa",
+                                    // Link to the identity-file datalist
+                                    // below — the browser will offer the
+                                    // `~/.ssh/id_*` files it found as the
+                                    // user types.
+                                    list: "ssh-identity-list",
                                     value: "{form().key_path}",
                                     oninput: move |e| form.write().key_path = e.value(),
+                                }
+                                // Hint showing how many identity files were
+                                // found in `~/.ssh/` (so the user knows the
+                                // dropdown is populated).
+                                {(!identity_suggestions().is_empty()).then(|| rsx! {
+                                    div {
+                                        style: "font-size: 11px; color: #565f89; margin-top: 2px;",
+                                        "提示：从 ~/.ssh/ 找到 {identity_suggestions().len()} 个私钥文件"
+                                    }
+                                })}
+                                // Datalist of identity files from `~/.ssh/`.
+                                datalist {
+                                    id: "ssh-identity-list",
+                                    for path in identity_suggestions().iter() {
+                                        option {
+                                            value: "{path}",
+                                        }
+                                    }
                                 }
                             }
 

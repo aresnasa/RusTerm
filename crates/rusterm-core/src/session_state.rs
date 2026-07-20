@@ -141,29 +141,14 @@ pub struct PersistedSession {
 impl SessionState {
     /// Resolve the path to the session-state file.
     ///
-    /// Mirrors `ConfigManager::resolve_config_path`'s precedence:
-    /// 1. `RUSTERM_CONFIG_DIR` env var (test/config override),
-    /// 2. next to the binary (same dir as `settings.json`),
-    /// 3. platform config dir fallback.
-    ///
-    /// This keeps the file co-located with `settings.json` so a portable
-    /// install on a USB stick carries its saved session state with it.
+    /// Delegates to the centralised path resolver (`crate::paths`). See
+    /// `rusterm_core::paths` for the full resolution order. In short: the
+    /// platform config dir is now the primary location (so `cargo clean`
+    /// doesn't wipe session state during development), with an automatic
+    /// one-shot migration from the legacy "next to the binary" location
+    /// if the platform dir doesn't have the file yet.
     pub fn resolve_path() -> Result<PathBuf> {
-        if let Ok(dir) = std::env::var("RUSTERM_CONFIG_DIR") {
-            let path = PathBuf::from(dir);
-            std::fs::create_dir_all(&path).ok();
-            return Ok(path.join(FILE_NAME));
-        }
-        if let Ok(exe) = std::env::current_exe() {
-            if let Some(parent) = exe.parent() {
-                return Ok(parent.join(FILE_NAME));
-            }
-        }
-        let config_dir = dirs::config_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("rusterm");
-        std::fs::create_dir_all(&config_dir).ok();
-        Ok(config_dir.join(FILE_NAME))
+        crate::paths::resolve_config_file_path(FILE_NAME)
     }
 
     /// Load and decrypt the saved session state. Returns `Ok(None)` if the
