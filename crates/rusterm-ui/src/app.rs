@@ -2268,7 +2268,7 @@ fn open_cloned_sessions_for_self_drop(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn finish_tab_drag(
     mut state: Signal<AppState>,
-    input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    mut input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
     mut tab_drag: Signal<Option<TabDragState>>,
     mut drag_over_pane: Signal<Option<(usize, PaneDropRegion)>>,
     container_size: Signal<Option<(f64, f64)>>,
@@ -2435,41 +2435,82 @@ pub(crate) fn finish_tab_drag(
                 }
             }
             DragKind::Connection(conn) => {
-                // Sidebar → pane drop: open a NEW session for side-by-side
-                // comparison. When the target pane is already occupied, we
-                // PRESERVE the existing session by growing the layout (or
-                // reusing another empty pane) instead of replacing the
-                // target's session. This implements the "拖动左侧会话 = 新开会话对比"
-                // contract — the existing session stays visible alongside the
-                // new one.
+                // Sidebar → pane drop. The behavior depends on the drop region:
                 //
-                // `prepare_split_for_sidebar_drop` returns the pane index
-                // where the new session should land (which may differ from
-                // `target_idx` if we reused an empty pane or appended a new
-                // pane on demand). We then call `open_connection` with a
-                // `PaneTarget` keyed by the layout owner returned from that
-                // call — this is NOT necessarily `active_id`, because the
-                // layout mutation inside `prepare_split_for_sidebar_drop`
-                // may have changed things; using the returned owner keeps the
-                // assignment stable against any active-tab mutation.
+                //   - Center (swap/move zone): REPLACE the target pane's session
+                //     with the new connection's session. The old session is
+                //     closed (via close_session) and the new one opens in the
+                //     SAME pane slot. This is the "拖到中间 = 替换" affordance
+                //     — the user wants to switch the pane to a different
+                //     connection without growing the layout.
+                //
+                //   - Left/Right/Top/Bottom (split zones): SPLIT the target pane
+                //     and open the new connection in the new pane. The existing
+                //     session stays visible alongside the new one. This is the
+                //     "拖动左侧会话 = 新开会话对比" contract — side-by-side
+                //     comparison.
+                //
+                // The prior implementation ALWAYS split (even for Center),
+                // which caused the "错误的产生多个不需要的四方块" bug: every
+                // sidebar drop onto an occupied pane created a new pane, so
+                // repeatedly dragging the same connection onto different
+                // panes (or the same pane) piled up many unwanted panes.
+                // Center-now-replaces fixes that — the user can aim at the
+                // center to swap, or at an edge to split.
                 let conn_name = conn.name.clone();
                 let conn_id_short = conn.id.clone();
-                let plan = prepare_split_for_sidebar_drop_at(
-                    &mut state.write(),
-                    target_idx,
-                    split_direction,
-                );
-                let (owner_for_target, pane_for_target, created_new_pane) = match plan {
-                    Some(plan) => (
-                        plan.layout_owner_tab_id.clone(),
-                        plan.pane_idx,
-                        plan.created_new_pane,
-                    ),
-                    None => {
-                        // No active tab — open as a new tab without a pane target.
-                        (String::new(), 0usize, false)
-                    }
-                };
+                let is_center_drop = target.region == PaneDropRegion::Center;
+                let target_session_for_replace = target_session.clone();
+                // For Center drops onto an OCCUPIED pane, replace the session
+                // instead of splitting. Empty-pane Center drops still go
+                // through the "fill empty pane" path (no session to replace).
+                let should_replace = is_center_drop && !target_session.is_empty();
+                let (owner_for_target, pane_for_target, created_new_pane, replaced_session) =
+                    if should_replace {
+                        // Close the existing session in the target pane, then
+                        // open the new connection in the same pane slot.
+                        // close_session clears the pane's session_id; we then
+                        // pass the same pane_idx as the PaneTarget so
+                        // open_connection assigns the new session there.
+                        let owner = active_id.clone().unwrap_or_default();
+                        close_session(
+                            &mut state.write(),
+                            &mut input_senders.write(),
+                            &target_session_for_replace,
+                        );
+                        // If close_session removed the whole tab (anchor closed
+                        // + no other sessions), there's no layout to place into
+                        // — fall back to opening as a new tab.
+                        let tab_still_exists = state.read().tabs.iter().any(|t| t.id == owner);
+                        if tab_still_exists {
+                            (owner, target_idx, false, true)
+                        } else {
+                            (String::new(), 0usize, false, true)
+                        }
+                    } else {
+                        // Split or fill-empty path. prepare_split_for_sidebar_drop_at
+                        // returns the pane index where the new session should
+                        // land (which may differ from `target_idx` if we reused
+                        // an empty pane or appended a new pane on demand).
+                        let plan = prepare_split_for_sidebar_drop_at(
+                            &mut state.write(),
+                            target_idx,
+                            split_direction,
+                        );
+                        match plan {
+                            Some(plan) => (
+                                plan.layout_owner_tab_id.clone(),
+                                plan.pane_idx,
+                                plan.created_new_pane,
+                                false,
+                            ),
+                            None => {
+                                // No active tab — open as a new tab without a
+                                // pane target.
+                                (String::new(), 0usize, false, false)
+                            }
+                        }
+                    };
                 let target = if owner_for_target.is_empty() {
                     None
                 } else {
@@ -2479,7 +2520,7 @@ pub(crate) fn finish_tab_drag(
                     })
                 };
                 tracing::info!(
-                    "[TAB-DRAG] opening sidebar connection {} ({:?}) in pane {} (owner={:?}, created_new_pane={}, original_target={})",
+                    "[TAB-DRAG] opening sidebar connection {} ({:?}) in pane {} (owner={:?}, created_new_pane={}, replaced_session={}, original_target={})",
                     &conn_id_short[..conn_id_short.len().min(8)],
                     conn_name,
                     pane_for_target,
@@ -2489,6 +2530,7 @@ pub(crate) fn finish_tab_drag(
                         Some(&owner_for_target[..owner_for_target.len().min(8)])
                     },
                     created_new_pane,
+                    replaced_session,
                     target_idx
                 );
                 let result = open_connection(state, input_senders, conn, target);
@@ -6183,6 +6225,58 @@ mod connection_target_tests {
         assert_eq!(layout.panes[2].session_id, "new-from-sidebar");
         assert!(layout.panes.iter().all(|pane| !pane.session_id.is_empty()));
         assert_eq!(state.active_tab.as_deref(), Some(layout_owner.as_str()));
+    }
+
+    /// Center-region sidebar drop: the existing session in the target pane
+    /// is closed, and the new connection's session opens in the SAME pane slot.
+    /// This is the "拖到中间 = 替换" affordance — the layout does NOT grow.
+    ///
+    /// This test simulates the state-level side of the Center drop: it closes
+    /// the existing session (as `finish_tab_drag` does for Center drops) and
+    /// then assigns a new session to the same pane. The pane count must stay
+    /// the same, and the new session must occupy the target pane.
+    #[test]
+    fn center_region_sidebar_drop_replaces_session_without_growing_layout() {
+        let mut state = AppState::default();
+        let layout_owner = push_workspace_tab(&mut state, "existing-one");
+        state.layouts.insert(
+            layout_owner.clone(),
+            PaneLayout::from_preset(
+                LayoutPreset::Split2H,
+                &["existing-one".to_string(), "existing-two".to_string()],
+            ),
+        );
+        let mut senders = std::collections::HashMap::new();
+
+        // Simulate Center drop onto pane 0 (occupied by "existing-one"):
+        // close the existing session, then assign the new one to pane 0.
+        close_session(&mut state, &mut senders, "existing-one");
+        // close_session clears pane 0's session_id to "" and promotes
+        // "existing-two" to the tab's anchor (the only remaining session).
+        assert_eq!(state.layouts[&layout_owner].panes[0].session_id, "");
+        assert_eq!(
+            state.layouts[&layout_owner].panes[1].session_id,
+            "existing-two"
+        );
+        // Layout did NOT grow — Center drop replaces, doesn't split.
+        assert_eq!(state.layouts[&layout_owner].panes.len(), 2);
+
+        // Now assign the new session to pane 0 (the Center drop target).
+        let target = PaneTarget {
+            layout_owner_tab_id: layout_owner.clone(),
+            pane_idx: 0,
+        };
+        assert!(assign_opened_session(
+            &mut state,
+            Some(&target),
+            "new-from-sidebar"
+        ));
+        let layout = &state.layouts[&layout_owner];
+        assert_eq!(layout.panes.len(), 2);
+        assert_eq!(layout.panes[0].session_id, "new-from-sidebar");
+        assert_eq!(layout.panes[1].session_id, "existing-two");
+        // No pane is empty — both sessions are live.
+        assert!(layout.panes.iter().all(|pane| !pane.session_id.is_empty()));
     }
 }
 
