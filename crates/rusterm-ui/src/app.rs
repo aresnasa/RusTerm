@@ -26,15 +26,16 @@ use crate::components::Sidebar;
 use crate::components::TabBar;
 use crate::components::TerminalView;
 use crate::components::connection_dialog::NewConnectionForm;
-use crate::layout::PaneLayout;
+use crate::layout::{PaneLayout, SplitAxis, SplitDirection};
 use crate::state::{
     AppState, Modal, OneKeyMatch, OneKeyPopupState, PendingDangerousCommand,
     SessionConnectionState, SessionTab, TabDropOutcome, TerminalEntry, UnlockState,
-    begin_floating_pane_move, close_session, close_workspace, cycle_layout_preset,
-    execute_tab_drop_on_pane, focus_pane_for_layout, focused_pane_session,
-    move_floating_pane_for_active, move_session_to_leftmost, push_workspace_tab, resize_layout_col,
-    resize_layout_row, set_active_tab, set_pane_session_for_layout, source_pane_for_copy,
-    toggle_comparison_mode, toggle_pane_zoom,
+    append_pane_to_active, begin_floating_pane_move, close_session, close_workspace,
+    distribute_sessions_across_panes, execute_tab_drop_on_pane, execute_tab_drop_on_pane_at,
+    focus_pane_for_layout, focused_pane_session, move_floating_pane_for_active,
+    move_session_to_leftmost, prepare_split_for_sidebar_drop, prepare_split_for_sidebar_drop_at,
+    push_workspace_tab, resize_layout_split, set_active_tab, set_pane_session_for_layout,
+    source_pane_for_copy, toggle_comparison_mode, toggle_pane_zoom,
 };
 
 fn save_config(state: &Signal<AppState>) {
@@ -51,19 +52,23 @@ fn save_config(state: &Signal<AppState>) {
     }
 }
 
-/// Human-readable label for the current layout preset, shown in the status
-/// bar's layout toolbar. Kept short so it fits in the status bar's small
-/// footprint. Used instead of `{:?}` because dioxus's rsx! formatter
-/// doesn't support `#?` and the default `Debug` output is too long.
-fn layout_label(preset: crate::layout::LayoutPreset) -> &'static str {
-    use crate::layout::LayoutPreset::*;
-    match preset {
-        Single => "1",
-        Split2H => "2H",
-        Split2V => "2V",
-        Grid4 => "4",
-        Grid8 => "8",
-    }
+/// Human-readable label for the active tab's current layout, shown in the
+/// status bar's layout toolbar. Reads the actual pane count from the layout
+/// (not `state.layout_preset`, which no longer reflects reality after
+/// `append_pane_to_active` — e.g. 3 panes has no preset).
+///
+/// Returns "Layout: N panes" (or "Layout: 1 pane" for the singular case)
+/// when a layout exists, or "Layout: 1 pane" when no layout exists yet
+/// (the single-pane default view).
+fn layout_display_label(state: &AppState) -> String {
+    let pane_count = state
+        .active_tab
+        .as_ref()
+        .and_then(|id| state.layouts.get(id))
+        .map(|l| l.panes.len())
+        .unwrap_or(1);
+    let noun = if pane_count == 1 { "pane" } else { "panes" };
+    format!("Layout: {pane_count} {noun}")
 }
 
 /// Render a single TerminalView for the session identified by `session_id`.
@@ -883,22 +888,110 @@ fn render_terminal_pane(
 ///    - If this is a zoomed multi-pane layout, target the zoomed pane through
 ///      its stable layout owner. If no layout exists, open a new active tab.
 ///
-/// `drag_over_pane` is set to `Some(0)` on drag-over/enter and `None` on
-/// drop, mirroring the multi-pane container's highlight logic. The border
-/// highlight uses the same `#7aa2f7` colour so the visual feedback is
-/// consistent across single-pane and multi-pane modes.
+/// NOTE: Both branches are DEFENSIVE FALLBACKS since Task 22's manual
+/// mouse-based drag system replaced HTML5 DnD for both tab/pane-title
+/// drags AND sidebar → pane drags (the latter via `DragKind::Connection`).
+/// The sidebar no longer sets `draggable: true`, so the connection-id
+/// branch should never fire — it's retained for forward compat in case
+/// HTML5 DnD is re-enabled. The session-id branch is in the same boat.
+/// The primary paths are `start_tab_drag` → `finish_tab_drag`, which
+/// dispatch on `DragKind` (Session vs Connection).
+///
+/// `drag_over_pane` is read here to render the drop-zone overlay. The SOLE
+/// writer of that signal is the manual polling loop in `App`, which
+/// hit-tests the cursor at ~60Hz and sets `Some((pane_idx, region))` with
+/// the real 4-quadrant region. HTML5 `ondragover`/`ondragenter` only call
+/// `prevent_default` (for drop permission) — they do NOT write the signal,
+/// avoiding a race that caused the overlay to flicker between adjacent
+/// panes (the "错误的产生多个不需要的四方块" bug). `ondrop` and
+/// `finish_tab_drag` clear the signal to `None`.
+///
+/// The border highlight uses the same `#7aa2f7` colour as the multi-pane
+/// path. On top of the border, when a non-Center region is active a
+/// translucent blue overlay covers the target half and a SINGLE bright
+/// blue center line ("中线") shows the dividing axis — vertical for
+/// Left/Right (横着 placement), horizontal for Top/Bottom (竖着 placement).
+/// This is the "用中线作为标记" UX: one line per region, not the prior
+/// "田"-shaped crosshair that always drew both lines.
 fn single_pane_with_drop(
     mut state: Signal<AppState>,
     input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
     render_sid: String,
-    mut drag_over_pane: Signal<Option<usize>>,
+    mut drag_over_pane: Signal<Option<(usize, PaneDropRegion)>>,
 ) -> Element {
     // The session id rendered in this pane, cloned for the drop closure.
     let drop_session_id = render_sid.clone();
-    let border_style = if drag_over_pane() == Some(0) {
+    // Read once — this subscribes `App` to the signal so any change
+    // triggers ONE re-render of this component (and rebuilds the overlay
+    // style below with the new region).
+    let drag_over = drag_over_pane();
+    let is_drag_over = drag_over.is_some_and(|(idx, _)| idx == 0);
+    let region = drag_over.and_then(|(idx, r)| if idx == 0 { Some(r) } else { None });
+    let border_style = if is_drag_over {
         "border: 2px solid #7aa2f7; box-sizing: border-box;"
     } else {
         "border: 2px solid transparent; box-sizing: border-box;"
+    };
+    // Drop-hint overlay: highlighted target half + the SINGLE center line
+    // that marks the dividing axis (the "用中线作为标记" affordance).
+    //
+    // The overlay is mounted only while `drag_over_pane` points at THIS
+    // pane. `pointer-events: none` is critical — without it the overlay
+    // would intercept the drop event and the pane's `ondrop` would never
+    // fire.
+    //
+    // Visual scheme (single center line, NOT the "田" 4-block shape):
+    //   Left / Right  → VERTICAL center line (divides left from right;
+    //                  tells the user the new pane will sit beside the
+    //                  existing one — a 横着 / horizontal arrangement).
+    //   Top  / Bottom → HORIZONTAL center line (divides top from bottom;
+    //                  tells the user the new pane will stack above/below
+    //                  — a 竖着 / vertical arrangement).
+    //   Center        → both lines dimmed (swap/move zone, no split).
+    //
+    // Showing only ONE line (instead of both) is the fix for the
+    // "错误的产生多个不需要的四方块" bug — the prior crosshair always
+    // drew both lines, forming a 田 shape that was ambiguous about which
+    // direction the split would go, and visually stacked with the
+    // half-rectangle highlight into a confusing 4-quadrant mosaic.
+    let drop_overlay = if is_drag_over {
+        let half_overlay_style = match region {
+            Some(PaneDropRegion::Top) => Some(
+                "position: absolute; left: 0; top: 0; width: 100%; height: 50%; \
+                 background: rgba(122,162,247,0.18); pointer-events: none; z-index: 20;",
+            ),
+            Some(PaneDropRegion::Bottom) => Some(
+                "position: absolute; left: 0; top: 50%; width: 100%; height: 50%; \
+                 background: rgba(122,162,247,0.18); pointer-events: none; z-index: 20;",
+            ),
+            Some(PaneDropRegion::Left) => Some(
+                "position: absolute; left: 0; top: 0; width: 50%; height: 100%; \
+                 background: rgba(122,162,247,0.18); pointer-events: none; z-index: 20;",
+            ),
+            Some(PaneDropRegion::Right) => Some(
+                "position: absolute; left: 50%; top: 0; width: 50%; height: 100%; \
+                 background: rgba(122,162,247,0.18); pointer-events: none; z-index: 20;",
+            ),
+            // Center = swap/move zone — no half overlay.
+            Some(PaneDropRegion::Center) | None => None,
+        };
+        // Pick the SINGLE center line ("中线") matching the split axis.
+        // See `center_line_styles_for_region` for the visual scheme.
+        let (vertical_line, horizontal_line) = match region {
+            Some(r) => center_line_styles_for_region(r),
+            None => center_line_styles_for_region(PaneDropRegion::Center),
+        };
+        Some(rsx! {
+            // Highlighted target half (only for split regions).
+            {half_overlay_style.map(|style| rsx! { div { style: "{style}" } })}
+            // The single relevant center line ("中线"). Only one is
+            // shown for split regions — this is what tells the user
+            // 横着 (horizontal, left/right) vs 竖着 (vertical, top/bottom).
+            {vertical_line.map(|style| rsx! { div { style: "{style}" } })}
+            {horizontal_line.map(|style| rsx! { div { style: "{style}" } })}
+        })
+    } else {
+        None
     };
     rsx! {
         div {
@@ -907,19 +1000,30 @@ fn single_pane_with_drop(
                 "position: absolute; left: 0; top: 0; right: 0; bottom: 0; overflow: hidden; display: flex; flex-direction: column; {border_style}"
             ),
             // `ondragover` must call prevent_default to signal that this
-            // element accepts drops. Without it the browser blocks the
+            // element accepts drops. Without it, the browser blocks the
             // drop and fires `ondrop` with an empty DataTransfer.
+            //
+            // NOTE: we do NOT write to `drag_over_pane` here. The manual
+            // polling loop in `App` is the SOLE writer of that signal —
+            // it hit-tests the cursor at ~60Hz and sets the real
+            // 4-quadrant region. Letting HTML5 dragover also write
+            // `Some((0, Center))` caused it to race with the polling loop
+            // at pane boundaries, flickering the overlay between the
+            // HTML5-reported pane and the hit-test pane — visually this
+            // looked like "多个不需要的四方块" (multiple unwanted
+            // 4-block overlays) appearing and disappearing. Keeping the
+            // signal write ONLY in the polling loop fixes that.
             ondragover: move |e: DragEvent| {
                 e.prevent_default();
                 e.data_transfer().set_drop_effect("move");
-                drag_over_pane.set(Some(0));
             },
             // `ondragenter` also needs prevent_default for cross-browser
             // compatibility (some browsers require both dragenter AND
-            // dragover to be cancelled to allow drop).
+            // dragover to be cancelled to allow drop). As with
+            // `ondragover` above, we do NOT write `drag_over_pane` —
+            // the polling loop owns that signal.
             ondragenter: move |e: DragEvent| {
                 e.prevent_default();
-                drag_over_pane.set(Some(0));
             },
             ondrop: move |e: DragEvent| {
                 e.prevent_default();
@@ -1009,8 +1113,14 @@ fn single_pane_with_drop(
                     }
                     return;
                 }
-                // Check for the "drag from sidebar" MIME type — a
-                // connection is being opened in this pane.
+                // DEFENSIVE FALLBACK: sidebar → pane drags now use the
+                // manual mouse-based system (Task 22 extension —
+                // `DragKind::Connection` in `start_tab_drag`/`finish_tab_drag`).
+                // The sidebar no longer sets `draggable: true` + this MIME
+                // type, so this branch should never fire. It's retained
+                // symmetrically with the session-id fallback above, in
+                // case a future change re-enables HTML5 DnD for sidebar
+                // items — the dispatch logic stays correct either way.
                 if let Some(conn_id) = dt.get_data("application/x-rusterm-connection-id") {
                     if conn_id.is_empty() {
                         tracing::warn!("[DROP-SINGLE] empty connection-id in drag data");
@@ -1034,22 +1144,30 @@ fn single_pane_with_drop(
                         &conn_id[..conn_id.len().min(8)],
                         conn.name
                     );
-                    let target = {
-                        let state_snapshot = state.read();
-                        state_snapshot.active_tab.as_ref().and_then(|owner| {
-                            state_snapshot.layouts.get(owner).map(|layout| PaneTarget {
-                                layout_owner_tab_id: owner.clone(),
-                                pane_idx: layout.zoomed.unwrap_or(0),
-                            })
-                        })
+                    let target_pane_idx = {
+                        let snapshot = state.read();
+                        snapshot
+                            .active_tab
+                            .as_ref()
+                            .and_then(|owner| snapshot.layouts.get(owner).and_then(|l| l.zoomed))
+                            .unwrap_or(0)
                     };
-                    // A zoomed layout still has a stable owner and target pane.
-                    // With no layout, preserve the legacy new-active-tab path.
+                    let target = prepare_split_for_sidebar_drop(
+                        &mut state.write(),
+                        target_pane_idx,
+                    )
+                    .map(|plan| PaneTarget {
+                        layout_owner_tab_id: plan.layout_owner_tab_id,
+                        pane_idx: plan.pane_idx,
+                    });
+                    // Use the same preserve-and-grow plan as the primary manual
+                    // drag path. At MAX_PANES, `None` opens a separate tab.
                     open_connection(state, input_senders, conn, target);
                     return;
                 }
                 tracing::debug!("[DROP-SINGLE] received drop with no recognized MIME type");
             },
+            {drop_overlay}
             {render_terminal_pane(state, input_senders, render_sid)}
         }
     }
@@ -1094,7 +1212,7 @@ fn single_pane_with_drop(
 /// every subsequent delta is correctly computed in viewport space.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct SplitDragState {
-    /// Index of the column/row being resized (the left/top of the pair).
+    /// Preorder index of the recursive split node being resized.
     pub(crate) idx: usize,
     /// Container extent (width for col drag, height for row drag) at drag
     /// start, used to convert the pixel delta into a fractional delta.
@@ -1106,9 +1224,7 @@ pub(crate) struct SplitDragState {
     /// Skipping when `pos == last_applied_pos` avoids redundant layout
     /// writes for duplicate mousemove events.
     pub(crate) last_applied_pos: f64,
-    /// `true` for a column splitter (vertical bar, drag adjusts column
-    /// widths), `false` for a row splitter (horizontal bar, drag adjusts
-    /// row heights).
+    /// `true` for a left/right split, `false` for a top/bottom split.
     pub(crate) is_col: bool,
 }
 
@@ -1274,11 +1390,7 @@ fn apply_split_drag_step(
     let Some(frac_delta) = compute_split_drag_delta(&drag, pos) else {
         return;
     };
-    let applied = if drag.is_col {
-        resize_layout_col(&mut state.write(), drag.idx, frac_delta)
-    } else {
-        resize_layout_row(&mut state.write(), drag.idx, frac_delta)
-    };
+    let applied = resize_layout_split(&mut state.write(), drag.idx, frac_delta);
     if applied {
         split_drag.set(Some(SplitDragState {
             last_applied_pos: pos,
@@ -1590,12 +1702,42 @@ fn restore_focus_to_active_session(state: Signal<AppState>, delay_ms: u64) {
 /// plain click-to-select: a mousedown with no significant mousemove is
 /// a click, not a drag — the polling loop cleans up the signal and the
 /// tab's `onclick` fires normally.
+///
+/// ## `kind` — session drag vs connection drag (Task 22 extension)
+///
+/// The drag system was originally built for tab/pane-title drags (move
+/// an EXISTING session between panes — `execute_tab_drop_on_pane`).
+/// Sidebar → pane drags used HTML5 DnD, which is UNRELIABLE in dioxus
+/// 0.7's desktop webview (the same wall Task 22 hit for tab drags).
+/// Extending this struct with a `kind` field lets sidebar drags reuse
+/// the entire manual-mouse infrastructure (JS listeners, polling
+/// loop, hit-test, ghost element) — only `finish_tab_drag`'s dispatch
+/// branches on `kind`. `Session` carries the dragged session id;
+/// `Connection` carries the connection config to open.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum DragKind {
+    /// Dragging an existing session (from the tab bar or a pane title
+    /// bar). The wrapped String is the session id — `finish_tab_drag`
+    /// calls `execute_tab_drop_on_pane` to move/swap/split it into the
+    /// target pane.
+    Session(String),
+    /// Dragging a sidebar connection. The wrapped `ConnectionConfig` is
+    /// opened as a brand-new session in the target pane — `finish_tab_drag`
+    /// calls `open_connection` with a `PaneTarget`. This preserves the
+    /// "sidebar drop = new independent session" contract.
+    Connection(ConnectionConfig),
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct TabDragState {
-    /// The session id being dragged (from the tab bar or pane title).
-    pub(crate) session_id: String,
-    /// Display name of the dragged session (shown in the ghost element).
-    pub(crate) session_name: String,
+    /// What's being dragged — an existing session or a sidebar connection.
+    /// `finish_tab_drag` branches on this to decide between
+    /// `execute_tab_drop_on_pane` (Session) and `open_connection`
+    /// (Connection). See `DragKind` for the full rationale.
+    pub(crate) kind: DragKind,
+    /// Display name shown in the drag ghost element. For `Session` this
+    /// is the session's name; for `Connection` it's the connection's name.
+    pub(crate) display_name: String,
     /// Viewport-relative mouse position at drag start.
     pub(crate) start_x: f64,
     pub(crate) start_y: f64,
@@ -1798,6 +1940,151 @@ pub(crate) fn hit_test_pane_at(
         .map(|(idx, pane, _)| (idx, pane.session_id.clone()))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PaneDropRegion {
+    Top,
+    Bottom,
+    Left,
+    Right,
+    Center,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct PaneDropTarget {
+    pub(crate) pane_idx: usize,
+    pub(crate) session_id: String,
+    pub(crate) region: PaneDropRegion,
+}
+
+/// 4-quadrant drop-zone hit-test. Within the hovered pane's rectangle the
+/// center ±15% on both axes is the `Center` zone (swap/move — no split).
+/// Outside the center zone, the dominant axis (the one whose distance from
+/// center is larger) determines the split direction:
+///   - horizontal axis dominates → `Left` or `Right`
+///   - vertical axis dominates   → `Top` or `Bottom`
+///
+/// This is the "用中线作为标记" (use the center line as a marker) UX: a
+/// center crosshair on the hovered pane shows both dividing lines, and the
+/// highlighted target half follows the cursor to indicate which side the
+/// new pane will occupy.
+pub(crate) fn hit_test_pane_drop_target_at(
+    cursor_x: f64,
+    cursor_y: f64,
+    container_left: f64,
+    container_top: f64,
+    container_w: f64,
+    container_h: f64,
+    layout: &PaneLayout,
+) -> Option<PaneDropTarget> {
+    let (pane_idx, session_id) = hit_test_pane_at(
+        cursor_x,
+        cursor_y,
+        container_left,
+        container_top,
+        container_w,
+        container_h,
+        layout,
+    )?;
+    let (pane_x, pane_y, pane_w, pane_h) = layout.pane_rect(pane_idx, container_w, container_h)?;
+    if pane_w <= 0.0 || pane_h <= 0.0 {
+        return None;
+    }
+    // Cursor position relative to the pane, normalised to [0, 1].
+    let rel_x_in_pane = (cursor_x - container_left - pane_x) / pane_w;
+    let rel_y_in_pane = (cursor_y - container_top - pane_y) / pane_h;
+    // Distance from pane center, in [-0.5, 0.5] on each axis.
+    let dx_from_center = rel_x_in_pane - 0.5;
+    let dy_from_center = rel_y_in_pane - 0.5;
+    let region = pane_drop_region_for_cursor(dx_from_center, dy_from_center);
+    Some(PaneDropTarget {
+        pane_idx,
+        session_id,
+        region,
+    })
+}
+
+/// Map a cursor's normalised distance from pane center (each axis in
+/// `[-0.5, 0.5]`) to a 4-quadrant drop region. Center ±15% on BOTH axes
+/// is the swap/move zone; outside that, the dominant axis (the one farther
+/// from center) picks between left/right vs top/bottom.
+///
+/// Extracted as a pure function so both the multi-pane hit-test
+/// (`hit_test_pane_drop_target_at`) and the single-pane fallbacks in
+/// `finish_tab_drag` and the polling loop share the SAME region-decision
+/// logic. This keeps the drop-region consistent across all code paths.
+pub(crate) fn pane_drop_region_for_cursor(
+    dx_from_center: f64,
+    dy_from_center: f64,
+) -> PaneDropRegion {
+    const CENTER_HALF: f64 = 0.15;
+    if dx_from_center.abs() < CENTER_HALF && dy_from_center.abs() < CENTER_HALF {
+        PaneDropRegion::Center
+    } else if dx_from_center.abs() > dy_from_center.abs() {
+        // Horizontal axis dominates — split left/right.
+        if dx_from_center < 0.0 {
+            PaneDropRegion::Left
+        } else {
+            PaneDropRegion::Right
+        }
+    } else {
+        // Vertical axis dominates — split top/bottom.
+        if dy_from_center < 0.0 {
+            PaneDropRegion::Top
+        } else {
+            PaneDropRegion::Bottom
+        }
+    }
+}
+
+/// The two CSS style strings for the drop-zone center-line overlay.
+/// Returns `(vertical_line_style, horizontal_line_style)` — each is
+/// `Some` when that line should be drawn, `None` when it should not.
+///
+/// This is the "用中线作为标记" UX: exactly ONE bright line is drawn for
+/// split regions (vertical for Left/Right = 横着 placement, horizontal for
+/// Top/Bottom = 竖着 placement). For the Center swap/move zone, BOTH lines
+/// are drawn dimmed so the user can see the swap zone without it dominating
+/// the pane.
+///
+/// Showing ONE line per region (instead of always both) is the fix for the
+/// "错误的产生多个不需要的四方块" bug — the prior crosshair always drew
+/// both lines forming a 田 shape that was ambiguous about the split
+/// direction and visually competed with the half-rectangle highlight.
+///
+/// Extracted as a pure function so the overlay decision can be unit-tested
+/// without a dioxus runtime, and so `single_pane_with_drop` and
+/// `multi_pane_container` share the SAME line-selection logic.
+pub(crate) fn center_line_styles_for_region(
+    region: PaneDropRegion,
+) -> (Option<&'static str>, Option<&'static str>) {
+    // The bright accent line (2px, full opacity, glow) is used for split
+    // regions; the dimmed line (1px, 35% opacity) is used for Center.
+    const VERTICAL_BRIGHT: &str = "position: absolute; left: 50%; top: 0; width: 2px; height: 100%; \
+         background: #7aa2f7; pointer-events: none; z-index: 21; \
+         transform: translateX(-1px); box-shadow: 0 0 6px rgba(122,162,247,0.5);";
+    const HORIZONTAL_BRIGHT: &str = "position: absolute; left: 0; top: 50%; width: 100%; height: 2px; \
+         background: #7aa2f7; pointer-events: none; z-index: 21; \
+         transform: translateY(-1px); box-shadow: 0 0 6px rgba(122,162,247,0.5);";
+    const VERTICAL_DIM: &str = "position: absolute; left: 50%; top: 0; width: 1px; height: 100%; \
+         background: rgba(122,162,247,0.35); pointer-events: none; z-index: 21; \
+         transform: translateX(-0.5px);";
+    const HORIZONTAL_DIM: &str = "position: absolute; left: 0; top: 50%; width: 100%; height: 1px; \
+         background: rgba(122,162,247,0.35); pointer-events: none; z-index: 21; \
+         transform: translateY(-0.5px);";
+    match region {
+        // Horizontal-axis split (Left/Right): show ONLY the vertical divider.
+        // This is the 横着 placement marker — the new pane sits beside the
+        // existing one, separated by a vertical line.
+        PaneDropRegion::Left | PaneDropRegion::Right => (Some(VERTICAL_BRIGHT), None),
+        // Vertical-axis split (Top/Bottom): show ONLY the horizontal divider.
+        // This is the 竖着 placement marker — the new pane stacks above/below,
+        // separated by a horizontal line.
+        PaneDropRegion::Top | PaneDropRegion::Bottom => (None, Some(HORIZONTAL_BRIGHT)),
+        // Center swap/move zone: both lines dimmed (no split will happen).
+        PaneDropRegion::Center => (Some(VERTICAL_DIM), Some(HORIZONTAL_DIM)),
+    }
+}
+
 /// Start a tab drag: set the `tab_drag` signal (with `dragging: false` —
 /// the polling loop promotes it to `true` once the cursor crosses the
 /// threshold) and install the document-level JS listeners.
@@ -1808,16 +2095,18 @@ pub(crate) fn hit_test_pane_at(
 ///
 /// The session name is included so the polling loop can render a ghost
 /// element showing the dragged session's name following the cursor.
+/// `display_name` is shown in the ghost element. The polling `use_future`
+/// in `App` takes over from there.
 pub(crate) fn start_tab_drag(
     mut tab_drag: Signal<Option<TabDragState>>,
-    session_id: String,
-    session_name: String,
+    kind: DragKind,
+    display_name: String,
     start_x: f64,
     start_y: f64,
 ) {
     tab_drag.set(Some(TabDragState {
-        session_id,
-        session_name,
+        kind,
+        display_name,
         start_x,
         start_y,
         cur_x: start_x,
@@ -1965,7 +2254,7 @@ pub(crate) fn finish_tab_drag(
     mut state: Signal<AppState>,
     input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
     mut tab_drag: Signal<Option<TabDragState>>,
-    mut drag_over_pane: Signal<Option<usize>>,
+    mut drag_over_pane: Signal<Option<(usize, PaneDropRegion)>>,
     container_size: Signal<Option<(f64, f64)>>,
     final_x: f64,
     final_y: f64,
@@ -1981,13 +2270,16 @@ pub(crate) fn finish_tab_drag(
         drag_over_pane.set(None);
         return;
     };
-    let dragged_sid = drag.session_id.clone();
+    let drag_kind = drag.kind.clone();
 
     // Compute the hit-test target.
     //
     // The layout we care about is the ACTIVE tab's layout (layouts are
     // keyed by `active_tab`, NOT by `dragged_sid` — the dragged
     // session may be a pane-only session with no tab of its own).
+    // For sidebar `Connection` drags the active tab is also the right
+    // owner: a sidebar drop opens a NEW session in the target pane of
+    // the currently-visible layout, not in some other tab's layout.
     let active_id = state.read().active_tab.clone();
     let active_layout = active_id
         .as_ref()
@@ -1999,7 +2291,7 @@ pub(crate) fn finish_tab_drag(
     let hit = if let Some(layout) = active_layout.as_ref() {
         // Multi-pane (or single-pane-but-layout-exists) path: use the
         // pure hit-test helper.
-        hit_test_pane_at(
+        hit_test_pane_drop_target_at(
             final_x,
             final_y,
             container_left,
@@ -2011,89 +2303,197 @@ pub(crate) fn finish_tab_drag(
     } else {
         // No layout for the active session (Single preset, single
         // pane). The cursor is in pane 0 iff it's inside the container.
+        // Apply the same 4-quadrant scheme as `hit_test_pane_drop_target_at`
+        // so the single-pane path supports left/right/top/bottom splits too.
         let rel_x = final_x - container_left;
         let rel_y = final_y - container_top;
         if rel_x >= 0.0 && rel_y >= 0.0 && rel_x <= container_w && rel_y <= container_h {
             // Pane 0 holds the active session.
-            Some((0usize, active_id.clone().unwrap_or_default()))
+            let dx_from_center = if container_w > 0.0 {
+                rel_x / container_w - 0.5
+            } else {
+                0.0
+            };
+            let dy_from_center = if container_h > 0.0 {
+                rel_y / container_h - 0.5
+            } else {
+                0.0
+            };
+            let region = pane_drop_region_for_cursor(dx_from_center, dy_from_center);
+            Some(PaneDropTarget {
+                pane_idx: 0,
+                session_id: active_id.clone().unwrap_or_default(),
+                region,
+            })
         } else {
             None
         }
     };
 
-    // Apply the drop if we hit a pane.
-    if let Some((target_idx, target_session)) = hit {
-        let outcome = execute_tab_drop_on_pane(
-            &mut state.write(),
-            &dragged_sid,
-            target_idx,
-            &target_session,
-        );
-        match outcome {
-            TabDropOutcome::SelfDropExpanded {
-                first_pane_idx,
-                pane_count,
-            } => {
-                let opened = open_cloned_sessions_for_self_drop(
-                    state,
-                    input_senders,
+    // Apply the drop if we hit a pane. Dispatch on `drag_kind`:
+    //  - `Session` moves an existing session into the target pane
+    //    (execute_tab_drop_on_pane handles swap/move/split).
+    //  - `Connection` opens a NEW session in the target pane
+    //    (open_connection with a PaneTarget keyed by the active tab).
+    //    This preserves the "sidebar drop = new independent session for
+    //    comparison" contract — existing pane sessions remain visible and
+    //    one new pane is created when capacity permits.
+    if let Some(target) = hit {
+        let target_idx = target.pane_idx;
+        let target_session = target.session_id;
+        let split_direction = match target.region {
+            PaneDropRegion::Top => SplitDirection::Top,
+            PaneDropRegion::Bottom => SplitDirection::Bottom,
+            PaneDropRegion::Left => SplitDirection::Left,
+            PaneDropRegion::Right => SplitDirection::Right,
+            PaneDropRegion::Center => SplitDirection::Bottom,
+        };
+        match drag_kind {
+            DragKind::Session(dragged_sid) => {
+                let outcome = execute_tab_drop_on_pane_at(
+                    &mut state.write(),
                     &dragged_sid,
-                    first_pane_idx,
-                    pane_count,
+                    target_idx,
+                    &target_session,
+                    split_direction,
                 );
-                tracing::info!(
-                    "[TAB-DRAG] self-drop expanded layout: source={} panes={} opened={}",
-                    &dragged_sid[..dragged_sid.len().min(8)],
-                    pane_count,
-                    opened
-                );
-                restore_focus_to_active_session(state, 80);
+                match outcome {
+                    TabDropOutcome::SelfDropExpanded {
+                        first_pane_idx,
+                        pane_count,
+                    } => {
+                        let opened = open_cloned_sessions_for_self_drop(
+                            state,
+                            input_senders,
+                            &dragged_sid,
+                            first_pane_idx,
+                            pane_count,
+                        );
+                        tracing::info!(
+                            "[TAB-DRAG] self-drop expanded layout: source={} panes={} opened={}",
+                            &dragged_sid[..dragged_sid.len().min(8)],
+                            pane_count,
+                            opened
+                        );
+                        restore_focus_to_active_session(state, 80);
+                    }
+                    TabDropOutcome::SplitCreated { pane_idx }
+                    | TabDropOutcome::SplitFilledExisting { pane_idx } => {
+                        tracing::info!(
+                            "[TAB-DRAG] created split: session {} placed in pane {} (outcome={:?})",
+                            &dragged_sid[..dragged_sid.len().min(8)],
+                            pane_idx,
+                            outcome
+                        );
+                        restore_focus_to_active_session(state, 80);
+                    }
+                    TabDropOutcome::Swapped
+                    | TabDropOutcome::MovedToEmptyPane { .. }
+                    | TabDropOutcome::AssignedToEmptyPane => {
+                        tracing::info!(
+                            "[TAB-DRAG] {} (session {})",
+                            match outcome {
+                                TabDropOutcome::Swapped => "swapped panes",
+                                TabDropOutcome::MovedToEmptyPane { .. } => "moved to empty pane",
+                                TabDropOutcome::AssignedToEmptyPane => "assigned to empty pane",
+                                _ => "?",
+                            },
+                            &dragged_sid[..dragged_sid.len().min(8)]
+                        );
+                    }
+                    TabDropOutcome::NoOpSelfDrop => {
+                        tracing::info!(
+                            "[TAB-DRAG] self-drop no-op (session {})",
+                            &dragged_sid[..dragged_sid.len().min(8)]
+                        );
+                    }
+                    TabDropOutcome::SwapFailed
+                    | TabDropOutcome::SplitFallbackSwapFailed
+                    | TabDropOutcome::SplitFailed => {
+                        tracing::warn!(
+                            "[TAB-DRAG] drop failed (outcome={:?}, session {})",
+                            outcome,
+                            &dragged_sid[..dragged_sid.len().min(8)]
+                        );
+                    }
+                }
             }
-            TabDropOutcome::SplitCreated { pane_idx }
-            | TabDropOutcome::SplitFilledExisting { pane_idx } => {
-                tracing::info!(
-                    "[TAB-DRAG] created split: session {} placed in pane {} (outcome={:?})",
-                    &dragged_sid[..dragged_sid.len().min(8)],
-                    pane_idx,
-                    outcome
+            DragKind::Connection(conn) => {
+                // Sidebar → pane drop: open a NEW session for side-by-side
+                // comparison. When the target pane is already occupied, we
+                // PRESERVE the existing session by growing the layout (or
+                // reusing another empty pane) instead of replacing the
+                // target's session. This implements the "拖动左侧会话 = 新开会话对比"
+                // contract — the existing session stays visible alongside the
+                // new one.
+                //
+                // `prepare_split_for_sidebar_drop` returns the pane index
+                // where the new session should land (which may differ from
+                // `target_idx` if we reused an empty pane or appended a new
+                // pane on demand). We then call `open_connection` with a
+                // `PaneTarget` keyed by the layout owner returned from that
+                // call — this is NOT necessarily `active_id`, because the
+                // layout mutation inside `prepare_split_for_sidebar_drop`
+                // may have changed things; using the returned owner keeps the
+                // assignment stable against any active-tab mutation.
+                let conn_name = conn.name.clone();
+                let conn_id_short = conn.id.clone();
+                let plan = prepare_split_for_sidebar_drop_at(
+                    &mut state.write(),
+                    target_idx,
+                    split_direction,
                 );
-                restore_focus_to_active_session(state, 80);
-            }
-            TabDropOutcome::Swapped
-            | TabDropOutcome::MovedToEmptyPane { .. }
-            | TabDropOutcome::AssignedToEmptyPane => {
+                let (owner_for_target, pane_for_target, created_new_pane) = match plan {
+                    Some(plan) => (
+                        plan.layout_owner_tab_id.clone(),
+                        plan.pane_idx,
+                        plan.created_new_pane,
+                    ),
+                    None => {
+                        // No active tab — open as a new tab without a pane target.
+                        (String::new(), 0usize, false)
+                    }
+                };
+                let target = if owner_for_target.is_empty() {
+                    None
+                } else {
+                    Some(PaneTarget {
+                        layout_owner_tab_id: owner_for_target.clone(),
+                        pane_idx: pane_for_target,
+                    })
+                };
                 tracing::info!(
-                    "[TAB-DRAG] {} (session {})",
-                    match outcome {
-                        TabDropOutcome::Swapped => "swapped panes",
-                        TabDropOutcome::MovedToEmptyPane { .. } => "moved to empty pane",
-                        TabDropOutcome::AssignedToEmptyPane => "assigned to empty pane",
-                        _ => "?",
+                    "[TAB-DRAG] opening sidebar connection {} ({:?}) in pane {} (owner={:?}, created_new_pane={}, original_target={})",
+                    &conn_id_short[..conn_id_short.len().min(8)],
+                    conn_name,
+                    pane_for_target,
+                    if owner_for_target.is_empty() {
+                        None
+                    } else {
+                        Some(&owner_for_target[..owner_for_target.len().min(8)])
                     },
-                    &dragged_sid[..dragged_sid.len().min(8)]
+                    created_new_pane,
+                    target_idx
                 );
-            }
-            TabDropOutcome::NoOpSelfDrop => {
-                tracing::info!(
-                    "[TAB-DRAG] self-drop no-op (session {})",
-                    &dragged_sid[..dragged_sid.len().min(8)]
-                );
-            }
-            TabDropOutcome::SwapFailed
-            | TabDropOutcome::SplitFallbackSwapFailed
-            | TabDropOutcome::SplitFailed => {
-                tracing::warn!(
-                    "[TAB-DRAG] drop failed (outcome={:?}, session {})",
-                    outcome,
-                    &dragged_sid[..dragged_sid.len().min(8)]
-                );
+                let result = open_connection(state, input_senders, conn, target);
+                if result.assigned_to_target {
+                    tracing::info!(
+                        "[TAB-DRAG] connection {} assigned to pane {}",
+                        &conn_id_short[..conn_id_short.len().min(8)],
+                        pane_for_target
+                    );
+                    restore_focus_to_active_session(state, 80);
+                } else {
+                    tracing::warn!(
+                        "[TAB-DRAG] connection {} NOT assigned to pane {} (opened as new tab?)",
+                        &conn_id_short[..conn_id_short.len().min(8)],
+                        pane_for_target
+                    );
+                }
             }
         }
     } else {
-        tracing::info!(
-            "[TAB-DRAG] release outside any pane — no-op (session {})",
-            &dragged_sid[..dragged_sid.len().min(8)]
-        );
+        tracing::info!("[TAB-DRAG] release outside any pane — no-op");
     }
 
     // Clear the drag state and the drop-target highlight.
@@ -2147,7 +2547,7 @@ fn empty_pane_title_actions(
             let copy_owner = layout_owner_tab_id;
             rsx! {
                 button {
-                    style: "height: 18px; min-width: 22px; padding: 0 5px; border: 1px solid #414868; border-radius: 3px; background: #24283b; color: #7aa2f7; cursor: pointer; font-size: 12px; line-height: 16px;",
+                    style: "height: 18px; min-width: 24px; padding: 0 6px; border: 1px solid #414868; border-radius: 3px; background: #24283b; color: #7aa2f7; cursor: pointer; font-size: 12px; line-height: 16px; transition: background 0.12s ease, color 0.12s ease;",
                     title: "复制当前焦点会话：{source_name}",
                     onmousedown: move |e: MouseEvent| {
                         e.prevent_default();
@@ -2175,7 +2575,7 @@ fn empty_pane_title_actions(
         }
         None => rsx! {
             button {
-                style: "height: 18px; min-width: 22px; padding: 0 5px; border: 1px solid #2a2b3d; border-radius: 3px; background: #1f2335; color: #414868; cursor: not-allowed; font-size: 12px; line-height: 16px;",
+                style: "height: 18px; min-width: 24px; padding: 0 6px; border: 1px solid #2a2b3d; border-radius: 3px; background: #1f2335; color: #414868; cursor: not-allowed; font-size: 12px; line-height: 16px;",
                 title: "没有可复制的焦点会话",
                 disabled: true,
                 "⧉"
@@ -2188,7 +2588,7 @@ fn empty_pane_title_actions(
             style: "display: inline-flex; align-items: center; gap: 4px; margin-left: 6px;",
             {copy_button}
             button {
-                style: "height: 18px; min-width: 22px; padding: 0 5px; border: 1px solid #414868; border-radius: 3px; background: #24283b; color: #9ece6a; cursor: pointer; font-size: 13px; line-height: 16px;",
+                style: "height: 18px; min-width: 24px; padding: 0 6px; border: 1px solid #414868; border-radius: 3px; background: #24283b; color: #9ece6a; cursor: pointer; font-size: 13px; line-height: 16px; transition: background 0.12s ease, color 0.12s ease;",
                 title: "打开侧栏，将自定义连接拖入此窗格",
                 onmousedown: move |e: MouseEvent| {
                     e.prevent_default();
@@ -2206,6 +2606,24 @@ fn empty_pane_title_actions(
                 "+"
             }
         }
+    }
+}
+
+/// Accent color for a session type, used as the left edge highlight on
+/// pane title bars (mirrors the sidebar's per-kind dot color). Returns a
+/// neutral dim color for empty panes so the title bar still has a visual
+/// anchor without implying a session type.
+///
+/// This is separate from `sidebar.rs::kind_color` because the pane title
+/// bar only has `SessionType` (not `ConnectionKind`) — a cloned pane shares
+/// the source session's type, so the accent stays consistent across clones.
+fn session_type_accent_color(kind: &SessionType) -> &'static str {
+    match kind {
+        SessionType::Ssh => "#7aa2f7",    // blue
+        SessionType::Shell => "#9ece6a",  // green
+        SessionType::Serial => "#e0af68", // amber
+        SessionType::Telnet => "#ff9e64", // orange
+        SessionType::Tcp => "#7dcfff",    // cyan
     }
 }
 
@@ -2237,7 +2655,7 @@ fn multi_pane_container(
     mut state: Signal<AppState>,
     input_senders: Signal<std::collections::HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
     layout: PaneLayout,
-    mut drag_over_pane: Signal<Option<usize>>,
+    mut drag_over_pane: Signal<Option<(usize, PaneDropRegion)>>,
     container_size: Signal<Option<(f64, f64)>>,
     split_drag: Signal<Option<SplitDragState>>,
     tab_drag: Signal<Option<TabDragState>>,
@@ -2317,20 +2735,22 @@ fn multi_pane_container(
     // drag-handle title bar.
     //
     // Each pane is both a manual session-drag source (via its title text)
-    // and an HTML5 drop target: the user can
-    // drag an open session from the tab bar OR from another pane's title
-    // bar onto a pane (moves or swaps the session into that pane), or drag
-    // a sidebar connection onto a pane (opens a new session in that pane).
-    // The drag source identifies itself via a custom MIME type in the
-    // DragEvent's DataTransfer:
+    // and an HTML5 drop target. Both drag paths now have a PRIMARY path
+    // via the manual mouse-based system (Task 22 + sidebar extension):
+    //   - tab/pane-title drag → `start_tab_drag` with `DragKind::Session`
+    //   - sidebar → pane drag → `start_tab_drag` with `DragKind::Connection`
+    // The HTML5 `ondrop` branches below are DEFENSIVE FALLBACKS retained
+    // for forward compat in case HTML5 DnD is ever re-enabled. They read
+    // the drag source from a custom MIME type in the DragEvent's DataTransfer:
     //   - "application/x-rusterm-session-id"     → drag from tab bar or pane title
-    //   - "application/x-rusterm-connection-id"  → drag from sidebar
+    //   - "application/x-rusterm-connection-id"  → drag from sidebar (legacy)
     let pane_items: Vec<(
         usize,
         String,
         (f64, f64, f64, f64),
         String,
         &'static str,
+        Option<PaneDropRegion>,
         &'static str,
         String,
         String,
@@ -2339,11 +2759,19 @@ fn multi_pane_container(
         Element,
         String,
         String,
-        String,
+        &'static str,
     )> = visible
         .into_iter()
         .map(|(idx, sid, rect)| {
-            let is_drag_over = drag_over_pane() == Some(idx);
+            // Read once per pane during Vec construction — subscribes
+            // `App` to the signal so any change triggers ONE re-render.
+            let drag_over = drag_over_pane();
+            let is_drag_over = drag_over.is_some_and(|(i, _)| i == idx);
+            let drag_over_region = if is_drag_over {
+                drag_over.and_then(|(i, r)| if i == idx { Some(r) } else { None })
+            } else {
+                None
+            };
             let is_focused = focused_pane.as_ref().is_some_and(|focused| {
                 focused.layout_owner_tab_id == layout_owner_tab_id && focused.pane_idx == idx
             });
@@ -2356,12 +2784,46 @@ fn multi_pane_container(
             } else {
                 "border: 2px solid transparent; box-sizing: border-box;"
             };
+            // Title bar chrome — three states with deliberately distinct
+            // contrast so the focused pane pops and the default panes are
+            // still readable (the prior `#1f2335` default blended into the
+            // terminal background and the title bar looked invisible).
+            //
+            // Palette (Tokyo Night, brightened pass 2026-07-20):
+            //   default  #2f3550 — two steps lighter than terminal bg #1a1b26;
+            //                      clearly delimits the title bar without
+            //                      competing with the focused pane.
+            //   focused  linear-gradient(#565f89 → #414868) — Tokyo Night
+            //                      "selection" tone with a subtle vertical
+            //                      gradient so the focused pane reads as a
+            //                      distinct highlighted surface (the user
+            //                      explicitly asked for "高亮会话的小框").
+            //   drag-over #7aa2f7 — bright blue accent; unambiguous drop
+            //                      target, mirrors the splitter hover color.
             let title_chrome = if is_drag_over {
-                "background: #24283b; border-bottom: 2px solid #7aa2f7;"
+                "background: #7aa2f7; border-bottom: 2px solid #bb9af7;"
             } else if is_focused {
-                "background: #292e42; border-bottom: 2px solid #bb9af7;"
+                "background: linear-gradient(180deg, #565f89 0%, #414868 100%); \
+                 border-bottom: 2px solid #7aa2f7; \
+                 box-shadow: 0 1px 6px rgba(122,162,247,0.25);"
             } else {
-                "background: #1f2335; border-bottom: 1px solid #2a2b3d;"
+                "background: #2f3550; border-bottom: 1px solid #414868;"
+            };
+            // Accent color for the left edge of the title bar — a thin
+            // vertical strip that identifies the session type at a glance
+            // (mirrors the sidebar's per-kind dot). Empty panes use a dim
+            // grey so the strip is still visible but doesn't imply a kind.
+            // The strip is 4px wide (was 3px) for stronger visual anchoring.
+            let accent_color = if sid.is_empty() {
+                "#414868"
+            } else {
+                state
+                    .read()
+                    .sessions
+                    .iter()
+                    .find(|t| t.id == sid)
+                    .map(|t| session_type_accent_color(&t.kind))
+                    .unwrap_or("#414868")
             };
             let window_chrome = if layout_floating {
                 "border-radius: 6px; box-shadow: 0 8px 24px rgba(0,0,0,0.45);"
@@ -2442,6 +2904,7 @@ fn multi_pane_container(
                 rect,
                 sid,
                 border,
+                drag_over_region,
                 title_chrome,
                 title,
                 drag_sid,
@@ -2450,7 +2913,7 @@ fn multi_pane_container(
                 pane_actions,
                 layout_owner_tab_id.clone(),
                 layout_owner_tab_id.clone(),
-                layout_owner_tab_id.clone(),
+                accent_color,
             )
         })
         .collect();
@@ -2505,22 +2968,53 @@ fn multi_pane_container(
             id: "multi-pane-container",
             style: "position: absolute; left: 0; right: 0; top: 0; bottom: 0; overflow: hidden;",
 
+            // Scoped CSS for pane title bar hover effects. dioxus 0.7's inline
+            // `style` attribute can't express `:hover` pseudo-classes, so we
+            // use a `<style>` block with namespaced class names (mirrors the
+            // sidebar's `conn-` pattern). The hover rules ONLY apply to
+            // title bars whose inline `background` is the default — focused
+            // and drag-over states set a stronger background inline which
+            // the `.pane-title-bar:hover` rule doesn't override (CSS
+            // specificity: inline style > class rule).
+            //
+            // The drag handle (`⠿`) brightens on hover so the user can
+            // discover that the title bar is draggable. The slight
+            // `transform: scale` gives a tactile "lift" affordance.
+            style { "
+                .pane-title-bar:hover {{ filter: brightness(1.10); }}
+                .pane-drag-handle:hover {{ color: #bb9af7 !important; transform: scale(1.15); }}
+                .pane-title-text {{ transition: color 0.12s ease; }}
+                .pane-title-bar:hover .pane-title-text {{ color: #ffffff; }}
+                .pane-accent-strip {{ transition: width 0.12s ease; }}
+            " }
+
             // Comparison-mode banner.
+            //
+            // Sits at the top of the terminal area as a non-interactive
+            // overlay (`pointer-events: none` so it never blocks clicks on
+            // the terminal below). Uses a subtle vertical gradient instead
+            // of a flat fill so it reads as a status strip rather than a
+            // solid block covering terminal content. The 1px bottom border
+            // + box-shadow give it depth so the user can visually separate
+            // it from the terminal output underneath.
             {comparison_on.then(|| rsx! {
                 div {
                     style: "
                         position: absolute;
                         top: 0; left: 0; right: 0;
-                        height: 20px;
-                        background: #7aa2f7;
+                        height: 18px;
+                        background: linear-gradient(180deg, #7aa2f7 0%, #6a92e8 100%);
                         color: #1a1b26;
-                        font-size: 11px;
+                        font-size: 10px;
                         font-weight: 600;
+                        letter-spacing: 0.3px;
                         display: flex;
                         align-items: center;
                         justify-content: center;
                         z-index: 100;
                         pointer-events: none;
+                        border-bottom: 1px solid #414868;
+                        box-shadow: 0 1px 4px rgba(0,0,0,0.3);
                     ",
                     "⚠ Comparison mode ON — input is broadcast to all panes"
                 }
@@ -2531,13 +3025,12 @@ fn multi_pane_container(
             // PERF: `border_style` is pre-computed in `pane_items` by reading
             // `drag_over_pane()` once per pane during Vec construction. This
             // read subscribes `App` to the signal, so any change triggers
-            // ONE re-render of `App` (not per-tick). The Signal equality
-            // check prevents re-renders for no-op `set(Some(idx))` calls in
-            // the high-frequency `ondragover` (~60Hz) handler — the
-            // highlight only changes when the dragged pane actually changes.
-            // This aligns with the user's frequency-vs-feedback
-            // preference: fewer re-renders over per-tick feedback.
-            for (idx, session_id, (x, y, w, h), drop_session_id, border_style, title_chrome, pane_title, drag_sid, z_index, window_chrome, pane_actions, pane_owner_for_click, pane_owner_for_title, pane_owner_for_drop) in pane_items.into_iter() {
+            // ONE re-render of `App`. The Signal equality check prevents
+            // re-renders for no-op `set` calls — the highlight only changes
+            // when the dragged pane actually changes. This aligns with the
+            // user's frequency-vs-feedback preference: fewer re-renders over
+            // per-tick feedback.
+            for (idx, session_id, (x, y, w, h), drop_session_id, border_style, drag_over_region, title_chrome, pane_title, drag_sid, z_index, window_chrome, pane_actions, pane_owner_for_click, pane_owner_for_title, accent_color) in pane_items.into_iter() {
                 div {
                     key: "pane-{idx}-{session_id}",
                     style: format!(
@@ -2557,25 +3050,30 @@ fn multi_pane_container(
                     // (security restriction: drops without a dragover
                     // prevent_default are blocked).
                     //
-                    // PERF: we also set `drag_over_pane` here. The Signal
-                    // equality check makes this a no-op when the value is
-                    // already `Some(idx)`, so the high-frequency dragover
-                    // (~60Hz) does NOT trigger per-tick re-renders.
+                    // NOTE: we do NOT write to `drag_over_pane` here. The
+                    // manual polling loop in `App` is the SOLE writer of
+                    // that signal — it hit-tests the cursor at ~60Hz and
+                    // sets the real 4-quadrant region. Letting HTML5
+                    // dragover also write `Some((idx, Center))` caused it
+                    // to race with the polling loop at pane boundaries:
+                    // HTML5 reported pane A while the hit-test said pane B,
+                    // flickering the overlay between them. Visually this
+                    // looked like multiple "田"-shaped 4-block overlays
+                    // appearing and disappearing on adjacent panes — the
+                    // "错误的产生多个不需要的四方块" bug. Keeping the signal
+                    // write ONLY in the polling loop fixes that.
                     ondragover: move |e: DragEvent| {
                         e.prevent_default();
                         e.data_transfer().set_drop_effect("move");
-                        drag_over_pane.set(Some(idx));
                     },
                     // `ondragenter` also needs prevent_default for
-                    // cross-browser compatibility (some browsers
-                    // require both dragenter AND dragover to be
-                    // cancelled to allow drop). We also set
-                    // `drag_over_pane` here — this is the event that
-                    // actually changes the highlight when the cursor
-                    // enters a new pane.
+                    // cross-browser compatibility (some browsers require
+                    // both dragenter AND dragover to be cancelled to
+                    // allow drop). As with `ondragover`, we do NOT write
+                    // `drag_over_pane` — the polling loop owns that
+                    // signal and computes the real region.
                     ondragenter: move |e: DragEvent| {
                         e.prevent_default();
-                        drag_over_pane.set(Some(idx));
                     },
                     ondrop: move |e: DragEvent| {
                         e.prevent_default();
@@ -2679,7 +3177,7 @@ fn multi_pane_container(
                                 }
                                 TabDropOutcome::SplitFallbackSwapFailed => {
                                     tracing::warn!(
-                                        "[DROP] Grid8 full and swap failed — session {} not placed",
+                                        "[DROP] layout at MAX_PANES and swap failed — session {} not placed",
                                         &dragged_sid[..dragged_sid.len().min(8)]
                                     );
                                 }
@@ -2693,8 +3191,14 @@ fn multi_pane_container(
                             }
                             return;
                         }
-                        // Check for the "drag from sidebar" MIME type —
-                        // a connection is being opened in this pane.
+                        // DEFENSIVE FALLBACK: sidebar → pane drags now
+                        // use the manual mouse-based system (Task 22
+                        // extension — `DragKind::Connection` in
+                        // `start_tab_drag`/`finish_tab_drag`). The
+                        // sidebar no longer sets `draggable: true` +
+                        // this MIME type, so this branch should never
+                        // fire. Retained symmetrically with the
+                        // session-id fallback above for forward compat.
                         if let Some(conn_id) = dt.get_data("application/x-rusterm-connection-id") {
                             if conn_id.is_empty() {
                                 tracing::warn!("[DROP] empty connection-id in drag data");
@@ -2720,13 +3224,17 @@ fn multi_pane_container(
                                 conn.name,
                                 idx
                             );
-                            // Open the connection in this pane. The
-                            // `open_connection` creates the terminal and
-                            // assigns it through a stable layout owner + pane
-                            // target, independent of later active-tab changes.
-                            let target = Some(PaneTarget {
-                                layout_owner_tab_id: pane_owner_for_drop.clone(),
-                                pane_idx: idx,
+                            // Use the same preserve-and-grow state path as the
+                            // primary manual drag system. Never replace the
+                            // occupied target pane merely because this fallback
+                            // HTML5 event fired.
+                            let target = prepare_split_for_sidebar_drop(
+                                &mut state.write(),
+                                idx,
+                            )
+                            .map(|plan| PaneTarget {
+                                layout_owner_tab_id: plan.layout_owner_tab_id,
+                                pane_idx: plan.pane_idx,
                             });
                             open_connection(state, input_senders, conn, target);
                             return;
@@ -2758,12 +3266,13 @@ fn multi_pane_container(
                     // executes a drop only after the cursor crosses the drag
                     // threshold.
                     div {
+                        class: "pane-title-bar",
                         style: format!("
                             height: 24px;
                             {title_chrome}
                             display: flex;
                             align-items: center;
-                            padding: 0 7px;
+                            padding: 0 7px 0 0;
                             font-size: 11px;
                             color: #c0caf5;
                             cursor: grab;
@@ -2771,8 +3280,9 @@ fn multi_pane_container(
                             -webkit-user-select: none;
                             flex-shrink: 0;
                             z-index: 10;
+                            transition: background 0.12s ease;
                         "),
-                        title: "Drag to move this session to another pane",
+                        title: "拖动会话标题可移动到其他窗格；⠿ 可拖动浮动窗",
                         onmousedown: move |e: MouseEvent| {
                             // Only start a drag on primary button (left
                             // click). Middle/right clicks have other
@@ -2809,16 +3319,27 @@ fn multi_pane_container(
                                     .unwrap_or_else(|| drag_sid.clone());
                                 start_tab_drag(
                                     tab_drag,
-                                    drag_sid.clone(),
+                                    DragKind::Session(drag_sid.clone()),
                                     ghost_name,
                                     c.x,
                                     c.y,
                                 );
                             }
                         },
+                        // Left accent strip — a thin vertical bar colored
+                        // by the session type (mirrors the sidebar's
+                        // per-kind dot). Empty panes get a dim grey strip.
+                        // `flex-shrink: 0` keeps it from collapsing when
+                        // the title text is long.
                         span {
-                            style: "display: inline-flex; align-items: center; justify-content: center; width: 18px; margin-left: -5px; margin-right: 5px; cursor: move; color: #7aa2f7; font-size: 13px;",
-                            title: "拖动小窗口",
+                            class: "pane-accent-strip",
+                            style: "width: 4px; align-self: stretch; flex-shrink: 0; background: {accent_color}; margin-right: 7px; box-shadow: 0 0 4px {accent_color};",
+                            title: "session-type-accent",
+                        }
+                        span {
+                            class: "pane-drag-handle",
+                            style: "display: inline-flex; align-items: center; justify-content: center; width: 18px; margin-right: 5px; cursor: move; color: #7aa2f7; font-size: 13px; transition: color 0.12s ease, transform 0.12s ease;",
+                            title: "拖动小窗口（浮动模式）",
                             onmousedown: move |e: MouseEvent| {
                                 if e.trigger_button() == Some(MouseButton::Primary) {
                                     e.prevent_default();
@@ -2846,7 +3367,8 @@ fn multi_pane_container(
                             "⠿"
                         }
                         span {
-                            style: "flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
+                            class: "pane-title-text",
+                            style: "flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding-left: 2px;",
                             "{pane_title}"
                         }
                         {pane_actions}
@@ -2857,6 +3379,11 @@ fn multi_pane_container(
                     // gets the rest. `position: relative` + `overflow:
                     // hidden` matches the single-pane path's container.
                     //
+                    // The drop-zone hint overlay (highlighted target half
+                    // + center crosshair) is mounted INSIDE this content
+                    // area so it doesn't overlap the title bar and is
+                    // clipped to the terminal region.
+                    //
                     // An EMPTY session_id means this pane is a drop-zone
                     // placeholder (created by the free-split gesture
                     // before a session was assigned). Render a visible
@@ -2864,19 +3391,97 @@ fn multi_pane_container(
                     // looked like "the window can't be filled".
                     div {
                         style: "flex: 1; position: relative; overflow: hidden; min-height: 0;",
+                        // Drop hint overlay: translucent blue rectangle on
+                        // the target half plus the SINGLE center line that
+                        // marks the dividing axis (the "用中线作为标记"
+                        // affordance). Mounted only while `drag_over_pane`
+                        // points at THIS pane. `pointer-events: none` is
+                        // critical — without it the overlay would
+                        // intercept the drop and the pane's `ondrop` would
+                        // never fire.
+                        //
+                        // Visual scheme (single center line, NOT the "田"
+                        // 4-block shape):
+                        //   Left / Right  → VERTICAL center line (divides
+                        //                  left from right; signals 横着 /
+                        //                  horizontal placement).
+                        //   Top  / Bottom → HORIZONTAL center line (divides
+                        //                  top from bottom; signals 竖着 /
+                        //                  vertical placement).
+                        //   Center        → both lines dimmed (swap/move zone).
+                        //
+                        // Showing ONE line per region (instead of always
+                        // both) is the fix for the "错误的产生多个不需要的
+                        // 四方块" bug — the prior crosshair always drew both
+                        // lines forming a 田 shape that was ambiguous about
+                        // the split direction.
+                        {drag_over_region.is_some().then(|| {
+                            let region = drag_over_region.unwrap();
+                            let half_style = match region {
+                                PaneDropRegion::Top => "position: absolute; left: 0; top: 0; width: 100%; height: 50%; background: rgba(122,162,247,0.18); pointer-events: none; z-index: 20;",
+                                PaneDropRegion::Bottom => "position: absolute; left: 0; top: 50%; width: 100%; height: 50%; background: rgba(122,162,247,0.18); pointer-events: none; z-index: 20;",
+                                PaneDropRegion::Left => "position: absolute; left: 0; top: 0; width: 50%; height: 100%; background: rgba(122,162,247,0.18); pointer-events: none; z-index: 20;",
+                                PaneDropRegion::Right => "position: absolute; left: 50%; top: 0; width: 50%; height: 100%; background: rgba(122,162,247,0.18); pointer-events: none; z-index: 20;",
+                                PaneDropRegion::Center => "",
+                            };
+                            // Pick the SINGLE center line ("中线") matching the
+                            // split axis. See `center_line_styles_for_region`
+                            // for the visual scheme.
+                            let (vertical_line, horizontal_line) =
+                                center_line_styles_for_region(region);
+                            rsx! {
+                                // Highlighted target half (skipped for Center).
+                                {(!matches!(region, PaneDropRegion::Center)).then(|| rsx! {
+                                    div { style: "{half_style}" }
+                                })}
+                                // The single relevant center line ("中线").
+                                // Only one is shown for split regions — this
+                                // is what tells the user 横着 (left/right)
+                                // vs 竖着 (top/bottom) placement.
+                                {vertical_line.map(|style| rsx! { div { style: "{style}" } })}
+                                {horizontal_line.map(|style| rsx! { div { style: "{style}" } })}
+                            }
+                        })}
                         if session_id.is_empty() {
+                            // Empty drop-zone pane: split-pane hint with clear
+                            // call-to-action. The hint shows three options the
+                            // user can take, mirroring the buttons in the title
+                            // bar (copy focused / open sidebar / new session).
+                            // This is the "分屏提示" affordance — when the
+                            // user enters split mode (or drags a tab onto a
+                            // pane to expand the layout), each new empty pane
+                            // tells them exactly how to fill it.
                             div {
                                 style: "
                                     position: absolute; inset: 0;
-                                    display: flex; align-items: center; justify-content: center;
-                                    background: #16161e;
-                                    border: 1px dashed #3b4261;
+                                    display: flex; flex-direction: column;
+                                    align-items: center; justify-content: center;
+                                    gap: 8px;
+                                    background: linear-gradient(180deg, #16161e 0%, #1a1b26 100%);
+                                    border: 1px dashed #414868;
                                     color: #565f89;
                                     font-size: 12px;
                                     user-select: none;
                                     -webkit-user-select: none;
+                                    padding: 12px;
+                                    text-align: center;
                                 ",
-                                "点击标题栏 ⧉ 复制相邻会话，或拖拽标签页/侧栏连接到此处"
+                                div {
+                                    style: "font-size: 22px; color: #414868; line-height: 1; margin-bottom: 4px;",
+                                    "⊡"
+                                }
+                                div {
+                                    style: "color: #7aa2f7; font-weight: 600; font-size: 12px;",
+                                    "空白窗格"
+                                }
+                                div {
+                                    style: "color: #565f89; font-size: 11px; line-height: 1.5;",
+                                    "点击标题栏 ⧉ 复制焦点会话"
+                                    br {}
+                                    "拖动左侧会话到此处新建会话"
+                                    br {}
+                                    "或拖动标签页/会话标题到此处"
+                                }
                             }
                         } else {
                             {render_terminal_pane(state, input_senders, session_id.clone())}
@@ -2888,8 +3493,8 @@ fn multi_pane_container(
             // Grid splitters are hidden after promotion to floating windows;
             // each window then owns its position independently.
             {(!layout_floating).then(|| rsx! {
-                {render_col_splitters(&layout, container_w, state, split_drag)}
-                {render_row_splitters(&layout, container_h, state, split_drag)}
+                {render_col_splitters(&layout, container_w, container_h, state, split_drag)}
+                {render_row_splitters(&layout, container_w, container_h, state, split_drag)}
             })}
 
             // Drag-resize overlay: while a splitter drag is in progress,
@@ -2921,192 +3526,117 @@ fn multi_pane_container(
     }
 }
 
-/// Render vertical splitter bars between adjacent columns. Drag the bar to
-/// resize the two columns it separates (smooth, continuous — not the prior
-/// 5%-step click). Right-click still does a 5% shrink for keyboard-free
-/// fine-tuning.
-///
-/// ## Drag-resize mechanism
-///
-/// The splitter bar carries ONLY `onmousedown`. When the user presses the
-/// mouse button, we:
-///  1. Set `split_drag = Some(...)` so the overlay mounts (visual cursor).
-///  2. Call `install_split_drag_js_listeners` to attach document-level
-///     capture-phase `mousemove`/`mouseup` listeners. These listeners write
-///     the mouse position to `window.__rusterm_drag_pos` and set
-///     `window.__rusterm_drag_done = true` on mouseup.
-///
-/// A polling `use_future` in `App` reads those globals every 16ms and calls
-/// `apply_split_drag_step` to apply the delta.
-///
-/// We do NOT attach `onmousemove`/`onmouseup` to the splitter bar itself —
-/// dioxus 0.7's desktop webview doesn't reliably fire element-level mouse
-/// events during a button-held drag (pointer capture behavior is inconsistent
-/// across WKWebView/webkitgtk/WebView2). Document-level capture-phase
-/// listeners are the only mechanism that works reliably. See
-/// `install_split_drag_js_listeners` for the full rationale.
 fn render_col_splitters(
     layout: &PaneLayout,
     container_w: f64,
+    container_h: f64,
     mut state: Signal<AppState>,
     mut split_drag: Signal<Option<SplitDragState>>,
 ) -> Element {
-    let cols = layout.cols();
-    if cols < 2 {
-        return rsx! {};
-    }
-    // Collect into an owned Vec of (col_idx, x_px) tuples. The `for` loop
-    // in rsx! can't contain `let` bindings (dioxus 0.7 macro
-    // limitation), so we pre-compute owned values here and destructure
-    // them in the pattern. `f64` is `Copy`, so this is cheap.
-    let boundaries: Vec<(usize, f64)> = {
-        let mut out = Vec::new();
-        let mut acc = 0.0_f64;
-        for (i, frac) in layout.col_fracs.iter().enumerate() {
-            if i > 0 {
-                out.push((i - 1, acc * container_w));
-            }
-            acc += frac;
-        }
-        out
-    };
+    let boundaries: Vec<(usize, f64, f64, f64, f64)> = layout
+        .splitters(container_w, container_h)
+        .into_iter()
+        .filter(|splitter| splitter.axis == SplitAxis::LeftRight)
+        .map(|splitter| {
+            (
+                splitter.splitter_idx,
+                splitter.x,
+                splitter.y,
+                splitter.height,
+                splitter.local_extent,
+            )
+        })
+        .collect();
     rsx! {
-        for (col_idx, x_val) in boundaries.into_iter() {
+        for (splitter_idx, x_val, y_val, height, local_extent) in boundaries.into_iter() {
             div {
-                key: "col-split-{col_idx}",
+                key: "col-split-{splitter_idx}",
                 style: format!(
-                    "position: absolute; left: {x_val}px; top: 0; bottom: 0; width: 10px; \
+                    "position: absolute; left: {x_val}px; top: {y_val}px; height: {height}px; width: 10px; \
                      margin-left: -5px; cursor: col-resize; background: #2a2b3d; z-index: 50; \
                      transition: background 0.1s; user-select: none;",
                 ),
-                // Begin a drag-resize. We capture the viewport-relative mouse
-                // position (NOT the container-relative splitter position) as
-                // `last_applied_pos` — see `SplitDragState`'s doc comment for
-                // why viewport space matters for delta computation.
-                //
-                // `e.prevent_default()` is needed to stop the browser from
-                // initiating a text-selection drag (which would hijack
-                // subsequent mousemove events) AND to prevent the splitter
-                // bar from receiving focus (we want focus to stay on the
-                // terminal pane the user was typing in).
-                //
-                // We then install document-level capture-phase listeners
-                // (see `install_split_drag_js_listeners`) — these are the
-                // ONLY reliable way to intercept mousemove during a
-                // button-held drag in dioxus 0.7's desktop webview.
                 onmousedown: move |e: MouseEvent| {
                     e.prevent_default();
                     e.stop_propagation();
-                    if container_w <= 0.0 {
+                    if local_extent <= 0.0 {
                         return;
                     }
-                    // Viewport-relative mouse position at drag start.
                     let start_client_x = e.client_coordinates().x;
                     let start_client_y = e.client_coordinates().y;
                     split_drag.set(Some(SplitDragState {
+                        idx: splitter_idx,
                         is_col: true,
-                        idx: col_idx,
-                        container_extent: container_w,
+                        container_extent: local_extent,
                         last_applied_pos: start_client_x,
                     }));
-                    tracing::info!(
-                        "[LAYOUT] col-split drag started: idx={} splitter_x={:.1} client_x={:.1} container_w={:.1}",
-                        col_idx, x_val, start_client_x, container_w
-                    );
-                    // Install document-level capture-phase listeners. These
-                    // fire on every mousemove/mouseup during the drag,
-                    // regardless of where the cursor is or which element is
-                    // under it. The polling use_future in App reads the
-                    // position from `window.__rusterm_drag_pos` and applies
-                    // the delta.
                     install_split_drag_js_listeners(start_client_x, start_client_y);
                 },
                 oncontextmenu: move |e: MouseEvent| {
                     e.prevent_default();
-                    let delta = -0.05;
-                    if resize_layout_col(&mut state.write(), col_idx, delta) {
-                        tracing::info!("[LAYOUT] col {} shrunk by {:.2}", col_idx, -delta);
+                    if resize_layout_split(&mut state.write(), splitter_idx, -0.05) {
+                        tracing::info!("[LAYOUT] local left/right split shrunk");
                     }
                 },
-                title: "Drag to resize columns, right-click to shrink left",
+                title: "Drag to resize local left/right split",
             }
         }
     }
 }
 
-/// Render horizontal splitter bars between adjacent rows. Drag the bar to
-/// resize the two rows it separates (smooth, continuous). Right-click still
-/// does a 5% shrink.
-///
-/// See `render_col_splitters` for the drag-resize mechanism rationale
-/// (splitter carries only `onmousedown`; document-level capture-phase
-/// listeners installed via JS `eval` handle `mousemove`/`mouseup`).
 fn render_row_splitters(
     layout: &PaneLayout,
+    container_w: f64,
     container_h: f64,
     mut state: Signal<AppState>,
     mut split_drag: Signal<Option<SplitDragState>>,
 ) -> Element {
-    let rows = layout.rows();
-    if rows < 2 {
-        return rsx! {};
-    }
-    let mut boundaries = Vec::new();
-    let mut acc = 0.0_f64;
-    for (i, frac) in layout.row_fracs.iter().enumerate() {
-        if i > 0 {
-            boundaries.push(acc * container_h);
-        }
-        acc += frac;
-    }
-    // Collect into owned (row_idx, y_px) tuples — see the col-splitter
-    // comment for why.
-    let boundaries: Vec<(usize, f64)> = boundaries
+    let boundaries: Vec<(usize, f64, f64, f64, f64)> = layout
+        .splitters(container_w, container_h)
         .into_iter()
-        .enumerate()
-        .map(|(i, y)| (i, y))
+        .filter(|splitter| splitter.axis == SplitAxis::TopBottom)
+        .map(|splitter| {
+            (
+                splitter.splitter_idx,
+                splitter.x,
+                splitter.y,
+                splitter.width,
+                splitter.local_extent,
+            )
+        })
         .collect();
     rsx! {
-        for (row_idx, y_val) in boundaries.into_iter() {
+        for (splitter_idx, x_val, y_val, width, local_extent) in boundaries.into_iter() {
             div {
-                key: "row-split-{row_idx}",
+                key: "row-split-{splitter_idx}",
                 style: format!(
-                    "position: absolute; top: {y_val}px; left: 0; right: 0; height: 10px; \
+                    "position: absolute; top: {y_val}px; left: {x_val}px; width: {width}px; height: 10px; \
                      margin-top: -5px; cursor: row-resize; background: #2a2b3d; z-index: 50; \
                      transition: background 0.1s; user-select: none;",
                 ),
                 onmousedown: move |e: MouseEvent| {
                     e.prevent_default();
                     e.stop_propagation();
-                    if container_h <= 0.0 {
+                    if local_extent <= 0.0 {
                         return;
                     }
-                    // Viewport-relative mouse position at drag start.
                     let start_client_x = e.client_coordinates().x;
                     let start_client_y = e.client_coordinates().y;
                     split_drag.set(Some(SplitDragState {
+                        idx: splitter_idx,
                         is_col: false,
-                        idx: row_idx,
-                        container_extent: container_h,
+                        container_extent: local_extent,
                         last_applied_pos: start_client_y,
                     }));
-                    tracing::info!(
-                        "[LAYOUT] row-split drag started: idx={} splitter_y={:.1} client_y={:.1} container_h={:.1}",
-                        row_idx, y_val, start_client_y, container_h
-                    );
-                    // Install document-level capture-phase listeners — see
-                    // `install_split_drag_js_listeners` for why this is the
-                    // only reliable mechanism in dioxus 0.7's desktop webview.
                     install_split_drag_js_listeners(start_client_x, start_client_y);
                 },
                 oncontextmenu: move |e: MouseEvent| {
                     e.prevent_default();
-                    let delta = -0.05;
-                    if resize_layout_row(&mut state.write(), row_idx, delta) {
-                        tracing::info!("[LAYOUT] row {} shrunk by {:.2}", row_idx, -delta);
+                    if resize_layout_split(&mut state.write(), splitter_idx, -0.05) {
+                        tracing::info!("[LAYOUT] local top/bottom split shrunk");
                     }
                 },
-                title: "Drag to resize rows, right-click to shrink top",
+                title: "Drag to resize local top/bottom split",
             }
         }
     }
@@ -5449,6 +5979,106 @@ mod connection_target_tests {
         assert!(!assign_opened_session(&mut state, Some(&target), "clone"));
         assert_eq!(state.active_session.as_deref(), Some("layout-owner"));
     }
+
+    /// The sidebar drop's state preparation plus open-session assignment must
+    /// preserve two occupied panes and place the new session in exactly one
+    /// additional pane.
+    #[test]
+    fn sidebar_drag_full_two_pane_layout_adds_and_assigns_exactly_one_pane() {
+        let mut state = AppState::default();
+        let layout_owner = push_workspace_tab(&mut state, "existing-one");
+        state.layouts.insert(
+            layout_owner.clone(),
+            PaneLayout::from_preset(
+                LayoutPreset::Split2H,
+                &["existing-one".to_string(), "existing-two".to_string()],
+            ),
+        );
+
+        let plan = prepare_split_for_sidebar_drop(&mut state, 0).expect("drop plan");
+        assert_eq!(plan.layout_owner_tab_id, layout_owner);
+        assert_eq!(plan.pane_idx, 2);
+        assert!(plan.created_new_pane);
+        let target = PaneTarget {
+            layout_owner_tab_id: plan.layout_owner_tab_id,
+            pane_idx: plan.pane_idx,
+        };
+
+        assert!(assign_opened_session(
+            &mut state,
+            Some(&target),
+            "new-from-sidebar"
+        ));
+        let layout = &state.layouts[&layout_owner];
+        assert_eq!(layout.panes.len(), 3);
+        assert_eq!(layout.panes[0].session_id, "existing-one");
+        assert_eq!(layout.panes[1].session_id, "existing-two");
+        assert_eq!(layout.panes[2].session_id, "new-from-sidebar");
+        assert!(layout.panes.iter().all(|pane| !pane.session_id.is_empty()));
+        assert_eq!(state.active_tab.as_deref(), Some(layout_owner.as_str()));
+    }
+}
+
+/// Tests for the pane title bar's session-type accent color helper.
+///
+/// The accent color is rendered as a 3px left strip on each pane title
+/// bar so the user can tell session types apart at a glance (SSH vs Shell
+/// vs Serial etc.). The mapping mirrors `sidebar.rs::kind_color` but is
+/// keyed on `SessionType` (what `SessionTab` exposes) rather than
+/// `ConnectionKind` — a cloned pane inherits the source session's type,
+/// so the accent stays consistent across clones.
+#[cfg(test)]
+mod session_type_accent_tests {
+    use super::session_type_accent_color;
+    use rusterm_core::session::SessionType;
+
+    #[test]
+    fn ssh_accent_is_blue() {
+        assert_eq!(session_type_accent_color(&SessionType::Ssh), "#7aa2f7");
+    }
+
+    #[test]
+    fn shell_accent_is_green() {
+        assert_eq!(session_type_accent_color(&SessionType::Shell), "#9ece6a");
+    }
+
+    #[test]
+    fn serial_accent_is_amber() {
+        assert_eq!(session_type_accent_color(&SessionType::Serial), "#e0af68");
+    }
+
+    #[test]
+    fn telnet_accent_is_orange() {
+        assert_eq!(session_type_accent_color(&SessionType::Telnet), "#ff9e64");
+    }
+
+    #[test]
+    fn tcp_accent_is_cyan() {
+        assert_eq!(session_type_accent_color(&SessionType::Tcp), "#7dcfff");
+    }
+
+    /// All accent colors must be distinct so two panes of different types
+    /// are visually distinguishable. This is a regression guard against
+    /// accidentally collapsing two types onto the same color.
+    #[test]
+    fn all_accents_are_distinct() {
+        let colors = [
+            session_type_accent_color(&SessionType::Ssh),
+            session_type_accent_color(&SessionType::Shell),
+            session_type_accent_color(&SessionType::Serial),
+            session_type_accent_color(&SessionType::Telnet),
+            session_type_accent_color(&SessionType::Tcp),
+        ];
+        for i in 0..colors.len() {
+            for j in (i + 1)..colors.len() {
+                assert_ne!(
+                    colors[i], colors[j],
+                    "accent colors collide at {} vs {}",
+                    i, j
+                );
+            }
+        }
+    }
 }
 
 /// Open a connection as a new runtime session.
@@ -5654,16 +6284,25 @@ pub fn App() -> Element {
     // Pane index currently being hovered by a drag operation, or `None` when
     // no drag is in progress. Used by `multi_pane_container` to highlight the
     // drop-target pane. Reads happen inside the pane `for` loop (subscribing
-    // `App` to the signal); writes happen in `ondragenter`/`ondragover`/`ondrop`.
+    // `App` to the signal).
+    //
+    // SOLE WRITER: the manual polling loop below. It hit-tests the cursor
+    // at ~60Hz against the active layout and sets `Some((pane_idx, region))`
+    // with the real 4-quadrant region. HTML5 `ondragover`/`ondragenter` only
+    // call `prevent_default` (for drop permission) — they do NOT write the
+    // signal. This avoids a race between HTML5 (which reports the pane the
+    // browser thinks the cursor is over) and the hit-test (which computes
+    // the pane from viewport coordinates) — that race caused the overlay
+    // to flicker between adjacent panes at boundaries, visually appearing
+    // as multiple "田"-shaped 4-block overlays (the "错误的产生多个不需要的
+    // 四方块" bug). `ondrop` and `finish_tab_drag` clear the signal to `None`.
     //
     // PERF: `Signal::set` performs an equality check before triggering a
-    // re-render, so calling `set(Some(idx))` when the value is already
-    // `Some(idx)` is a no-op. This lets us call `set` in the high-frequency
-    // `ondragover` handler (~60Hz) without causing per-tick re-renders — the
-    // highlight only changes when the dragged pane actually changes. This
-    // matches the user's "取舍分频性能" preference: fewer re-renders over
-    // per-tick feedback.
-    let mut drag_over_pane: Signal<Option<usize>> = use_signal(|| None);
+    // re-render, so calling `set` with an unchanged `(pane_idx, region)` is
+    // a no-op — the highlight only changes when the dragged pane OR region
+    // actually changes. This matches the user's "取舍分频性能" preference:
+    // fewer re-renders over per-tick feedback.
+    let mut drag_over_pane: Signal<Option<(usize, PaneDropRegion)>> = use_signal(|| None);
 
     // Measured pixel dimensions of the `#terminal-content` container (the
     // flex:1 div that holds either the single active TerminalView or the
@@ -5931,22 +6570,32 @@ pub fn App() -> Element {
                             .active_tab
                             .as_ref()
                             .and_then(|aid| state.read().layouts.get(aid).cloned());
-                        let hit = if let Some(layout) = active_layout.as_ref() {
-                            hit_test_pane_at(x, y, left, top, cw, ch, layout).map(|(idx, _)| idx)
-                        } else {
-                            // No layout — single pane. Cursor in container
-                            // rect → pane 0.
-                            let rel_x = x - left;
-                            let rel_y = y - top;
-                            if rel_x >= 0.0 && rel_y >= 0.0 && rel_x <= cw && rel_y <= ch {
-                                Some(0usize)
+                        // Compute the (pane_idx, region) tuple for the
+                        // drag-over highlight. Multi-pane layouts use the
+                        // full 4-quadrant hit-test so the overlay's target
+                        // half tracks the cursor; the single-pane fallback
+                        // synthesizes pane 0 with a 4-quadrant region on
+                        // container bounds.
+                        let hit: Option<(usize, PaneDropRegion)> =
+                            if let Some(layout) = active_layout.as_ref() {
+                                hit_test_pane_drop_target_at(x, y, left, top, cw, ch, layout)
+                                    .map(|target| (target.pane_idx, target.region))
                             } else {
-                                None
-                            }
-                        };
+                                // No layout — single pane. Cursor in container
+                                // rect → pane 0 with a 4-quadrant region.
+                                let rel_x = x - left;
+                                let rel_y = y - top;
+                                if rel_x >= 0.0 && rel_y >= 0.0 && rel_x <= cw && rel_y <= ch {
+                                    let dx = if cw > 0.0 { rel_x / cw - 0.5 } else { 0.0 };
+                                    let dy = if ch > 0.0 { rel_y / ch - 0.5 } else { 0.0 };
+                                    Some((0usize, pane_drop_region_for_cursor(dx, dy)))
+                                } else {
+                                    None
+                                }
+                            };
                         // `Signal::set` is a no-op if the value is
                         // unchanged, so this is cheap when the cursor
-                        // stays in the same pane.
+                        // stays in the same pane AND region.
                         drag_over_pane.set(hit);
                     }
                 }
@@ -6358,36 +7007,56 @@ pub fn App() -> Element {
             tabindex: "0",
             onkeydown: move |e: KeyboardEvent| {
                 let mods = e.modifiers();
-                // Close-focused-pane-session hotkey — macOS ONLY.
+                // Close-focused-pane-session hotkeys.
                 //
-                // On macOS, Cmd+W is WKWebView's default "close window"
-                // shortcut. We intercept it to instead close the focused
-                // pane session (preserving the rest of the window/tab).
-                // When no pane session exists we let the event fall through
-                // so the OS closes the window — standard last-tab-closes-
-                // app behaviour.
+                // Three bindings, all deliberately AVOID clobbering the
+                // STANDARD terminal Ctrl+W (which deletes the previous word
+                // in shells, is the vim window-switch prefix, and is
+                // emacs' kill-region). The TerminalView intercepts Ctrl+W
+                // at its own `onkeydown` and sends `0x17` to the PTY —
+                // this handler only fires when focus is NOT on a terminal
+                // (e.g., sidebar, search box, or the main div itself after
+                // a click on empty chrome).
                 //
-                // On Linux/Windows we deliberately do NOT bind any W-based
-                // close shortcut. Plain Ctrl+W is a STANDARD terminal
-                // shortcut (shell: delete word backward; vim: window-switch
-                // prefix; emacs: kill-region) — the TerminalView's own
-                // `onkeydown` handles it by sending `0x17` to the PTY.
-                // Even Ctrl+Shift+W is intentionally left alone: some
-                // terminals use it as "close tab", but binding it here
-                // would require `stop_propagation` in TerminalView (since
-                // dioxus bubbles events even after `prevent_default`),
-                // and the cost (race between PTY-send and close_session)
-                // isn't worth it. Users on Linux/Windows close panes via
-                // the TabBar close button or the Cmd/Ctrl+Shift+L preset
-                // cycle (which collapses to Single and drops empty panes).
-                if cfg!(target_os = "macos")
-                    && mods.meta()
-                    && !mods.ctrl()
-                    && !mods.alt()
-                    && !mods.shift()
-                {
-                    if let Key::Character(ref s) = e.key() {
-                        if s.eq_ignore_ascii_case("w") {
+                //   - macOS Cmd+W — WKWebView's default "close window"
+                //     shortcut. We intercept it to instead close the focused
+                //     pane session (preserving the rest of the window/tab).
+                //     When no pane session exists we let the event fall through
+                //     so the OS closes the window (last-tab-closes-app).
+                //
+                //   - All platforms Cmd/Ctrl+Shift+W — a dedicated
+                //     "close pane" shortcut that doesn't collide with plain
+                //     Ctrl+W. Shift+W is the conventional "close tab" companion
+                //     in browsers/editors, so Cmd/Ctrl+Shift+W is discoverable.
+                //
+                //   - Linux/Windows Ctrl+W (no Shift) — ONLY when this handler
+                //     fires (i.e., focus is NOT on a terminal). When a terminal
+                //     has focus, the TerminalView sends 0x17 to the PTY and
+                //     this handler never sees the event. So Ctrl+W works as
+                //     the standard Linux terminal shortcut inside a session,
+                //     AND as a close-pane shortcut when the user has clicked
+                //     away from a terminal (e.g., onto the sidebar or empty
+                //     chrome). This resolves the "control+w 不能关闭窗口" report
+                //     without breaking the "标准的 linux 终端快捷键在会话中需要能
+                //     正常执行的" requirement.
+                //
+                // The TerminalView's `onkeydown` returns early when `meta`
+                // is pressed (so Cmd+W and Cmd+Shift+W bubble here), and
+                // calls `prevent_default` for Ctrl-key combos (so Ctrl+W
+                // never reaches this handler WHEN a terminal has focus). The
+                // Shift variant works on Linux/Windows too because
+                // TerminalView's Ctrl+Shift handlers (copy/paste/search)
+                // only match C/V/F, not W — so Ctrl+Shift+W bubbles up to
+                // here even from a focused terminal.
+                if let Key::Character(ref s) = e.key() {
+                    if s.eq_ignore_ascii_case("w") {
+                        // macOS Cmd+W (no Shift) — the original binding.
+                        if cfg!(target_os = "macos")
+                            && mods.meta()
+                            && !mods.ctrl()
+                            && !mods.alt()
+                            && !mods.shift()
+                        {
                             let snapshot = state.read();
                             let target =
                                 focused_pane_session(&snapshot)
@@ -6400,17 +7069,68 @@ pub fn App() -> Element {
                                     &mut input_senders.write(),
                                     &session_id,
                                 );
-                                // Restore focus to whatever is now the active
-                                // session's input. After a close, the active
-                                // session may have switched (if the closed
-                                // session was the active tab); a small delay
-                                // lets the renderer mount the new focus target
-                                // before we try to focus it.
                                 restore_focus_to_active_session(state, 50);
                             }
                             // else: no session to close — let the event
                             // propagate so the OS handles Cmd+W (closes the
                             // window on macOS).
+                        }
+                        // Cmd/Ctrl+Shift+W — cross-platform close-pane.
+                        // `stop_propagation` so the TerminalView doesn't
+                        // also process it (it wouldn't, but be explicit).
+                        if (mods.meta() || mods.ctrl())
+                            && mods.shift()
+                            && !mods.alt()
+                            && !(mods.meta() && mods.ctrl())
+                        {
+                            let snapshot = state.read();
+                            let target =
+                                focused_pane_session(&snapshot)
+                                    .or_else(|| snapshot.active_session.clone());
+                            drop(snapshot);
+                            if let Some(session_id) = target {
+                                e.prevent_default();
+                                e.stop_propagation();
+                                close_session(
+                                    &mut state.write(),
+                                    &mut input_senders.write(),
+                                    &session_id,
+                                );
+                                restore_focus_to_active_session(state, 50);
+                            }
+                        }
+                        // Linux/Windows: plain Ctrl+W (no Shift) — close
+                        // the focused pane session. This handler ONLY fires
+                        // when no terminal has focus, so it does NOT collide
+                        // with the standard terminal Ctrl+W (which the
+                        // TerminalView intercepts and sends as 0x17 to the
+                        // PTY). On macOS, Cmd+W (above) is the equivalent
+                        // — we deliberately don't bind plain Ctrl+W on
+                        // macOS because Cmd+W is the platform convention.
+                        if cfg!(not(target_os = "macos"))
+                            && mods.ctrl()
+                            && !mods.meta()
+                            && !mods.alt()
+                            && !mods.shift()
+                        {
+                            let snapshot = state.read();
+                            let target =
+                                focused_pane_session(&snapshot)
+                                    .or_else(|| snapshot.active_session.clone());
+                            drop(snapshot);
+                            if let Some(session_id) = target {
+                                e.prevent_default();
+                                e.stop_propagation();
+                                close_session(
+                                    &mut state.write(),
+                                    &mut input_senders.write(),
+                                    &session_id,
+                                );
+                                restore_focus_to_active_session(state, 50);
+                            }
+                            // else: no session to close — let the event
+                            // propagate so the OS handles Ctrl+W (closes the
+                            // window on Linux/Windows when there are no tabs).
                         }
                     }
                 }
@@ -6439,18 +7159,22 @@ pub fn App() -> Element {
                         }
                     }
                 }
-                // Cmd/Ctrl+Shift+L → cycle pane layout preset
-                // (1 → 2H → 2V → 4 → 8 → 1).
+                // Cmd/Ctrl+Shift+L → append one pane (on-demand split).
+                // Grows the active tab's layout by exactly one pane per press
+                // (1 → 2 → 3 → 4 → …), matching the toolbar's "⊕ Split" button.
+                // This replaces the old preset-cycling behaviour (1 → 2H → 2V → 4
+                // → 8 → 1) per the user's request to not use 2/4/8 jumps.
                 if (mods.meta() || mods.ctrl()) && mods.shift() && !mods.alt() {
                     if let Key::Character(ref s) = e.key() {
                         if s.eq_ignore_ascii_case("l") {
                             e.prevent_default();
-                            let next = cycle_layout_preset(&mut state.write());
-                            if let Some(p) = next {
-                                tracing::info!("[LAYOUT] hotkey cycled to {:?}", p);
-                            }
+                            let new_idx = append_pane_to_active(&mut state.write());
+                            tracing::info!(
+                                "[LAYOUT] hotkey appended pane idx={:?}",
+                                new_idx
+                            );
                             // Restore focus to the active session's input div.
-                            // Applying a new preset re-mounts panes, and the
+                            // Appending a pane re-mounts panes, and the
                             // auto-focus `use_effect` in each pane's
                             // `TerminalView` may race — the last-mounted pane
                             // wins focus, which may not be the active session.
@@ -6528,6 +7252,19 @@ pub fn App() -> Element {
                             delete_target.set(Some(conn));
                         }
                     },
+                    // Sidebar → pane drag (Task 22 extension): replaces the
+                    // prior HTML5 `ondragstart` + `ondrop` wiring that
+                    // was unreliable in dioxus 0.7's desktop webview.
+                    // `onmousedown` on a ConnItem hands the connection
+                    // config + cursor position to `start_tab_drag`, which
+                    // installs the document-level JS listeners. The polling
+                    // `use_future` takes over and `finish_tab_drag` opens
+                    // the connection in the hit-test pane. Plain
+                    // click-to-connect still works (the polling loop only
+                    // fires the drop if the cursor crossed the threshold).
+                    on_drag_start: move |(conn, name, x, y): (ConnectionConfig, String, f64, f64)| {
+                        start_tab_drag(tab_drag, DragKind::Connection(conn), name, x, y);
+                    },
                 }
             }}
 
@@ -6571,7 +7308,7 @@ pub fn App() -> Element {
                     // crosses the threshold, highlights the drop-target
                     // pane, and calls `finish_tab_drag` on `mouseup`.
                     on_drag_start: move |(sid, name, x, y): (String, String, f64, f64)| {
-                        start_tab_drag(tab_drag, sid, name, x, y);
+                        start_tab_drag(tab_drag, DragKind::Session(sid), name, x, y);
                     },
                 }
 
@@ -6662,7 +7399,7 @@ pub fn App() -> Element {
                         }
                         let ghost_x = drag.cur_x + 12.0;
                         let ghost_y = drag.cur_y + 14.0;
-                        let ghost_name = drag.session_name.clone();
+                        let ghost_name = drag.display_name.clone();
                         rsx! {
                             div {
                                 key: "tab-drag-ghost-{ghost_x}-{ghost_y}",
@@ -6754,46 +7491,156 @@ pub fn App() -> Element {
                     }
 
                     // Right side actions
+                    //
+                    // The `.compare-btn*` rules live in the `<style>` block
+                    // below. We use classes (not pure inline styles) so we
+                    // can express `:hover` states — dioxus 0.7's inline
+                    // `style` attribute can't do pseudo-classes. The inline
+                    // `style` on the span only carries the static layout
+                    // props; the colour/background/border come from the
+                    // class so hover can override them.
+                    //
+                    // Why a `<style>` block instead of pure inline: when the
+                    // button is toggled ON, the old inline-style approach
+                    // swapped between `color:#7aa2f7;border:1px solid #2a2b3d`
+                    // (OFF) and `background:#7aa2f7;color:#1a1b26` (ON, no
+                    // border). The missing border in the ON state caused a
+                    // 2px layout shift, and the background-only-with-no-
+                    // vertical-padding made the blue strip look like it was
+                    // "covering" the text rather than framing it. The class
+                    // approach keeps a transparent border in the ON state
+                    // (no shift) and gives the button real vertical padding
+                    // so the background reads as a button, not a highlight.
+                    //
+                    // 2026-07-20 redesign: added a ⇄ icon before the text to
+                    // make the toggle's purpose obvious even if the text
+                    // rendering is ambiguous on a particular display. The
+                    // ON state uses a darker text color (#0f1119) and a
+                    // subtle text-shadow for extra contrast against the
+                    // bright #7aa2f7 background, addressing the
+                    // "字体被颜色覆盖" report.
+                    style { "
+                        .compare-btn {{
+                            cursor: pointer;
+                            font-size: 11px;
+                            user-select: none;
+                            -webkit-user-select: none;
+                            padding: 3px 10px;
+                            border-radius: 4px;
+                            line-height: 18px;
+                            border: 1px solid transparent;
+                            transition: background 0.12s ease, color 0.12s ease, border-color 0.12s ease, box-shadow 0.12s ease;
+                            display: inline-flex;
+                            align-items: center;
+                            gap: 4px;
+                            font-weight: 500;
+                        }}
+                        .compare-btn-off {{
+                            color: #7aa2f7;
+                            border-color: #414868;
+                            background: transparent;
+                        }}
+                        .compare-btn-off:hover {{
+                            background: #24283b;
+                            border-color: #7aa2f7;
+                            color: #c0caf5;
+                        }}
+                        .compare-btn-on {{
+                            background: #7aa2f7;
+                            color: #0f1119;
+                            font-weight: 700;
+                            border-color: #89b5fa;
+                            box-shadow: 0 0 6px rgba(122,162,247,0.45);
+                            text-shadow: 0 1px 0 rgba(255,255,255,0.25);
+                        }}
+                        .compare-btn-on:hover {{
+                            background: #89b5fa;
+                            border-color: #a8c4fb;
+                            box-shadow: 0 0 8px rgba(122,162,247,0.6);
+                        }}
+                        .compare-btn-icon {{
+                            font-size: 13px;
+                            line-height: 1;
+                            font-weight: 700;
+                        }}
+                    " }
                     div {
                         style: "margin-left: auto; display: flex; gap: 12px; align-items: center;",
 
                         // --- Multi-pane layout controls ---
-                        // The layout toolbar lets the user cycle the active tab's
-                        // pane preset (Single → Split2H → Split2V → Grid4 → Grid8),
-                        // toggle the cross-terminal comparison mode (synchronized
-                        // scrolling + input broadcast), and zoom the active pane
-                        // to fill the container (全屏模式). When no session is
-                        // active, these are no-ops (cycle returns None).
+                        // The layout toolbar lets the user append one pane at a
+                        // time (on-demand split, not preset jumps), toggle the
+                        // cross-terminal comparison mode (synchronized scrolling
+                        // + input broadcast), and zoom the active pane to fill
+                        // the container (全屏模式). When no session is active,
+                        // these are no-ops.
+                        //
+                        // Layout display: read the actual pane count from the
+                        // active tab's layout (not `state.layout_preset`, which
+                        // no longer reflects reality after `append_pane_to_active`
+                        // — e.g. 3 panes has no preset). Shows "Layout: N panes"
+                        // or "Layout: 1 pane" when no multi-pane layout exists.
                         span {
-                            style: "cursor: pointer; color: #7aa2f7; font-size: 11px; user-select: none;",
+                            style: "color: #7aa2f7; font-size: 11px; user-select: none; opacity: 0.85;",
+                            title: "Number of panes in the active tab's layout",
+                            { layout_display_label(&state.read()) }
+                        }
+                        // "Split" button — appends exactly ONE new pane to the
+                        // active tab's layout (on-demand split, not a preset
+                        // jump). Direction is picked from the layout's shape
+                        // (wide layouts grow a column, tall layouts grow a row).
+                        // The new pane starts EMPTY; the user fills it via the
+                        // empty-pane hint buttons (⧉ copy focused / + sidebar)
+                        // or by dragging a session/sidebar connection into it.
+                        // This is the explicit "create new pane" affordance for
+                        // the "一个新的会话支持多分屏" requirement — each click adds
+                        // exactly one pane, growing 1 → 2 → 3 → 4 → … → MAX_PANES.
+                        span {
+                            style: "cursor: pointer; color: #9ece6a; font-size: 11px; user-select: none; border: 1px solid #414868; border-radius: 3px; padding: 1px 6px; line-height: 16px;",
                             onclick: move |_| {
-                                let next = cycle_layout_preset(&mut state.write());
-                                if let Some(p) = next {
-                                    tracing::info!("[LAYOUT] cycled to {:?}", p);
-                                }
-                                // Restore focus to the active session's input
-                                // div after layout preset change — see the
-                                // hotkey handler above for why.
+                                let new_idx = append_pane_to_active(&mut state.write());
+                                tracing::info!(
+                                    "[LAYOUT] split button: appended pane idx={:?}",
+                                    new_idx
+                                );
                                 restore_focus_to_active_session(state, 100);
                             },
-                            title: "Cycle pane layout (1 → 2H → 2V → 4 → 8 → 1)",
-                            "Layout: {layout_label(state.read().layout_preset)}"
+                            title: "Split — append one pane (1 → 2 → 3 → 4 → …)",
+                            "⊕ Split"
+                        }
+                        // "Distribute" button — fills the active tab's panes
+                        // with all open sessions (in tab order, active first).
+                        // This is the explicit "多个会话放到多个分屏中" affordance:
+                        // a one-click way to populate the current on-demand layout
+                        // after the user has opened several sessions. Sessions beyond
+                        // the pane count remain in `state.sessions` and can be
+                        // placed by growing the layout further.
+                        span {
+                            style: "cursor: pointer; color: #bb9af7; font-size: 11px; user-select: none; border: 1px solid #414868; border-radius: 3px; padding: 1px 6px; line-height: 16px;",
+                            onclick: move |_| {
+                                let placed = distribute_sessions_across_panes(&mut state.write());
+                                tracing::info!("[LAYOUT] distribute button: placed {} sessions", placed);
+                                restore_focus_to_active_session(state, 100);
+                            },
+                            title: "Distribute — fill panes with all open sessions",
+                            "⇶ Distribute"
                         }
                         span {
-                            style: format!(
-                                "cursor: pointer; font-size: 11px; user-select: none; padding: 0 6px; border-radius: 3px; {};",
-                                if state.read().layouts.get(&state.read().active_tab.clone().unwrap_or_default())
-                                    .is_some_and(|l| l.comparison) {
-                                    "background: #7aa2f7; color: #1a1b26;"
-                                } else {
-                                    "color: #7aa2f7; border: 1px solid #2a2b3d;"
-                                }
-                            ),
+                            class: if state.read().layouts.get(&state.read().active_tab.clone().unwrap_or_default())
+                                .is_some_and(|l| l.comparison) {
+                                "compare-btn compare-btn-on"
+                            } else {
+                                "compare-btn compare-btn-off"
+                            },
                             onclick: move |_| {
                                 let on = toggle_comparison_mode(&mut state.write());
                                 tracing::info!("[LAYOUT] comparison mode toggled: {:?}", on);
                             },
                             title: "Toggle comparison mode (sync scroll + broadcast input)",
+                            span {
+                                class: "compare-btn-icon",
+                                "⇄"
+                            }
                             "Compare"
                         }
                         span {
@@ -8097,8 +8944,9 @@ mod split_drag_js_tests {
 #[cfg(test)]
 mod tab_drag_tests {
     use super::{
-        TAB_DRAG_THRESHOLD, build_install_tab_drag_script, hit_test_pane_at,
-        parse_tab_drag_poll_response, tab_drag_threshold_exceeded,
+        PaneDropRegion, TAB_DRAG_THRESHOLD, build_install_tab_drag_script,
+        center_line_styles_for_region, hit_test_pane_at, hit_test_pane_drop_target_at,
+        pane_drop_region_for_cursor, parse_tab_drag_poll_response, tab_drag_threshold_exceeded,
     };
     use crate::layout::{LayoutPreset, PaneLayout};
 
@@ -8442,6 +9290,258 @@ mod tab_drag_tests {
     // ------------------------------------------------------------------
 
     /// Cursor inside the container's only pane returns pane 0.
+    #[test]
+    fn pane_drop_hit_test_distinguishes_target_top_and_bottom() {
+        let layout = PaneLayout::from_preset(
+            LayoutPreset::Split2H,
+            &["alpha".to_string(), "beta".to_string()],
+        );
+
+        let top = hit_test_pane_drop_target_at(900.0, 160.0, 0.0, 0.0, 1200.0, 800.0, &layout)
+            .expect("top target");
+        let bottom = hit_test_pane_drop_target_at(900.0, 700.0, 0.0, 0.0, 1200.0, 800.0, &layout)
+            .expect("bottom target");
+
+        assert_eq!(top.pane_idx, 1);
+        assert_eq!(top.region, PaneDropRegion::Top);
+        assert_eq!(bottom.pane_idx, 1);
+        assert_eq!(bottom.region, PaneDropRegion::Bottom);
+    }
+
+    /// 4-quadrant hit-test: cursor in the LEFT half of pane 0 reports
+    /// `Left`, in the RIGHT half reports `Right`. Center crosshair zone
+    /// (within 15% of pane center on both axes) reports `Center`.
+    #[test]
+    fn pane_drop_hit_test_distinguishes_target_left_and_right() {
+        let layout = PaneLayout::from_preset(
+            LayoutPreset::Split2H,
+            &["alpha".to_string(), "beta".to_string()],
+        );
+        // Container 1200×800, Split2H: pane 0 at x=[0,600), pane 1 at x=[600,1200).
+        // Pane 0 spans y=[0,800). Pane 0 center is at (300, 400).
+        //
+        // Cursor at (200, 400): rel_x_in_pane = 200/600 = 0.333,
+        //   dx_from_center = 0.333 - 0.5 = -0.167, |dx| > 0.15,
+        //   dy_from_center = 0 → horizontal axis dominates → Left.
+        let left = hit_test_pane_drop_target_at(200.0, 400.0, 0.0, 0.0, 1200.0, 800.0, &layout)
+            .expect("left target");
+        // Cursor at (450, 400): rel_x_in_pane = 450/600 = 0.75,
+        //   dx_from_center = 0.25 → Right.
+        let right = hit_test_pane_drop_target_at(450.0, 400.0, 0.0, 0.0, 1200.0, 800.0, &layout)
+            .expect("right target");
+        // Cursor at (300, 400) is exactly pane 0's center → Center zone.
+        let center = hit_test_pane_drop_target_at(300.0, 400.0, 0.0, 0.0, 1200.0, 800.0, &layout)
+            .expect("center target");
+
+        assert_eq!(left.pane_idx, 0);
+        assert_eq!(left.region, PaneDropRegion::Left);
+        assert_eq!(right.pane_idx, 0);
+        assert_eq!(right.region, PaneDropRegion::Right);
+        assert_eq!(center.pane_idx, 0);
+        assert_eq!(center.region, PaneDropRegion::Center);
+    }
+
+    /// Direct unit tests for the 4-quadrant decision function. The
+    /// function takes the cursor's normalised distance from pane center
+    /// (each axis in `[-0.5, 0.5]`) and returns the drop region. Center
+    /// ±0.15 on BOTH axes is the swap/move zone; outside that, the axis
+    /// with the larger |distance| wins.
+    #[test]
+    fn pane_drop_region_for_cursor_returns_center_near_middle() {
+        // Exactly at center → Center.
+        assert_eq!(
+            pane_drop_region_for_cursor(0.0, 0.0),
+            PaneDropRegion::Center
+        );
+        // Within ±0.15 on both axes → Center.
+        assert_eq!(
+            pane_drop_region_for_cursor(0.1, 0.1),
+            PaneDropRegion::Center
+        );
+        assert_eq!(
+            pane_drop_region_for_cursor(-0.14, 0.14),
+            PaneDropRegion::Center
+        );
+        // Just inside the boundary (0.149).
+        assert_eq!(
+            pane_drop_region_for_cursor(0.149, -0.149),
+            PaneDropRegion::Center
+        );
+    }
+
+    #[test]
+    fn pane_drop_region_for_cursor_picks_dominant_axis() {
+        // Horizontal dominates: |dx| > |dy|, dx < 0 → Left.
+        assert_eq!(pane_drop_region_for_cursor(-0.4, 0.0), PaneDropRegion::Left);
+        // Horizontal dominates: |dx| > |dy|, dx > 0 → Right.
+        assert_eq!(pane_drop_region_for_cursor(0.4, 0.0), PaneDropRegion::Right);
+        // Vertical dominates: |dy| > |dx|, dy < 0 → Top.
+        assert_eq!(pane_drop_region_for_cursor(0.0, -0.4), PaneDropRegion::Top);
+        // Vertical dominates: |dy| > |dx|, dy > 0 → Bottom.
+        assert_eq!(
+            pane_drop_region_for_cursor(0.0, 0.4),
+            PaneDropRegion::Bottom
+        );
+        // Corner: |dx| == |dy| → tie goes to vertical (>=). At (0.3, 0.3)
+        // |dx| is NOT > |dy| (0.3 > 0.3 is false) → vertical → Bottom.
+        assert_eq!(
+            pane_drop_region_for_cursor(0.3, 0.3),
+            PaneDropRegion::Bottom
+        );
+        // Just outside center zone but |dx| > |dy|: dx=0.2, dy=0.1 → Right.
+        assert_eq!(pane_drop_region_for_cursor(0.2, 0.1), PaneDropRegion::Right);
+        // Just outside center zone but |dy| > |dx|: dy=-0.2, dx=0.1 → Top.
+        assert_eq!(pane_drop_region_for_cursor(0.1, -0.2), PaneDropRegion::Top);
+    }
+
+    /// The overlay must show EXACTLY ONE bright center line for split regions
+    /// (vertical for Left/Right = 横着 placement, horizontal for Top/Bottom =
+    /// 竖着 placement). This is the fix for the "错误的产生多个不需要的
+    /// 四方块" bug — the prior crosshair always drew BOTH lines, forming a
+    /// 田 shape that was ambiguous about the split direction.
+    ///
+    /// For Center (swap/move zone), BOTH lines are drawn dimmed so the user
+    /// can see the swap zone without it dominating the pane.
+    #[test]
+    fn center_line_styles_for_region_shows_one_line_per_split_axis() {
+        // Left/Right (horizontal split): vertical line ONLY.
+        let (v, h) = center_line_styles_for_region(PaneDropRegion::Left);
+        assert!(
+            v.is_some(),
+            "Left region must show the vertical divider line"
+        );
+        assert!(h.is_none(), "Left region must NOT show the horizontal line");
+        let (v, h) = center_line_styles_for_region(PaneDropRegion::Right);
+        assert!(
+            v.is_some(),
+            "Right region must show the vertical divider line"
+        );
+        assert!(
+            h.is_none(),
+            "Right region must NOT show the horizontal line"
+        );
+
+        // Top/Bottom (vertical split): horizontal line ONLY.
+        let (v, h) = center_line_styles_for_region(PaneDropRegion::Top);
+        assert!(v.is_none(), "Top region must NOT show the vertical line");
+        assert!(
+            h.is_some(),
+            "Top region must show the horizontal divider line"
+        );
+        let (v, h) = center_line_styles_for_region(PaneDropRegion::Bottom);
+        assert!(v.is_none(), "Bottom region must NOT show the vertical line");
+        assert!(
+            h.is_some(),
+            "Bottom region must show the horizontal divider line"
+        );
+
+        // Center: both lines (dimmed) — the swap zone.
+        let (v, h) = center_line_styles_for_region(PaneDropRegion::Center);
+        assert!(
+            v.is_some(),
+            "Center region must show the (dimmed) vertical line"
+        );
+        assert!(
+            h.is_some(),
+            "Center region must show the (dimmed) horizontal line"
+        );
+    }
+
+    /// The bright accent lines for split regions must be visually distinct
+    /// from the dimmed Center lines (bright = 2px solid #7aa2f7 with glow,
+    /// dimmed = 1px rgba(122,162,247,0.35)). This is what makes the split
+    /// direction immediately readable: a bright line jumps out, a dimmed
+    /// line recedes.
+    #[test]
+    fn center_line_styles_for_region_uses_bright_line_for_splits_dimmed_for_center() {
+        // Split regions use the bright (2px, full-opacity, glow) line.
+        let (v, _) = center_line_styles_for_region(PaneDropRegion::Left);
+        let v = v.expect("Left region has a vertical line");
+        assert!(
+            v.contains("width: 2px"),
+            "split line must be 2px wide (bright): got {v}"
+        );
+        assert!(
+            v.contains("background: #7aa2f7"),
+            "split line must be full-opacity #7aa2f7: got {v}"
+        );
+        assert!(
+            v.contains("box-shadow"),
+            "split line must have a glow (box-shadow): got {v}"
+        );
+
+        let (_, h) = center_line_styles_for_region(PaneDropRegion::Top);
+        let h = h.expect("Top region has a horizontal line");
+        assert!(
+            h.contains("height: 2px"),
+            "split line must be 2px wide (bright): got {h}"
+        );
+        assert!(
+            h.contains("background: #7aa2f7"),
+            "split line must be full-opacity #7aa2f7: got {h}"
+        );
+
+        // Center uses the dimmed (1px, 35% opacity, no glow) lines.
+        let (v, h) = center_line_styles_for_region(PaneDropRegion::Center);
+        let v = v.expect("Center region has a (dimmed) vertical line");
+        let h = h.expect("Center region has a (dimmed) horizontal line");
+        assert!(
+            v.contains("width: 1px"),
+            "center line must be 1px wide (dimmed): got {v}"
+        );
+        assert!(
+            v.contains("rgba(122,162,247,0.35)"),
+            "center line must be 35% opacity: got {v}"
+        );
+        assert!(
+            !v.contains("box-shadow"),
+            "center line must NOT have a glow: got {v}"
+        );
+        assert!(
+            h.contains("height: 1px"),
+            "center line must be 1px wide (dimmed): got {h}"
+        );
+        assert!(
+            h.contains("rgba(122,162,247,0.35)"),
+            "center line must be 35% opacity: got {h}"
+        );
+        assert!(
+            !h.contains("box-shadow"),
+            "center line must NOT have a glow: got {h}"
+        );
+    }
+
+    /// Symmetry: Left and Right produce the SAME vertical-line style (the
+    /// divider is at the pane center regardless of which half is highlighted).
+    /// Top and Bottom similarly produce the same horizontal-line style. This
+    /// is a regression guard against accidentally permuting the styles per
+    /// side (which would make the divider jump around as the cursor moves
+    /// within the same split axis).
+    #[test]
+    fn center_line_styles_for_region_is_symmetric_within_split_axis() {
+        let (left_v, left_h) = center_line_styles_for_region(PaneDropRegion::Left);
+        let (right_v, right_h) = center_line_styles_for_region(PaneDropRegion::Right);
+        assert_eq!(
+            left_v, right_v,
+            "Left and Right must share the same vertical-line style"
+        );
+        assert_eq!(
+            left_h, right_h,
+            "Left and Right must share the same horizontal-line style"
+        );
+
+        let (top_v, top_h) = center_line_styles_for_region(PaneDropRegion::Top);
+        let (bot_v, bot_h) = center_line_styles_for_region(PaneDropRegion::Bottom);
+        assert_eq!(
+            top_v, bot_v,
+            "Top and Bottom must share the same vertical-line style"
+        );
+        assert_eq!(
+            top_h, bot_h,
+            "Top and Bottom must share the same horizontal-line style"
+        );
+    }
+
     #[test]
     fn hit_test_single_pane_returns_pane_zero() {
         let layout = PaneLayout::from_preset(LayoutPreset::Single, &["alpha".to_string()]);

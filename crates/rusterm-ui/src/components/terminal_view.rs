@@ -484,6 +484,22 @@ pub fn TerminalView(
         }
         e.prevent_default();
 
+        // Ctrl+Shift+W — cross-platform "close focused pane" shortcut.
+        // Let it bubble to the App's `onkeydown` (which calls
+        // `close_session`) WITHOUT sending anything to the PTY. Without
+        // this early return, the keymap's `Ctrl+Shift+<alpha>` arm would
+        // emit a CSI modifier-6 sequence (Ctrl+Shift+W = `CSI 1;6 W`),
+        // and the pane would close at the same time — double action.
+        // macOS Cmd+Shift+W already bubbles via the `meta` early return
+        // above, so this only needs to handle the Ctrl variant.
+        if ctrl && shift && !alt {
+            if let Key::Character(ref s) = key {
+                if s.eq_ignore_ascii_case("w") {
+                    return;
+                }
+            }
+        }
+
         // Disconnected session: Enter reconnects, everything else is ignored
         // (there's no live PTY to send to).
         if current_disconnected {

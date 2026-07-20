@@ -2,9 +2,8 @@
 //!
 //! This module implements a tmux/zellij-style split-pane layout for RusTerm's
 //! terminal display area. A single tab can host multiple terminal sessions
-//! arranged in a 2D grid. The layout is driven by a normalized list of panes
-//! whose widths/heights are expressed as fractions of the available space,
-//! so resizing the window simply rescales the panes without recomputing the
+//! arranged by a recursive split tree. Each split stores a normalized ratio,
+//! so resizing the window rescales the entire tree without changing its
 //! structure.
 //!
 //! ## Design choices
@@ -16,15 +15,13 @@
 //!   dimension. This decouples layout from rendering and lets the layout
 //!   module be unit-tested with pure arithmetic — no dioxus runtime needed.
 //!
-//! - **Row-major grid**: panes are laid out in a grid of `rows` rows ×
-//!   `cols` columns. Each pane occupies one cell. This is simpler than a
-//!   general tree (tmux's `left|right` recursion) but covers the requested
-//!   presets (2, 4, 8 split) and is trivially resizable via per-row and
-//!   per-column fractions.
+//! - **Recursive local splits**: panes remain in a stable vector for session
+//!   routing, while a binary tree maps each pane index to geometry. Splitting
+//!   one leaf affects only that leaf, so five sessions need exactly five
+//!   leaves and never require a sixth rectangular-grid cell.
 //!
-//! - **Splitter dragging**: each interior column has a draggable vertical
-//!   splitter, and each interior row has a draggable horizontal splitter.
-//!   Adjusting a column's fraction shifts width between adjacent columns;
+//! - **Splitter dragging**: every split node exposes one local divider.
+//!   Adjusting its ratio shifts space only between its two child subtrees;
 //!   the `MIN_PANE_FRAC` constant enforces a minimum so panes can't be
 //!   shrunk to zero (which would crash the PTY whose cols must be ≥1).
 //!
@@ -83,13 +80,70 @@ pub struct Pane {
     pub floating: Option<FloatingPane>,
 }
 
-/// A multi-pane terminal layout. Owns the list of panes and the per-row and
-/// per-column fractions that control their sizes. Empty `rows`/`cols` vectors
-/// are treated as the "single pane" degenerate case by the renderer.
+/// Axis used by a local split node.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SplitAxis {
+    /// Children are arranged left and right.
+    LeftRight,
+    /// Children are arranged top and bottom.
+    TopBottom,
+}
+
+/// Which side of a target pane receives the newly-created pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SplitDirection {
+    Left,
+    Right,
+    Top,
+    Bottom,
+}
+
+/// One step in a split-tree path. Paths provide stable splitter identity
+/// without exposing or allocating node IDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub enum SplitBranch {
+    First,
+    Second,
+}
+
+pub type SplitPath = Vec<SplitBranch>;
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+enum SplitNode {
+    Leaf {
+        pane_idx: usize,
+    },
+    Split {
+        axis: SplitAxis,
+        ratio: f64,
+        first: Box<SplitNode>,
+        second: Box<SplitNode>,
+    },
+}
+
+/// Geometry for one draggable divider in the split tree.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SplitterGeometry {
+    /// Stable preorder index while the tree structure is unchanged (which it
+    /// is throughout one drag gesture).
+    pub splitter_idx: usize,
+    pub path: SplitPath,
+    pub axis: SplitAxis,
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub local_extent: f64,
+}
+
+/// A multi-pane terminal layout. `panes` retains stable vector indices for
+/// focus/session routing, while `root` owns the recursive non-rectangular
+/// geometry. The legacy row/column fields remain as a preset compatibility
+/// facade; local splits do not depend on their rectangular-grid invariant.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
 pub struct PaneLayout {
-    /// All panes in the layout. Order is row-major: pane at (row=0,col=0)
-    /// comes first, then (0,1), …, (0,cols-1), then (1,0), …
+    /// All panes in stable creation order. Tree leaves reference these
+    /// indices; local splits only append and never reorder existing panes.
     pub panes: Vec<Pane>,
     /// Fraction of the container's width taken by each column.
     /// `col_fracs.len()` must equal the number of distinct columns in
@@ -98,6 +152,10 @@ pub struct PaneLayout {
     /// Fraction of the container's height taken by each row.
     /// Same contract as `col_fracs`.
     pub row_fracs: Vec<f64>,
+    /// Recursive geometry. Layouts are runtime-only today, but the default
+    /// keeps old serialized values defensively readable.
+    #[serde(default)]
+    root: Option<SplitNode>,
     /// If `Some(idx)`, the pane at this index is "zoomed" to fill the
     /// whole container. All other panes are hidden but kept in `panes`
     /// so un-zooming restores the prior layout. This is the fullscreen
@@ -155,15 +213,10 @@ impl LayoutPreset {
 impl PaneLayout {
     /// Build a layout from a preset and an ordered list of session IDs.
     ///
-    /// `session_ids` must have at least `preset.pane_count()` entries; extra
-    /// entries are ignored. If fewer are supplied, the layout is still
-    /// constructed but with the available sessions repeated into the empty
-    /// slots — the caller is responsible for ensuring enough sessions exist
-    /// before calling. We don't silently drop the missing ones from the
-    /// grid because doing so would break the grid invariant
-    /// (`rows * cols == panes.len()`); instead we leave the slot empty
-    /// (`session_id = ""`) and the renderer treats an empty session_id as
-    /// "no pane here" (renders nothing).
+    /// Extra session IDs are ignored. If fewer are supplied, the remaining
+    /// preset leaves are retained as empty drop targets (`session_id = ""`).
+    /// Presets are only construction adapters; subsequent growth uses local
+    /// tree splits and does not preserve a rectangular-grid invariant.
     pub fn from_preset(preset: LayoutPreset, session_ids: &[String]) -> Self {
         let (rows, cols) = preset.grid_dims();
         let n = rows * cols;
@@ -183,10 +236,12 @@ impl PaneLayout {
         // values already sum to 1.0 by construction.
         let col_fracs = vec![1.0 / cols as f64; cols];
         let row_fracs = vec![1.0 / rows as f64; rows];
+        let root = grid_split_tree(rows, cols, &col_fracs, &row_fracs);
         Self {
             panes,
             col_fracs,
             row_fracs,
+            root,
             zoomed: None,
             comparison: false,
         }
@@ -231,9 +286,14 @@ impl PaneLayout {
             return true;
         }
 
+        let rects: Vec<_> = (0..self.panes.len())
+            .map(|idx| {
+                self.tree_pane_rect(idx, 1.0, 1.0)
+                    .unwrap_or((0.0, 0.0, 1.0, 1.0))
+            })
+            .collect();
         for (idx, pane) in self.panes.iter_mut().enumerate() {
-            let (cell_x, cell_w) = span(&self.col_fracs, pane.col, 1.0);
-            let (cell_y, cell_h) = span(&self.row_fracs, pane.row, 1.0);
+            let (cell_x, cell_y, cell_w, cell_h) = rects[idx];
             let width = cell_w.clamp(0.32, 0.68);
             let height = cell_h.clamp(0.34, 0.68);
             let x = (cell_x + (cell_w - width) / 2.0).clamp(0.0, 1.0 - width);
@@ -371,6 +431,7 @@ impl PaneLayout {
         }
         self.col_fracs[col] = a;
         self.col_fracs[col + 1] = b;
+        self.root = grid_split_tree(self.rows(), self.cols(), &self.col_fracs, &self.row_fracs);
         true
     }
 
@@ -387,6 +448,7 @@ impl PaneLayout {
         }
         self.row_fracs[row] = a;
         self.row_fracs[row + 1] = b;
+        self.root = grid_split_tree(self.rows(), self.cols(), &self.col_fracs, &self.row_fracs);
         true
     }
 
@@ -455,9 +517,124 @@ impl PaneLayout {
                 geometry.height_frac * container_h,
             ));
         }
-        let (x, w) = span(&self.col_fracs, pane.col, container_w);
-        let (y, h) = span(&self.row_fracs, pane.row, container_h);
-        Some((x, y, w, h))
+        self.tree_pane_rect(idx, container_w, container_h)
+            .or_else(|| {
+                // Defensive compatibility for an old value without a split tree.
+                let (x, w) = span(&self.col_fracs, pane.col, container_w);
+                let (y, h) = span(&self.row_fracs, pane.row, container_h);
+                Some((x, y, w, h))
+            })
+    }
+
+    fn tree_pane_rect(
+        &self,
+        idx: usize,
+        container_w: f64,
+        container_h: f64,
+    ) -> Option<(f64, f64, f64, f64)> {
+        let root = self.root.as_ref()?;
+        find_leaf_rect(root, idx, (0.0, 0.0, container_w, container_h))
+    }
+
+    /// Split one target pane locally, preserving every existing pane and
+    /// adding exactly one empty leaf. The returned index is stable because
+    /// panes are only appended, never inserted or reordered.
+    pub fn split_pane(&mut self, target_idx: usize, direction: SplitDirection) -> Option<usize> {
+        if target_idx >= self.panes.len() || self.panes.len() >= MAX_PANES {
+            return None;
+        }
+        if self.root.is_none() {
+            self.root = Some(grid_split_tree(
+                self.rows(),
+                self.cols(),
+                &self.col_fracs,
+                &self.row_fracs,
+            )?);
+        }
+
+        let was_floating = self.is_floating();
+        let target_geometry = self.panes[target_idx].floating;
+        let new_idx = self.panes.len();
+        if !replace_leaf_with_split(self.root.as_mut()?, target_idx, new_idx, direction) {
+            return None;
+        }
+
+        let floating = if was_floating {
+            target_geometry.map(|geometry| {
+                let mut created = geometry;
+                match direction {
+                    SplitDirection::Left => {
+                        created.x_frac = (geometry.x_frac - geometry.width_frac * 0.12)
+                            .clamp(0.0, 1.0 - geometry.width_frac);
+                    }
+                    SplitDirection::Right => {
+                        created.x_frac = (geometry.x_frac + geometry.width_frac * 0.12)
+                            .clamp(0.0, 1.0 - geometry.width_frac);
+                    }
+                    SplitDirection::Top => {
+                        created.y_frac = (geometry.y_frac - geometry.height_frac * 0.12)
+                            .clamp(0.0, 1.0 - geometry.height_frac);
+                    }
+                    SplitDirection::Bottom => {
+                        created.y_frac = (geometry.y_frac + geometry.height_frac * 0.12)
+                            .clamp(0.0, 1.0 - geometry.height_frac);
+                    }
+                }
+                created.z_index = self
+                    .panes
+                    .iter()
+                    .filter_map(|pane| pane.floating.map(|item| item.z_index))
+                    .max()
+                    .unwrap_or(0)
+                    .saturating_add(1);
+                created
+            })
+        } else {
+            None
+        };
+        let target = &self.panes[target_idx];
+        self.panes.push(Pane {
+            session_id: String::new(),
+            row: target.row,
+            col: target.col,
+            floating,
+        });
+        Some(new_idx)
+    }
+
+    /// Return every local divider in the tree with its CSS-pixel geometry.
+    pub fn splitters(&self, container_w: f64, container_h: f64) -> Vec<SplitterGeometry> {
+        let mut out = Vec::new();
+        if let Some(root) = self.root.as_ref() {
+            collect_splitters(
+                root,
+                (0.0, 0.0, container_w, container_h),
+                &mut Vec::new(),
+                &mut out,
+            );
+        }
+        out
+    }
+
+    /// Resize one local tree divider by a fraction of that divider's own
+    /// parent extent.
+    pub fn resize_split(&mut self, splitter_idx: usize, delta: f64) -> bool {
+        let Some(node) = self
+            .root
+            .as_mut()
+            .and_then(|root| nth_split_node_mut(root, splitter_idx, &mut 0))
+        else {
+            return false;
+        };
+        let SplitNode::Split { ratio, .. } = node else {
+            return false;
+        };
+        let next = *ratio + delta;
+        if !next.is_finite() || !(MIN_PANE_FRAC..=1.0 - MIN_PANE_FRAC).contains(&next) {
+            return false;
+        }
+        *ratio = next;
+        true
     }
 
     /// Iterate over `(pane_index, pane, rect)` for every visible pane.
@@ -489,6 +666,99 @@ impl PaneLayout {
         } else {
             false
         }
+    }
+
+    pub fn append_pane(&mut self, horizontal: bool) -> Option<usize> {
+        if self.panes.len() >= MAX_PANES {
+            return None;
+        }
+
+        // An empty PaneLayout represents the pre-layout single-pane state.
+        // Materialize that implicit pane plus one requested pane.
+        if self.panes.is_empty() {
+            self.col_fracs = if horizontal {
+                vec![0.5, 0.5]
+            } else {
+                vec![1.0]
+            };
+            self.row_fracs = if horizontal {
+                vec![1.0]
+            } else {
+                vec![0.5, 0.5]
+            };
+            self.panes.push(Pane {
+                session_id: String::new(),
+                row: 0,
+                col: 0,
+                floating: None,
+            });
+            self.root = Some(SplitNode::Split {
+                axis: if horizontal {
+                    SplitAxis::LeftRight
+                } else {
+                    SplitAxis::TopBottom
+                },
+                ratio: 0.5,
+                first: Box::new(SplitNode::Leaf { pane_idx: 0 }),
+                second: Box::new(SplitNode::Leaf { pane_idx: 1 }),
+            });
+            self.panes.push(Pane {
+                session_id: String::new(),
+                row: if horizontal { 0 } else { 1 },
+                col: if horizontal { 1 } else { 0 },
+                floating: None,
+            });
+            return Some(1);
+        }
+
+        // Generic toolbar/hotkey growth splits the largest leaf along the
+        // requested axis, avoiding the old forced 1×N strip. Targeted drops
+        // call `split_pane` directly and therefore split exactly the leaf under
+        // the cursor.
+        let target_idx = (0..self.panes.len())
+            .filter_map(|idx| {
+                self.tree_pane_rect(idx, 1.0, 1.0).map(|rect| {
+                    let score = if horizontal { rect.2 } else { rect.3 };
+                    (idx, score)
+                })
+            })
+            .max_by(|(left_idx, left), (right_idx, right)| {
+                left.total_cmp(right).then_with(|| right_idx.cmp(left_idx))
+            })
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        self.split_pane(
+            target_idx,
+            if horizontal {
+                SplitDirection::Right
+            } else {
+                SplitDirection::Bottom
+            },
+        )
+    }
+
+    /// Add one pane by splitting the largest current leaf along its longest
+    /// side. This is the toolbar/hotkey growth policy and avoids degenerating
+    /// into a forced 1×N strip as pane count increases.
+    pub fn append_balanced(&mut self) -> Option<usize> {
+        if self.panes.is_empty() {
+            return self.append_pane(true);
+        }
+        let (target_idx, rect) = (0..self.panes.len())
+            .filter_map(|idx| self.tree_pane_rect(idx, 1.0, 1.0).map(|rect| (idx, rect)))
+            .max_by(|(left_idx, left), (right_idx, right)| {
+                (left.2 * left.3)
+                    .total_cmp(&(right.2 * right.3))
+                    .then_with(|| right_idx.cmp(left_idx))
+            })?;
+        self.split_pane(
+            target_idx,
+            if rect.2 >= rect.3 {
+                SplitDirection::Right
+            } else {
+                SplitDirection::Bottom
+            },
+        )
     }
 
     /// Swap the sessions displayed in panes `a` and `b`. Used when the user
@@ -558,6 +828,203 @@ impl PaneLayout {
             .filter(|s| !s.is_empty())
             .collect()
     }
+}
+
+fn grid_split_tree(
+    rows: usize,
+    cols: usize,
+    col_fracs: &[f64],
+    row_fracs: &[f64],
+) -> Option<SplitNode> {
+    if rows == 0 || cols == 0 {
+        return None;
+    }
+    let mut row_nodes = Vec::with_capacity(rows);
+    for row in 0..rows {
+        let leaves = (0..cols)
+            .map(|col| SplitNode::Leaf {
+                pane_idx: row * cols + col,
+            })
+            .collect::<Vec<_>>();
+        row_nodes.push(weighted_split_nodes(
+            leaves,
+            col_fracs,
+            SplitAxis::LeftRight,
+        )?);
+    }
+    weighted_split_nodes(row_nodes, row_fracs, SplitAxis::TopBottom)
+}
+
+fn weighted_split_nodes(
+    mut nodes: Vec<SplitNode>,
+    weights: &[f64],
+    axis: SplitAxis,
+) -> Option<SplitNode> {
+    if nodes.is_empty() {
+        return None;
+    }
+    if nodes.len() == 1 {
+        return nodes.pop();
+    }
+    let first = nodes.remove(0);
+    let first_weight = weights.first().copied().unwrap_or(1.0);
+    let remaining_weights = if weights.len() > 1 {
+        &weights[1..]
+    } else {
+        &[]
+    };
+    let remaining_weight = remaining_weights.iter().sum::<f64>();
+    let total = first_weight + remaining_weight;
+    let ratio = if total.is_finite() && total > 0.0 {
+        first_weight / total
+    } else {
+        1.0 / (nodes.len() + 1) as f64
+    };
+    let second = weighted_split_nodes(nodes, remaining_weights, axis)?;
+    Some(SplitNode::Split {
+        axis,
+        ratio,
+        first: Box::new(first),
+        second: Box::new(second),
+    })
+}
+
+fn split_rect(
+    rect: (f64, f64, f64, f64),
+    axis: SplitAxis,
+    ratio: f64,
+) -> ((f64, f64, f64, f64), (f64, f64, f64, f64)) {
+    let (x, y, width, height) = rect;
+    match axis {
+        SplitAxis::LeftRight => {
+            let first_width = width * ratio;
+            (
+                (x, y, first_width, height),
+                (x + first_width, y, width - first_width, height),
+            )
+        }
+        SplitAxis::TopBottom => {
+            let first_height = height * ratio;
+            (
+                (x, y, width, first_height),
+                (x, y + first_height, width, height - first_height),
+            )
+        }
+    }
+}
+
+fn find_leaf_rect(
+    node: &SplitNode,
+    pane_idx: usize,
+    rect: (f64, f64, f64, f64),
+) -> Option<(f64, f64, f64, f64)> {
+    match node {
+        SplitNode::Leaf { pane_idx: idx } => (*idx == pane_idx).then_some(rect),
+        SplitNode::Split {
+            axis,
+            ratio,
+            first,
+            second,
+        } => {
+            let (first_rect, second_rect) = split_rect(rect, *axis, *ratio);
+            find_leaf_rect(first, pane_idx, first_rect)
+                .or_else(|| find_leaf_rect(second, pane_idx, second_rect))
+        }
+    }
+}
+
+fn replace_leaf_with_split(
+    node: &mut SplitNode,
+    target_idx: usize,
+    new_idx: usize,
+    direction: SplitDirection,
+) -> bool {
+    match node {
+        SplitNode::Leaf { pane_idx } if *pane_idx == target_idx => {
+            let original = SplitNode::Leaf {
+                pane_idx: target_idx,
+            };
+            let created = SplitNode::Leaf { pane_idx: new_idx };
+            let (axis, first, second) = match direction {
+                SplitDirection::Left => (SplitAxis::LeftRight, created, original),
+                SplitDirection::Right => (SplitAxis::LeftRight, original, created),
+                SplitDirection::Top => (SplitAxis::TopBottom, created, original),
+                SplitDirection::Bottom => (SplitAxis::TopBottom, original, created),
+            };
+            *node = SplitNode::Split {
+                axis,
+                ratio: 0.5,
+                first: Box::new(first),
+                second: Box::new(second),
+            };
+            true
+        }
+        SplitNode::Leaf { .. } => false,
+        SplitNode::Split { first, second, .. } => {
+            replace_leaf_with_split(first, target_idx, new_idx, direction)
+                || replace_leaf_with_split(second, target_idx, new_idx, direction)
+        }
+    }
+}
+
+fn collect_splitters(
+    node: &SplitNode,
+    rect: (f64, f64, f64, f64),
+    path: &mut SplitPath,
+    out: &mut Vec<SplitterGeometry>,
+) {
+    let SplitNode::Split {
+        axis,
+        ratio,
+        first,
+        second,
+    } = node
+    else {
+        return;
+    };
+    let (first_rect, second_rect) = split_rect(rect, *axis, *ratio);
+    let (x, y, width, height, local_extent) = match axis {
+        SplitAxis::LeftRight => (first_rect.0 + first_rect.2, rect.1, 0.0, rect.3, rect.2),
+        SplitAxis::TopBottom => (rect.0, first_rect.1 + first_rect.3, rect.2, 0.0, rect.3),
+    };
+    out.push(SplitterGeometry {
+        splitter_idx: out.len(),
+        path: path.clone(),
+        axis: *axis,
+        x,
+        y,
+        width,
+        height,
+        local_extent,
+    });
+    path.push(SplitBranch::First);
+    collect_splitters(first, first_rect, path, out);
+    path.pop();
+    path.push(SplitBranch::Second);
+    collect_splitters(second, second_rect, path, out);
+    path.pop();
+}
+
+fn nth_split_node_mut<'a>(
+    node: &'a mut SplitNode,
+    wanted: usize,
+    next: &mut usize,
+) -> Option<&'a mut SplitNode> {
+    if !matches!(node, SplitNode::Split { .. }) {
+        return None;
+    }
+    let current = *next;
+    *next += 1;
+    if current == wanted {
+        return Some(node);
+    }
+    let SplitNode::Split { first, second, .. } = node else {
+        unreachable!();
+    };
+    if let Some(found) = nth_split_node_mut(first, wanted, next) {
+        return Some(found);
+    }
+    nth_split_node_mut(second, wanted, next)
 }
 
 /// Compute the pixel offset and size of the `i`-th item in a list of
@@ -865,6 +1332,236 @@ mod tests {
         assert_eq!(layout.panes[1].session_id, "new-session");
         // Out-of-range index returns false.
         assert!(!layout.set_pane_session(99, "x".to_string()));
+    }
+
+    // ------------------------------------------------------------------
+    // append_pane (on-demand split, +1 pane per call)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn splitting_target_pane_at_bottom_adds_one_local_leaf() {
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+
+        let new_idx = layout
+            .split_pane(1, SplitDirection::Bottom)
+            .expect("target pane splits");
+
+        assert_eq!(new_idx, 2);
+        assert_eq!(layout.panes.len(), 3);
+        assert_eq!(layout.panes[0].session_id, "s0");
+        assert_eq!(layout.panes[1].session_id, "s1");
+        assert_eq!(layout.panes[2].session_id, "");
+        assert_eq!(
+            layout.pane_rect(0, 1000.0, 800.0),
+            Some((0.0, 0.0, 500.0, 800.0))
+        );
+        assert_eq!(
+            layout.pane_rect(1, 1000.0, 800.0),
+            Some((500.0, 0.0, 500.0, 400.0))
+        );
+        assert_eq!(
+            layout.pane_rect(2, 1000.0, 800.0),
+            Some((500.0, 400.0, 500.0, 400.0))
+        );
+    }
+
+    #[test]
+    fn splitting_target_pane_at_right_adds_one_local_leaf() {
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+
+        let new_idx = layout
+            .split_pane(0, SplitDirection::Right)
+            .expect("target pane splits at right");
+
+        assert_eq!(new_idx, 2);
+        assert_eq!(layout.panes.len(), 3);
+        assert_eq!(layout.panes[0].session_id, "s0");
+        assert_eq!(layout.panes[1].session_id, "s1");
+        assert_eq!(layout.panes[2].session_id, "");
+        // Pane 0 split horizontally at ratio 0.5: original stays on the
+        // left half (250px), new pane appears on the right half (250px).
+        // Pane 1 (originally at x=500) is unchanged (500px wide).
+        assert_eq!(
+            layout.pane_rect(0, 1000.0, 800.0),
+            Some((0.0, 0.0, 250.0, 800.0))
+        );
+        assert_eq!(
+            layout.pane_rect(2, 1000.0, 800.0),
+            Some((250.0, 0.0, 250.0, 800.0))
+        );
+        assert_eq!(
+            layout.pane_rect(1, 1000.0, 800.0),
+            Some((500.0, 0.0, 500.0, 800.0))
+        );
+    }
+
+    #[test]
+    fn append_pane_horizontal_to_empty_creates_1x2() {
+        let mut layout = PaneLayout::default();
+        assert!(layout.panes.is_empty());
+        let new_idx = layout.append_pane(true).expect("empty layout grows");
+        assert_eq!(layout.panes.len(), 2);
+        assert_eq!(layout.rows(), 1);
+        assert_eq!(layout.cols(), 2);
+        // The second pane is the "new" one returned.
+        assert_eq!(new_idx, 1);
+        // Both new panes are empty (caller fills them).
+        assert_eq!(layout.panes[0].session_id, "");
+        assert_eq!(layout.panes[1].session_id, "");
+        // Each column gets half the width.
+        let r0 = layout.pane_rect(0, 1000.0, 800.0).unwrap();
+        let r1 = layout.pane_rect(1, 1000.0, 800.0).unwrap();
+        assert_eq!(r0, (0.0, 0.0, 500.0, 800.0));
+        assert_eq!(r1, (500.0, 0.0, 500.0, 800.0));
+    }
+
+    #[test]
+    fn append_pane_horizontal_to_1x2_creates_1x3_with_one_new_pane() {
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        let before_len = layout.panes.len();
+        assert_eq!(before_len, 2);
+        let new_idx = layout.append_pane(true).expect("append to Split2H");
+        // Exactly ONE pane was added (not Grid4's +2).
+        assert_eq!(layout.panes.len(), 3);
+        assert_eq!(new_idx, 2);
+        // Tree growth no longer manufactures a global third column.
+        assert_eq!(layout.rows(), 1);
+        assert_eq!(layout.cols(), 2);
+        assert_eq!(layout.panes[2].session_id, "");
+        // Existing sessions are preserved.
+        assert_eq!(layout.panes[0].session_id, "s0");
+        assert_eq!(layout.panes[1].session_id, "s1");
+        // The largest leaf is split locally; the other half stays unchanged.
+        let r0 = layout.pane_rect(0, 900.0, 800.0).unwrap();
+        let r1 = layout.pane_rect(1, 900.0, 800.0).unwrap();
+        let r2 = layout.pane_rect(2, 900.0, 800.0).unwrap();
+        assert_eq!(r0, (0.0, 0.0, 225.0, 800.0));
+        assert_eq!(r2, (225.0, 0.0, 225.0, 800.0));
+        assert_eq!(r1, (450.0, 0.0, 450.0, 800.0));
+    }
+
+    #[test]
+    fn append_pane_vertical_to_2x1_creates_3x1_with_one_new_pane() {
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2V, &sids(2));
+        assert_eq!(layout.rows(), 2);
+        assert_eq!(layout.cols(), 1);
+        let new_idx = layout.append_pane(false).expect("append to Split2V");
+        assert_eq!(layout.panes.len(), 3);
+        assert_eq!(layout.rows(), 2);
+        assert_eq!(layout.cols(), 1);
+        assert_eq!(new_idx, 2);
+        assert_eq!(layout.panes[2].session_id, "");
+        let r0 = layout.pane_rect(0, 1000.0, 900.0).unwrap();
+        let r1 = layout.pane_rect(1, 1000.0, 900.0).unwrap();
+        let r2 = layout.pane_rect(2, 1000.0, 900.0).unwrap();
+        assert_eq!(r0, (0.0, 0.0, 1000.0, 225.0));
+        assert_eq!(r2, (0.0, 225.0, 1000.0, 225.0));
+        assert_eq!(r1, (0.0, 450.0, 1000.0, 450.0));
+    }
+
+    #[test]
+    fn five_balanced_panes_are_not_forced_into_one_horizontal_strip() {
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Single, &["s0".to_string()]);
+        for idx in 1..5 {
+            let new_idx = layout.append_balanced().expect("balanced growth");
+            assert_eq!(new_idx, idx);
+            assert!(layout.set_pane_session(new_idx, format!("s{idx}")));
+        }
+
+        assert_eq!(layout.panes.len(), 5);
+        assert_eq!(layout.session_ids().len(), 5);
+        let rects: Vec<_> = (0..5)
+            .map(|idx| layout.pane_rect(idx, 1000.0, 800.0).unwrap())
+            .collect();
+        assert!(rects.iter().any(|rect| rect.3 < 800.0));
+        assert!(rects.iter().any(|rect| rect.1 > 0.0));
+    }
+
+    #[test]
+    fn local_splitter_only_resizes_its_two_target_halves() {
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        let new_idx = layout
+            .split_pane(1, SplitDirection::Bottom)
+            .expect("local split");
+        assert_eq!(new_idx, 2);
+
+        let splitters = layout.splitters(1000.0, 800.0);
+        assert_eq!(splitters.len(), 2);
+        let local = splitters
+            .iter()
+            .find(|splitter| splitter.axis == SplitAxis::TopBottom)
+            .expect("local horizontal divider");
+        assert_eq!((local.x, local.y, local.width), (500.0, 400.0, 500.0));
+        assert_eq!(local.local_extent, 800.0);
+
+        assert!(layout.resize_split(local.splitter_idx, 0.1));
+        assert_eq!(
+            layout.pane_rect(0, 1000.0, 800.0),
+            Some((0.0, 0.0, 500.0, 800.0))
+        );
+        assert_eq!(
+            layout.pane_rect(1, 1000.0, 800.0),
+            Some((500.0, 0.0, 500.0, 480.0))
+        );
+        assert_eq!(
+            layout.pane_rect(2, 1000.0, 800.0),
+            Some((500.0, 480.0, 500.0, 320.0))
+        );
+    }
+
+    #[test]
+    fn append_pane_at_max_returns_none() {
+        // Build a layout at MAX_PANES by appending repeatedly from a Split2H
+        // base (1 row). MAX_PANES = 16, so we should be able to grow to 16
+        // then fail on the 17th attempt.
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        while layout.panes.len() < MAX_PANES {
+            assert!(layout.append_pane(true).is_some(), "append should succeed");
+        }
+        assert_eq!(layout.panes.len(), MAX_PANES);
+        // Now at the cap — append must fail.
+        assert!(layout.append_pane(true).is_none());
+    }
+
+    #[test]
+    fn append_pane_splits_the_largest_leaf_without_resetting_user_ratio() {
+        // Start with a 1×2 layout where the user has dragged the splitter so
+        // pane 0 is wider (0.7) than pane 1 (0.3). Growth splits that largest
+        // leaf instead of resetting the whole layout.
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        assert!(layout.resize_col(0, 0.2)); // 0.5→0.7, 0.5→0.3
+        assert!((layout.col_fracs[0] - 0.7).abs() < 1e-9);
+        assert!((layout.col_fracs[1] - 0.3).abs() < 1e-9);
+        let new_idx = layout.append_pane(true).expect("append");
+        assert_eq!(new_idx, 2);
+        assert_eq!(layout.col_fracs, vec![0.7, 0.3]);
+        assert_eq!(
+            layout.pane_rect(0, 1000.0, 800.0),
+            Some((0.0, 0.0, 350.0, 800.0))
+        );
+        assert_eq!(
+            layout.pane_rect(2, 1000.0, 800.0),
+            Some((350.0, 0.0, 350.0, 800.0))
+        );
+        assert_eq!(
+            layout.pane_rect(1, 1000.0, 800.0),
+            Some((700.0, 0.0, 300.0, 800.0))
+        );
+    }
+
+    #[test]
+    fn append_pane_to_legacy_grid4_locally_splits_one_cell() {
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Grid4, &sids(4));
+        let original_sessions = layout.session_ids();
+
+        let new_idx = layout.append_pane(true).expect("append to Grid4");
+
+        assert_eq!(new_idx, 4);
+        assert_eq!(layout.panes.len(), 5);
+        assert_eq!(layout.rows(), 2);
+        assert_eq!(layout.cols(), 2);
+        assert_eq!(&layout.session_ids()[..4], original_sessions.as_slice());
+        assert_eq!(layout.panes[4].session_id, "");
     }
 
     // ------------------------------------------------------------------

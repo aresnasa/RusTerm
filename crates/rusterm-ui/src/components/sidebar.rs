@@ -1,4 +1,9 @@
 use dioxus::prelude::*;
+// `MouseButton` lives in `dioxus::html::input_data` (not re-exported by
+// `dioxus::prelude::*`). Used by `ConnItem`'s `onmousedown` handler to
+// filter for primary-button (left-click) drags only — mirrors the tab
+// bar + pane title bar wiring.
+use dioxus::html::input_data::MouseButton;
 
 use rusterm_core::config::{ConnectionConfig, ConnectionKind};
 
@@ -34,6 +39,16 @@ pub fn Sidebar(
     /// Request deletion of the connection with this id (the App component
     /// owns the confirm dialog — the sidebar only triggers it).
     on_delete: EventHandler<String>,
+    /// Sidebar → pane drag handoff (Task 22 extension). Fired by a
+    /// ConnItem's `onmousedown` (primary button) with
+    /// `(connection_config, display_name, x, y)`. The App wires this to
+    /// `start_tab_drag` with `DragKind::Connection`, reusing the entire
+    /// manual-mouse drag infrastructure built for tab drags. Replaces the
+    /// prior HTML5 `ondragstart` + `ondrop` wiring, which was unreliable
+    /// in dioxus 0.7's desktop webview. Plain click-to-connect still
+    /// works — the polling loop only fires the drop if the cursor
+    /// crossed the drag threshold.
+    on_drag_start: EventHandler<(ConnectionConfig, String, f64, f64)>,
 ) -> Element {
     let mut search = use_signal(String::new);
     let mut expanded_ssh = use_signal(|| true);
@@ -153,6 +168,7 @@ pub fn Sidebar(
                                         on_copy: on_copy,
                                         on_edit: on_edit,
                                         on_delete: on_delete,
+                                        on_drag_start: on_drag_start,
                                         context_menu: context_menu,
                                     }
                                 }}
@@ -181,6 +197,7 @@ pub fn Sidebar(
                                         on_copy: on_copy,
                                         on_edit: on_edit,
                                         on_delete: on_delete,
+                                        on_drag_start: on_drag_start,
                                         context_menu: context_menu,
                                     }
                                 }}
@@ -209,6 +226,7 @@ pub fn Sidebar(
                                         on_copy: on_copy,
                                         on_edit: on_edit,
                                         on_delete: on_delete,
+                                        on_drag_start: on_drag_start,
                                         context_menu: context_menu,
                                     }
                                 }}
@@ -293,6 +311,11 @@ fn ConnItem(
     on_copy: EventHandler<String>,
     on_edit: EventHandler<String>,
     on_delete: EventHandler<String>,
+    /// Fired on primary-button `onmousedown` with
+    /// `(connection_config, display_name, x, y)`. The App wires this to
+    /// `start_tab_drag` with `DragKind::Connection`. See `Sidebar`'s
+    /// `on_drag_start` prop doc for the full rationale.
+    on_drag_start: EventHandler<(ConnectionConfig, String, f64, f64)>,
     mut context_menu: Signal<Option<(String, f64, f64)>>,
 ) -> Element {
     let color = kind_color(&conn.kind);
@@ -303,23 +326,30 @@ fn ConnItem(
     let mut hovered = use_signal(|| false);
     let bg = if hovered() { "#24283b" } else { "transparent" };
 
-    // Clone the connection id for the dragstart handler. When the user
-    // starts dragging a sidebar item, we stash the connection id in the
-    // drag's DataTransfer under a custom MIME type. The drop handler on
-    // each pane reads this MIME type to know which connection to open.
-    // We use a custom MIME rather than text/plain so the drop handler
-    // can distinguish "dragging a sidebar connection" (open a new
-    // session in the target pane) from "dragging an open session tab"
-    // (move/swap the existing session into the target pane).
-    let id_for_drag = conn.id.clone();
+    // Clone the connection config + name for the mousedown handoff.
+    // `on_drag_start` consumes both — the config drives `open_connection`
+    // in `finish_tab_drag`, and the name shows up in the drag ghost.
+    // We clone upfront because `conn` is moved into the rsx! tree (used
+    // by `conn.name` interpolation + kind_color etc.), so the mousedown
+    // closure can't borrow it.
+    let conn_for_drag = conn.clone();
+    let name_for_drag = conn.name.clone();
 
     rsx! {
         div {
             class: "conn-item",
-            // `draggable=true` is what makes the element a drag source.
-            // Without it, ondragstart never fires (the browser treats
-            // the div as a non-draggable element).
-            draggable: true,
+            // NOTE: NO `draggable: true` — that would start a native
+            // HTML5 drag alongside the manual mouse-based system,
+            // producing two ghosts and double-executing drops. The
+            // `onmousedown` handler below is the sole drag entry point
+            // (Task 22 extension for sidebar → pane drags; mirrors the
+            // tab bar + pane title bar wiring). HTML5 DnD was unreliable
+            // in dioxus 0.7's desktop webview, which is why the manual
+            // system exists. Plain click-to-connect still works:
+            // `onmousedown` only hands off to `start_tab_drag` with
+            // `dragging: false`; the polling loop only fires the drop
+            // if the cursor crossed the threshold, otherwise `onclick`
+            // fires normally.
             style: "
                 padding: 6px 10px;
                 margin: 1px 4px;
@@ -335,32 +365,32 @@ fn ConnItem(
             onclick: move |_| {
                 on_connect.call(id.clone());
             },
+            onmousedown: move |e: MouseEvent| {
+                // Only start a drag on primary button (left click).
+                // Middle/right clicks have other semantics (middle-click
+                // could be paste, right-click opens the context menu) and
+                // shouldn't initiate a drag.
+                if e.trigger_button() == Some(MouseButton::Primary) {
+                    // Prevent the browser from starting a native text-
+                    // selection drag on this mousedown (mirrors the tab
+                    // bar's onmousedown). preventDefault on mousedown
+                    // does NOT cancel the subsequent click event, so
+                    // click-to-connect still works.
+                    e.prevent_default();
+                    let c = e.client_coordinates();
+                    on_drag_start.call((
+                        conn_for_drag.clone(),
+                        name_for_drag.clone(),
+                        c.x,
+                        c.y,
+                    ));
+                }
+            },
             onmouseenter: move |_| hovered.set(true),
             onmouseleave: move |_| hovered.set(false),
             oncontextmenu: move |e: MouseEvent| {
                 e.prevent_default();
                 context_menu.set(Some((id_for_ctx.clone(), e.client_coordinates().x, e.client_coordinates().y)));
-            },
-            ondragstart: move |e: DragEvent| {
-                // Stash the connection id in the drag's DataTransfer.
-                // The drop handler reads this to identify which
-                // connection to open in the target pane. We use a
-                // custom MIME type to distinguish "drag from sidebar"
-                // (open a new session) from "drag from tab bar" (move
-                // an existing session).
-                let dt = e.data_transfer();
-                let _ = dt.set_data("application/x-rusterm-connection-id", &id_for_drag);
-                // Set a friendly drag image effect — "copy" indicates
-                // that dropping will create something new (a new
-                // session in the target pane), which matches the
-                // semantics here.
-                dt.set_drop_effect("copy");
-                dt.set_effect_allowed("copy");
-                tracing::debug!(
-                    "[DRAG] sidebar connection drag started: id={:?} name={:?}",
-                    &id_for_drag[..id_for_drag.len().min(8)],
-                    conn.name
-                );
             },
 
             span {
