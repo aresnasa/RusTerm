@@ -828,6 +828,89 @@ impl PaneLayout {
             .filter(|s| !s.is_empty())
             .collect()
     }
+
+    /// Remove the pane at `idx` from the layout, collapsing its parent split
+    /// so the surviving sibling expands to fill the freed space. This is the
+    /// inverse of `split_pane` / `append_pane` and is used by the empty-pane
+    /// close button (✕) to shrink the layout by exactly one pane.
+    ///
+    /// After the call:
+    ///   - The pane is removed from `panes` (the Vec shrinks by one).
+    ///   - The tree's leaf for `idx` is removed; its parent Split is replaced
+    ///     by the surviving sibling subtree (so the sibling expands to fill
+    ///     the whole parent rect).
+    ///   - Every leaf with `pane_idx > idx` is renumbered down by one so the
+    ///     "leaves point into `panes` by index" invariant is preserved.
+    ///   - `zoomed` is cleared if it pointed at the removed pane, or
+    ///     decremented if it pointed at a later pane.
+    ///
+    /// Returns `Some(())` on success. Returns `None` (and leaves the layout
+    /// untouched) when:
+    ///   - `idx` is out of range.
+    ///   - The layout has only one pane (cannot shrink to zero — the caller
+    ///     should close the whole tab instead).
+    ///   - The layout has no tree (`root == None`) and only the legacy
+    ///     grid fields; the operation is unsupported in that legacy mode.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use rusterm_ui::layout::{PaneLayout, LayoutPreset};
+    ///
+    /// let mut layout = PaneLayout::from_preset(
+    ///     LayoutPreset::Split2H,
+    ///     &["s0".to_string(), "s1".to_string()],
+    /// );
+    /// assert_eq!(layout.panes.len(), 2);
+    /// assert!(layout.remove_pane(1).is_some());
+    /// assert_eq!(layout.panes.len(), 1);
+    /// assert_eq!(layout.panes[0].session_id, "s0");
+    /// // The surviving pane now fills the whole container.
+    /// assert_eq!(layout.pane_rect(0, 1000.0, 800.0), Some((0.0, 0.0, 1000.0, 800.0)));
+    /// ```
+    pub fn remove_pane(&mut self, idx: usize) -> Option<()> {
+        if idx >= self.panes.len() || self.panes.len() <= 1 {
+            return None;
+        }
+
+        // If we have a tree, collapse the parent Split that owns the target
+        // leaf. If we don't have a tree (legacy grid-only layout), we can't
+        // safely shrink — bail out and let the caller fall back to a preset
+        // cycle or tab close.
+        let root = self.root.as_mut()?;
+        if !collapse_leaf(root, idx) {
+            return None;
+        }
+        // After collapse, the root may have become a lone leaf (the layout
+        // is now single-pane). That's a valid tree shape — leave it.
+
+        // Remove the pane from the stable vector.
+        self.panes.remove(idx);
+
+        // Renumber every leaf with pane_idx > idx down by one so the
+        // "leaves point into `panes` by index" invariant survives the shift.
+        if let Some(root) = self.root.as_mut() {
+            renumber_leaves(root, idx);
+        }
+
+        // Fix up the zoom pointer.
+        match self.zoomed {
+            Some(z) if z == idx => self.zoomed = None,
+            Some(z) if z > idx => self.zoomed = Some(z - 1),
+            _ => {}
+        }
+
+        // Legacy row/col fields are no longer authoritative after a local
+        // remove (the grid may no longer be rectangular). Clear them so the
+        // `tree_pane_rect` path is the sole geometry source. `col_fracs` and
+        // `row_fracs` are kept defensively (in case some reader still
+        // consults them) but won't be consulted by `pane_rect` as long as
+        // `root` is `Some`.
+        //
+        // The surviving sibling's expanded rect is derived from the tree, so
+        // the legacy fracs being out of sync doesn't affect rendering.
+        Some(())
+    }
 }
 
 fn grid_split_tree(
@@ -963,6 +1046,72 @@ fn replace_leaf_with_split(
         SplitNode::Split { first, second, .. } => {
             replace_leaf_with_split(first, target_idx, new_idx, direction)
                 || replace_leaf_with_split(second, target_idx, new_idx, direction)
+        }
+    }
+}
+
+/// Collapse the parent Split that owns the leaf at `target_idx`, replacing
+/// that Split with the surviving sibling subtree. The leaf itself is dropped,
+/// and the sibling expands to fill the whole parent rect (geometry is derived
+/// from the tree on read, so no ratio updates are needed).
+///
+/// Returns `true` if a leaf was found and collapsed. Returns `false` if the
+/// target leaf is not present in this subtree (the root has only one leaf and
+/// it doesn't match, or the tree shape doesn't include `target_idx`).
+///
+/// Special case: if `node` is itself the target `Leaf`, we can't collapse
+/// here — we'd need the PARENT to replace us with the sibling. That case is
+/// handled by the recursive call below: when we recurse into a child Split
+/// and find the target Leaf as one of its two children, we replace the whole
+/// child Split with its other child.
+fn collapse_leaf(node: &mut SplitNode, target_idx: usize) -> bool {
+    let SplitNode::Split { first, second, .. } = node else {
+        // Lone leaf at the root — nothing to collapse. The caller
+        // (`PaneLayout::remove_pane`) already rejected the single-pane case,
+        // so this branch should only be hit if the tree shape is unusual.
+        return false;
+    };
+
+    // If `first` is the target leaf, replace `*node` with `second`.
+    if matches!(first.as_ref(), SplitNode::Leaf { pane_idx } if *pane_idx == target_idx) {
+        let sibling = std::mem::replace(
+            second.as_mut(),
+            SplitNode::Leaf {
+                pane_idx: usize::MAX,
+            },
+        );
+        *node = sibling;
+        return true;
+    }
+    // If `second` is the target leaf, replace `*node` with `first`.
+    if matches!(second.as_ref(), SplitNode::Leaf { pane_idx } if *pane_idx == target_idx) {
+        let sibling = std::mem::replace(
+            first.as_mut(),
+            SplitNode::Leaf {
+                pane_idx: usize::MAX,
+            },
+        );
+        *node = sibling;
+        return true;
+    }
+    // Otherwise recurse into whichever child contains the target leaf.
+    collapse_leaf(first, target_idx) || collapse_leaf(second, target_idx)
+}
+
+/// Decrement every `pane_idx > removed_idx` in the tree by one. Used after
+/// `collapse_leaf` + `Vec::remove(idx)` to keep the leaf-to-pane invariant
+/// intact: leaves that pointed at panes AFTER the removed one must shift down
+/// by one to account for the Vec reindexing.
+fn renumber_leaves(node: &mut SplitNode, removed_idx: usize) {
+    match node {
+        SplitNode::Leaf { pane_idx } => {
+            if *pane_idx > removed_idx {
+                *pane_idx -= 1;
+            }
+        }
+        SplitNode::Split { first, second, .. } => {
+            renumber_leaves(first, removed_idx);
+            renumber_leaves(second, removed_idx);
         }
     }
 }
@@ -1562,6 +1711,179 @@ mod tests {
         assert_eq!(layout.cols(), 2);
         assert_eq!(&layout.session_ids()[..4], original_sessions.as_slice());
         assert_eq!(layout.panes[4].session_id, "");
+    }
+
+    // ------------------------------------------------------------------
+    // Pane removal (`remove_pane`) — the inverse of `append_pane` / `split_pane`.
+    // Used by the empty-pane close button (✕) to shrink the layout by one pane.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn remove_pane_on_single_pane_returns_none() {
+        // Can't shrink below one pane — caller should close the tab instead.
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Single, &sids(1));
+        assert!(layout.remove_pane(0).is_none());
+        assert_eq!(layout.panes.len(), 1);
+    }
+
+    #[test]
+    fn remove_pane_out_of_range_returns_none() {
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        assert!(layout.remove_pane(5).is_none());
+        assert_eq!(layout.panes.len(), 2, "layout unchanged on failure");
+    }
+
+    #[test]
+    fn remove_pane_on_split2h_removes_second_and_leaves_single() {
+        // Split2H (s0 | s1) — remove pane 1 → single pane (s0) filling all.
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        assert_eq!(layout.panes.len(), 2);
+        assert!(layout.remove_pane(1).is_some());
+        assert_eq!(layout.panes.len(), 1);
+        assert_eq!(layout.panes[0].session_id, "s0");
+        // The surviving pane now fills the whole container (single-pane rule).
+        assert_eq!(
+            layout.pane_rect(0, 1000.0, 800.0),
+            Some((0.0, 0.0, 1000.0, 800.0))
+        );
+    }
+
+    #[test]
+    fn remove_pane_on_split2h_removes_first_and_leaves_second() {
+        // Split2H (s0 | s1) — remove pane 0 → single pane (s1) filling all.
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        assert!(layout.remove_pane(0).is_some());
+        assert_eq!(layout.panes.len(), 1);
+        assert_eq!(layout.panes[0].session_id, "s1");
+        assert_eq!(
+            layout.pane_rect(0, 1000.0, 800.0),
+            Some((0.0, 0.0, 1000.0, 800.0))
+        );
+    }
+
+    #[test]
+    fn remove_pane_middle_of_three_panes_preserves_outer_sessions() {
+        // Build a 1×3 strip: s0 | s1 | s2 (panes 0, 1, 2).
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        let new_idx = layout.append_pane(true).expect("append to Split2H");
+        assert_eq!(new_idx, 2);
+        assert!(layout.set_pane_session(2, "s2".to_string()));
+        assert_eq!(layout.panes.len(), 3);
+
+        // Remove the middle pane (pane 1, session s1). The surviving panes
+        // should be s0 and s2, and pane 2's leaf must renumber down to 1.
+        assert!(layout.remove_pane(1).is_some());
+        assert_eq!(layout.panes.len(), 2);
+        assert_eq!(layout.panes[0].session_id, "s0");
+        assert_eq!(layout.panes[1].session_id, "s2");
+        // Both panes render without error (tree is consistent).
+        assert!(layout.pane_rect(0, 1000.0, 800.0).is_some());
+        assert!(layout.pane_rect(1, 1000.0, 800.0).is_some());
+    }
+
+    #[test]
+    fn remove_pane_last_of_three_panes_leaves_first_two() {
+        // Build a 1×3 strip: s0 | s1 | s2 (panes 0, 1, 2). Remove pane 2.
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        let new_idx = layout.append_pane(true).expect("append to Split2H");
+        assert!(layout.set_pane_session(new_idx, "s2".to_string()));
+
+        assert!(layout.remove_pane(2).is_some());
+        assert_eq!(layout.panes.len(), 2);
+        assert_eq!(layout.panes[0].session_id, "s0");
+        assert_eq!(layout.panes[1].session_id, "s1");
+    }
+
+    #[test]
+    fn remove_pane_first_of_three_panes_renumbers_survivors() {
+        // Build a 1×3 strip: s0 | s1 | s2 (panes 0, 1, 2). Remove pane 0.
+        // The remaining panes (sessions s1, s2) should slide down to indices
+        // 0 and 1, and the tree's leaves must be renumbered accordingly.
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        let new_idx = layout.append_pane(true).expect("append to Split2H");
+        assert!(layout.set_pane_session(new_idx, "s2".to_string()));
+
+        assert!(layout.remove_pane(0).is_some());
+        assert_eq!(layout.panes.len(), 2);
+        assert_eq!(layout.panes[0].session_id, "s1");
+        assert_eq!(layout.panes[1].session_id, "s2");
+        // Both panes must render (proves the leaf indices are valid).
+        assert!(layout.pane_rect(0, 1000.0, 800.0).is_some());
+        assert!(layout.pane_rect(1, 1000.0, 800.0).is_some());
+    }
+
+    #[test]
+    fn remove_pane_clears_zoomed_pointer_when_removing_zoomed_pane() {
+        // Zoom pane 1, then remove pane 1. zoomed should clear to None.
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        layout.zoom(1);
+        assert_eq!(layout.zoomed, Some(1));
+        assert!(layout.remove_pane(1).is_some());
+        assert_eq!(layout.zoomed, None);
+    }
+
+    #[test]
+    fn remove_pane_decrements_zoomed_pointer_when_removing_earlier_pane() {
+        // 3 panes, zoom pane 2. Remove pane 0. zoomed should drop to 1.
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        let new_idx = layout.append_pane(true).expect("append");
+        assert!(layout.set_pane_session(new_idx, "s2".to_string()));
+        layout.zoom(2);
+        assert_eq!(layout.zoomed, Some(2));
+        assert!(layout.remove_pane(0).is_some());
+        assert_eq!(layout.zoomed, Some(1));
+    }
+
+    #[test]
+    fn remove_pane_round_trips_with_append_pane() {
+        // Append then remove should leave the layout in its original state.
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        let original_rects: Vec<_> = (0..2)
+            .map(|i| layout.pane_rect(i, 1000.0, 800.0).unwrap())
+            .collect();
+        let original_sessions: Vec<_> = layout.session_ids();
+
+        let new_idx = layout.append_pane(true).expect("append");
+        assert!(layout.set_pane_session(new_idx, "temp".to_string()));
+        assert_eq!(layout.panes.len(), 3);
+
+        // Remove the newly-appended pane (it's at the end).
+        assert!(layout.remove_pane(new_idx).is_some());
+        assert_eq!(layout.panes.len(), 2);
+        assert_eq!(layout.session_ids(), original_sessions);
+        // Geometry of the two surviving panes is back to the original.
+        assert_eq!(
+            layout.pane_rect(0, 1000.0, 800.0).unwrap(),
+            original_rects[0]
+        );
+        assert_eq!(
+            layout.pane_rect(1, 1000.0, 800.0).unwrap(),
+            original_rects[1]
+        );
+    }
+
+    #[test]
+    fn remove_pane_on_nested_split_collapses_correct_subtree() {
+        // Build: Split2H (s0 | s1), then split pane 1 vertically into s1 / s2.
+        // Tree: Split(LR, 0.5, Leaf(0), Split(TB, 0.5, Leaf(1), Leaf(2)))
+        // Remove pane 2: the inner Split(TB) collapses to just Leaf(1),
+        // so the tree becomes Split(LR, 0.5, Leaf(0), Leaf(1)).
+        let mut layout = PaneLayout::from_preset(LayoutPreset::Split2H, &sids(2));
+        let new_idx = layout
+            .split_pane(1, SplitDirection::Bottom)
+            .expect("split pane 1");
+        assert_eq!(new_idx, 2);
+        assert!(layout.set_pane_session(2, "s2".to_string()));
+        assert_eq!(layout.panes.len(), 3);
+
+        assert!(layout.remove_pane(2).is_some());
+        assert_eq!(layout.panes.len(), 2);
+        assert_eq!(layout.panes[0].session_id, "s0");
+        assert_eq!(layout.panes[1].session_id, "s1");
+        // Pane 1 should now fill the right half (the bottom half it shared
+        // with the removed pane 2 is reclaimed).
+        let r1 = layout.pane_rect(1, 1000.0, 800.0).unwrap();
+        assert_eq!(r1, (500.0, 0.0, 500.0, 800.0));
     }
 
     // ------------------------------------------------------------------

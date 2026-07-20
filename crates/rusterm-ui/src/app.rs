@@ -31,7 +31,7 @@ use crate::layout::{PaneLayout, SplitAxis, SplitDirection};
 use crate::state::{
     AppState, Modal, OneKeyMatch, OneKeyPopupState, PendingDangerousCommand,
     SessionConnectionState, SessionTab, TabDropOutcome, TerminalEntry, UnlockState,
-    append_pane_to_active, begin_floating_pane_move, close_session, close_workspace,
+    append_pane_to_active, begin_floating_pane_move, close_pane, close_session, close_workspace,
     distribute_sessions_across_panes, execute_tab_drop_on_pane, execute_tab_drop_on_pane_at,
     focus_pane_for_layout, focused_pane_session, move_floating_pane_for_active,
     move_session_to_leftmost, prepare_split_for_sidebar_drop, prepare_split_for_sidebar_drop_at,
@@ -2552,12 +2552,14 @@ pub(crate) fn finish_tab_drag(
 /// "sidebar drop = new session for comparison" contract.
 fn empty_pane_title_actions(
     mut state: Signal<AppState>,
-    input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    mut input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
     layout_owner_tab_id: String,
     target_pane_idx: usize,
     copy_source: Option<(String, String)>,
 ) -> Element {
     let add_owner = layout_owner_tab_id.clone();
+    let close_owner = layout_owner_tab_id.clone();
+    let close_pane_idx = target_pane_idx;
     let copy_button = match copy_source {
         Some((source_session_id, source_name)) => {
             let copy_owner = layout_owner_tab_id;
@@ -2627,6 +2629,33 @@ fn empty_pane_title_actions(
                 },
                 "+"
             }
+            button {
+                style: "height: 18px; min-width: 24px; padding: 0 6px; border: 1px solid #414868; border-radius: 3px; background: #24283b; color: #f7768e; cursor: pointer; font-size: 13px; line-height: 16px; transition: background 0.12s ease, color 0.12s ease;",
+                title: "关闭此窗格（从布局中移除）",
+                // Same as the other buttons: stop_propagation only, NO
+                // prevent_default (prevent_default blocks click in webkit —
+                // see occupied_pane_title_actions for the same lesson).
+                onmousedown: move |e: MouseEvent| {
+                    e.stop_propagation();
+                },
+                onclick: move |e: MouseEvent| {
+                    e.stop_propagation();
+                    let outcome = close_pane(
+                        &mut state.write(),
+                        &mut input_senders.write(),
+                        &close_owner,
+                        close_pane_idx,
+                    );
+                    tracing::info!(
+                        "[PANE-CLOSE] empty pane {} in tab {} → outcome {:?}",
+                        close_pane_idx,
+                        &close_owner,
+                        outcome
+                    );
+                    restore_focus_to_active_session(state, 50);
+                },
+                "✕"
+            }
         }
     }
 }
@@ -2635,8 +2664,9 @@ fn empty_pane_title_actions(
 ///
 /// Mirrors `empty_pane_title_actions` in shape (returns a right-aligned
 /// inline-flex div) but contains only a single "✕" close button. Clicking it
-/// closes the pane's session via `close_session` and restores focus to the
-/// next available session.
+/// closes the pane's session via `close_pane` (which tears down the session's
+/// resources AND removes the pane from the layout, shrinking the grid) and
+/// restores focus to the next available session.
 ///
 /// ## Why a dedicated function (not inline `rsx!`)
 ///
@@ -2658,27 +2688,49 @@ fn empty_pane_title_actions(
 /// `onclick` also calls `e.stop_propagation()` so the pane div's `onclick`
 /// (which changes focus) doesn't fire after the session is already closed —
 /// the close action should be atomic.
+///
+/// ## Why `close_pane` and not `close_session`
+///
+/// The prior version called `close_session` directly, which cleared the
+/// session's resources but left an empty pane behind in the layout. The user
+/// explicitly asked "窗格右上角的十字按钮要支持关闭窗格" (the ✕ should
+/// CLOSE the pane, not just clear its session). `close_pane` does both:
+/// tears down the session (via `close_session`) AND removes the pane from the
+/// layout (via `PaneLayout::remove_pane`).
 fn occupied_pane_title_actions(
     mut state: Signal<AppState>,
     mut input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
     session_id: String,
+    layout_owner_tab_id: String,
+    pane_idx: usize,
 ) -> Element {
     let sid_for_close = session_id.clone();
+    let close_owner = layout_owner_tab_id.clone();
+    let close_pane_idx = pane_idx;
     rsx! {
         div {
             style: "display: inline-flex; align-items: center; gap: 4px; margin-left: 6px;",
             button {
                 style: "height: 18px; min-width: 24px; padding: 0 6px; border: 1px solid #414868; border-radius: 3px; background: #24283b; color: #f7768e; cursor: pointer; font-size: 13px; line-height: 16px; transition: background 0.12s ease, color 0.12s ease;",
-                title: "关闭此窗格的会话（Cmd+W / Ctrl+Shift+W 亦可）",
+                title: "关闭此窗格（从布局中移除，Cmd+W / Ctrl+Shift+W 亦可）",
                 onmousedown: move |e: MouseEvent| {
                     e.stop_propagation();
                 },
                 onclick: move |e: MouseEvent| {
                     e.stop_propagation();
-                    close_session(
+                    let _ = sid_for_close;
+                    let outcome = close_pane(
                         &mut state.write(),
                         &mut input_senders.write(),
-                        &sid_for_close,
+                        &close_owner,
+                        close_pane_idx,
+                    );
+                    tracing::info!(
+                        "[PANE-CLOSE] occupied pane {} (sid {}) in tab {} → outcome {:?}",
+                        close_pane_idx,
+                        sid_for_close,
+                        &close_owner,
+                        outcome
                     );
                     restore_focus_to_active_session(state, 50);
                 },
@@ -2985,7 +3037,13 @@ fn multi_pane_container(
                     copy_source,
                 )
             } else {
-                occupied_pane_title_actions(state, input_senders, sid.clone())
+                occupied_pane_title_actions(
+                    state,
+                    input_senders,
+                    sid.clone(),
+                    layout_owner_tab_id.clone(),
+                    idx,
+                )
             };
             (
                 idx,
@@ -7262,11 +7320,36 @@ pub fn App() -> Element {
                             && !mods.shift()
                         {
                             let snapshot = state.read();
-                            let target =
-                                focused_pane_session(&snapshot)
-                                    .or_else(|| snapshot.active_session.clone());
+                            // Close the focused PANE (not just the session), so the
+                            // pane itself is removed from the layout (mirrors the
+                            // ✕ button on the title bar). Falls back to closing
+                            // the active_session if there's no focused_pane.
+                            let (close_tab, close_idx, fallback_sid) =
+                                match snapshot.focused_pane.as_ref() {
+                                    Some(fp) => (
+                                        Some(fp.layout_owner_tab_id.clone()),
+                                        Some(fp.pane_idx),
+                                        None,
+                                    ),
+                                    None => (None, None, snapshot.active_session.clone()),
+                                };
                             drop(snapshot);
-                            if let Some(session_id) = target {
+                            if let (Some(tab), Some(idx)) = (close_tab, close_idx) {
+                                e.prevent_default();
+                                let outcome = close_pane(
+                                    &mut state.write(),
+                                    &mut input_senders.write(),
+                                    &tab,
+                                    idx,
+                                );
+                                tracing::info!(
+                                    "[CMD+W] closed focused pane {} in tab {} → {:?}",
+                                    idx, tab, outcome
+                                );
+                                restore_focus_to_active_session(state, 50);
+                            } else if let Some(session_id) = fallback_sid {
+                                // No focused_pane but there's an active_session —
+                                // fall back to close_session (pre-Layout-B behavior).
                                 e.prevent_default();
                                 close_session(
                                     &mut state.write(),
@@ -7288,11 +7371,31 @@ pub fn App() -> Element {
                             && !(mods.meta() && mods.ctrl())
                         {
                             let snapshot = state.read();
-                            let target =
-                                focused_pane_session(&snapshot)
-                                    .or_else(|| snapshot.active_session.clone());
+                            let (close_tab, close_idx, fallback_sid) =
+                                match snapshot.focused_pane.as_ref() {
+                                    Some(fp) => (
+                                        Some(fp.layout_owner_tab_id.clone()),
+                                        Some(fp.pane_idx),
+                                        None,
+                                    ),
+                                    None => (None, None, snapshot.active_session.clone()),
+                                };
                             drop(snapshot);
-                            if let Some(session_id) = target {
+                            if let (Some(tab), Some(idx)) = (close_tab, close_idx) {
+                                e.prevent_default();
+                                e.stop_propagation();
+                                let outcome = close_pane(
+                                    &mut state.write(),
+                                    &mut input_senders.write(),
+                                    &tab,
+                                    idx,
+                                );
+                                tracing::info!(
+                                    "[CMD+SHIFT+W] closed focused pane {} in tab {} → {:?}",
+                                    idx, tab, outcome
+                                );
+                                restore_focus_to_active_session(state, 50);
+                            } else if let Some(session_id) = fallback_sid {
                                 e.prevent_default();
                                 e.stop_propagation();
                                 close_session(
@@ -7304,7 +7407,7 @@ pub fn App() -> Element {
                             }
                         }
                         // Linux/Windows: plain Ctrl+W (no Shift) — close
-                        // the focused pane session. This handler ONLY fires
+                        // the focused pane. This handler ONLY fires
                         // when no terminal has focus, so it does NOT collide
                         // with the standard terminal Ctrl+W (which the
                         // TerminalView intercepts and sends as 0x17 to the
@@ -7318,11 +7421,31 @@ pub fn App() -> Element {
                             && !mods.shift()
                         {
                             let snapshot = state.read();
-                            let target =
-                                focused_pane_session(&snapshot)
-                                    .or_else(|| snapshot.active_session.clone());
+                            let (close_tab, close_idx, fallback_sid) =
+                                match snapshot.focused_pane.as_ref() {
+                                    Some(fp) => (
+                                        Some(fp.layout_owner_tab_id.clone()),
+                                        Some(fp.pane_idx),
+                                        None,
+                                    ),
+                                    None => (None, None, snapshot.active_session.clone()),
+                                };
                             drop(snapshot);
-                            if let Some(session_id) = target {
+                            if let (Some(tab), Some(idx)) = (close_tab, close_idx) {
+                                e.prevent_default();
+                                e.stop_propagation();
+                                let outcome = close_pane(
+                                    &mut state.write(),
+                                    &mut input_senders.write(),
+                                    &tab,
+                                    idx,
+                                );
+                                tracing::info!(
+                                    "[CTRL+W] closed focused pane {} in tab {} → {:?}",
+                                    idx, tab, outcome
+                                );
+                                restore_focus_to_active_session(state, 50);
+                            } else if let Some(session_id) = fallback_sid {
                                 e.prevent_default();
                                 e.stop_propagation();
                                 close_session(

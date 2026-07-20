@@ -697,3 +697,70 @@ Two related asks:
 - **The migration is one-shot per file** — after the first run, the platform dir has the file and the binary dir doesn't, so the migration's `if !target_path.exists()` guard short-circuits. Don't add a "migrate every time" loop — it'd be a no-op after the first run and would waste I/O.
 - **`APP_CONFIG_SUBDIR = "rusterm"` is constant across platforms** — don't try to "localise" it (e.g. `RusTerm` with capital letters on macOS). The lowercase form matches the existing `dirs::config_dir().join("rusterm")` calls that were already in the codebase, and changing it would break existing installs.
 - **The connection dialog's `<datalist>` uses fixed IDs `"ssh-host-list"` and `"ssh-identity-list"`** — if the dialog is ever rendered twice simultaneously (it isn't — it's a singleton modal), the IDs would collide and the browser would link both inputs to the same datalist. Not a problem now, but worth knowing if the dialog ever becomes a multi-instance component.
+
+## Empty-pane ✕ close button + occupied-pane ✕ now closes the pane (2026-07-20)
+
+### Goal
+
+User reported: "检查右上角的空窗口关闭逻辑，没有正确的关闭逻辑，需要能够关闭窗格" (check the top-right close button on empty windows — there's no proper close logic, panes need to be closeable). Also: "窗格右上角的十字按钮要支持关闭窗格" (the ✕ on occupied panes should close the pane, not just clear its session). And: "支持焦点选中窗格，然后 command+w 关闭窗格" (focus a pane, then Cmd+W closes the pane).
+
+The prior pass added an ✕ button to OCCUPIED panes that called `close_session` (cleared the session but left the pane as an empty slot). The user wants the ✕ to actually REMOVE the pane from the layout (shrinking the grid). Empty panes had NO ✕ button at all.
+
+### Changes
+
+**`crates/rusterm-ui/src/layout.rs`** — new `PaneLayout::remove_pane(idx) -> Option<()>` method (the inverse of `split_pane` / `append_pane`):
+- Collapses the parent Split that owns the leaf at `idx`: the leaf is dropped, and the surviving sibling subtree expands to fill the whole parent rect (geometry is derived from the tree on read, so no ratio updates are needed).
+- Removes the pane from `panes` (the stable-index Vec shrinks by one).
+- Renumbers every leaf with `pane_idx > idx` down by one so the "leaves point into `panes` by index" invariant survives the shift. New helper `renumber_leaves(node, removed_idx)`.
+- Updates `zoomed`: cleared if it pointed at the removed pane, decremented if it pointed at a later pane.
+- Returns `None` when: `idx` is out of range, the layout has only one pane (can't shrink to zero — caller should close the whole tab), or the layout has no tree (`root == None`, legacy grid-only mode).
+- New helper `collapse_leaf(node, target_idx) -> bool`: walks the tree looking for a Split whose `first` or `second` child is a Leaf at `target_idx`. When found, replaces the whole Split with the OTHER child (the sibling subtree), returning `true`. Returns `false` if the target leaf isn't a direct child of any Split in this subtree (e.g. lone-leaf root).
+- 11 new unit tests in `layout.rs` `mod tests`: single-pane returns None, out-of-range returns None, Split2H removes second/first, 3-pane strip removes middle/last/first, zoomed pointer cleared/decremented, round-trip with append_pane, nested Split collapses correct subtree.
+
+**`crates/rusterm-ui/src/state.rs`** — new `close_pane(state, input_senders, layout_owner_tab_id, pane_idx) -> ClosePaneOutcome` function (the state-level wrapper):
+- Captures the removed pane's session BEFORE borrowing `state.layouts` mutably (for the anchor-promotion check after `close_session`).
+- Returns `NoLayout` if no layout exists, `OutOfRange` if `pane_idx` is invalid, `SinglePane` if the layout has ≤1 panes (caller should close the tab via `close_workspace` instead).
+- If the pane has a session: calls `close_session(state, input_senders, sid)` first — this tears down the session's resources AND handles anchor promotion / tab removal via the existing logic. If `close_session` removed the tab (anchor closed + no other sessions), returns `TabClosed`. Defensive: clears `focused_pane` if it pointed into the closed tab (close_session only clears `focused_pane` when the focused pane's `session_id == closed_id`, but a focused_pane on an EMPTY pane of this tab would otherwise dangle).
+- Then calls `PaneLayout::remove_pane(pane_idx)` to physically remove the pane from the layout tree.
+- Fixes up `focused_pane`: cleared if it pointed at the removed pane, decremented if it pointed at a later pane (mirrors the tree-leaf renumbering).
+- New `ClosePaneOutcome` enum: `Removed`, `SinglePane`, `NoLayout`, `TabClosed`, `OutOfRange`.
+- 9 new tests in `state.rs` `mod tests`: empty pane removes from layout, pane with non-anchor session closes session + removes pane, anchor pane with other sessions promotes + removes, anchor pane with no other sessions closes tab, no-layout returns NoLayout, out-of-range returns OutOfRange, focused pane cleared when removing focused pane, focused pane cleared when tab is closed (the dangling-pointer case), round-trip with append_pane_to_active.
+
+**`crates/rusterm-ui/src/app.rs`** — three wiring changes:
+1. **`empty_pane_title_actions`** — added a third ✕ button (red `#f7768e`, matching the occupied-pane ✕). `onclick` calls `close_pane(state, input_senders, layout_owner_tab_id, pane_idx)` then `restore_focus_to_active_session(state, 50)`. `onmousedown` calls ONLY `e.stop_propagation()` — NOT `e.prevent_default()` (same lesson as the prior empty-pane button fix; webkit on macOS blocks click when mousedown prevents default). The function signature gained `mut input_senders` (was by-value) because `close_pane` calls `&mut input_senders.write()`.
+2. **`occupied_pane_title_actions`** — switched from `close_session` to `close_pane`. Now clicking the ✕ on an occupied pane REMOVES the pane from the layout (was: just cleared the session, leaving an empty pane behind). Function signature gained `layout_owner_tab_id: String` + `pane_idx: usize` params (needed by `close_pane`). `pane_actions` dispatch updated to pass these.
+3. **Cmd+W / Cmd+Shift+W / Ctrl+W (Linux/Windows) handlers** — switched from `close_session` to `close_pane` when there's a `focused_pane`. Falls back to `close_session` when there's no `focused_pane` but there's an `active_session` (the pre-layout single-pane case). Reads `state.focused_pane` to get `(layout_owner_tab_id, pane_idx)` instead of just the session id.
+
+### Tests
+
+- `layout::tests::remove_pane_*` — 11 new tests.
+- `state::tests::close_pane_*` — 9 new tests.
+- Doctest on `PaneLayout::remove_pane` (the `\```rust` example) — passes.
+- Total workspace: 585 tests passing (was 564; +21 = 11 layout + 9 state + 1 doctest).
+
+### Validation
+
+- nightly rustfmt on `layout.rs`, `state.rs`, `app.rs` → clean
+- `cargo build --workspace` → 0 warnings, 0 errors
+- `cargo test --workspace` → 585 passed, 0 failed
+- `cargo clippy -p rusterm-ui --lib` → 102 warnings (same as baseline; no new warnings from the new code). The `collapsible_if` warning at `app.rs:7313` is pre-existing (the nested `if let Key::Character { if s.eq_ignore_ascii_case("w") { ... } }` structure was already there; my change just lengthened the inner block).
+- `git diff --check HEAD` → clean
+
+### Design decisions
+
+- **`close_pane` calls `close_session` first (when the pane has a session)**: this reuses the existing anchor-promotion / tab-removal logic instead of duplicating it. If we removed the pane WITHOUT closing the session first, the session would leak (its `input_senders`, `terminals`, `close_senders` entries would dangle). The only case `close_pane` skips `close_session` is when the pane is EMPTY (no session) — the primary use case for the empty-pane ✕ button.
+- **`focused_pane` is cleared, not renumbered, when the focused pane is removed**: this is simpler than picking a "next" pane to focus (which would require layout-aware heuristics). The caller's `restore_focus_to_active_session(state, 50)` will land focus on the active session's input div, which is usually the right behavior. If the user wants focus to go to a specific pane, they can click it.
+- **`occupied_pane_title_actions` now uses `close_pane` (not `close_session`)**: this is a behavior change. Previously, clicking ✕ on an occupied pane left an empty pane behind. Now it removes the pane entirely, shrinking the layout. This matches the user's request ("窗格右上角的十字按钮要支持关闭窗格"). If the user wants the old "clear session, keep pane" behavior, they can use a different action (e.g. drag the session to another pane to empty this one).
+- **Cmd+W falls back to `close_session` when there's no `focused_pane`**: this preserves the pre-layout single-pane behavior (no layout entry → `close_pane` would return `NoLayout`). The fallback closes the session via `close_session`, which may close the tab if it's the anchor with no other sessions.
+- **`collapse_leaf` uses `mem::replace` on the Box's contents** (not `mem::replace` on the SplitNode itself): the original approach `std::mem::replace(node, (*second).clone())` doesn't compile because `*second` is a `SplitNode` inside a `Box<SplitNode>`, and `(*second).clone()` returns a `Box<SplitNode>` (the clone of a Box is still a Box). The fix is `std::mem::replace(second.as_mut(), SplitNode::Leaf { pane_idx: usize::MAX })` (swap the sibling's content out of its Box, then move the owned SplitNode into `*node`). The `usize::MAX` is a sentinel that's immediately discarded — we replace the whole `*node` with the sibling's content, so the sentinel never reaches the tree.
+
+### Pitfalls / gotchas
+
+- **`PaneLayout::remove_pane` requires a tree (`root.is_some()`)**: legacy layouts (pre-tree-geometry era) have `root == None` and rely on `col_fracs`/`row_fracs` for geometry. `remove_pane` returns `None` for these — the caller should fall back to a preset cycle or tab close. In practice, all layouts created after the local-split-tree refactor have `root.is_some()`, so this is only a defensive guard.
+- **`collapse_leaf` can't collapse a lone-leaf root**: if `node` is a `Leaf` (not a `Split`), there's no sibling to promote — return `false`. The caller (`PaneLayout::remove_pane`) already rejected the single-pane case (`panes.len() <= 1`), so this branch is only hit if the tree shape is unusual.
+- **`focused_pane` dangling after `close_session` closes the tab**: `close_session` only clears `focused_pane` when `focused_points_at_closed` (the focused pane's `session_id == closed_id`). If the focused pane was EMPTY (no session_id to match), `close_session` leaves `focused_pane` pointing into the now-deleted layout. `close_pane` defensively clears `focused_pane` when the tab is closed, regardless of what `close_session` did.
+- **`occupied_pane_title_actions`'s `let _ = sid_for_close;`**: the `sid_for_close` clone is now used only for the `tracing::info!` log message (after the `close_pane` call). The `let _ = sid_for_close;` is a defensive "this variable is used in the log below" marker — without it, clippy would warn about an unused variable if the log line were ever removed. The clone is cheap (a `String`).
+- **`close_pane`'s borrow dance**: the function captures `(removed_session_id, pane_count, in_range)` in a single `state.layouts.get(...).map(...)` call (returns owned `String` + `usize` + `bool` — all `Copy` or owned, no borrowed references escape). This lets the immutable borrow end before the `&mut state` calls to `close_session`. The earlier attempt used `drop(layout)` to end the borrow, but `drop` on a `&PaneLayout` reference does nothing (references are `Copy`) — the clippy `dropping_references` lint caught it.
+- **`close_pane` does NOT call `apply_layout_preset` to shrink**: it uses `PaneLayout::remove_pane` (the targeted, layout-preserving path). This preserves the user's manual pane rearrangement. The alternative (cycle the preset DOWN via `apply_layout_preset`) would re-fill all panes via `from_preset`, blowing away manual arrangement — explicitly avoided.
+- **The empty-pane ✕ button is ALWAYS shown** (even when the layout has only 2 panes): clicking it on a 2-pane layout collapses to a single pane. This is the intended behavior — the user wants to be able to remove panes one at a time. If the layout has only 1 pane, `close_pane` returns `SinglePane` (no-op) — the user should close the whole tab via the tab bar's ✕ instead.
+- **The `remove_pane` doctest uses `PaneLayout::from_preset(Split2H, ...)` then `remove_pane(1)`**: this is the simplest test case (2 panes → 1 pane). The doctest verifies the basic contract. The 11 unit tests cover the more complex cases (3-pane strips, nested splits, zoom pointer fixup, round-trip with append_pane).

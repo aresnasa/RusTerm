@@ -1095,6 +1095,144 @@ pub fn append_pane_to_active(state: &mut AppState) -> Option<usize> {
     state.layouts.get_mut(&active_id)?.append_balanced()
 }
 
+/// Outcome of [`close_pane`] — tells the caller what happened so it can
+/// run follow-up actions (e.g. restore focus, refresh tab bar).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ClosePaneOutcome {
+    /// A pane was removed from the layout. The tab and layout survive.
+    /// `focused_pane` was either cleared (if it pointed at the removed pane)
+    /// or decremented (if it pointed at a later pane).
+    Removed,
+    /// The layout has only one pane — can't shrink further. The caller should
+    /// close the whole tab (or do nothing, if the user clicked ✕ on the last
+    /// pane in a tab they want to keep).
+    SinglePane,
+    /// No layout exists for this tab (the tab is in the pre-layout single-pane
+    /// state). Nothing to remove.
+    NoLayout,
+    /// The pane held the tab's anchor session AND no other pane had a
+    /// session, so the whole tab was closed via [`close_session`]. The
+    /// caller should run tab-bar refresh / focus-restore logic.
+    TabClosed,
+    /// The pane index was out of range.
+    OutOfRange,
+}
+
+/// Close a pane in a specific tab's layout. This is the state-level wrapper
+/// around [`PaneLayout::remove_pane`] that also handles session teardown,
+/// anchor promotion, and `focused_pane` invalidation.
+///
+/// # Behavior
+///
+/// 1. **Empty pane** (no session): just call `PaneLayout::remove_pane` — no
+///    session cleanup needed. This is the case the empty-pane ✕ button hits.
+/// 2. **Pane with a non-anchor session**: call [`close_session`] to tear down
+///    the session's resources (input_senders, terminals, etc.), then call
+///    `PaneLayout::remove_pane` to shrink the layout.
+/// 3. **Pane with the anchor session + other panes have sessions**: call
+///    `close_session` (which promotes the first available pane session to
+///    the new anchor), then call `PaneLayout::remove_pane`.
+/// 4. **Pane with the anchor session + no other sessions**: call
+///    `close_session` (which removes the whole tab + layout). Return
+///    `TabClosed` — the layout is gone.
+///
+/// `focused_pane` is cleared if it pointed at the removed pane, or
+/// decremented if it pointed at a later pane (matching the tree-leaf
+/// renumbering done by `PaneLayout::remove_pane`).
+///
+/// # Why a state-level wrapper
+///
+/// Mirrors the `*_for_active` / `*_to_active` pattern: takes `&mut AppState`
+/// (unit-testable without a dioxus runtime) and handles the layout lookup
+/// boilerplate. The caller still owns the `input_senders` Signal borrow
+/// because `close_session` needs it.
+pub fn close_pane(
+    state: &mut AppState,
+    input_senders: &mut HashMap<String, mpsc::UnboundedSender<Vec<u8>>>,
+    layout_owner_tab_id: &str,
+    pane_idx: usize,
+) -> ClosePaneOutcome {
+    // Capture the removed pane's session BEFORE we borrow `state.layouts`
+    // mutably (we'll need it for the anchor-promotion check after
+    // `close_session`).
+    let (removed_session_id, pane_count, in_range) = state
+        .layouts
+        .get(layout_owner_tab_id)
+        .map(|layout| {
+            let sid = layout
+                .panes
+                .get(pane_idx)
+                .map(|pane| pane.session_id.clone());
+            (sid, layout.panes.len(), pane_idx < layout.panes.len())
+        })
+        .unwrap_or((None, 0, false));
+
+    if pane_count == 0 {
+        return ClosePaneOutcome::NoLayout;
+    }
+    if !in_range {
+        return ClosePaneOutcome::OutOfRange;
+    }
+    if pane_count <= 1 {
+        return ClosePaneOutcome::SinglePane;
+    }
+
+    // If the pane has a session, tear down its resources first. This also
+    // handles anchor promotion / tab removal via close_session's existing
+    // logic. After close_session, the pane slot is cleared (session_id == "").
+    if let Some(sid) = removed_session_id.as_deref().filter(|s| !s.is_empty()) {
+        let before_tabs = state.tabs.len();
+        close_session(state, input_senders, sid);
+        if state.tabs.len() < before_tabs {
+            // close_session tore down the whole tab (anchor closed + no other
+            // sessions). Layout is gone; nothing more to do. Defensive: clear
+            // any focused_pane that pointed into this tab (close_session only
+            // clears focused_pane when the focused pane's session_id == closed
+            // id, but a focused_pane on an EMPTY pane of this tab would
+            // otherwise dangle).
+            if state
+                .focused_pane
+                .as_ref()
+                .is_some_and(|fp| fp.layout_owner_tab_id == layout_owner_tab_id)
+            {
+                state.focused_pane = None;
+            }
+            return ClosePaneOutcome::TabClosed;
+        }
+    }
+
+    // After close_session (or if the pane was empty), the pane slot is
+    // cleared but the pane still exists in the layout. Now physically remove
+    // it from the layout tree.
+    let Some(layout) = state.layouts.get_mut(layout_owner_tab_id) else {
+        // Defensive: layout vanished somehow (shouldn't happen unless
+        // close_session's tab-removal path ran but we missed it above).
+        return ClosePaneOutcome::TabClosed;
+    };
+    if layout.remove_pane(pane_idx).is_none() {
+        // Shouldn't happen — we checked pane count above — but be defensive.
+        return ClosePaneOutcome::SinglePane;
+    }
+
+    // Fix up `focused_pane` to match the new pane indices.
+    match &state.focused_pane {
+        Some(fp) if fp.layout_owner_tab_id == layout_owner_tab_id => {
+            if fp.pane_idx == pane_idx {
+                state.focused_pane = None;
+            } else if fp.pane_idx > pane_idx {
+                state.focused_pane = Some(FocusedPane {
+                    layout_owner_tab_id: fp.layout_owner_tab_id.clone(),
+                    pane_idx: fp.pane_idx - 1,
+                });
+            }
+            // else: focused pane was before the removed one — no change.
+        }
+        _ => {}
+    }
+
+    ClosePaneOutcome::Removed
+}
+
 /// Outcome of [`prepare_split_for_sidebar_drop`]. The caller opens the new
 /// sidebar connection and assigns it to the pane at `pane_idx` in the layout
 /// owned by `layout_owner_tab_id`.
@@ -2999,6 +3137,200 @@ mod tests {
         close_workspace(&mut state, &mut senders, "alpha");
         assert_eq!(state.active_tab.as_deref(), Some("gamma"));
         assert_eq!(state.active_session.as_deref(), Some("gamma"));
+    }
+
+    // ------------------------------------------------------------------
+    // `close_pane` — removes a pane from the layout (used by the empty-pane
+    // ✕ button on the title bar). Inverse of `append_pane_to_active` /
+    // `split_pane_to_active`.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn close_pane_on_empty_pane_removes_it_from_layout() {
+        // The primary use case: an empty pane (no session) gets its ✕ button
+        // clicked. The pane should be removed from the layout, and no session
+        // teardown happens (there's no session to tear down).
+        let (mut state, mut senders) = state_with_senders(&["alpha"]);
+        // Make a Split2H layout with pane 1 empty.
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        let layout = state.layouts.get("alpha").unwrap();
+        assert_eq!(layout.panes[0].session_id, "alpha");
+        assert_eq!(layout.panes[1].session_id, "");
+        assert_eq!(layout.panes.len(), 2);
+
+        // Close the empty pane (pane 1).
+        let outcome = close_pane(&mut state, &mut senders, "alpha", 1);
+        assert_eq!(outcome, ClosePaneOutcome::Removed);
+
+        // Layout now has 1 pane; alpha's session survives.
+        let layout = state.layouts.get("alpha").unwrap();
+        assert_eq!(layout.panes.len(), 1);
+        assert_eq!(layout.panes[0].session_id, "alpha");
+        // alpha's session entry is still there (we didn't close any session).
+        assert!(state.sessions.iter().any(|s| s.id == "alpha"));
+    }
+
+    #[test]
+    fn close_pane_on_pane_with_non_anchor_session_closes_session_and_removes_pane() {
+        // Pane 1 holds a non-anchor session (beta). Closing pane 1 should:
+        //   1. Tear down beta's session resources (via close_session).
+        //   2. Remove pane 1 from the layout (the pane itself is gone, not
+        //      just cleared).
+        let (mut state, mut senders) = state_with_senders(&["alpha", "beta"]);
+        state.tabs.retain(|t| t.id != "beta");
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        // Sanity: pane 0=alpha, pane 1=beta.
+        let layout = state.layouts.get("alpha").unwrap();
+        assert_eq!(layout.panes[0].session_id, "alpha");
+        assert_eq!(layout.panes[1].session_id, "beta");
+        assert_eq!(state.sessions.len(), 2);
+
+        let outcome = close_pane(&mut state, &mut senders, "alpha", 1);
+        assert_eq!(outcome, ClosePaneOutcome::Removed);
+
+        // beta's session is gone.
+        assert!(!state.sessions.iter().any(|s| s.id == "beta"));
+        assert!(senders.get("beta").is_none());
+        // Layout shrunk to 1 pane; alpha survives.
+        let layout = state.layouts.get("alpha").unwrap();
+        assert_eq!(layout.panes.len(), 1);
+        assert_eq!(layout.panes[0].session_id, "alpha");
+        // Tab survives with alpha as anchor.
+        assert_eq!(state.tabs.len(), 1);
+        assert_eq!(state.tabs[0].anchor_session_id.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn close_pane_on_anchor_pane_with_other_sessions_promotes_and_removes() {
+        // Pane 0 holds the anchor (alpha). Pane 1 holds beta. Closing pane 0
+        // should: (1) close alpha's session, (2) promote beta to be the new
+        // anchor, (3) remove pane 0 from the layout (so beta moves to pane 0).
+        let (mut state, mut senders) = state_with_senders(&["alpha", "beta"]);
+        state.tabs.retain(|t| t.id != "beta");
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+
+        let outcome = close_pane(&mut state, &mut senders, "alpha", 0);
+        assert_eq!(outcome, ClosePaneOutcome::Removed);
+
+        // alpha is gone; beta is the new anchor.
+        assert!(!state.sessions.iter().any(|s| s.id == "alpha"));
+        assert!(state.sessions.iter().any(|s| s.id == "beta"));
+        assert_eq!(state.tabs[0].anchor_session_id.as_deref(), Some("beta"));
+        assert_eq!(state.active_session.as_deref(), Some("beta"));
+        // Layout shrunk to 1 pane (beta).
+        let layout = state.layouts.get("alpha").unwrap();
+        assert_eq!(layout.panes.len(), 1);
+        assert_eq!(layout.panes[0].session_id, "beta");
+    }
+
+    #[test]
+    fn close_pane_on_anchor_pane_with_no_other_sessions_closes_tab() {
+        // 2-pane layout where pane 0 = anchor (alpha) and pane 1 is EMPTY.
+        // Closing pane 0 closes alpha (the only session) → close_session
+        // removes the whole tab + layout. close_pane returns TabClosed.
+        let (mut state, mut senders) = state_with_senders(&["alpha", "beta"]);
+        state.tabs.retain(|t| t.id != "beta");
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        // Manually clear pane 1 so it's empty (apply_layout_preset filled it
+        // with beta, but we want to test the "only alpha is in the layout" case).
+        state
+            .layouts
+            .get_mut("alpha")
+            .unwrap()
+            .set_pane_session(1, String::new());
+        // Sanity: only alpha is in the layout.
+        let layout = state.layouts.get("alpha").unwrap();
+        assert_eq!(layout.panes[0].session_id, "alpha");
+        assert_eq!(layout.panes[1].session_id, "");
+        assert_eq!(state.sessions.len(), 2); // beta still in registry, just not placed.
+
+        // Close pane 0 (alpha — the anchor, with no other pane sessions).
+        let outcome = close_pane(&mut state, &mut senders, "alpha", 0);
+        assert_eq!(outcome, ClosePaneOutcome::TabClosed);
+        // alpha's tab + layout are gone.
+        assert!(state.tabs.iter().all(|t| t.id != "alpha"));
+        assert!(!state.layouts.contains_key("alpha"));
+        assert!(state.sessions.iter().all(|s| s.id != "alpha"));
+        // beta survives in the registry (it wasn't placed in any pane).
+        assert!(state.sessions.iter().any(|s| s.id == "beta"));
+    }
+
+    #[test]
+    fn close_pane_with_no_layout_returns_no_layout() {
+        let (mut state, mut senders) = state_with_senders(&["alpha"]);
+        // alpha's tab has no layout entry (Single preset).
+        let outcome = close_pane(&mut state, &mut senders, "alpha", 0);
+        assert_eq!(outcome, ClosePaneOutcome::NoLayout);
+    }
+
+    #[test]
+    fn close_pane_out_of_range_returns_out_of_range() {
+        let (mut state, mut senders) = state_with_senders(&["alpha"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        let outcome = close_pane(&mut state, &mut senders, "alpha", 99);
+        assert_eq!(outcome, ClosePaneOutcome::OutOfRange);
+        // Layout unchanged.
+        assert_eq!(state.layouts.get("alpha").unwrap().panes.len(), 2);
+    }
+
+    #[test]
+    fn close_pane_clears_focused_pane_when_removing_focused_pane() {
+        let (mut state, mut senders) = state_with_senders(&["alpha"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        // Focus pane 1.
+        assert!(focus_pane_for_layout(&mut state, "alpha", 1));
+        assert_eq!(state.focused_pane.as_ref().unwrap().pane_idx, 1);
+
+        // Close pane 1 (the focused pane). focused_pane should be cleared.
+        let outcome = close_pane(&mut state, &mut senders, "alpha", 1);
+        assert_eq!(outcome, ClosePaneOutcome::Removed);
+        assert!(state.focused_pane.is_none());
+    }
+
+    #[test]
+    fn close_pane_clears_focused_pane_when_tab_is_closed() {
+        // 3 panes: pane 0 (alpha), pane 1 (empty), pane 2 (empty). Focus pane 2.
+        // Close pane 0 (alpha — the anchor). Since no other pane has a session,
+        // close_session removes the whole tab. focused_pane (which pointed at
+        // pane 2 — an empty pane, so close_session's "focused_points_at_closed"
+        // check didn't fire) must be cleared by close_pane so it's not dangling.
+        let (mut state, mut senders) = state_with_senders(&["alpha"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        // Grow to 3 panes (1x3 strip).
+        let layout = state.layouts.get_mut("alpha").unwrap();
+        layout.append_pane(true).expect("append");
+        assert_eq!(layout.panes.len(), 3);
+
+        // Focus pane 2 (an empty pane).
+        assert!(focus_pane_for_layout(&mut state, "alpha", 2));
+        assert_eq!(state.focused_pane.as_ref().unwrap().pane_idx, 2);
+
+        // Close pane 0 (alpha). Tab is closed; focused_pane must be cleared.
+        let outcome = close_pane(&mut state, &mut senders, "alpha", 0);
+        assert_eq!(outcome, ClosePaneOutcome::TabClosed);
+        assert!(
+            state.focused_pane.is_none(),
+            "focused_pane must not dangle after tab close"
+        );
+    }
+
+    #[test]
+    fn close_pane_round_trips_with_append_pane_to_active() {
+        // Append then close should leave the layout in its original state.
+        let (mut state, mut senders) = state_with_senders(&["alpha"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        let before = state.layouts.get("alpha").unwrap().panes.len();
+        assert_eq!(before, 2);
+
+        // Append one pane (3 total).
+        let new_idx = append_pane_to_active(&mut state).expect("append");
+        assert_eq!(new_idx, 2);
+        assert_eq!(state.layouts.get("alpha").unwrap().panes.len(), 3);
+
+        // Close the newly-appended pane (empty).
+        let outcome = close_pane(&mut state, &mut senders, "alpha", new_idx);
+        assert_eq!(outcome, ClosePaneOutcome::Removed);
+        assert_eq!(state.layouts.get("alpha").unwrap().panes.len(), before);
     }
 
     #[test]
