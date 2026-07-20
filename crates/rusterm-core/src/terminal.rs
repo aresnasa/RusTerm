@@ -112,6 +112,34 @@ pub struct RenderOutput {
     pub scrollback_capacity: usize,
 }
 
+// ── Reflow helpers ─────────────────────────────────────────────────
+
+/// A grid cell that is purely the default background/foreground (a blank
+/// space with no styling) is the right-padding a wider grid fills columns
+/// with. It carries no logical content, so `reflow_grid` trims runs of these
+/// from the end of each non-wrapped row before re-wrapping into the new
+/// width. Styled blanks (e.g. a coloured space inside a banner) have a
+/// non-default `bg`/`fg`/`flags` and are preserved.
+fn is_padding_cell(cell: &Cell) -> bool {
+    cell.character == ' '
+        && cell.fg == CellColor::Default
+        && cell.bg == CellColor::Default
+        && cell.flags == CellFlags::empty()
+        && !cell.wide
+        && !cell.wide_next
+}
+
+/// Trim trailing default-padding cells from a row's cell vector. Used by
+/// `reflow_grid` when shrinking the grid so the old right-padding does not
+/// become phantom blank rows in the new, narrower grid.
+fn trim_trailing_padding(cells: &[Cell]) -> Vec<Cell> {
+    let mut end = cells.len();
+    while end > 0 && is_padding_cell(&cells[end - 1]) {
+        end -= 1;
+    }
+    cells[..end].to_vec()
+}
+
 // ── Cursor State (for save/restore) ─────────────────────────────────
 
 #[derive(Clone)]
@@ -484,9 +512,27 @@ impl Terminal {
     }
 
     fn reflow_grid(&self, _old_cols: usize, _old_rows: usize) -> Vec<Vec<Cell>> {
-        // Simple reflow: treat each row as a logical line for now
-        // TODO: handle wrapped lines properly
-        self.grid.iter().map(|row| row.cells.clone()).collect()
+        // Each grid row is one physical line. When shrinking columns, the
+        // right-padding cells (default blanks) from the old wider grid must be
+        // trimmed so they don't materialise as phantom blank rows in the new
+        // narrower grid. A real blank line (user pressed Enter on an empty
+        // prompt) yields a row whose cells are ALL default padding — trimming
+        // it down to an empty Vec is fine: resize wraps an empty line into a
+        // single blank row of the new width, which is the correct rendering.
+        //
+        // Wrapped rows are continuation fragments produced by a prior resize
+        // and are kept as-is: their trailing cells are part of the wrapped
+        // line's visual extent, not old-width padding.
+        self.grid
+            .iter()
+            .map(|row| {
+                if row.wrapped {
+                    row.cells.clone()
+                } else {
+                    trim_trailing_padding(&row.cells)
+                }
+            })
+            .collect()
     }
 
     pub fn render(&self) -> RenderOutput {
@@ -1518,6 +1564,50 @@ fn parse_osc7_payload(payload: &[u8]) -> Option<std::path::PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A newly opened session starts at the default 80 columns and can receive
+    /// its MOTD before a narrower split pane is measured. Resizing must not
+    /// treat every row's right-padding as terminal content, or each short MOTD
+    /// line is followed by a phantom blank row.
+    #[test]
+    fn resize_to_narrower_pane_keeps_short_motd_lines_contiguous() {
+        let mut term = Terminal::new(TerminalSize {
+            cols: 80,
+            rows: 24,
+            ..Default::default()
+        });
+        let mut parser = vte::ansi::Processor::new();
+        term.process(
+            b"Welcome to Ubuntu\r\nSystem load: 0.0\r\nUpdates available: 7",
+            &mut parser,
+        );
+
+        term.resize(40, 24, 400, 480);
+
+        let output = term.render();
+        let visible_lines: Vec<String> = output
+            .rows
+            .iter()
+            .take(3)
+            .map(|row| {
+                row.cells
+                    .iter()
+                    .map(|cell| cell.character)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            visible_lines,
+            [
+                "Welcome to Ubuntu",
+                "System load: 0.0",
+                "Updates available: 7",
+            ],
+            "narrowing a pane must not insert rows made from old right-padding"
+        );
+    }
 
     #[test]
     fn osc133_exit_code_parsed() {

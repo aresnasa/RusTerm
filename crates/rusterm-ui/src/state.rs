@@ -5,7 +5,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use rusterm_core::config::{ConnectionConfig, OneKey};
+use rusterm_core::config::{ConnectionConfig, FocusedTabAppearance, OneKey};
 use rusterm_core::config_manager::ConfigManager;
 use rusterm_core::session::SessionType;
 use rusterm_core::session_log::SessionLog;
@@ -67,13 +67,69 @@ pub enum UnlockState {
     Unlocked,
 }
 
+/// Pane-level focus is independent from `active_session`.
+///
+/// `active_session` remains the tab/layout anchor; changing it on a pane click
+/// would make the renderer look up a different layout. This runtime-only value
+/// exists solely for pane chrome/highlight and floating-window z-order.
+///
+/// `layout_owner_tab_id` is the group_id of the tab whose layout contains
+/// the focused pane. It is NOT a session id — sessions and tabs are decoupled
+/// in Plan B (one tab may host multiple independent pane sessions).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FocusedPane {
+    pub layout_owner_tab_id: String,
+    pub pane_idx: usize,
+}
+
+/// A top-level workspace tab. Each WorkspaceTab owns a `PaneLayout` (keyed by
+/// its `id`) and hosts one or more independent terminal sessions in its panes.
+///
+/// The top TabBar renders one entry per `WorkspaceTab` (NOT per session), so
+/// splitting a pane or cloning a session into an empty slot no longer adds a
+/// new top-level tab — that was the "Tab 膨胀" symptom.
+///
+/// `anchor_session_id` is the session displayed in pane 0 of this tab's
+/// layout. It exists for backwards-compatible display paths (the status bar
+/// and Cmd+Shift+F still key off `active_session` which mirrors the active
+/// tab's anchor). Step 2 of the Plan B migration will replace those paths
+/// with `focused_pane_session` and drop `anchor_session_id` + `active_session`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct WorkspaceTab {
+    /// Stable group id (independent uuid). Used as the key in
+    /// `AppState::layouts` and as `FocusedPane.layout_owner_tab_id`.
+    pub id: String,
+    /// The session id occupying pane 0 of this tab's layout. `None` only
+    /// briefly during teardown when the last session is being closed.
+    pub anchor_session_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppState {
+    /// Terminal registry. Every live session (whether it's a tab anchor or
+    /// only a pane inside a tab) has exactly one entry here. This is the
+    /// source of truth for "does this session exist?".
     pub sessions: Vec<SessionTab>,
+    /// Active workspace tab id (group_id). Layouts are keyed by this value.
+    /// Switching the top TabBar updates `active_tab` AND `active_session`
+    /// (the latter is the active tab's anchor, kept for Step-1 backwards
+    /// compatibility with code that still reads `active_session`).
+    pub active_tab: Option<String>,
+    /// Backwards-compatible anchor session of the active tab. Step 2 will
+    /// migrate the remaining readers (`restore_focus_to_active_session`,
+    /// status bar, Cmd+Shift+F, sidebar AI apply) to `focused_pane_session`
+    /// and delete this field.
     pub active_session: Option<String>,
+    /// Top TabBar data source. One entry per workspace tab. Pane-only
+    /// sessions (created by a sidebar drop or a pane clone) do NOT appear
+    /// here — they're displayed only inside their host tab's layout.
+    #[serde(default)]
+    pub tabs: Vec<WorkspaceTab>,
     pub sidebar_open: bool,
     pub connections: Vec<ConnectionConfig>,
     pub theme: Theme,
+    #[serde(default)]
+    pub focused_tab_appearance: FocusedTabAppearance,
     #[serde(skip)]
     pub close_senders: Vec<(String, mpsc::UnboundedSender<()>)>,
     #[serde(skip)]
@@ -140,11 +196,11 @@ pub struct AppState {
     /// disconnected session can be reconnected by pressing Enter.
     #[serde(skip)]
     pub session_configs: HashMap<String, ConnectionConfig>,
-    /// Session ids whose SSH/shell channel has dropped. While a session is in
-    /// this set, pressing Enter triggers a reconnect instead of going to the
-    /// (dead) PTY.
+    /// Runtime connection state per SSH/shell session. Keeping `Reconnecting`
+    /// distinct from `Disconnected` makes Enter-triggered retries idempotent
+    /// while preserving the same session id and pane assignment.
     #[serde(skip)]
-    pub disconnected_sessions: HashSet<String>,
+    pub session_connection_states: HashMap<String, SessionConnectionState>,
     /// DuckDB-backed analytics handle. Lazily opened on first use (so the
     /// ~50MB bundled libduckdb doesn't initialize on app startup unless
     /// the user actually queries analytics). When the `analytics` feature
@@ -155,10 +211,15 @@ pub struct AppState {
     /// default), the rendering path falls back to the legacy
     /// single-active-session view. When the user cycles to Split2H /
     /// Grid4 / Grid8 / etc., the rendering path renders every pane in the
-    /// layout side-by-side. Indexed by session id (same key as
-    /// `terminals`). A tab with no entry here is implicitly `Single`.
+    /// layout side-by-side. Indexed by the tab's group id (the
+    /// `WorkspaceTab::id`, mirrored by `AppState::active_tab`). A tab with
+    /// no entry here is implicitly `Single`.
     #[serde(skip)]
     pub layouts: HashMap<String, PaneLayout>,
+    /// Pane selected by the user for visual highlighting. This must never be
+    /// used as the tab/layout key; `active_tab` remains that stable anchor.
+    #[serde(skip)]
+    pub focused_pane: Option<FocusedPane>,
     /// The current layout preset for the active tab. Cycling this with a
     /// hotkey rebuilds the active tab's `PaneLayout` with the next preset
     /// in `LayoutPreset`'s cycle order. Kept as a separate field (rather
@@ -217,6 +278,14 @@ pub struct PendingDangerousCommand {
     /// Session id the command was typed into. Used to route the eventual
     /// Enter to the right PTY sender.
     pub session_id: String,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum SessionConnectionState {
+    #[default]
+    Connected,
+    Disconnected,
+    Reconnecting,
 }
 
 /// State of the OneKey autofill popup for a single session.
@@ -291,10 +360,13 @@ impl Default for AppState {
         };
         Self {
             sessions: Vec::new(),
+            active_tab: None,
             active_session: None,
+            tabs: Vec::new(),
             sidebar_open: true,
             connections: Vec::new(),
             theme: Theme::Dark,
+            focused_tab_appearance: FocusedTabAppearance::default(),
             close_senders: Vec::new(),
             resize_senders: HashMap::new(),
             config_manager: None,
@@ -308,9 +380,10 @@ impl Default for AppState {
             onekeys: Vec::new(),
             onekey_popups: HashMap::new(),
             session_configs: HashMap::new(),
-            disconnected_sessions: HashSet::new(),
+            session_connection_states: HashMap::new(),
             analytics: crate::analytics::AnalyticsHandle::default(),
             layouts: HashMap::new(),
+            focused_pane: None,
             layout_preset: LayoutPreset::default(),
             restore_pending: None,
             restore_disabled: false,
@@ -409,65 +482,127 @@ impl AppState {
             Theme::Light => "Light",
         }
     }
+
+    /// Look up the active tab's anchor session id (the session occupying
+    /// pane 0 of the active tab's layout). Returns `None` if there's no
+    /// active tab or the tab has no anchor yet.
+    ///
+    /// This is the bridge between the new `active_tab` (group_id) and the
+    /// legacy `active_session` (a session id). Step 1 keeps `active_session`
+    /// in sync with this value; Step 2 will replace readers of
+    /// `active_session` with `focused_pane_session` and delete both.
+    pub fn active_tab_anchor_session(&self) -> Option<String> {
+        let tab_id = self.active_tab.as_ref()?;
+        self.tabs
+            .iter()
+            .find(|t| &t.id == tab_id)
+            .and_then(|t| t.anchor_session_id.clone())
+    }
 }
 
-/// Move the session tab identified by `tab_id` to the leftmost position
-/// (index 0) of `state.sessions`. This is the "configure terminal to the
-/// left side" action triggered after a successful SSH login (feature #7).
+/// Helper: set the active tab and derive `active_session` from the tab's
+/// anchor. Use this whenever the active top TabBar entry changes so the two
+/// fields stay in sync (Step 1 compatibility).
+///
+/// `state` is taken by `&mut` so this is unit-testable without a dioxus
+/// runtime.
+pub fn set_active_tab(state: &mut AppState, tab_id: &str) {
+    state.active_tab = Some(tab_id.to_string());
+    state.active_session = state
+        .tabs
+        .iter()
+        .find(|t| t.id == tab_id)
+        .and_then(|t| t.anchor_session_id.clone());
+}
+
+/// Helper: push a new workspace tab + anchor and make it the active tab.
+/// `anchor_session_id` is the session that will occupy pane 0 of the tab's
+/// layout (and, during Step 1, mirror `active_session`).
+///
+/// Returns the new tab's group id so the caller can use it as a layout key
+/// when applying presets.
+pub fn push_workspace_tab(state: &mut AppState, anchor_session_id: &str) -> String {
+    let group_id = uuid::Uuid::new_v4().to_string();
+    state.tabs.push(WorkspaceTab {
+        id: group_id.clone(),
+        anchor_session_id: Some(anchor_session_id.to_string()),
+    });
+    set_active_tab(state, &group_id);
+    group_id
+}
+
+/// Move the workspace tab whose anchor is `session_id` to the leftmost
+/// position (index 0) of `state.tabs`. This is the "configure terminal to
+/// the left side" action triggered after a successful SSH login (feature #7).
 ///
 /// Returns `true` if the tab was found and actually moved (i.e., it was not
-/// already at position 0), `false` if the tab was not found OR was already
-/// at the leftmost position. The SSH connect flow uses the `true` return
-/// value as the signal that a configuration step actually occurred — only
-/// then is the host recorded as configured in the DB (avoid duplicate
-/// configuration).
+/// already at position 0), `false` if the tab was not found OR was already at
+/// the leftmost position. The SSH connect flow uses the `true` return value
+/// as the signal that a configuration step actually occurred — only then is
+/// the host recorded as configured in the DB (avoid duplicate configuration).
 ///
 /// This is a no-op when the tab is already at index 0: "already configured
 /// in-place" is treated as "no configuration step occurred", so the caller
 /// won't record the host again.
 ///
+/// Plan B note: in the prior model this rearranged `state.sessions` (the
+/// terminal registry). Under Plan B the top TabBar reads `state.tabs`, so
+/// we rearrange THAT instead. The sessions registry order is no longer
+/// user-visible and stays in creation order.
+///
 /// Takes `&mut AppState` (rather than `&mut Signal<AppState>`) so it's
 /// unit-testable without spinning up a dioxus runtime. Callers in `app.rs`
 /// pass `&mut state.write()`.
-pub fn move_session_to_leftmost(state: &mut AppState, tab_id: &str) -> bool {
-    let pos = state.sessions.iter().position(|t| t.id == tab_id);
+pub fn move_session_to_leftmost(state: &mut AppState, session_id: &str) -> bool {
+    let pos = state
+        .tabs
+        .iter()
+        .position(|t| t.anchor_session_id.as_deref() == Some(session_id));
     let Some(pos) = pos else {
-        // Tab not found — nothing to configure. Don't record this as a
-        // successful configuration (the requirement is to record only on
-        // confirmed success, and we couldn't even find the session).
+        // No tab whose anchor is this session — nothing to configure. Don't
+        // record this as a successful configuration (the requirement is to
+        // record only on confirmed success, and we couldn't even find the
+        // tab).
         return false;
     };
     if pos == 0 {
         // Already leftmost. Treat as already-configured-in-place — don't
-        // record (avoids duplicate configuration on repeat connects to
-        // a host whose tab happens to be the only one / already first).
+        // record (avoids duplicate configuration on repeat connects to a
+        // host whose tab happens to be the only one / already first).
         return false;
     }
-    let tab = state.sessions.remove(pos);
-    state.sessions.insert(0, tab);
+    let tab = state.tabs.remove(pos);
+    state.tabs.insert(0, tab);
     true
 }
 
 /// Apply a layout preset to the active tab. Builds a fresh `PaneLayout`
-/// from the preset using the active session's id as the first pane, then
-/// fills the remaining pane slots with other open sessions (in tab order).
-/// If there aren't enough sessions to fill the grid, the trailing slots
-/// are left empty (the renderer skips panes with empty `session_id`).
+/// from the preset using the active tab's anchor session as the first pane,
+/// then fills the remaining pane slots with other open sessions (in tab
+/// order). If there aren't enough sessions to fill the grid, the trailing
+/// slots are left empty (the renderer skips panes with empty `session_id`).
 ///
 /// Returns `true` if the layout was applied, `false` if there's no active
-/// session to anchor the layout on.
+/// tab (or no anchor session to put in pane 0).
 ///
 /// Takes `&mut AppState` so it's unit-testable without a dioxus runtime.
 pub fn apply_layout_preset(state: &mut AppState, preset: LayoutPreset) -> bool {
-    let Some(active_id) = state.active_session.clone() else {
+    let Some(active_id) = state.active_tab.clone() else {
         return false;
     };
-    // Collect session ids in priority order: active first, then every other
-    // open session in tab order. We dedupe in case the active session is
-    // also the first tab.
-    let mut ids = vec![active_id.clone()];
+    // The active tab's anchor session is pane 0. If the tab has no anchor
+    // (shouldn't happen in practice), bail — we can't build a layout without
+    // a session for pane 0.
+    let anchor_session = match state.active_tab_anchor_session() {
+        Some(s) => s,
+        None => return false,
+    };
+    // Collect session ids in priority order: anchor first, then every other
+    // open session in tab order. We dedupe in case the anchor is also the
+    // first tab.
+    let mut ids = vec![anchor_session.clone()];
     for tab in &state.sessions {
-        if tab.id != active_id && !ids.contains(&tab.id) {
+        if tab.id != anchor_session && !ids.contains(&tab.id) {
             ids.push(tab.id.clone());
         }
     }
@@ -505,7 +640,7 @@ pub fn cycle_layout_preset(state: &mut AppState) -> Option<LayoutPreset> {
 /// Returns `true` if the zoom was toggled, `false` if there's no layout
 /// or no pane displaying that session.
 pub fn toggle_pane_zoom(state: &mut AppState, session_id: &str) -> bool {
-    let active_id = match state.active_session.clone() {
+    let active_id = match state.active_tab.clone() {
         Some(id) => id,
         None => return false,
     };
@@ -523,9 +658,9 @@ pub fn toggle_pane_zoom(state: &mut AppState, session_id: &str) -> bool {
 /// input broadcast) on the active tab's layout.
 ///
 /// Returns the new comparison state (`true` = now on), or `None` if
-/// there's no active session with a layout.
+/// there's no active tab with a layout.
 pub fn toggle_comparison_mode(state: &mut AppState) -> Option<bool> {
-    let active_id = state.active_session.clone()?;
+    let active_id = state.active_tab.clone()?;
     let layout = state.layouts.get_mut(&active_id)?;
     Some(layout.toggle_comparison())
 }
@@ -535,7 +670,7 @@ pub fn toggle_comparison_mode(state: &mut AppState) -> Option<bool> {
 ///
 /// Returns `true` if the resize was applied.
 pub fn resize_layout_col(state: &mut AppState, col: usize, delta: f64) -> bool {
-    let active_id = match state.active_session.clone() {
+    let active_id = match state.active_tab.clone() {
         Some(id) => id,
         None => return false,
     };
@@ -550,7 +685,7 @@ pub fn resize_layout_col(state: &mut AppState, col: usize, delta: f64) -> bool {
 ///
 /// Returns `true` if the resize was applied.
 pub fn resize_layout_row(state: &mut AppState, row: usize, delta: f64) -> bool {
-    let active_id = match state.active_session.clone() {
+    let active_id = match state.active_tab.clone() {
         Some(id) => id,
         None => return false,
     };
@@ -561,9 +696,9 @@ pub fn resize_layout_row(state: &mut AppState, row: usize, delta: f64) -> bool {
 }
 
 /// Promote the active layout to floating windows and bring `pane_idx` to the
-/// front. The active session remains the layout anchor.
+/// front. The active tab anchor remains the layout owner.
 pub fn begin_floating_pane_move(state: &mut AppState, pane_idx: usize) -> bool {
-    let Some(active_id) = state.active_session.clone() else {
+    let Some(active_id) = state.active_tab.clone() else {
         return false;
     };
     let Some(layout) = state.layouts.get_mut(&active_id) else {
@@ -581,7 +716,7 @@ pub fn move_floating_pane_for_active(
     container_w: f64,
     container_h: f64,
 ) -> bool {
-    let Some(active_id) = state.active_session.clone() else {
+    let Some(active_id) = state.active_tab.clone() else {
         return false;
     };
     let Some(layout) = state.layouts.get_mut(&active_id) else {
@@ -612,17 +747,24 @@ pub fn move_floating_pane_for_active(
 /// in `app.rs`'s `on_input` handler — this function only decides which
 /// sessions should receive the input.
 pub fn broadcast_targets(state: &AppState) -> Vec<String> {
-    let Some(active_id) = state.active_session.as_ref() else {
+    let Some(active_id) = state.active_tab.as_ref() else {
         return Vec::new();
     };
-    // No layout → single-session path.
+    // No layout → single-session path. The active session (pane 0 / tab
+    // anchor) is the only target.
     let Some(layout) = state.layouts.get(active_id) else {
-        return vec![active_id.clone()];
+        return state
+            .active_tab_anchor_session()
+            .map(|s| vec![s])
+            .unwrap_or_default();
     };
     // Layout exists but comparison is off → input only goes to the
     // focused session. (Multi-pane without sync = panes are independent.)
     if !layout.comparison {
-        return vec![active_id.clone()];
+        return state
+            .active_tab_anchor_session()
+            .map(|s| vec![s])
+            .unwrap_or_default();
     }
     // Comparison is on → broadcast to every non-empty pane session.
     // Dedupe in case the same session appears in multiple panes (which
@@ -684,28 +826,139 @@ pub fn scroll_sync_targets(state: &AppState) -> Vec<String> {
 // path. A future task can introduce tree-based splits if the user
 // wants arbitrary layouts.
 
-/// Replace the session displayed in pane `pane_idx` of the active tab's
-/// layout with `session_id`. Used when the user drag-and-drops an open
-/// session (from the tab bar) or a sidebar connection (after the
-/// connection has been opened as a new session) onto a specific pane.
+/// Choose the nearest non-empty pane to clone into an empty target pane.
 ///
-/// Returns `true` if the pane's session was replaced. Returns `false`
-/// if there's no active session, no layout for the active session, or
-/// `pane_idx` is out of range — in all these cases the layout is left
-/// untouched and the caller should fall back to the legacy "open new
-/// tab" path.
+/// The search follows the visual reading order users expect from the built-in
+/// grids: nearest pane on the left, then nearest pane above, then right/below,
+/// and finally the nearest non-empty pane by Manhattan distance. This makes a
+/// Grid4's bottom panes copy from the pane directly above when their left
+/// neighbour is also empty.
+pub fn source_pane_for_copy(layout: &PaneLayout, target_idx: usize) -> Option<usize> {
+    let target = layout.panes.get(target_idx)?;
+    let rows = layout.rows();
+    let cols = layout.cols();
+    let is_usable = |idx: usize| {
+        idx != target_idx
+            && layout
+                .panes
+                .get(idx)
+                .is_some_and(|pane| !pane.session_id.is_empty())
+    };
+
+    for col in (0..target.col).rev() {
+        let idx = target.row * cols + col;
+        if is_usable(idx) {
+            return Some(idx);
+        }
+    }
+    for row in (0..target.row).rev() {
+        let idx = row * cols + target.col;
+        if is_usable(idx) {
+            return Some(idx);
+        }
+    }
+    for col in (target.col + 1)..cols {
+        let idx = target.row * cols + col;
+        if is_usable(idx) {
+            return Some(idx);
+        }
+    }
+    for row in (target.row + 1)..rows {
+        let idx = row * cols + target.col;
+        if is_usable(idx) {
+            return Some(idx);
+        }
+    }
+
+    layout
+        .panes
+        .iter()
+        .enumerate()
+        .filter(|(idx, pane)| *idx != target_idx && !pane.session_id.is_empty())
+        .min_by_key(|(idx, pane)| {
+            (
+                pane.row.abs_diff(target.row) + pane.col.abs_diff(target.col),
+                idx.abs_diff(target_idx),
+            )
+        })
+        .map(|(idx, _)| idx)
+}
+
+/// Select a pane for visual focus without changing the active tab/layout
+/// anchor. Floating panes are also brought to the front, while their geometry
+/// and session assignment remain unchanged.
+///
+/// `layout_owner_tab_id` is the group_id of the tab whose layout contains
+/// the pane. It's NOT a session id — Plan B decoupled these concepts.
+pub fn focus_pane_for_layout(
+    state: &mut AppState,
+    layout_owner_tab_id: &str,
+    pane_idx: usize,
+) -> bool {
+    let Some(layout) = state.layouts.get_mut(layout_owner_tab_id) else {
+        return false;
+    };
+    if pane_idx >= layout.panes.len() {
+        return false;
+    }
+    if layout.is_floating() {
+        layout.bring_floating_pane_to_front(pane_idx);
+    }
+    state.focused_pane = Some(FocusedPane {
+        layout_owner_tab_id: layout_owner_tab_id.to_string(),
+        pane_idx,
+    });
+    true
+}
+
+/// Return the session displayed by the currently focused pane.
+///
+/// Pane focus is visual runtime state only. Resolving it through the stored
+/// layout owner keeps `active_session` free to remain the tab/layout anchor.
+/// Empty panes and stale layout or pane references do not map to a session.
+pub fn focused_pane_session(state: &AppState) -> Option<String> {
+    let focused = state.focused_pane.as_ref()?;
+    state
+        .layouts
+        .get(&focused.layout_owner_tab_id)?
+        .panes
+        .get(focused.pane_idx)
+        .map(|pane| pane.session_id.clone())
+        .filter(|session_id| !session_id.is_empty())
+}
+
+/// Replace the session displayed in `pane_idx` of a specific layout.
+///
+/// Unlike [`set_pane_session_for_active`], this helper does not consult or
+/// mutate `active_tab`. Runtime operations that span multiple state writes
+/// (for example, opening several cloned SSH sessions after a self-drop) must
+/// use this explicit owner so a tab change cannot redirect later assignments.
+pub fn set_pane_session_for_layout(
+    state: &mut AppState,
+    layout_owner_tab_id: &str,
+    pane_idx: usize,
+    session_id: String,
+) -> bool {
+    let Some(layout) = state.layouts.get_mut(layout_owner_tab_id) else {
+        return false;
+    };
+    layout.set_pane_session(pane_idx, session_id)
+}
+
+/// Replace the session displayed in a pane of the current active layout.
+///
+/// This convenience wrapper is appropriate for a single synchronous state
+/// operation. Multi-step runtime flows must use [`set_pane_session_for_layout`]
+/// with a captured layout owner.
 pub fn set_pane_session_for_active(
     state: &mut AppState,
     pane_idx: usize,
     session_id: String,
 ) -> bool {
-    let Some(active_id) = state.active_session.clone() else {
+    let Some(active_id) = state.active_tab.clone() else {
         return false;
     };
-    let Some(layout) = state.layouts.get_mut(&active_id) else {
-        return false;
-    };
-    layout.set_pane_session(pane_idx, session_id)
+    set_pane_session_for_layout(state, &active_id, pane_idx, session_id)
 }
 
 /// Swap the panes displaying `from_session` and `to_session` in the
@@ -718,7 +971,7 @@ pub fn set_pane_session_for_active(
 /// unchanged) if there's no active session, no layout, or either
 /// session isn't currently displayed in any pane.
 pub fn swap_pane_sessions(state: &mut AppState, from_session: &str, to_session: &str) -> bool {
-    let Some(active_id) = state.active_session.clone() else {
+    let Some(active_id) = state.active_tab.clone() else {
         return false;
     };
     let Some(layout) = state.layouts.get_mut(&active_id) else {
@@ -727,8 +980,244 @@ pub fn swap_pane_sessions(state: &mut AppState, from_session: &str, to_session: 
     layout.swap_panes_by_session(from_session, to_session)
 }
 
+/// Close a single session and clean up every piece of state tied to it.
+///
+/// This is the single source of truth for session teardown — called by the
+/// Cmd+W keyboard shortcut (closes the focused pane session) and by the
+/// group teardown path inside [`close_workspace`]. The TabBar close button
+/// does NOT call this — it calls `close_workspace` to tear down the whole
+/// group at once.
+///
+/// Plan B group semantics: when the closed session was a tab anchor
+/// (i.e., some `WorkspaceTab.anchor_session_id == id`):
+///   - If that tab's layout has other non-empty pane sessions, the first
+///     such session is promoted to be the new anchor. `active_session`
+///     follows if it pointed at the closed session. The layout stays.
+///   - If no other session remains in the tab, the layout entry + the
+///     WorkspaceTab are removed. `active_tab` switches to the first
+///     remaining tab (and `active_session` follows its anchor).
+/// When the closed session was a pane-only session (not an anchor), the
+/// pane slot is cleared and the tab survives intact.
+///
+/// `input_senders` is the UI-side per-session stdin channel map. It's passed
+/// in by reference (rather than living inside `AppState`) because it's a
+/// `Signal`-backed map owned by the App component, not part of the
+/// serializable app state. The caller is responsible for the
+/// `Signal::write()` borrow; this function only mutates the underlying map.
+///
+/// After this call:
+///   - The session's stdin, close, resize, terminal, popup, connection,
+///     config, and pending-exit entries are dropped.
+///   - The session is removed from `sessions`.
+///   - The session is cleared from every pane slot of every layout (so a
+///     dangling reference doesn't try to render a dead session).
+///   - `focused_pane` is cleared if its pane was displaying this session.
+///   - If the closed session was the active tab's anchor and the tab had
+///     other sessions, the first such session is promoted to anchor.
+///   - If the closed session was the active tab's anchor and the tab had
+///     NO other sessions, the tab is removed and `active_tab`/`active_session`
+///     switch to the next remaining tab (or `None`).
+pub fn close_session(
+    state: &mut AppState,
+    input_senders: &mut HashMap<String, mpsc::UnboundedSender<Vec<u8>>>,
+    id: &str,
+) {
+    input_senders.remove(id);
+    if let Some((_, tx)) = state
+        .close_senders
+        .iter()
+        .find(|(sid, _)| sid == id)
+        .cloned()
+    {
+        let _ = tx.send(());
+    }
+    state.close_senders.retain(|(sid, _)| sid != id);
+    state.resize_senders.remove(id);
+    state.terminals.remove(id);
+    state.onekey_popups.remove(id);
+    state.session_connection_states.remove(id);
+    state.session_configs.remove(id);
+    state.pending_exit_check.remove(id);
+    state.sessions.retain(|s| s.id != id);
+
+    // Capture whether the focused pane was displaying this session BEFORE
+    // we mutate layouts. We compare by looking up the focused pane's current
+    // session_id, not by comparing the layout owner — the layout owner is a
+    // tab id now (Plan B), not a session id.
+    let focused_points_at_closed = state.focused_pane.as_ref().is_some_and(|focused| {
+        state
+            .layouts
+            .get(&focused.layout_owner_tab_id)
+            .and_then(|layout| layout.panes.get(focused.pane_idx))
+            .is_some_and(|pane| pane.session_id == id)
+    });
+    if focused_points_at_closed {
+        state.focused_pane = None;
+    }
+
+    // Find the tab whose anchor is this session (if any). Capture the
+    // candidate new anchor BEFORE we mutate the layouts so the borrow on
+    // `state.layouts` ends before the `&mut state` calls below.
+    let closed_tab_id = state
+        .tabs
+        .iter()
+        .find(|t| t.anchor_session_id.as_deref() == Some(id))
+        .map(|t| t.id.clone());
+    let new_anchor = closed_tab_id.as_ref().and_then(|tab_id| {
+        state.layouts.get(tab_id).and_then(|layout| {
+            layout
+                .panes
+                .iter()
+                .map(|p| p.session_id.clone())
+                .find(|sid| !sid.is_empty() && sid != id)
+        })
+    });
+
+    // Clear the closed session from every pane slot of every layout. This
+    // also handles the pane-only case (session wasn't an anchor).
+    for (_, layout) in state.layouts.iter_mut() {
+        for pane in layout.panes.iter_mut() {
+            if pane.session_id == id {
+                pane.session_id = String::new();
+            }
+        }
+    }
+
+    // Group promotion / removal.
+    if let Some(tab_id) = closed_tab_id {
+        if let Some(new_anchor) = new_anchor {
+            // Promote: keep the layout + tab, swap the anchor.
+            if let Some(tab) = state.tabs.iter_mut().find(|t| t.id == tab_id) {
+                tab.anchor_session_id = Some(new_anchor.clone());
+            }
+            if state.active_session.as_deref() == Some(id) {
+                state.active_session = Some(new_anchor);
+            }
+        } else {
+            // No other sessions in this tab — remove the tab + layout.
+            state.tabs.retain(|t| t.id != tab_id);
+            state.layouts.remove(&tab_id);
+            if state.active_tab.as_deref() == Some(&tab_id) {
+                let next_tab = state.tabs.first().map(|t| t.id.clone());
+                state.active_tab = next_tab.clone();
+                state.active_session = next_tab
+                    .as_ref()
+                    .and_then(|tid| state.tabs.iter().find(|t| &t.id == tid))
+                    .and_then(|t| t.anchor_session_id.clone());
+            }
+        }
+    }
+
+    // Defensive fallback: if the closed session was active_session but no
+    // tab owned it (a transient inconsistency), fall back to the first
+    // remaining session. This shouldn't happen in practice but keeps the
+    // invariant "active_session is always a live session id when set."
+    if state.active_session.as_deref() == Some(id) {
+        state.active_session = state.sessions.first().map(|s| s.id.clone());
+    }
+}
+
+/// Close an entire workspace tab (group) and every session hosted in its
+/// layout. This is what the TabBar close button calls — closing the tab
+/// should close ALL pane sessions inside it, not just the anchor.
+///
+/// `input_senders` is passed by reference for the same reason as
+/// [`close_session`] — it's a Signal-backed map owned by the App component.
+///
+/// After this call:
+///   - Every session that was the anchor or a non-empty pane in this tab's
+///     layout has its stdin/close/resize/terminal/popup/connection/config/
+///     pending-exit entries dropped and is removed from `sessions`.
+///   - The tab is removed from `tabs`.
+///   - The tab's layout entry is removed.
+///   - `focused_pane` is cleared if it pointed at this tab.
+///   - `active_tab` / `active_session` switch to the next remaining tab
+///     (or `None`).
+///
+/// We do NOT call [`close_session`] in a loop because each call would
+/// trigger group-promotion logic for the same tab we're tearing down —
+/// instead we inline the per-session cleanup so the tab is removed in one
+/// atomic step.
+pub fn close_workspace(
+    state: &mut AppState,
+    input_senders: &mut HashMap<String, mpsc::UnboundedSender<Vec<u8>>>,
+    group_id: &str,
+) {
+    // Collect every session id belonging to this group (anchor + every
+    // non-empty pane session).
+    let mut session_ids: Vec<String> = Vec::new();
+    if let Some(tab) = state.tabs.iter().find(|t| t.id == group_id) {
+        if let Some(anchor) = &tab.anchor_session_id {
+            session_ids.push(anchor.clone());
+        }
+    }
+    if let Some(layout) = state.layouts.get(group_id) {
+        for pane in &layout.panes {
+            if !pane.session_id.is_empty() && !session_ids.contains(&pane.session_id) {
+                session_ids.push(pane.session_id.clone());
+            }
+        }
+    }
+
+    // Per-session cleanup (mirrors `close_session`'s body minus the
+    // group-promotion logic).
+    for sid in &session_ids {
+        input_senders.remove(sid);
+        if let Some((_, tx)) = state
+            .close_senders
+            .iter()
+            .find(|(id, _)| id == sid)
+            .cloned()
+        {
+            let _ = tx.send(());
+        }
+        state.close_senders.retain(|(id, _)| id != sid);
+        state.resize_senders.remove(sid);
+        state.terminals.remove(sid);
+        state.onekey_popups.remove(sid);
+        state.session_connection_states.remove(sid);
+        state.session_configs.remove(sid);
+        state.pending_exit_check.remove(sid);
+    }
+    state.sessions.retain(|s| !session_ids.contains(&s.id));
+
+    // Clear focused_pane if it pointed at this tab.
+    if state
+        .focused_pane
+        .as_ref()
+        .is_some_and(|focused| focused.layout_owner_tab_id == group_id)
+    {
+        state.focused_pane = None;
+    }
+
+    // Remove the tab + its layout.
+    state.tabs.retain(|t| t.id != group_id);
+    state.layouts.remove(group_id);
+
+    // Also clear any remaining pane references to the closed sessions in
+    // OTHER tabs' layouts (defensive — a session could in theory appear in
+    // multiple layouts via drag-drop, though Plan B discourages it).
+    for (_, layout) in state.layouts.iter_mut() {
+        for pane in layout.panes.iter_mut() {
+            if session_ids.contains(&pane.session_id) {
+                pane.session_id = String::new();
+            }
+        }
+    }
+
+    // Switch active_tab to the next remaining tab.
+    if state.active_tab.as_deref() == Some(group_id) {
+        let next_tab = state.tabs.first().map(|t| t.id.clone());
+        state.active_tab = next_tab.clone();
+        state.active_session = next_tab
+            .as_ref()
+            .and_then(|tid| state.tabs.iter().find(|t| &t.id == tid))
+            .and_then(|t| t.anchor_session_id.clone());
+    }
+}
+
 /// Look up the pane index displaying `session_id` in the active tab's
-/// layout. Returns `None` if there's no active session, no layout, or
+/// layout. Returns `None` if there's no active tab, no layout, or
 /// the session isn't displayed in any pane.
 ///
 /// Used by the drag-and-drop drop handler to identify which pane the
@@ -736,13 +1225,13 @@ pub fn swap_pane_sessions(state: &mut AppState, from_session: &str, to_session: 
 /// `visible_panes` list) and to find the source pane of a drag (given
 /// the dragged tab's `session_id`).
 pub fn pane_index_for_active_session(state: &AppState, session_id: &str) -> Option<usize> {
-    let active_id = state.active_session.as_ref()?;
+    let active_id = state.active_tab.as_ref()?;
     let layout = state.layouts.get(active_id)?;
     layout.pane_index_for_session(session_id)
 }
 
 /// Get the `session_id` displayed at pane `pane_idx` in the active
-/// tab's layout. Returns `None` if there's no active session, no
+/// tab's layout. Returns `None` if there's no active tab, no
 /// layout, or `pane_idx` is out of range. The returned string may be
 /// empty (a pane slot with no session).
 ///
@@ -750,7 +1239,7 @@ pub fn pane_index_for_active_session(state: &AppState, session_id: &str) -> Opti
 /// displayed at the drop target (so we can swap it with the dragged
 /// session, or replace it with a freshly-opened connection).
 pub fn session_at_pane(state: &AppState, pane_idx: usize) -> Option<String> {
-    let active_id = state.active_session.as_ref()?;
+    let active_id = state.active_tab.as_ref()?;
     let layout = state.layouts.get(active_id)?;
     layout.panes.get(pane_idx).map(|p| p.session_id.clone())
 }
@@ -789,32 +1278,37 @@ pub fn session_at_pane(state: &AppState, pane_idx: usize) -> Option<String> {
 /// Returns a `DropSplitOutcome` describing what happened, so the caller
 /// can log / fall back appropriately.
 ///
-/// CRITICAL: this function does NOT update `active_session`. The layout
-/// is keyed by `active_session` in `state.layouts`; changing it would
-/// break the layout lookup. The dragged session is placed in a pane of
-/// the CURRENTLY ACTIVE tab's layout.
+/// CRITICAL: this function does NOT update `active_tab` or `active_session`.
+/// The layout is keyed by `active_tab` in `state.layouts`; changing it would
+/// break the layout lookup. The dragged session is placed in a pane of the
+/// CURRENTLY ACTIVE tab's layout. (Note: in Plan B, the anchor session of the
+/// active tab is `active_session`, NOT the layout key — the layout key is the
+/// tab's group_id.)
 pub fn drop_background_tab_to_create_split(
     state: &mut AppState,
     dragged_sid: &str,
     _target_pane_idx: usize,
 ) -> DropSplitOutcome {
-    let Some(active_id) = state.active_session.clone() else {
+    let Some(active_id) = state.active_tab.clone() else {
+        return DropSplitOutcome::Failed;
+    };
+    let Some(anchor_session) = state.active_tab_anchor_session() else {
         return DropSplitOutcome::Failed;
     };
 
-    // Case 1: no layout for the active session yet (Single preset).
+    // Case 1: no layout for the active tab yet (Single preset).
     // Apply Split2H and place the dragged session in pane 1.
     if !state.layouts.contains_key(&active_id) {
         state.layout_preset = LayoutPreset::Split2H;
-        let mut ids = vec![active_id.clone()];
+        let mut ids = vec![anchor_session.clone()];
         for tab in &state.sessions {
-            if tab.id != active_id && !ids.contains(&tab.id) {
+            if tab.id != anchor_session && !ids.contains(&tab.id) {
                 ids.push(tab.id.clone());
             }
         }
         let mut layout = PaneLayout::from_preset(LayoutPreset::Split2H, &ids);
         // Place the dragged session in pane 1 (pane 0 is the active tab's
-        // own session — that's the user's "anchor" and shouldn't move).
+        // own anchor session — the user's "anchor" shouldn't move).
         if layout.panes.len() >= 2 {
             layout.panes[1].session_id = dragged_sid.to_string();
         }
@@ -1003,8 +1497,8 @@ pub enum TabDropOutcome {
 ///      `FallbackSwap →` attempt `swap_pane_sessions` (`Swapped` /
 ///      `SplitFallbackSwapFailed`), `Failed → SplitFailed`.
 ///
-/// CRITICAL invariants: this function does NOT update `active_session`
-/// (it's a tab pointer; layouts are keyed by it). Apart from the
+/// CRITICAL invariants: this function does NOT update `active_tab` or
+/// `active_session` (the tab pointer is the layout key). Apart from the
 /// single-pane self-drop upgrade in case 1, it does NOT call
 /// `apply_layout_preset` directly — preset cycling otherwise happens
 /// only inside `drop_background_tab_to_create_split`.
@@ -1019,7 +1513,10 @@ pub fn execute_tab_drop_on_pane(
     // the returned range tells the caller exactly where cloned sessions
     // must be opened.
     if dragged_sid == target_pane_session {
-        let Some(active_id) = state.active_session.clone() else {
+        let Some(active_id) = state.active_tab.clone() else {
+            return TabDropOutcome::NoOpSelfDrop;
+        };
+        let Some(anchor_session) = state.active_tab_anchor_session() else {
             return TabDropOutcome::NoOpSelfDrop;
         };
 
@@ -1029,7 +1526,10 @@ pub fn execute_tab_drop_on_pane(
                 (layout, count)
             }
             None => (
-                PaneLayout::from_preset(LayoutPreset::Single, std::slice::from_ref(&active_id)),
+                PaneLayout::from_preset(
+                    LayoutPreset::Single,
+                    std::slice::from_ref(&anchor_session),
+                ),
                 1,
             ),
         };
@@ -1128,6 +1628,8 @@ pub fn execute_tab_drop_on_pane(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusterm_core::config::{ConnectionKind, ShellConfig};
+    use rusterm_core::terminal::TerminalSize;
 
     /// Verify the deferred-recording FIFO contract: Enter pushes a pending
     /// entry onto the back; OSC 133;D pops the front. This is the data-structure
@@ -1243,16 +1745,23 @@ mod tests {
 
     /// move_session_to_leftmost must relocate the matching tab to index 0.
     /// This is the core of feature #7 (auto-configure terminal to left side
-    /// after SSH login): the SSH session's tab is moved to the leftmost
-    /// position in the tab bar.
+    /// after SSH login): the SSH session's workspace tab is moved to the
+    /// leftmost position in the tab bar.
     #[test]
     fn move_session_to_leftmost_moves_matching_tab_to_index_zero() {
-        let mut state = state_with_tabs(&["alpha", "beta", "gamma"]);
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma"]);
         let moved = move_session_to_leftmost(&mut state, "gamma");
-        assert!(moved, "tab `gamma` (at index 2) should have been moved");
-        let ids: Vec<String> = state.sessions.iter().map(|t| t.id.clone()).collect();
+        assert!(
+            moved,
+            "tab whose anchor is `gamma` (at index 2) should have been moved"
+        );
+        let anchors: Vec<String> = state
+            .tabs
+            .iter()
+            .map(|t| t.anchor_session_id.clone().unwrap_or_default())
+            .collect();
         assert_eq!(
-            ids,
+            anchors,
             vec!["gamma".to_string(), "alpha".to_string(), "beta".to_string()],
             "`gamma` should now be at index 0; the rest should shift right"
         );
@@ -1264,15 +1773,19 @@ mod tests {
     /// tab is already in the desired leftmost position).
     #[test]
     fn move_session_to_leftmost_is_noop_when_already_leftmost() {
-        let mut state = state_with_tabs(&["alpha", "beta", "gamma"]);
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma"]);
         let moved = move_session_to_leftmost(&mut state, "alpha");
         assert!(
             !moved,
             "`alpha` is already at index 0 — no configuration step occurred"
         );
-        let ids: Vec<String> = state.sessions.iter().map(|t| t.id.clone()).collect();
+        let anchors: Vec<String> = state
+            .tabs
+            .iter()
+            .map(|t| t.anchor_session_id.clone().unwrap_or_default())
+            .collect();
         assert_eq!(
-            ids,
+            anchors,
             vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()],
             "order must be unchanged when the tab is already leftmost"
         );
@@ -1681,13 +2194,26 @@ mod tests {
     // toggle_pane_zoom, toggle_comparison_mode, resize_layout_col/row)
     // ------------------------------------------------------------------
 
-    /// Helper: AppState with N session tabs AND an active session set to the
-    /// first tab. This is the minimum state needed to test the layout
-    /// helpers (they all key off `active_session`).
+    /// Helper: AppState with N session tabs AND an active workspace tab whose
+    /// anchor is the first session. Each session gets its own workspace tab
+    /// (one session per tab — Plan B's default for restored or
+    /// freshly-opened single-session tabs). The workspace tab `id` is set
+    /// equal to the session's id so tests that hardcode
+    /// `state.layouts.get("alpha")` still work (in production, group ids
+    /// are UUIDs and don't match any session id — tests just use the
+    /// session-name-as-group-id convention for readability).
     fn state_with_active_session(names: &[&str]) -> AppState {
         let mut state = state_with_tabs(names);
+        for name in names {
+            state.tabs.push(WorkspaceTab {
+                id: (*name).to_string(),
+                anchor_session_id: Some((*name).to_string()),
+            });
+        }
         if let Some(first) = state.sessions.first() {
-            state.active_session = Some(first.id.clone());
+            let first_id = first.id.clone();
+            state.active_tab = Some(first_id.clone());
+            state.active_session = Some(first_id);
         }
         state
     }
@@ -1890,6 +2416,446 @@ mod tests {
         state.terminals.remove("alpha");
         state.layouts.remove("alpha");
         assert!(!state.layouts.contains_key("alpha"));
+    }
+
+    // ------------------------------------------------------------------
+    // close_session (single source of truth for session teardown)
+    //
+    // Both the TabBar close button and the Cmd+W hotkey go through this
+    // function, so the contract is pinned here once. The app.rs on_close
+    // closure cannot be unit-tested (it captures Dioxus Signals), but the
+    // underlying `close_session` function can be — so the invariants live
+    // here.
+    // ------------------------------------------------------------------
+
+    /// Helper: build a state with `names` sessions, each with an empty
+    /// terminal entry, the first session active, and `input_senders` pre-
+    /// populated with one closed-channel sender per session (so we can
+    /// assert `close_session` removed the entry without setting up a live
+    /// PTY). Returns `(state, input_senders)`.
+    fn state_with_senders(
+        names: &[&str],
+    ) -> (AppState, HashMap<String, mpsc::UnboundedSender<Vec<u8>>>) {
+        let mut state = state_with_active_session(names);
+        let mut senders = HashMap::new();
+        for name in names {
+            // Empty terminal entry so `close_session` can remove it.
+            state.terminals.insert(
+                (*name).to_string(),
+                Arc::new(Mutex::new(TerminalEntry {
+                    terminal: Terminal::new(TerminalSize::default()),
+                    parser: vte::ansi::Processor::new(),
+                    scroll_offset: 0,
+                })),
+            );
+            let (_tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+            senders.insert((*name).to_string(), _tx);
+        }
+        (state, senders)
+    }
+
+    #[test]
+    fn close_session_removes_session_from_every_state_map() {
+        let (mut state, mut senders) = state_with_senders(&["alpha", "beta"]);
+        // Seed every per-session map so we can assert close_session cleared them.
+        state
+            .close_senders
+            .push(("alpha".to_string(), mpsc::unbounded_channel::<()>().0));
+        state.resize_senders.insert(
+            "alpha".to_string(),
+            mpsc::unbounded_channel::<(u16, u16, u32, u32)>().0,
+        );
+        state
+            .onekey_popups
+            .insert("alpha".to_string(), OneKeyPopupState::default());
+        state.session_configs.insert(
+            "alpha".to_string(),
+            ConnectionConfig {
+                id: "alpha".to_string(),
+                name: "alpha".to_string(),
+                kind: ConnectionKind::Shell(ShellConfig {
+                    command: None,
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    working_dir: None,
+                }),
+                group: None,
+                tags: Vec::new(),
+                onekey: false,
+            },
+        );
+        state
+            .session_connection_states
+            .insert("alpha".to_string(), SessionConnectionState::default());
+        state
+            .pending_exit_check
+            .insert("alpha".to_string(), VecDeque::new());
+
+        close_session(&mut state, &mut senders, "alpha");
+
+        assert!(!state.sessions.iter().any(|s| s.id == "alpha"));
+        assert!(!senders.contains_key("alpha"));
+        assert!(!state.close_senders.iter().any(|(s, _)| s == "alpha"));
+        assert!(!state.resize_senders.contains_key("alpha"));
+        assert!(!state.terminals.contains_key("alpha"));
+        assert!(!state.onekey_popups.contains_key("alpha"));
+        assert!(!state.session_connection_states.contains_key("alpha"));
+        assert!(!state.session_configs.contains_key("alpha"));
+        assert!(!state.pending_exit_check.contains_key("alpha"));
+    }
+
+    #[test]
+    fn close_session_promotes_active_session_to_next_tab_when_no_layout() {
+        // Single preset (no layout entry), closing the active session
+        // should move active_session to the first remaining tab.
+        let (mut state, mut senders) = state_with_senders(&["alpha", "beta", "gamma"]);
+        assert_eq!(state.active_session.as_deref(), Some("alpha"));
+        close_session(&mut state, &mut senders, "alpha");
+        // First remaining session is `beta`.
+        assert_eq!(state.active_session.as_deref(), Some("beta"));
+        assert!(state.sessions.iter().any(|s| s.id == "beta"));
+        assert!(!state.sessions.iter().any(|s| s.id == "alpha"));
+    }
+
+    #[test]
+    fn close_session_clears_pane_slot_when_focused_pane_differs_from_active() {
+        // Multi-pane: active_session is `alpha` (the layout owner), and
+        // the focused pane displays `beta` (pane 1). Closing `beta` via
+        // Cmd+W should clear pane 1's session_id (set to empty string)
+        // and leave `active_session` untouched.
+        let (mut state, mut senders) = state_with_senders(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        // Sanity check the preset populated the panes. (Clone the
+        // session_ids so the immutable borrow on `state.layouts` ends
+        // before the `&mut state` calls below.)
+        let layout = state.layouts.get("alpha").expect("alpha layout exists");
+        let pane0_before = layout.panes[0].session_id.clone();
+        let pane1_before = layout.panes[1].session_id.clone();
+        assert_eq!(pane0_before, "alpha");
+        assert_eq!(pane1_before, "beta");
+        // Focus pane 1 (which displays beta). This is the scenario Cmd+W
+        // is supposed to handle: focused pane != active_session.
+        assert!(focus_pane_for_layout(&mut state, "alpha", 1));
+        assert_eq!(focused_pane_session(&state).as_deref(), Some("beta"));
+
+        close_session(&mut state, &mut senders, "beta");
+
+        // active_session must stay `alpha` — the tab anchor is still alive.
+        assert_eq!(state.active_session.as_deref(), Some("alpha"));
+        // The layout entry for alpha survives (the tab anchor wasn't closed).
+        let layout = state
+            .layouts
+            .get("alpha")
+            .expect("alpha layout still exists");
+        assert_eq!(layout.panes[0].session_id, "alpha");
+        // Pane 1 now shows an empty session — no dangling reference to beta.
+        assert_eq!(layout.panes[1].session_id, "");
+    }
+
+    #[test]
+    fn close_session_clears_focused_pane_when_owner_is_closed() {
+        // Plan B: closing the anchor session of a tab whose layout has NO
+        // other sessions removes the tab + layout entirely. `focused_pane`
+        // pointed at that layout, so it must be cleared (otherwise it would
+        // reference a layout that no longer exists).
+        //
+        // We construct this scenario with a Single-preset tab (no layout
+        // entry) so closing the anchor removes the tab and there's no
+        // other pane session to promote to.
+        let (mut state, mut senders) = state_with_senders(&["alpha", "beta"]);
+        // No layout applied — the tab is in Single preset. Focus pane 0.
+        // We need a layout entry to have a `focused_pane`, so apply Split2H
+        // but then clear pane 1 so the only session is `alpha`.
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        // Manually clear pane 1 so `alpha` is the only session in the layout.
+        {
+            let layout = state.layouts.get_mut("alpha").unwrap();
+            layout.panes[1].session_id = String::new();
+        }
+        assert!(focus_pane_for_layout(&mut state, "alpha", 0));
+        assert!(state.focused_pane.is_some());
+
+        close_session(&mut state, &mut senders, "alpha");
+
+        assert!(state.focused_pane.is_none());
+        assert!(!state.layouts.contains_key("alpha"));
+        // active_session should have moved to the next remaining tab
+        // (whose anchor is `beta`).
+        assert_eq!(state.active_session.as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn close_session_with_last_session_clears_active_session() {
+        // Closing the only remaining session should leave active_session
+        // as None (no tab to promote to).
+        let (mut state, mut senders) = state_with_senders(&["alpha"]);
+        assert_eq!(state.active_session.as_deref(), Some("alpha"));
+        close_session(&mut state, &mut senders, "alpha");
+        assert!(state.active_session.is_none());
+        assert!(state.sessions.is_empty());
+    }
+
+    #[test]
+    fn close_session_noop_for_unknown_session() {
+        // Closing a non-existent session should not panic and should leave
+        // the state untouched.
+        let (mut state, mut senders) = state_with_senders(&["alpha", "beta"]);
+        let sessions_before = state.sessions.clone();
+        close_session(&mut state, &mut senders, "nonexistent");
+        assert_eq!(state.sessions, sessions_before);
+        assert_eq!(state.active_session.as_deref(), Some("alpha"));
+    }
+
+    // ------------------------------------------------------------------
+    // Plan B (workspace tabs) — top-level TabBar shows one entry per
+    // WorkspaceTab, NOT per session. Pane-only sessions (sidebar drops,
+    // pane clones) live only inside their host tab's layout and don't
+    // inflate the top TabBar.
+    // ------------------------------------------------------------------
+
+    /// Helper: AppState with one workspace tab whose anchor is `anchor`,
+    /// plus a layout with `pane_sessions` (excluding the anchor if it's
+    /// already in the list). The layout is Split2H so we can hold up to 2
+    /// sessions without cycling presets. Extra pane sessions do NOT get their
+    /// own workspace tabs (they're pane-only inside `anchor`'s tab).
+    fn state_with_pane_sessions(anchor: &str, extra_pane_sessions: &[&str]) -> AppState {
+        let mut all_names = vec![anchor];
+        for s in extra_pane_sessions {
+            if !all_names.contains(s) {
+                all_names.push(*s);
+            }
+        }
+        let mut state = state_with_active_session(&all_names);
+        // state_with_active_session created one tab per session. We want
+        // ONLY the anchor's tab — the extras are pane-only sessions inside
+        // the anchor's tab. Remove the extras' tabs.
+        state.tabs.retain(|t| t.id == anchor);
+        // Force the active tab back to `anchor`'s tab (state_with_active_session
+        // makes the first session's tab active).
+        set_active_tab(&mut state, anchor);
+        // Build a Split2H layout: pane 0 = anchor, pane 1 = first extra
+        // (or empty if there are no extras). Extra sessions beyond the first
+        // aren't placed in any pane (they're background sessions in this
+        // test state).
+        let mut ids = vec![anchor.to_string()];
+        if let Some(first_extra) = extra_pane_sessions.first() {
+            ids.push(first_extra.to_string());
+        }
+        let layout = PaneLayout::from_preset(LayoutPreset::Split2H, &ids);
+        state.layouts.insert(anchor.to_string(), layout);
+        state.layout_preset = LayoutPreset::Split2H;
+        state
+    }
+
+    #[test]
+    fn split_new_pane_session_does_not_add_top_tab() {
+        // Plan B contract: a session opened into a pane (via sidebar drop
+        // or pane clone) does NOT create a new top-level WorkspaceTab. The
+        // top TabBar count stays at 1.
+        let state = state_with_pane_sessions("alpha", &["beta"]);
+        // Two sessions exist in the registry.
+        assert_eq!(state.sessions.len(), 2);
+        // But only one workspace tab (alpha's).
+        assert_eq!(state.tabs.len(), 1);
+        assert_eq!(state.tabs[0].anchor_session_id.as_deref(), Some("alpha"));
+    }
+
+    #[test]
+    fn one_tab_can_host_multiple_independent_sessions() {
+        // Plan B contract: a single WorkspaceTab can host multiple
+        // independent pane sessions in its layout. They're all reachable
+        // from the same top tab — switching the top TabBar doesn't show
+        // them as separate tabs.
+        let state = state_with_pane_sessions("alpha", &["beta", "gamma"]);
+        assert_eq!(state.tabs.len(), 1);
+        // The layout has alpha + beta (gamma is a background session here).
+        let layout = state.layouts.get("alpha").unwrap();
+        assert_eq!(layout.panes[0].session_id, "alpha");
+        assert_eq!(layout.panes[1].session_id, "beta");
+    }
+
+    #[test]
+    fn close_session_promotes_pane_session_to_anchor_when_anchor_closes() {
+        // Plan B contract: when a tab's anchor session closes and the
+        // layout has another non-empty pane session, that session is
+        // promoted to be the new anchor. The tab + layout survive.
+        let (mut state, mut senders) = state_with_senders(&["alpha", "beta"]);
+        // Both sessions are in the alpha tab's layout (alpha pane 0, beta pane 1).
+        // state_with_senders created one tab per session, so we need to
+        // consolidate: remove beta's tab, place beta in alpha's layout.
+        state.tabs.retain(|t| t.id != "beta");
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        // Sanity: layout has alpha + beta.
+        let layout = state.layouts.get("alpha").unwrap();
+        assert_eq!(layout.panes[0].session_id, "alpha");
+        assert_eq!(layout.panes[1].session_id, "beta");
+
+        // Close alpha (the anchor). Beta should be promoted.
+        close_session(&mut state, &mut senders, "alpha");
+
+        // The tab survives with beta as the new anchor.
+        assert_eq!(state.tabs.len(), 1);
+        assert_eq!(state.tabs[0].id, "alpha");
+        assert_eq!(state.tabs[0].anchor_session_id.as_deref(), Some("beta"));
+        // The layout survives — pane 0 was cleared (alpha closed), pane 1
+        // still shows beta.
+        let layout = state.layouts.get("alpha").unwrap();
+        assert_eq!(layout.panes[0].session_id, "");
+        assert_eq!(layout.panes[1].session_id, "beta");
+        // active_session follows the new anchor.
+        assert_eq!(state.active_session.as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn close_session_removes_tab_when_anchor_closes_and_no_pane_sessions_remain() {
+        // Plan B contract: closing the only session in a tab removes the
+        // tab + layout entirely. active_tab switches to the next remaining
+        // tab.
+        let (mut state, mut senders) = state_with_senders(&["alpha", "beta"]);
+        // alpha's tab has no layout (Single preset). Closing alpha should
+        // remove alpha's tab + switch active_tab to beta's tab.
+        assert_eq!(state.tabs.len(), 2);
+        assert_eq!(state.active_tab.as_deref(), Some("alpha"));
+
+        close_session(&mut state, &mut senders, "alpha");
+
+        // alpha's tab is gone; beta's tab survives.
+        assert_eq!(state.tabs.len(), 1);
+        assert_eq!(state.tabs[0].id, "beta");
+        // active_tab switched to beta's tab.
+        assert_eq!(state.active_tab.as_deref(), Some("beta"));
+        assert_eq!(state.active_session.as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn close_workspace_closes_every_pane_session_in_tab() {
+        // Plan B contract: close_workspace (the TabBar close button) tears
+        // down the entire tab — every pane session in its layout is closed.
+        let (mut state, mut senders) = state_with_senders(&["alpha", "beta"]);
+        // Consolidate beta into alpha's layout (same as the promote test).
+        state.tabs.retain(|t| t.id != "beta");
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        // Sanity: both sessions exist, only alpha's tab exists.
+        assert_eq!(state.sessions.len(), 2);
+        assert_eq!(state.tabs.len(), 1);
+
+        close_workspace(&mut state, &mut senders, "alpha");
+
+        // Both sessions are gone.
+        assert!(state.sessions.iter().all(|s| s.id != "alpha"));
+        assert!(state.sessions.iter().all(|s| s.id != "beta"));
+        // The tab + layout are gone.
+        assert!(state.tabs.is_empty());
+        assert!(!state.layouts.contains_key("alpha"));
+        // active_tab switched to None (no tabs remain).
+        assert!(state.active_tab.is_none());
+        assert!(state.active_session.is_none());
+    }
+
+    #[test]
+    fn close_workspace_with_multiple_tabs_switches_active_to_next() {
+        // close_workspace on a non-active tab leaves the active tab alone.
+        // close_workspace on the ACTIVE tab switches active_tab to the next
+        // remaining tab.
+        let (mut state, mut senders) = state_with_senders(&["alpha", "beta", "gamma"]);
+        // Active is alpha. Close beta's tab (a non-active tab).
+        close_workspace(&mut state, &mut senders, "beta");
+        // alpha is still active.
+        assert_eq!(state.active_tab.as_deref(), Some("alpha"));
+        assert_eq!(state.active_session.as_deref(), Some("alpha"));
+        // beta + its layout are gone.
+        assert!(state.tabs.iter().all(|t| t.id != "beta"));
+        assert!(!state.layouts.contains_key("beta"));
+
+        // Now close the active tab (alpha). active_tab should switch to
+        // the next remaining tab (gamma, since beta is gone).
+        close_workspace(&mut state, &mut senders, "alpha");
+        assert_eq!(state.active_tab.as_deref(), Some("gamma"));
+        assert_eq!(state.active_session.as_deref(), Some("gamma"));
+    }
+
+    #[test]
+    fn switching_top_tab_changes_layout_and_anchor() {
+        // Plan B contract: switching the top TabBar entry switches the
+        // active_tab + active_session (anchor). The layout lookup uses
+        // active_tab, so the new tab's layout is the one that renders.
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma"]);
+        // alpha tab gets a Split2H layout.
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        let alpha_layout_panes = state.layouts.get("alpha").unwrap().panes.len();
+        // Switch to beta's tab.
+        set_active_tab(&mut state, "beta");
+        assert_eq!(state.active_tab.as_deref(), Some("beta"));
+        assert_eq!(state.active_session.as_deref(), Some("beta"));
+        // alpha's layout still exists (switching tabs doesn't destroy it).
+        assert_eq!(
+            state.layouts.get("alpha").unwrap().panes.len(),
+            alpha_layout_panes
+        );
+        // beta's tab has no layout entry (Single preset).
+        assert!(!state.layouts.contains_key("beta"));
+    }
+
+    #[test]
+    fn cmd_w_closing_focused_pane_preserves_tab() {
+        // Plan B + Cmd+W contract: closing a NON-anchor pane session via
+        // close_session (Cmd+W) clears the pane slot but leaves the tab +
+        // anchor intact. This is the user-facing "close this pane, keep
+        // the tab" behaviour.
+        let (mut state, mut senders) = state_with_senders(&["alpha", "beta"]);
+        // Consolidate beta into alpha's layout.
+        state.tabs.retain(|t| t.id != "beta");
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        // Focus pane 1 (beta).
+        assert!(focus_pane_for_layout(&mut state, "alpha", 1));
+        assert_eq!(focused_pane_session(&state).as_deref(), Some("beta"));
+
+        // Cmd+W closes the focused pane session (beta).
+        close_session(&mut state, &mut senders, "beta");
+
+        // The tab survives (anchor alpha still alive).
+        assert_eq!(state.tabs.len(), 1);
+        assert_eq!(state.tabs[0].id, "alpha");
+        assert_eq!(state.active_session.as_deref(), Some("alpha"));
+        // Pane 1 is cleared; pane 0 still shows alpha.
+        let layout = state.layouts.get("alpha").unwrap();
+        assert_eq!(layout.panes[0].session_id, "alpha");
+        assert_eq!(layout.panes[1].session_id, "");
+        // beta is gone from the registry.
+        assert!(state.sessions.iter().all(|s| s.id != "beta"));
+    }
+
+    #[test]
+    fn pane_only_session_does_not_appear_as_top_tab() {
+        // Plan B contract: a pane-only session (no workspace tab owns it
+        // as anchor) doesn't appear in the top TabBar. We simulate this
+        // by adding a session to the registry WITHOUT creating a tab for
+        // it.
+        let mut state = state_with_active_session(&["alpha"]);
+        // Add a pane-only session "beta" (no tab).
+        state.sessions.push(SessionTab {
+            id: "beta".to_string(),
+            name: "beta".to_string(),
+            kind: SessionType::Ssh,
+            render_output: Default::default(),
+            version: 0,
+            suggestion: None,
+            suggestions: Vec::new(),
+            suggestion_selected: 0,
+            suggestion_visible: false,
+            command_history: Vec::new(),
+            hostname: None,
+            cwd: None,
+        });
+        // Place beta in alpha's layout pane 1.
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+
+        // Top TabBar shows only alpha's tab — beta is pane-only.
+        assert_eq!(state.tabs.len(), 1);
+        assert_eq!(state.tabs[0].anchor_session_id.as_deref(), Some("alpha"));
+        // beta is in the layout.
+        let layout = state.layouts.get("alpha").unwrap();
+        assert_eq!(layout.panes[1].session_id, "beta");
     }
 
     // ------------------------------------------------------------------
@@ -2138,7 +3104,7 @@ mod tests {
     // earlier tests don't directly exercise.
     // ------------------------------------------------------------------
 
-    /// Each tab owns its own layout — switching the active session must not
+    /// Each tab owns its own layout — switching the active tab must not
     /// disturb another tab's layout. This is the multi-tab invariant of
     /// Task 14's multi-pane display: switching tabs swaps which layout is
     /// rendered, but both layouts coexist in `state.layouts`.
@@ -2150,8 +3116,8 @@ mod tests {
         assert_eq!(state.layouts.len(), 1);
         assert!(state.layouts.contains_key("alpha"));
 
-        // Switch active session to beta and apply Split2H there.
-        state.active_session = Some("beta".to_string());
+        // Switch active tab to beta and apply Split2H there.
+        set_active_tab(&mut state, "beta");
         apply_layout_preset(&mut state, LayoutPreset::Split2H);
         assert_eq!(state.layouts.len(), 2);
         assert!(state.layouts.contains_key("beta"));
@@ -2162,7 +3128,7 @@ mod tests {
         assert_eq!(state.layouts.get("beta").unwrap().panes.len(), 2);
 
         // Switching back to alpha — its layout is preserved unchanged.
-        state.active_session = Some("alpha".to_string());
+        set_active_tab(&mut state, "alpha");
         let alpha_layout = state.layouts.get("alpha").unwrap().clone();
         assert_eq!(alpha_layout.panes.len(), 4);
         assert_eq!(alpha_layout.cols(), 2);
@@ -2170,14 +3136,14 @@ mod tests {
     }
 
     /// Task 15 contract: when the user cycles a layout preset on a tab whose
-    /// active session is `X`, the new layout is rebuilt with `X` anchored at
+    /// anchor session is `X`, the new layout is rebuilt with `X` anchored at
     /// pane 0 and the remaining sessions filling the rest in tab order.
     /// This is the session-allocation correctness criterion.
     #[test]
     fn cycle_layout_preset_anchors_active_session_at_pane_zero() {
         let mut state = state_with_active_session(&["alpha", "beta", "gamma", "delta"]);
-        // Make `gamma` the active session — it's at index 2 in `sessions`.
-        state.active_session = Some("gamma".to_string());
+        // Make `gamma` the active tab — its anchor session is `gamma`.
+        set_active_tab(&mut state, "gamma");
 
         // Cycle to Grid4. The new layout should have `gamma` at pane 0,
         // not `alpha` (which is the first tab). This is the contract
@@ -3347,6 +4313,164 @@ mod tests {
         assert_eq!(outcome, TabDropOutcome::SplitFallbackSwapFailed);
         // Preset unchanged.
         assert_eq!(state.layout_preset, LayoutPreset::Grid8);
+    }
+
+    /// Runtime clone creation may trigger unrelated state updates between
+    /// expanding a layout and assigning all newly-created sessions. Explicit
+    /// layout ownership must keep every clone in the layout that requested it,
+    /// regardless of the current active tab.
+    #[test]
+    fn explicit_layout_target_fills_self_drop_slots_after_active_tab_changes() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        assert_eq!(
+            execute_tab_drop_on_pane(&mut state, "alpha", 0, "alpha"),
+            TabDropOutcome::SelfDropExpanded {
+                first_pane_idx: 2,
+                pane_count: 2,
+            }
+        );
+
+        state.active_session = Some("beta".to_string());
+        assert!(set_pane_session_for_layout(
+            &mut state,
+            "alpha",
+            2,
+            "clone-a".to_string(),
+        ));
+        assert!(set_pane_session_for_layout(
+            &mut state,
+            "alpha",
+            3,
+            "clone-b".to_string(),
+        ));
+
+        assert_eq!(state.active_session.as_deref(), Some("beta"));
+        assert_eq!(state.layouts["alpha"].panes[2].session_id, "clone-a");
+        assert_eq!(state.layouts["alpha"].panes[3].session_id, "clone-b");
+    }
+
+    #[test]
+    fn copy_source_prefers_left_then_above_in_grid4() {
+        let layout = PaneLayout::from_preset(
+            LayoutPreset::Grid4,
+            &["top-left".to_string(), "top-right".to_string()],
+        );
+
+        assert_eq!(source_pane_for_copy(&layout, 2), Some(0));
+        assert_eq!(source_pane_for_copy(&layout, 3), Some(1));
+
+        let mut left_filled = layout.clone();
+        left_filled.panes[2].session_id = "bottom-left".to_string();
+        assert_eq!(source_pane_for_copy(&left_filled, 3), Some(2));
+    }
+
+    #[test]
+    fn copy_source_falls_back_past_empty_neighbours() {
+        let layout = PaneLayout::from_preset(LayoutPreset::Grid4, &["only".to_string()]);
+        assert_eq!(source_pane_for_copy(&layout, 3), Some(0));
+    }
+
+    #[test]
+    fn copy_source_returns_none_when_no_session_exists() {
+        let layout = PaneLayout::from_preset(LayoutPreset::Grid4, &[]);
+        assert_eq!(source_pane_for_copy(&layout, 3), None);
+        assert_eq!(source_pane_for_copy(&layout, 99), None);
+    }
+
+    #[test]
+    fn focusing_pane_does_not_change_layout_owner() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        state.active_session = Some("beta".to_string());
+
+        assert!(focus_pane_for_layout(&mut state, "alpha", 0));
+        assert!(focus_pane_for_layout(&mut state, "alpha", 1));
+        assert_eq!(state.active_session.as_deref(), Some("beta"));
+        assert_eq!(
+            state.focused_pane,
+            Some(FocusedPane {
+                layout_owner_tab_id: "alpha".to_string(),
+                pane_idx: 1,
+            })
+        );
+    }
+
+    #[test]
+    fn focused_pane_session_tracks_selected_grid_pane() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma", "delta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Grid4);
+        state.active_session = Some("beta".to_string());
+
+        assert!(focus_pane_for_layout(&mut state, "alpha", 2));
+        assert_eq!(focused_pane_session(&state).as_deref(), Some("gamma"));
+        assert_eq!(state.active_session.as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn focused_pane_session_ignores_empty_or_stale_focus() {
+        let mut state = state_with_active_session(&["alpha"]);
+        apply_layout_preset(&mut state, LayoutPreset::Grid4);
+
+        assert!(focus_pane_for_layout(&mut state, "alpha", 2));
+        assert_eq!(focused_pane_session(&state), None);
+
+        state.focused_pane = Some(FocusedPane {
+            layout_owner_tab_id: "missing".to_string(),
+            pane_idx: 0,
+        });
+        assert_eq!(focused_pane_session(&state), None);
+
+        state.focused_pane = Some(FocusedPane {
+            layout_owner_tab_id: "alpha".to_string(),
+            pane_idx: 99,
+        });
+        assert_eq!(focused_pane_session(&state), None);
+    }
+
+    #[test]
+    fn focusing_floating_pane_brings_it_forward_without_other_mutation() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma", "delta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Grid4);
+        assert!(begin_floating_pane_move(&mut state, 0));
+        let before_sessions = state.layouts["alpha"].session_ids();
+        let before_geometry: Vec<_> = state.layouts["alpha"]
+            .panes
+            .iter()
+            .map(|pane| pane.floating)
+            .collect();
+
+        assert!(focus_pane_for_layout(&mut state, "alpha", 2));
+
+        let layout = &state.layouts["alpha"];
+        assert_eq!(layout.session_ids(), before_sessions);
+        for (idx, pane) in layout.panes.iter().enumerate() {
+            let before = before_geometry[idx].unwrap();
+            let after = pane.floating.unwrap();
+            assert_eq!(
+                (
+                    after.x_frac,
+                    after.y_frac,
+                    after.width_frac,
+                    after.height_frac
+                ),
+                (
+                    before.x_frac,
+                    before.y_frac,
+                    before.width_frac,
+                    before.height_frac
+                )
+            );
+        }
+        let max_z = layout
+            .panes
+            .iter()
+            .filter_map(|pane| pane.floating.map(|geometry| geometry.z_index))
+            .max()
+            .unwrap();
+        assert_eq!(layout.pane_z_index(2), Some(max_z));
+        assert_eq!(focused_pane_session(&state).as_deref(), Some("gamma"));
+        assert_eq!(state.active_session.as_deref(), Some("alpha"));
     }
 
     #[test]

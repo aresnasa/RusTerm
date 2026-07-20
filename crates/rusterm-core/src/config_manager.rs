@@ -8,9 +8,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rand::RngCore;
 
 use crate::config::{
-    ConnectionConfig, ConnectionKind, EncryptedValue, OneKey, OneKeyStep, PersistedConfig,
-    PersistedConnection, PersistedConnectionKind, PersistedOneKey, PersistedOneKeyStep,
-    PersistedSshAuth, PersistedSshConfig, SshAuth, SshConfig,
+    ConnectionConfig, ConnectionKind, EncryptedValue, FocusedTabAppearance, OneKey, OneKeyStep,
+    PersistedConfig, PersistedConnection, PersistedConnectionKind, PersistedOneKey,
+    PersistedOneKeyStep, PersistedSshAuth, PersistedSshConfig, SshAuth, SshConfig,
 };
 use rusterm_crypto::{KeyringStore, decrypt_data, encrypt_data};
 
@@ -245,6 +245,35 @@ impl ConfigManager {
         self.read_persisted().restore_disabled
     }
 
+    /// Load the focused-pane tab outline, falling back to a safe light outline
+    /// for older or manually edited settings files.
+    pub fn load_focused_tab_appearance(&self) -> FocusedTabAppearance {
+        self.read_persisted().focused_tab_appearance.normalized()
+    }
+
+    /// Persist only the focused-pane tab appearance while preserving encrypted
+    /// connections, OneKeys, and all other settings.
+    pub fn save_focused_tab_appearance(&self, appearance: FocusedTabAppearance) -> Result<()> {
+        let existing = self.read_persisted();
+        let persisted = PersistedConfig {
+            version: CONFIG_VERSION,
+            connections: existing.connections,
+            onekeys: existing.onekeys,
+            master_password_hash: self.master_password_hash.clone(),
+            restore_disabled: existing.restore_disabled,
+            focused_tab_appearance: appearance.normalized(),
+        };
+
+        let json =
+            serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
+
+        let temp_path = self.config_path.with_extension("json.tmp");
+        fs::write(&temp_path, &json).context("Failed to write config file")?;
+        fs::rename(&temp_path, &self.config_path).context("Failed to rename temp config file")?;
+
+        Ok(())
+    }
+
     /// Persist the `restore_disabled` flag to settings.json. Used when the user
     /// picks "不再询问" on the restore dialog — we set the flag so we never
     /// prompt again (and stop saving session state entirely).
@@ -257,6 +286,7 @@ impl ConfigManager {
             onekeys: existing.onekeys,
             master_password_hash: self.master_password_hash.clone(),
             restore_disabled,
+            focused_tab_appearance: existing.focused_tab_appearance,
         };
 
         let json =
@@ -326,6 +356,7 @@ impl ConfigManager {
             onekeys: existing.onekeys,
             master_password_hash: self.master_password_hash.clone(),
             restore_disabled: existing.restore_disabled,
+            focused_tab_appearance: existing.focused_tab_appearance,
         };
 
         let json =
@@ -347,6 +378,7 @@ impl ConfigManager {
                 onekeys: vec![],
                 master_password_hash: None,
                 restore_disabled: false,
+                focused_tab_appearance: FocusedTabAppearance::default(),
             };
         }
         fs::read_to_string(&self.config_path)
@@ -358,6 +390,7 @@ impl ConfigManager {
                 onekeys: vec![],
                 master_password_hash: None,
                 restore_disabled: false,
+                focused_tab_appearance: FocusedTabAppearance::default(),
             })
     }
 
@@ -373,6 +406,7 @@ impl ConfigManager {
                 .collect::<Result<Vec<_>>>()?,
             master_password_hash: self.master_password_hash.clone(),
             restore_disabled: existing.restore_disabled,
+            focused_tab_appearance: existing.focused_tab_appearance,
         };
 
         let json =
@@ -587,6 +621,26 @@ mod tests {
             master_password_hash: None,
         };
         (cm, dir)
+    }
+
+    #[test]
+    fn focused_tab_appearance_roundtrips_and_survives_other_saves() {
+        let (cm, _dir) = test_config_manager();
+        let appearance = FocusedTabAppearance {
+            border_color: "#f0e0d0".to_string(),
+            border_width: 3,
+            border_radius: 8,
+        };
+
+        cm.save_focused_tab_appearance(appearance.clone()).unwrap();
+        assert_eq!(cm.load_focused_tab_appearance(), appearance);
+
+        cm.save_connections(&[]).unwrap();
+        cm.save_onekeys(&[]).unwrap();
+        cm.save_restore_disabled(true).unwrap();
+
+        assert_eq!(cm.load_focused_tab_appearance(), appearance);
+        assert!(cm.load_restore_disabled());
     }
 
     #[test]

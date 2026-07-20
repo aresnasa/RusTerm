@@ -156,6 +156,60 @@ impl std::fmt::Debug for EncryptedValue {
     }
 }
 
+/// Visual treatment for the top tab whose session owns the focused pane.
+///
+/// The full outline is rendered as an inset shadow so changing its width does
+/// not resize tabs or make the tab row jump.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FocusedTabAppearance {
+    #[serde(default = "default_focused_tab_border_color")]
+    pub border_color: String,
+    #[serde(default = "default_focused_tab_border_width")]
+    pub border_width: u8,
+    #[serde(default = "default_focused_tab_border_radius")]
+    pub border_radius: u8,
+}
+
+impl Default for FocusedTabAppearance {
+    fn default() -> Self {
+        Self {
+            border_color: default_focused_tab_border_color(),
+            border_width: default_focused_tab_border_width(),
+            border_radius: default_focused_tab_border_radius(),
+        }
+    }
+}
+
+impl FocusedTabAppearance {
+    /// Keep values safe for direct CSS interpolation, including settings that
+    /// were edited manually outside the application.
+    pub fn normalized(mut self) -> Self {
+        let color_is_hex = self.border_color.len() == 7
+            && self.border_color.starts_with('#')
+            && self.border_color[1..]
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit());
+        if !color_is_hex {
+            self.border_color = default_focused_tab_border_color();
+        }
+        self.border_width = self.border_width.clamp(1, 4);
+        self.border_radius = self.border_radius.min(12);
+        self
+    }
+}
+
+fn default_focused_tab_border_color() -> String {
+    "#c0caf5".to_string()
+}
+
+fn default_focused_tab_border_width() -> u8 {
+    1
+}
+
+fn default_focused_tab_border_radius() -> u8 {
+    4
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedConfig {
     pub version: u32,
@@ -170,6 +224,9 @@ pub struct PersistedConfig {
     /// Default false for backward compat — existing users get the prompt.
     #[serde(default)]
     pub restore_disabled: bool,
+    /// Appearance of the complete outline around the focused pane's top tab.
+    #[serde(default)]
+    pub focused_tab_appearance: FocusedTabAppearance,
 }
 
 // --- OneKeys (ZOC-style Expect/Send auto-fill) ---
@@ -365,6 +422,31 @@ mod tests {
             let de: ConnectionKind = serde_json::from_str(&json).unwrap();
             assert_eq!(kind, de);
         }
+    }
+
+    #[test]
+    fn focused_tab_appearance_defaults_for_legacy_settings() {
+        let config: PersistedConfig =
+            serde_json::from_str(r#"{"version":1,"connections":[]}"#).unwrap();
+
+        assert_eq!(
+            config.focused_tab_appearance,
+            FocusedTabAppearance::default()
+        );
+    }
+
+    #[test]
+    fn focused_tab_appearance_normalizes_untrusted_values() {
+        let appearance = FocusedTabAppearance {
+            border_color: "red; display: none".to_string(),
+            border_width: 99,
+            border_radius: 99,
+        }
+        .normalized();
+
+        assert_eq!(appearance.border_color, "#c0caf5");
+        assert_eq!(appearance.border_width, 4);
+        assert_eq!(appearance.border_radius, 12);
     }
 
     #[test]

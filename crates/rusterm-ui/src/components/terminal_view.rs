@@ -1313,7 +1313,8 @@ pub fn TerminalView(
                 }
             }
 
-            // OneKey autofill popup (above the cursor line, doesn't obscure it)
+            // OneKey autofill popup for this TerminalView's session. It is
+            // positioned relative to this pane and grows above the cursor.
             if onekey_visible && !onekey_entries.is_empty() {
                 OneKeyPopup {
                     entries: onekey_entries.clone(),

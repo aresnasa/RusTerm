@@ -115,11 +115,7 @@ impl SessionManager {
     }
 
     pub fn get(&self, id: &str) -> Option<Arc<Session>> {
-        self.sessions
-            .lock()
-            .iter()
-            .find(|s| s.id == id)
-            .cloned()
+        self.sessions.lock().iter().find(|s| s.id == id).cloned()
     }
 
     pub fn list(&self) -> Vec<Arc<Session>> {
@@ -141,7 +137,13 @@ mod tests {
         let (resize_tx, _) = mpsc::unbounded_channel();
         let (close_tx, _) = mpsc::unbounded_channel();
 
-        let session = Session::new("test-host".to_string(), SessionType::Ssh, input_tx, resize_tx, close_tx);
+        let session = Session::new(
+            "test-host".to_string(),
+            SessionType::Ssh,
+            input_tx,
+            resize_tx,
+            close_tx,
+        );
 
         assert_eq!(session.name, "test-host");
         assert_eq!(session.kind, SessionType::Ssh);
@@ -157,7 +159,13 @@ mod tests {
         let (resize_tx, _) = mpsc::unbounded_channel();
         let (close_tx, _) = mpsc::unbounded_channel();
 
-        let session = Session::new("host1".to_string(), SessionType::Ssh, input_tx, resize_tx, close_tx);
+        let session = Session::new(
+            "host1".to_string(),
+            SessionType::Ssh,
+            input_tx,
+            resize_tx,
+            close_tx,
+        );
         let id = session.id.clone();
 
         let _arc = manager.add(session);
@@ -176,12 +184,23 @@ mod tests {
         let (event_tx, _rx) = mpsc::unbounded_channel();
         let manager = SessionManager::new(event_tx);
 
-        let kinds = [SessionType::Ssh, SessionType::Serial, SessionType::Telnet, SessionType::Shell];
+        let kinds = [
+            SessionType::Ssh,
+            SessionType::Serial,
+            SessionType::Telnet,
+            SessionType::Shell,
+        ];
         for kind in kinds {
             let (input_tx, _) = mpsc::unbounded_channel();
             let (resize_tx, _) = mpsc::unbounded_channel();
             let (close_tx, _) = mpsc::unbounded_channel();
-            manager.add(Session::new(format!("{:?}", kind), kind, input_tx, resize_tx, close_tx));
+            manager.add(Session::new(
+                format!("{:?}", kind),
+                kind,
+                input_tx,
+                resize_tx,
+                close_tx,
+            ));
         }
 
         assert_eq!(manager.list().len(), 4);

@@ -21,17 +21,20 @@ use crate::components::DangerousCommandDialog;
 use crate::components::MasterPasswordDialog;
 use crate::components::OneKeyManager;
 use crate::components::RestoreSessionDialog;
+use crate::components::SettingsDialog;
 use crate::components::Sidebar;
 use crate::components::TabBar;
 use crate::components::TerminalView;
 use crate::components::connection_dialog::NewConnectionForm;
 use crate::layout::PaneLayout;
 use crate::state::{
-    AppState, Modal, OneKeyMatch, OneKeyPopupState, PendingDangerousCommand, SessionTab,
-    TabDropOutcome, TerminalEntry, UnlockState, begin_floating_pane_move, cycle_layout_preset,
-    execute_tab_drop_on_pane, move_floating_pane_for_active, move_session_to_leftmost,
-    resize_layout_col, resize_layout_row, set_pane_session_for_active, toggle_comparison_mode,
-    toggle_pane_zoom,
+    AppState, Modal, OneKeyMatch, OneKeyPopupState, PendingDangerousCommand,
+    SessionConnectionState, SessionTab, TabDropOutcome, TerminalEntry, UnlockState,
+    begin_floating_pane_move, close_session, close_workspace, cycle_layout_preset,
+    execute_tab_drop_on_pane, focus_pane_for_layout, focused_pane_session,
+    move_floating_pane_for_active, move_session_to_leftmost, push_workspace_tab, resize_layout_col,
+    resize_layout_row, set_active_tab, set_pane_session_for_layout, source_pane_for_copy,
+    toggle_comparison_mode, toggle_pane_zoom,
 };
 
 fn save_config(state: &Signal<AppState>) {
@@ -112,8 +115,13 @@ fn render_terminal_pane(
             let ok_visible = ok_popup.visible;
             let ok_entries = ok_popup.matches.clone();
             let ok_selected = ok_popup.selected;
-            // Whether this session's channel has dropped (Enter → reconnect).
-            let tab_disconnected = state.read().disconnected_sessions.contains(&tab.id);
+            // Both disconnected and reconnecting sessions have no live input
+            // channel. Repeated Enter during `Reconnecting` is ignored by the
+            // atomic state transition in `reconnect_session`.
+            let tab_disconnected = matches!(
+                state.read().session_connection_states.get(&tab.id),
+                Some(SessionConnectionState::Disconnected | SessionConnectionState::Reconnecting)
+            );
             rsx! {
                 TerminalView {
                     session_id: tab.id.clone(),
@@ -772,10 +780,9 @@ fn render_terminal_pane(
                         // the length to confirm the plaintext (not the encrypted
                         // blob) is being sent.
                         tracing::info!(
-                            "[ONEKEY-SELECT] session={} send_len={} first_byte={:?}",
+                            "[ONEKEY-SELECT] session={} send_len={}",
                             &sid_for_ok_sel[..sid_for_ok_sel.len().min(8)],
-                            send.len(),
-                            send.as_bytes().first().copied()
+                            send.len()
                         );
                         if let Some(sender) = senders.read().get(&sid_for_ok_sel) {
                             let mut data = send.into_bytes();
@@ -873,11 +880,8 @@ fn render_terminal_pane(
 ///      which has its own per-pane drop handlers for subsequent drags.
 ///
 /// 2. `application/x-rusterm-connection-id` present (drag from sidebar):
-///    - Open the connection in pane 0 via `open_connection(state,
-///      input_senders, conn, Some(0))`. With no layout, `open_connection`
-///      falls back to making the new session active (legacy behaviour).
-///      This is acceptable: the user can then drag the previous tab back
-///      to create a split if desired.
+///    - If this is a zoomed multi-pane layout, target the zoomed pane through
+///      its stable layout owner. If no layout exists, open a new active tab.
 ///
 /// `drag_over_pane` is set to `Some(0)` on drag-over/enter and `None` on
 /// drop, mirroring the multi-pane container's highlight logic. The border
@@ -1030,10 +1034,18 @@ fn single_pane_with_drop(
                         &conn_id[..conn_id.len().min(8)],
                         conn.name
                     );
-                    // With no layout, `open_connection` falls back to
-                    // making the new session active. This is acceptable
-                    // for the single-pane path.
-                    open_connection(state, input_senders, conn, Some(0));
+                    let target = {
+                        let state_snapshot = state.read();
+                        state_snapshot.active_tab.as_ref().and_then(|owner| {
+                            state_snapshot.layouts.get(owner).map(|layout| PaneTarget {
+                                layout_owner_tab_id: owner.clone(),
+                                pane_idx: layout.zoomed.unwrap_or(0),
+                            })
+                        })
+                    };
+                    // A zoomed layout still has a stable owner and target pane.
+                    // With no layout, preserve the legacy new-active-tab path.
+                    open_connection(state, input_senders, conn, target);
                     return;
                 }
                 tracing::debug!("[DROP-SINGLE] received drop with no recognized MIME type");
@@ -1815,10 +1827,94 @@ pub(crate) fn start_tab_drag(
     install_tab_drag_js_listeners(start_x, start_y);
 }
 
-/// Open independent copies of `source_session_id` in every pane created by
-/// a self-drop expansion. Layout mutation happens first in the state layer;
-/// this runtime layer owns terminal creation, session registration, and
-/// spawning the SSH/shell task through the existing `open_connection` path.
+/// Clone one SSH/shell session into a specific empty pane.
+///
+/// `open_connection` generates a fresh UUID and creates a fresh terminal,
+/// sender set, connection task, and reconnect lifecycle. Only the connection
+/// configuration is copied; the source pane and its runtime objects are never
+/// reused. The explicit layout owner (a tab group_id) prevents an active-tab
+/// change from redirecting the assignment.
+fn clone_session_into_pane(
+    state: Signal<AppState>,
+    input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    layout_owner_tab_id: &str,
+    source_session_id: &str,
+    target_pane_idx: usize,
+) -> Option<String> {
+    let snapshot = state.read();
+    let target_is_empty = snapshot
+        .layouts
+        .get(layout_owner_tab_id)
+        .and_then(|layout| layout.panes.get(target_pane_idx))
+        .is_some_and(|pane| pane.session_id.is_empty());
+    let conn = snapshot.session_configs.get(source_session_id).cloned();
+    drop(snapshot);
+
+    if !target_is_empty {
+        tracing::warn!(
+            "[PANE-CLONE] layout_owner={} target_pane={} is missing or occupied; clone skipped",
+            &layout_owner_tab_id[..layout_owner_tab_id.len().min(8)],
+            target_pane_idx
+        );
+        return None;
+    }
+    let Some(conn) = conn else {
+        tracing::warn!(
+            "[PANE-CLONE] source={} has no stored connection config",
+            &source_session_id[..source_session_id.len().min(8)]
+        );
+        return None;
+    };
+    if !matches!(
+        &conn.kind,
+        ConnectionKind::Ssh(_) | ConnectionKind::Shell(_)
+    ) {
+        tracing::warn!(
+            "[PANE-CLONE] source={} connection type is not cloneable",
+            &source_session_id[..source_session_id.len().min(8)]
+        );
+        return None;
+    }
+
+    let result = open_connection(
+        state,
+        input_senders,
+        conn,
+        Some(PaneTarget {
+            layout_owner_tab_id: layout_owner_tab_id.to_string(),
+            pane_idx: target_pane_idx,
+        }),
+    );
+    let assignment_verified = result.assigned_to_target
+        && result.session_id != source_session_id
+        && state
+            .read()
+            .layouts
+            .get(layout_owner_tab_id)
+            .and_then(|layout| layout.panes.get(target_pane_idx))
+            .is_some_and(|pane| pane.session_id == result.session_id);
+
+    if assignment_verified {
+        tracing::info!(
+            "[PANE-CLONE] source={} layout_owner={} target_pane={} new_session={} assignment=verified",
+            &source_session_id[..source_session_id.len().min(8)],
+            &layout_owner_tab_id[..layout_owner_tab_id.len().min(8)],
+            target_pane_idx,
+            &result.session_id[..result.session_id.len().min(8)]
+        );
+        Some(result.session_id)
+    } else {
+        tracing::error!(
+            "[PANE-CLONE] source={} layout_owner={} target_pane={} new_session={} assignment=failed",
+            &source_session_id[..source_session_id.len().min(8)],
+            &layout_owner_tab_id[..layout_owner_tab_id.len().min(8)],
+            target_pane_idx,
+            &result.session_id[..result.session_id.len().min(8)]
+        );
+        None
+    }
+}
+
 fn open_cloned_sessions_for_self_drop(
     state: Signal<AppState>,
     input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
@@ -1826,40 +1922,27 @@ fn open_cloned_sessions_for_self_drop(
     first_pane_idx: usize,
     pane_count: usize,
 ) -> usize {
-    let conn = state.read().session_configs.get(source_session_id).cloned();
-    let Some(conn) = conn else {
-        tracing::warn!(
-            "[SPLIT-CLONE] source={} has no stored connection config; {} pane(s) remain empty",
+    let Some(layout_owner_tab_id) = state.read().active_tab.clone() else {
+        tracing::error!(
+            "[SPLIT-CLONE] source={} has no layout owner; {} pane(s) remain empty",
             &source_session_id[..source_session_id.len().min(8)],
             pane_count
         );
         return 0;
     };
 
-    if !matches!(
-        &conn.kind,
-        ConnectionKind::Ssh(_) | ConnectionKind::Shell(_)
-    ) {
-        tracing::warn!(
-            "[SPLIT-CLONE] source={} connection type is not supported for automatic cloning; {} pane(s) remain empty",
-            &source_session_id[..source_session_id.len().min(8)],
-            pane_count
-        );
-        return 0;
-    }
-
-    for pane_idx in first_pane_idx..first_pane_idx.saturating_add(pane_count) {
-        let new_session_id = open_connection(state, input_senders, conn.clone(), Some(pane_idx));
-        tracing::info!(
-            "[SPLIT-CLONE] source={} target_pane={} new_session={} connection={}",
-            &source_session_id[..source_session_id.len().min(8)],
-            pane_idx,
-            &new_session_id[..new_session_id.len().min(8)],
-            conn.name
-        );
-    }
-
-    pane_count
+    (first_pane_idx..first_pane_idx.saturating_add(pane_count))
+        .filter(|pane_idx| {
+            clone_session_into_pane(
+                state,
+                input_senders,
+                &layout_owner_tab_id,
+                source_session_id,
+                *pane_idx,
+            )
+            .is_some()
+        })
+        .count()
 }
 
 /// Finish a tab drag: do the final hit-test at the release position,
@@ -1903,9 +1986,9 @@ pub(crate) fn finish_tab_drag(
     // Compute the hit-test target.
     //
     // The layout we care about is the ACTIVE tab's layout (layouts are
-    // keyed by `active_session`, NOT by `dragged_sid` — the dragged
-    // session may be a background tab with no layout of its own).
-    let active_id = state.read().active_session.clone();
+    // keyed by `active_tab`, NOT by `dragged_sid` — the dragged
+    // session may be a pane-only session with no tab of its own).
+    let active_id = state.read().active_tab.clone();
     let active_layout = active_id
         .as_ref()
         .and_then(|aid| state.read().layouts.get(aid).cloned());
@@ -2039,6 +2122,93 @@ pub(crate) fn finish_tab_drag(
     let _ = active_id;
 }
 
+/// Actions shown in an empty pane's title bar.
+///
+/// Copy duplicates the FOCUSED pane's session (Plan B semantics): the user
+/// is operating in some pane, switches to a split layout, and the newly
+/// created empty pane offers a one-click "clone what I was just using"
+/// button. If no pane has focus (or the focused pane is itself empty),
+/// the caller passes a fallback source so the button still works.
+///
+/// The plus button exposes the existing connection sidebar so any saved
+/// connection can be dragged into this pane — dragging from the sidebar
+/// opens a NEW independent session (not a clone), preserving the
+/// "sidebar drop = new session for comparison" contract.
+fn empty_pane_title_actions(
+    mut state: Signal<AppState>,
+    input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    layout_owner_tab_id: String,
+    target_pane_idx: usize,
+    copy_source: Option<(String, String)>,
+) -> Element {
+    let add_owner = layout_owner_tab_id.clone();
+    let copy_button = match copy_source {
+        Some((source_session_id, source_name)) => {
+            let copy_owner = layout_owner_tab_id;
+            rsx! {
+                button {
+                    style: "height: 18px; min-width: 22px; padding: 0 5px; border: 1px solid #414868; border-radius: 3px; background: #24283b; color: #7aa2f7; cursor: pointer; font-size: 12px; line-height: 16px;",
+                    title: "复制当前焦点会话：{source_name}",
+                    onmousedown: move |e: MouseEvent| {
+                        e.prevent_default();
+                        e.stop_propagation();
+                    },
+                    onclick: move |e: MouseEvent| {
+                        e.stop_propagation();
+                        if focus_pane_for_layout(
+                            &mut state.write(),
+                            &copy_owner,
+                            target_pane_idx,
+                        ) {
+                            let _ = clone_session_into_pane(
+                                state,
+                                input_senders,
+                                &copy_owner,
+                                &source_session_id,
+                                target_pane_idx,
+                            );
+                        }
+                    },
+                    "⧉"
+                }
+            }
+        }
+        None => rsx! {
+            button {
+                style: "height: 18px; min-width: 22px; padding: 0 5px; border: 1px solid #2a2b3d; border-radius: 3px; background: #1f2335; color: #414868; cursor: not-allowed; font-size: 12px; line-height: 16px;",
+                title: "没有可复制的焦点会话",
+                disabled: true,
+                "⧉"
+            }
+        },
+    };
+
+    rsx! {
+        div {
+            style: "display: inline-flex; align-items: center; gap: 4px; margin-left: 6px;",
+            {copy_button}
+            button {
+                style: "height: 18px; min-width: 22px; padding: 0 5px; border: 1px solid #414868; border-radius: 3px; background: #24283b; color: #9ece6a; cursor: pointer; font-size: 13px; line-height: 16px;",
+                title: "打开侧栏，将自定义连接拖入此窗格",
+                onmousedown: move |e: MouseEvent| {
+                    e.prevent_default();
+                    e.stop_propagation();
+                },
+                onclick: move |e: MouseEvent| {
+                    e.stop_propagation();
+                    let _ = focus_pane_for_layout(
+                        &mut state.write(),
+                        &add_owner,
+                        target_pane_idx,
+                    );
+                    state.write().sidebar_open = true;
+                },
+                "+"
+            }
+        }
+    }
+}
+
 /// Multi-pane container: renders a `PaneLayout` as a grid of `TerminalView`
 /// panes positioned absolutely within a relative-positioned container. Each
 /// pane is sized according to the layout's per-row and per-column fractions.
@@ -2092,6 +2262,40 @@ fn multi_pane_container(
 
     let comparison_on = layout.comparison;
     let layout_floating = layout.is_floating();
+    let layout_owner_tab_id = state.read().active_tab.clone().unwrap_or_default();
+    let focused_pane = state.read().focused_pane.clone();
+    // Source session for the empty-pane "copy" button. Per the Plan B
+    // UX contract, the copy button duplicates the *focused* pane's session
+    // ("copy what I'm currently using"), NOT a geometric neighbour. When
+    // no pane has focus OR the focused pane is itself empty (the user
+    // clicked an empty pane's title bar), we fall back to the nearest
+    // non-empty neighbour via `source_pane_for_copy` so the button remains
+    // useful instead of going dead.
+    //
+    // This computed once here (not inside the `for` body) because it's
+    // the same for every empty pane in this layout.
+    let focused_session_for_copy = focused_pane_session(&state.read()).or_else(|| {
+        // Fallback: scan the layout for the nearest non-empty pane.
+        // We pick the first non-empty pane in layout order — the
+        // geometric "nearest" via `source_pane_for_copy` would need
+        // a target_idx, and we don't have a single target here.
+        layout
+            .panes
+            .iter()
+            .find(|p| !p.session_id.is_empty())
+            .map(|p| p.session_id.clone())
+    });
+    let focused_session_name = focused_session_for_copy
+        .as_ref()
+        .and_then(|sid| {
+            state
+                .read()
+                .sessions
+                .iter()
+                .find(|t| t.id == *sid)
+                .map(|t| t.name.clone())
+        })
+        .or_else(|| focused_session_for_copy.clone());
 
     // Pre-collect the (pane_idx, session_id, rect, drop_session_id,
     // border_style, pane_title) tuples as owned values. The move closures inside each
@@ -2127,19 +2331,37 @@ fn multi_pane_container(
         (f64, f64, f64, f64),
         String,
         &'static str,
+        &'static str,
         String,
         String,
         u32,
         &'static str,
+        Element,
+        String,
+        String,
+        String,
     )> = visible
         .into_iter()
         .map(|(idx, sid, rect)| {
-            let border = if drag_over_pane() == Some(idx) {
+            let is_drag_over = drag_over_pane() == Some(idx);
+            let is_focused = focused_pane.as_ref().is_some_and(|focused| {
+                focused.layout_owner_tab_id == layout_owner_tab_id && focused.pane_idx == idx
+            });
+            let border = if is_drag_over {
                 "border: 2px solid #7aa2f7; box-sizing: border-box;"
+            } else if is_focused {
+                "border: 2px solid #bb9af7; box-sizing: border-box;"
             } else if layout_floating {
                 "border: 1px solid #414868; box-sizing: border-box;"
             } else {
                 "border: 2px solid transparent; box-sizing: border-box;"
+            };
+            let title_chrome = if is_drag_over {
+                "background: #24283b; border-bottom: 2px solid #7aa2f7;"
+            } else if is_focused {
+                "background: #292e42; border-bottom: 2px solid #bb9af7;"
+            } else {
+                "background: #1f2335; border-bottom: 1px solid #2a2b3d;"
             };
             let window_chrome = if layout_floating {
                 "border-radius: 6px; box-shadow: 0 8px 24px rgba(0,0,0,0.45);"
@@ -2169,16 +2391,66 @@ fn multi_pane_container(
             // `key:` interpolation and `render_terminal_pane`). rsx!
             // can't hold `let` bindings in the for body, so we pre-clone.
             let drag_sid = sid.clone();
+            // Plan B copy semantics: an empty pane's copy button duplicates
+            // the FOCUSED pane's session (computed once above as
+            // `focused_session_for_copy`), falling back to the nearest
+            // non-empty pane if no pane has focus. This replaces the prior
+            // `source_pane_for_copy` geometric-neighbour heuristic, which
+            // would copy an arbitrary neighbour instead of "what the user
+            // is currently using". Sidebar-drag-into-pane still opens a
+            // brand-new independent session (the drop handler calls
+            // `open_connection`), preserving the "drag from sidebar =
+            // new session for comparison" contract.
+            let copy_source = if sid.is_empty() {
+                focused_session_for_copy
+                    .clone()
+                    .zip(focused_session_name.clone())
+                    .or_else(|| {
+                        // Defensive fallback: if the focused session
+                        // lookup failed (no focus, or focus on an empty
+                        // pane), use the geometric-neighbour heuristic
+                        // so the button isn't dead.
+                        source_pane_for_copy(&layout, idx).and_then(|source_idx| {
+                            let source_sid = layout.panes.get(source_idx)?.session_id.clone();
+                            let source_name = state
+                                .read()
+                                .sessions
+                                .iter()
+                                .find(|tab| tab.id == source_sid)
+                                .map(|tab| tab.name.clone())
+                                .unwrap_or_else(|| source_sid.clone());
+                            Some((source_sid, source_name))
+                        })
+                    })
+            } else {
+                None
+            };
+            let pane_actions = if sid.is_empty() {
+                empty_pane_title_actions(
+                    state,
+                    input_senders,
+                    layout_owner_tab_id.clone(),
+                    idx,
+                    copy_source,
+                )
+            } else {
+                rsx! {}
+            };
             (
                 idx,
                 sid.clone(),
                 rect,
                 sid,
                 border,
+                title_chrome,
                 title,
                 drag_sid,
                 z_index,
                 window_chrome,
+                pane_actions,
+                layout_owner_tab_id.clone(),
+                layout_owner_tab_id.clone(),
+                layout_owner_tab_id.clone(),
             )
         })
         .collect();
@@ -2265,13 +2537,20 @@ fn multi_pane_container(
             // highlight only changes when the dragged pane actually changes.
             // This aligns with the user's frequency-vs-feedback
             // preference: fewer re-renders over per-tick feedback.
-            for (idx, session_id, (x, y, w, h), drop_session_id, border_style, pane_title, drag_sid, z_index, window_chrome) in pane_items.into_iter() {
+            for (idx, session_id, (x, y, w, h), drop_session_id, border_style, title_chrome, pane_title, drag_sid, z_index, window_chrome, pane_actions, pane_owner_for_click, pane_owner_for_title, pane_owner_for_drop) in pane_items.into_iter() {
                 div {
                     key: "pane-{idx}-{session_id}",
                     style: format!(
                         "position: absolute; left: {x}px; top: {y}px; width: {w}px; height: {h}px; overflow: hidden; display: flex; flex-direction: column; z-index: {z_index}; {border} {window_chrome}",
                         x = x, y = y, w = w, h = h, border = border_style
                     ),
+                    onclick: move |_| {
+                        let _ = focus_pane_for_layout(
+                            &mut state.write(),
+                            &pane_owner_for_click,
+                            idx,
+                        );
+                    },
                     // `ondragover` must call prevent_default to signal
                     // that this element accepts drops. Without it, the
                     // browser fires `ondrop` with an empty DataTransfer
@@ -2442,17 +2721,14 @@ fn multi_pane_container(
                                 idx
                             );
                             // Open the connection in this pane. The
-                            // `open_connection` helper handles creating
-                            // the terminal, pushing the session tab, and
-                            // assigning the new session_id to
-                            // pane `idx` via
-                            // `set_pane_session_for_active`.
-                            open_connection(
-                                state,
-                                input_senders,
-                                conn,
-                                Some(idx),
-                            );
+                            // `open_connection` creates the terminal and
+                            // assigns it through a stable layout owner + pane
+                            // target, independent of later active-tab changes.
+                            let target = Some(PaneTarget {
+                                layout_owner_tab_id: pane_owner_for_drop.clone(),
+                                pane_idx: idx,
+                            });
+                            open_connection(state, input_senders, conn, target);
                             return;
                         }
                         // Unknown MIME type — log and ignore.
@@ -2477,20 +2753,17 @@ fn multi_pane_container(
                     // takes over from there.
                     //
                     // Plain click-to-select still works: `onmousedown`
-                    // sets `tab_drag` with `dragging: false`; the
-                    // polling loop only executes a drop if the cursor
-                    // crossed the threshold (i.e. it became a real
-                    // drag). The title bar has no `onclick` of its own,
-                    // so a click on it is a no-op (the pane's terminal
-                    // content area has its own focus handler).
+                    // updates only pane focus, then sets `tab_drag` with
+                    // `dragging: false` for non-empty panes. The polling loop
+                    // executes a drop only after the cursor crosses the drag
+                    // threshold.
                     div {
-                        style: "
-                            height: 18px;
-                            background: #1f2335;
-                            border-bottom: 1px solid #2a2b3d;
+                        style: format!("
+                            height: 24px;
+                            {title_chrome}
                             display: flex;
                             align-items: center;
-                            padding: 0 8px;
+                            padding: 0 7px;
                             font-size: 11px;
                             color: #c0caf5;
                             cursor: grab;
@@ -2498,7 +2771,7 @@ fn multi_pane_container(
                             -webkit-user-select: none;
                             flex-shrink: 0;
                             z-index: 10;
-                        ",
+                        "),
                         title: "Drag to move this session to another pane",
                         onmousedown: move |e: MouseEvent| {
                             // Only start a drag on primary button (left
@@ -2506,15 +2779,21 @@ fn multi_pane_container(
                             // semantics and shouldn't initiate a drag.
                             // Empty drop-zone panes have no session to
                             // drag.
-                            if e.trigger_button() == Some(MouseButton::Primary)
-                                && !drag_sid.is_empty()
-                            {
+                            if e.trigger_button() == Some(MouseButton::Primary) {
+                                let _ = focus_pane_for_layout(
+                                    &mut state.write(),
+                                    &pane_owner_for_title,
+                                    idx,
+                                );
                                 // Stop the browser from starting a native
                                 // text-selection drag on this mousedown
                                 // (prevents page text getting highlighted
                                 // while dragging the pane title bar).
                                 e.prevent_default();
                                 e.stop_propagation();
+                                if drag_sid.is_empty() {
+                                    return;
+                                }
                                 let c = e.client_coordinates();
                                 // Look up the session's display name for
                                 // the ghost element. Falls back to the
@@ -2544,6 +2823,14 @@ fn multi_pane_container(
                                 if e.trigger_button() == Some(MouseButton::Primary) {
                                     e.prevent_default();
                                     e.stop_propagation();
+                                    let owner = state.read().active_tab.clone();
+                                    if let Some(owner) = owner {
+                                        let _ = focus_pane_for_layout(
+                                            &mut state.write(),
+                                            &owner,
+                                            idx,
+                                        );
+                                    }
                                     let c = e.client_coordinates();
                                     start_pane_move(
                                         state,
@@ -2562,10 +2849,11 @@ fn multi_pane_container(
                             style: "flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
                             "{pane_title}"
                         }
+                        {pane_actions}
                     },
                     // Terminal content area: fills the remaining height
                     // below the title bar. Wrapped in a flex:1 div so the
-                    // title bar (above) stays at 18px and the terminal
+                    // title bar (above) stays at 24px and the terminal
                     // gets the rest. `position: relative` + `overflow:
                     // hidden` matches the single-pane path's container.
                     //
@@ -2588,7 +2876,7 @@ fn multi_pane_container(
                                     user-select: none;
                                     -webkit-user-select: none;
                                 ",
-                                "拖拽标签页或侧栏连接到此处"
+                                "点击标题栏 ⧉ 复制相邻会话，或拖拽标签页/侧栏连接到此处"
                             }
                         } else {
                             {render_terminal_pane(state, input_senders, session_id.clone())}
@@ -2860,11 +3148,27 @@ fn first_matching_step<'a>(ok: &'a OneKey, line: &str) -> Option<&'a OneKeyStep>
     None
 }
 
+fn onekey_prompt_text(state: &AppState, session_id: &str, data: &[u8]) -> String {
+    let terminal_line = state
+        .terminals
+        .get(session_id)
+        .map(|handle| handle.lock().terminal.extract_current_line())
+        .unwrap_or_default();
+    if terminal_line.trim().is_empty() {
+        strip_ansi(&String::from_utf8_lossy(data))
+    } else {
+        terminal_line
+    }
+}
+
 /// Scan new terminal output for OneKey expect-pattern matches. If any OneKey's
 /// expect regex matches and the session's popup isn't already showing, show the
 /// popup with the matching entries. Persists across focus changes (only new
 /// output triggers this — focus changes produce no output, so no re-scan).
 fn check_onekey_match(mut state: Signal<AppState>, session_id: &str, data: &[u8]) {
+    if !onekey_enabled_for_session(&state.read(), session_id) {
+        return;
+    }
     let onekeys = state.read().onekeys.clone();
     if onekeys.is_empty() {
         return;
@@ -2879,22 +3183,19 @@ fn check_onekey_match(mut state: Signal<AppState>, session_id: &str, data: &[u8]
     if already_visible {
         return;
     }
-    // Strip ANSI/VT escapes first. Real credential prompts are sometimes
-    // colored by the remote (bastion login screens, network-device banners),
-    // e.g. `\x1b[1;36mPassword\x1b[0m for 'host': `. Without stripping, the
-    // escape bytes between "Password" and "for" break the expect regex → no
-    // popup → the password is never autofilled.
-    let text = strip_ansi(&String::from_utf8_lossy(data));
-    // Only match against the LAST non-empty line of the new output. A prompt
-    // (e.g. "Username for …: ") is the last line — the shell is waiting for
-    // input. Matching the whole chunk would spuriously fire on injected output
-    // (the history import dumps ~77KB of old commands, some of which may
-    // contain "password"/"username"), popping up at the wrong time and sending
-    // a credential into the wrong place.
+    // Read the assembled current line from this session's own terminal model.
+    // Credential prompts are frequently split across SSH output chunks; matching
+    // only `data` would miss `"Pass" + "word:"`. The terminal has already
+    // processed this output at both call sites, so its current line is the
+    // correct pane-local matching boundary. Fall back to stripped chunk text
+    // when the terminal line is empty (for unusual newline-terminated prompts).
+    let text = onekey_prompt_text(&state.read(), session_id, data);
+    // Match only the final non-empty line. Matching full scrollback/history
+    // output could surface credentials for an old command in the wrong prompt.
     let last_line = text
         .lines()
         .rev()
-        .find(|l| !l.trim().is_empty())
+        .find(|line| !line.trim().is_empty())
         .unwrap_or("");
     // For each OneKey, find the FIRST step whose expect matches the last line
     // (case-insensitive). first_matching_step picks the right step per prompt,
@@ -2951,6 +3252,244 @@ fn check_onekey_match(mut state: Signal<AppState>, session_id: &str, data: &[u8]
     }
 }
 
+const SHELL_INTEGRATION_QUIET_PERIOD: std::time::Duration = std::time::Duration::from_millis(1_200);
+
+/// Debounces the remote shell's initial output before injecting shell
+/// integration. Unlike a fixed startup sleep, every late MOTD/banner chunk
+/// moves the deadline forward, so the integration command cannot create a new
+/// prompt in front of output that is still arriving. No fallback deadline is
+/// used before the first output: a silent/not-ready shell is safer left
+/// untouched than having input injected blindly.
+#[derive(Default)]
+struct InitialOutputQuiescence {
+    last_output_at: Option<std::time::Instant>,
+}
+
+impl InitialOutputQuiescence {
+    fn observe_output(&mut self, observed_at: std::time::Instant) {
+        self.last_output_at = Some(observed_at);
+    }
+
+    fn remaining(
+        &self,
+        now: std::time::Instant,
+        quiet_period: std::time::Duration,
+    ) -> Option<std::time::Duration> {
+        self.last_output_at
+            .map(|last| (last + quiet_period).saturating_duration_since(now))
+    }
+}
+
+fn shell_integration_setup() -> Vec<u8> {
+    let mut setup = r#"__rusterm_precmd() { printf '\e]133;D;%s\e\\' "$?"; printf '\e]133;A\e\\'; printf '\e]7;file://%s%s\e\\' "${HOSTNAME:-localhost}" "$PWD"; }; if [ -n "$ZSH_VERSION" ]; then precmd_functions+=(__rusterm_precmd); elif [ -n "$BASH_VERSION" ]; then PROMPT_COMMAND="__rusterm_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"; fi"#
+        .as_bytes()
+        .to_vec();
+    setup.push(b'\n');
+    setup
+}
+
+async fn inject_shell_integration_when_quiet(
+    mut output_activity: mpsc::UnboundedReceiver<()>,
+    integration_tx: mpsc::UnboundedSender<Vec<u8>>,
+    session_id: String,
+) {
+    // Require actual remote output (normally banner/MOTD/prompt) before any
+    // automatic input. This prevents a slow login from being raced by a
+    // fallback timer.
+    if output_activity.recv().await.is_none() {
+        return;
+    }
+    let mut gate = InitialOutputQuiescence::default();
+    gate.observe_output(std::time::Instant::now());
+
+    loop {
+        let remaining = gate
+            .remaining(std::time::Instant::now(), SHELL_INTEGRATION_QUIET_PERIOD)
+            .expect("initial output was observed");
+        match tokio::time::timeout(remaining, output_activity.recv()).await {
+            Ok(Some(())) => gate.observe_output(std::time::Instant::now()),
+            Ok(None) => return,
+            Err(_) => break,
+        }
+    }
+
+    if integration_tx.send(shell_integration_setup()).is_ok() {
+        tracing::info!(
+            "[SSH] injected shell integration after initial-output quiet period for {}",
+            session_id
+        );
+    }
+}
+
+fn preferred_initial_terminal_size(
+    pane_size: TerminalSize,
+    connect_measurement: TerminalSize,
+) -> TerminalSize {
+    let pane_is_unmeasured = pane_size.cols == 80
+        && pane_size.rows == 24
+        && pane_size.pixel_width == 0
+        && pane_size.pixel_height == 0;
+    if pane_is_unmeasured {
+        connect_measurement
+    } else {
+        pane_size
+    }
+}
+
+fn onekey_enabled_for_session(state: &AppState, session_id: &str) -> bool {
+    state
+        .session_configs
+        .get(session_id)
+        .is_some_and(|config| config.onekey)
+}
+
+fn begin_reconnect(state: &mut AppState, session_id: &str) -> bool {
+    if state.session_connection_states.get(session_id)
+        != Some(&SessionConnectionState::Disconnected)
+    {
+        return false;
+    }
+    state
+        .session_connection_states
+        .insert(session_id.to_string(), SessionConnectionState::Reconnecting);
+    true
+}
+
+#[cfg(test)]
+mod session_startup_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn delayed_motd_tail_resets_shell_integration_quiet_period() {
+        let started_at = Instant::now();
+        let mut gate = InitialOutputQuiescence::default();
+        let quiet_period = Duration::from_millis(1_200);
+
+        assert_eq!(gate.remaining(started_at, quiet_period), None);
+        gate.observe_output(started_at + Duration::from_millis(100));
+        assert_eq!(
+            gate.remaining(started_at + Duration::from_millis(1_299), quiet_period),
+            Some(Duration::from_millis(1)),
+        );
+
+        // Ubuntu's dynamic MOTD may emit a final paragraph after the prompt.
+        // That output must restart the quiet period instead of allowing the
+        // integration command to create a second prompt ahead of the MOTD tail.
+        gate.observe_output(started_at + Duration::from_millis(1_300));
+        assert_eq!(
+            gate.remaining(started_at + Duration::from_millis(2_499), quiet_period),
+            Some(Duration::from_millis(1)),
+        );
+        assert_eq!(
+            gate.remaining(started_at + Duration::from_millis(2_500), quiet_period),
+            Some(Duration::ZERO),
+        );
+    }
+
+    #[test]
+    fn pane_terminal_size_wins_over_stale_connect_measurement() {
+        let pane_size = TerminalSize {
+            cols: 132,
+            rows: 41,
+            pixel_width: 1_056,
+            pixel_height: 779,
+        };
+        let stale_measurement = TerminalSize {
+            cols: 126,
+            rows: 41,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+
+        assert_terminal_size_eq(
+            preferred_initial_terminal_size(pane_size, stale_measurement),
+            pane_size,
+        );
+    }
+
+    #[test]
+    fn onekey_enablement_is_scoped_to_the_pane_session() {
+        let enabled = ConnectionConfig {
+            id: "enabled".to_string(),
+            name: "enabled".to_string(),
+            kind: ConnectionKind::Shell(ShellConfig {
+                command: None,
+                args: Vec::new(),
+                env: Vec::new(),
+                working_dir: None,
+            }),
+            group: None,
+            tags: Vec::new(),
+            onekey: true,
+        };
+        let mut disabled = enabled.clone();
+        disabled.id = "disabled".to_string();
+        disabled.name = "disabled".to_string();
+        disabled.onekey = false;
+
+        let mut state = AppState::default();
+        state.session_configs.insert("pane-a".to_string(), enabled);
+        state.session_configs.insert("pane-b".to_string(), disabled);
+
+        assert!(onekey_enabled_for_session(&state, "pane-a"));
+        assert!(!onekey_enabled_for_session(&state, "pane-b"));
+        assert!(!onekey_enabled_for_session(&state, "missing"));
+    }
+
+    #[test]
+    fn onekey_prompt_uses_the_owning_panes_assembled_terminal_line() {
+        let mut entry = TerminalEntry {
+            terminal: Terminal::new(TerminalSize::default()),
+            parser: vte::ansi::Processor::new(),
+            scroll_offset: 0,
+        };
+        entry.process_and_render(b"[sudo] Pass");
+        entry.process_and_render(b"word for ecs-user: ");
+
+        let mut state = AppState::default();
+        state
+            .terminals
+            .insert("pane-b".to_string(), Arc::new(Mutex::new(entry)));
+
+        assert_eq!(
+            onekey_prompt_text(&state, "pane-b", b"word for ecs-user: "),
+            "[sudo] Password for ecs-user: ",
+        );
+        assert_eq!(
+            onekey_prompt_text(&state, "pane-a", b"Username: "),
+            "Username: ",
+        );
+    }
+
+    #[test]
+    fn reconnect_transition_blocks_duplicates_and_allows_retry_after_failure() {
+        let mut state = AppState::default();
+        state
+            .session_connection_states
+            .insert("pane-a".to_string(), SessionConnectionState::Disconnected);
+
+        assert!(begin_reconnect(&mut state, "pane-a"));
+        assert!(!begin_reconnect(&mut state, "pane-a"));
+        assert_eq!(
+            state.session_connection_states.get("pane-a"),
+            Some(&SessionConnectionState::Reconnecting),
+        );
+
+        state
+            .session_connection_states
+            .insert("pane-a".to_string(), SessionConnectionState::Disconnected);
+        assert!(begin_reconnect(&mut state, "pane-a"));
+    }
+
+    fn assert_terminal_size_eq(actual: TerminalSize, expected: TerminalSize) {
+        assert_eq!(actual.cols, expected.cols);
+        assert_eq!(actual.rows, expected.rows);
+        assert_eq!(actual.pixel_width, expected.pixel_width);
+        assert_eq!(actual.pixel_height, expected.pixel_height);
+    }
+}
+
 fn start_ssh_connection(
     mut state: Signal<AppState>,
     mut input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
@@ -2968,7 +3507,7 @@ fn start_ssh_connection(
             let delay = if attempt < 3 { 50 } else { 100 };
             tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
             if let Ok(result) = dioxus::document::eval(&format!(
-                "(function() {{ const el = document.getElementById('{measure_cid}'); if (!el) return ''; const rect = el.getBoundingClientRect(); if (rect.width <= 0 || rect.height <= 0) return ''; const cs = getComputedStyle(el); const padH = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight); const padV = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom); const bw = parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth); const bh = parseFloat(cs.borderTopWidth) + parseFloat(cs.borderBottomWidth); const h = rect.height - padV - bh; if (h <= 0) return ''; let w; const sd = document.getElementById('{scroll_cid}'); if (sd && sd.lastElementChild) {{ w = sd.lastElementChild.getBoundingClientRect().width; }} else {{ w = rect.width - padH - bw; }} if (w <= 0) return ''; const test = document.createElement('span'); test.textContent = 'M'; test.style.cssText = 'font-family:JetBrains Mono,Fira Code,Cascadia Code,monospace;font-size:13px;line-height:1.5;position:absolute;visibility:hidden;white-space:pre;'; document.body.appendChild(test); const tr = test.getBoundingClientRect(); document.body.removeChild(test); const cw = Math.max(1, tr.width); const ch = Math.max(1, tr.height); const cols = Math.max(1, Math.floor(w / cw)); const rows = Math.max(1, Math.floor(h / ch)); if (cols > 1 && rows > 1) return cols + ',' + rows; return ''; }})()"
+                "(function() {{ const el = document.getElementById('{measure_cid}'); if (!el) return ''; const rect = el.getBoundingClientRect(); if (rect.width <= 0 || rect.height <= 0) return ''; const cs = getComputedStyle(el); const padH = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight); const padV = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom); const bw = parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth); const bh = parseFloat(cs.borderTopWidth) + parseFloat(cs.borderBottomWidth); const h = rect.height - padV - bh; if (h <= 0) return ''; let w = rect.width - padH - bw; const sd = document.getElementById('{scroll_cid}'); if (sd) {{ const sdRect = sd.getBoundingClientRect(); w = sdRect.width; if (sd.firstElementChild) {{ w = Math.max(0, sdRect.width - sd.firstElementChild.getBoundingClientRect().width); }} }} if (w <= 0) return ''; const test = document.createElement('span'); test.textContent = 'M'; test.style.cssText = 'font-family:JetBrains Mono,Fira Code,Cascadia Code,monospace;font-size:13px;line-height:1.5;position:absolute;visibility:hidden;white-space:pre;'; document.body.appendChild(test); const tr = test.getBoundingClientRect(); document.body.removeChild(test); const cw = Math.max(1, tr.width); const ch = Math.max(1, tr.height); const cols = Math.max(1, Math.floor(w / cw)); const rows = Math.max(1, Math.floor(h / ch)); if (cols > 1 && rows > 1) return cols + ',' + rows; return ''; }})()"
             )).await {
                 if let Some(s) = result.as_str() {
                     if !s.is_empty() {
@@ -2987,20 +3526,29 @@ fn start_ssh_connection(
             }
         }
 
-        // NOTE: we intentionally do NOT resize the local terminal to
-        // measured_size here. The resize future in TerminalView already
-        // measures the real container size and resizes the local terminal
-        // (and it's more reliable — start_ssh's own measurement can fail and
-        // fall back to 80x24, which would overwrite the correct size). The
-        // initial PTY resize below sends terminal.size(), which the resize
-        // future has already set correctly.
+        // TerminalView may already have measured and resized this pane before
+        // the SSH session exists. Prefer that size (including pixel dimensions)
+        // over the connect-time DOM fallback. This also closes the race where
+        // TerminalView's first resize happened before `resize_senders` was
+        // registered and therefore could not reach the remote PTY.
+        let pane_size = state
+            .read()
+            .terminals
+            .get(&tab_id)
+            .map(|handle| handle.lock().terminal.size())
+            .unwrap_or_default();
+        let initial_size = preferred_initial_terminal_size(pane_size, measured_size);
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
         let host_for_import = ssh_config.host.clone();
         let client = rusterm_ssh::SshClient::new(ssh_config, event_tx.clone());
 
-        match client.connect(tab_id.clone(), measured_size).await {
+        match client.connect(tab_id.clone(), initial_size).await {
             Ok((session, ssh_session)) => {
+                state
+                    .write()
+                    .session_connection_states
+                    .insert(tab_id.clone(), SessionConnectionState::Connected);
                 input_senders
                     .write()
                     .insert(tab_id.clone(), session.input_tx.clone());
@@ -3021,26 +3569,14 @@ fn start_ssh_connection(
                     entry.terminal.set_input_sender(session.input_tx.clone());
                 }
 
-                // Send initial resize to sync PTY with the measured container
-                // size. We use `measured_size` (not `terminal.size()`) because the
-                // local terminal model is still at its 80x24 default — the
-                // TerminalView resize future hasn't fired yet (it needs ~100ms
-                // to poll the DOM). Sending `terminal.size()` here would briefly
-                // shrink the remote PTY back to 80x24, causing remote output to
-                // re-wrap incorrectly until the resize future corrects it. The
-                // TerminalView's on_resize handler will keep both the local model
-                // and the remote PTY in sync after the first measurement lands.
-                //
-                // Pixel dims: measured_size.pixel_width is 0 (the connect-time
-                // measurement only computes cols/rows, not pixels). That's OK —
-                // xterm-pty spec treats pixel dims as advisory; the cols/rows are
-                // what matter for line wrapping. The subsequent resize from
-                // TerminalView carries the real pixel dims.
+                // Sync the remote PTY to the same size used to create the SSH
+                // channel. `initial_size` prefers TerminalView's pane-specific
+                // measurement, so every clone starts with its own geometry.
                 let _ = session.resize_tx.send((
-                    measured_size.cols,
-                    measured_size.rows,
-                    measured_size.pixel_width,
-                    measured_size.pixel_height,
+                    initial_size.cols,
+                    initial_size.rows,
+                    initial_size.pixel_width,
+                    initial_size.pixel_height,
                 ));
 
                 // Feature #7: SSH login auto-configure terminal to the left side.
@@ -3149,33 +3685,18 @@ fn start_ssh_connection(
                     });
                 }
 
-                // Inject shell integration (OSC 133 + OSC 7) so the shell
-                // reports each command's exit code AND its working directory.
-                // Additive (appends to precmd_functions / PROMPT_COMMAND) so it
-                // won't clobber the user's prompt.
-                //
-                // OSC 133;D — exit code (existing).
-                // OSC 7     — `file://<host><cwd>` (new); used by session-state
-                //             restore to know which dir to `cd` back to on
-                //             next launch. We never re-execute past commands,
-                //             only send a single `cd` per session on restore.
-                //
-                // NOTE: do NOT send a trailing Ctrl+L (0x0c) to hide the echoed
-                // setup line — Ctrl+L clears the WHOLE screen, which wipes the
-                // MOTD/session content into scrollback and leaves a blank
-                // terminal after every connect. The one-time setup echo is left
-                // visible (cosmetic) rather than blanking the session.
-                {
-                    let integration_tx = session.input_tx.clone();
-                    let int_sid = tab_id.clone();
-                    let mut setup: Vec<u8> = r#"__rusterm_precmd() { printf '\e]133;D;%s\e\\' "$?"; printf '\e]133;A\e\\'; printf '\e]7;file://%s%s\e\\' "${HOSTNAME:-localhost}" "$PWD"; }; if [ -n "$ZSH_VERSION" ]; then precmd_functions+=(__rusterm_precmd); elif [ -n "$BASH_VERSION" ]; then PROMPT_COMMAND="__rusterm_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"; fi"#.as_bytes().to_vec();
-                    setup.push(b'\n');
-                    spawn(async move {
-                        tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-                        let _ = integration_tx.send(setup);
-                        tracing::info!("[SSH] injected shell integration for {}", int_sid);
-                    });
-                }
+                // Install OSC 133/OSC 7 shell integration only after the
+                // remote's initial output has stayed quiet. Every SSH output
+                // chunk below resets the debounce deadline, including delayed
+                // dynamic-MOTD paragraphs. This avoids creating a new prompt in
+                // front of login text that is still arriving.
+                let (initial_output_activity_tx, initial_output_activity_rx) =
+                    mpsc::unbounded_channel();
+                spawn(inject_shell_integration_when_quiet(
+                    initial_output_activity_rx,
+                    session.input_tx.clone(),
+                    tab_id.clone(),
+                ));
 
                 let _session_guard = session;
 
@@ -3610,6 +4131,10 @@ fn start_ssh_connection(
                 while let Some(event) = event_rx.recv().await {
                     match event {
                         SessionEvent::Output(id, data) => {
+                            // Reset the SSH login-output debounce before any
+                            // capture filtering; hidden history-import output is
+                            // still remote activity and must postpone injection.
+                            let _ = initial_output_activity_tx.send(());
                             // Capture raw output for history import if active. While
                             // capturing (the interactive history-import dump), SKIP
                             // rendering/logging/matching: the ~77KB dump would
@@ -3911,7 +4436,9 @@ fn start_ssh_connection(
                                 let render_result =
                                     handle.lock().process_and_render(msg.as_bytes());
                                 let mut s = state.write();
-                                s.disconnected_sessions.insert(id.clone());
+                                s.session_connection_states
+                                    .insert(id.clone(), SessionConnectionState::Disconnected);
+                                s.onekey_popups.remove(&id);
                                 if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
                                     tab.render_output = render_result;
                                     tab.version += 1;
@@ -3950,7 +4477,16 @@ fn start_ssh_connection(
                 }
             }
             Err(e) => {
-                let msg = format!("Connection failed: {}\n", e);
+                tracing::warn!(
+                    "[Reconnect] SSH connection failed for {}: {}",
+                    &tab_id[..tab_id.len().min(8)],
+                    e
+                );
+                state
+                    .write()
+                    .session_connection_states
+                    .insert(tab_id.clone(), SessionConnectionState::Disconnected);
+                let msg = format!("Connection failed: {}\r\nPress Enter to reconnect.\r\n", e);
                 let terminals = state.read().terminals.clone();
                 if let Some(handle) = terminals.get(&tab_id) {
                     let render_result = handle.lock().process_and_render(msg.as_bytes());
@@ -3984,6 +4520,10 @@ fn start_shell_connection(
 
     match rusterm_proto::ShellConnection::open(&shell_config, size, tab_id.clone(), event_tx) {
         Ok(session) => {
+            state
+                .write()
+                .session_connection_states
+                .insert(tab_id.clone(), SessionConnectionState::Connected);
             input_senders
                 .write()
                 .insert(tab_id.clone(), session.input_tx.clone());
@@ -4337,7 +4877,9 @@ fn start_shell_connection(
                                 let render_result =
                                     handle.lock().process_and_render(msg.as_bytes());
                                 let mut s = state.write();
-                                s.disconnected_sessions.insert(id.clone());
+                                s.session_connection_states
+                                    .insert(id.clone(), SessionConnectionState::Disconnected);
+                                s.onekey_popups.remove(&id);
                                 if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
                                     tab.render_output = render_result;
                                     tab.version += 1;
@@ -4372,7 +4914,16 @@ fn start_shell_connection(
             });
         }
         Err(e) => {
-            let msg = format!("Shell failed: {}\n", e);
+            tracing::warn!(
+                "[Reconnect] shell connection failed for {}: {}",
+                &tab_id[..tab_id.len().min(8)],
+                e
+            );
+            state
+                .write()
+                .session_connection_states
+                .insert(tab_id.clone(), SessionConnectionState::Disconnected);
+            let msg = format!("Shell failed: {}\r\nPress Enter to reconnect.\r\n", e);
             let terminals = state.read().terminals.clone();
             if let Some(handle) = terminals.get(&tab_id) {
                 let render_result = handle.lock().process_and_render(msg.as_bytes());
@@ -4451,7 +5002,11 @@ fn rebuild_connection(original: &ConnectionConfig, form: &NewConnectionForm) -> 
 }
 
 fn create_terminal(id: String, state: &mut Signal<AppState>) {
-    let terminal = Terminal::new(TerminalSize::default());
+    create_terminal_with_size(id, TerminalSize::default(), state);
+}
+
+fn create_terminal_with_size(id: String, size: TerminalSize, state: &mut Signal<AppState>) {
+    let terminal = Terminal::new(size);
     let handle = Arc::new(Mutex::new(TerminalEntry {
         terminal,
         parser: vte::ansi::Processor::new(),
@@ -4541,7 +5096,13 @@ fn open_local_terminal(
         hostname: Some("local".to_string()),
         cwd: None,
     });
-    state.write().active_session = Some(tab_id.clone());
+    // No explicit pane target → this is a new top-level workspace tab.
+    // push_workspace_tab creates the WorkspaceTab + sets active_tab +
+    // active_session (anchor).
+    {
+        let mut s = state.write();
+        push_workspace_tab(&mut s, &tab_id);
+    }
 
     start_shell_connection(state, input_senders, tab_id, shell_config);
 }
@@ -4615,6 +5176,10 @@ fn restore_sessions(
                     hostname: Some("local".to_string()),
                     cwd: None,
                 });
+                // Each restored session becomes its own top-level workspace
+                // tab (one session per tab — Plan B's default layout for
+                // restored single-session tabs).
+                push_workspace_tab(&mut state.write(), &tab_id);
                 start_shell_connection(
                     state.clone(),
                     input_senders.clone(),
@@ -4685,18 +5250,21 @@ fn restore_sessions(
         }
     }
 
-    // Set active session to the saved one (if it exists in the new tabs).
-    // We match by name since the new tab ids are fresh UUIDs.
+    // Set active tab to the saved one (if it exists in the new tabs).
+    // We match by name since the new session ids are fresh UUIDs. The tab's
+    // anchor mirrors the matched session, so setting active_tab also
+    // restores active_session.
     if let Some(saved_active) = saved_active {
         // The saved_active id was from the previous launch — it won't match
-        // any current tab. Instead, find the tab whose name matches the saved
-        // active session's name, or fall back to the last opened tab.
+        // any current session. Instead, find the session whose name matches
+        // the saved active session's name, then find the workspace tab whose
+        // anchor is that session.
         let saved_name = to_restore
             .sessions
             .iter()
             .find(|s| s.id == saved_active)
             .map(|s| s.name.clone());
-        let target_id = if let Some(name) = saved_name {
+        let target_session_id = if let Some(name) = saved_name {
             state
                 .read()
                 .sessions
@@ -4706,8 +5274,22 @@ fn restore_sessions(
         } else {
             None
         };
-        state.write().active_session =
-            target_id.or_else(|| state.read().sessions.last().map(|t| t.id.clone()));
+        // Find the workspace tab whose anchor is this session. Fall back to
+        // the last opened tab if no match.
+        let target_tab_id = target_session_id
+            .as_ref()
+            .and_then(|sid| {
+                state
+                    .read()
+                    .tabs
+                    .iter()
+                    .find(|t| t.anchor_session_id.as_deref() == Some(sid))
+                    .map(|t| t.id.clone())
+            })
+            .or_else(|| state.read().tabs.last().map(|t| t.id.clone()));
+        if let Some(tab_id) = target_tab_id {
+            set_active_tab(&mut state.write(), &tab_id);
+        }
     }
 }
 
@@ -4785,37 +5367,103 @@ fn save_settings(state: &Signal<AppState>) {
     }
 }
 
-/// Open a connection (SSH / Shell / etc.) as a new session tab.
+/// Stable destination for a connection opened into a pane.
 ///
-/// This is the shared connection-opening helper used by:
-/// - The sidebar's `on_connect` handler (click a connection to open it).
-/// - The drag-and-drop drop handler on a pane (drag a sidebar connection
-///   onto a pane to open it in that pane).
+/// `active_tab` is deliberately not used for assignment: it is a tab/layout
+/// anchor and may change while a series of SSH or shell sessions is created.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct PaneTarget {
+    layout_owner_tab_id: String,
+    pane_idx: usize,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct OpenConnectionResult {
+    session_id: String,
+    assigned_to_target: bool,
+}
+
+fn assign_opened_session(
+    state: &mut AppState,
+    target: Option<&PaneTarget>,
+    session_id: &str,
+) -> bool {
+    let Some(target) = target else {
+        // No explicit pane target: this session becomes a new top-level tab.
+        // push_workspace_tab creates the WorkspaceTab + sets active_tab +
+        // active_session (the latter mirrors the tab's anchor for Step 1
+        // backwards compatibility).
+        push_workspace_tab(state, session_id);
+        return false;
+    };
+
+    set_pane_session_for_layout(
+        state,
+        &target.layout_owner_tab_id,
+        target.pane_idx,
+        session_id.to_string(),
+    )
+}
+
+#[cfg(test)]
+mod connection_target_tests {
+    use super::*;
+    use crate::layout::LayoutPreset;
+
+    #[test]
+    fn explicit_pane_target_keeps_source_independent_and_ignores_current_active_tab() {
+        let mut state = AppState {
+            active_session: Some("other-tab".to_string()),
+            ..AppState::default()
+        };
+        state.layouts.insert(
+            "layout-owner".to_string(),
+            PaneLayout::from_preset(LayoutPreset::Grid4, &["one".to_string(), "two".to_string()]),
+        );
+        let target = PaneTarget {
+            layout_owner_tab_id: "layout-owner".to_string(),
+            pane_idx: 2,
+        };
+
+        assert!(assign_opened_session(&mut state, Some(&target), "clone"));
+        assert_eq!(state.layouts["layout-owner"].panes[0].session_id, "one");
+        assert_eq!(state.layouts["layout-owner"].panes[2].session_id, "clone");
+        assert_ne!(
+            state.layouts["layout-owner"].panes[0].session_id,
+            state.layouts["layout-owner"].panes[2].session_id
+        );
+        assert_eq!(state.active_session.as_deref(), Some("other-tab"));
+    }
+
+    #[test]
+    fn failed_explicit_pane_target_does_not_change_active_tab() {
+        let mut state = AppState {
+            active_session: Some("layout-owner".to_string()),
+            ..AppState::default()
+        };
+        let target = PaneTarget {
+            layout_owner_tab_id: "missing-layout".to_string(),
+            pane_idx: 2,
+        };
+
+        assert!(!assign_opened_session(&mut state, Some(&target), "clone"));
+        assert_eq!(state.active_session.as_deref(), Some("layout-owner"));
+    }
+}
+
+/// Open a connection as a new runtime session.
 ///
-/// ## The `target_pane_idx` parameter
-///
-/// - `None`: the new session is opened as a new active tab. This is the
-///   legacy "click to connect" flow — the new tab becomes active and the
-///   single-pane render path displays it.
-/// - `Some(pane_idx)`: the new session is opened AND its session_id is
-///   assigned to pane `pane_idx` in the active tab's layout (via
-///   `set_pane_session_for_active`). This is the drag-and-drop flow —
-///   the new session replaces whatever was displayed in the target pane.
-///   The new session's tab is still pushed to `state.sessions` (so it
-///   appears in the tab bar and can be dragged later), but
-///   `active_session` is NOT changed (the user's active tab stays as
-///   whatever they were looking at when they dragged).
-///
-/// If `target_pane_idx` is `Some` but there's no active layout (the
-/// user dragged onto a single-pane tab), the function falls back to
-/// the `None` path — opens a new active tab. This is the graceful
-/// degradation for "drag onto a pane that doesn't exist yet".
+/// With no `target`, the new session becomes the active tab. With an explicit
+/// target, the session is assigned only to that layout and pane; assignment
+/// failure never changes `active_session`. The result reports whether the
+/// requested pane assignment succeeded so callers can verify it.
+
 fn open_connection(
     mut state: Signal<AppState>,
     input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
     conn: ConnectionConfig,
-    target_pane_idx: Option<usize>,
-) -> String {
+    target: Option<PaneTarget>,
+) -> OpenConnectionResult {
     let tab_id = uuid::Uuid::new_v4().to_string();
     create_terminal(tab_id.clone(), &mut state);
     // Remember the config so this session can be reconnected by pressing
@@ -4825,7 +5473,7 @@ fn open_connection(
         .session_configs
         .insert(tab_id.clone(), conn.clone());
 
-    match &conn.kind {
+    let assigned_to_target = match &conn.kind {
         ConnectionKind::Ssh(ssh_config) => {
             state.write().sessions.push(SessionTab {
                 id: tab_id.clone(),
@@ -4841,19 +5489,9 @@ fn open_connection(
                 hostname: Some(ssh_config.host.clone()),
                 cwd: None,
             });
-            // If a target pane was specified, assign the new session to
-            // that pane. Otherwise, make it the active session (legacy
-            // "click to connect" flow).
-            if let Some(idx) = target_pane_idx {
-                if !set_pane_session_for_active(&mut state.write(), idx, tab_id.clone()) {
-                    // No layout / out-of-range pane — fall back to
-                    // making the new session active.
-                    state.write().active_session = Some(tab_id.clone());
-                }
-            } else {
-                state.write().active_session = Some(tab_id.clone());
-            }
+            let assigned = assign_opened_session(&mut state.write(), target.as_ref(), &tab_id);
             start_ssh_connection(state, input_senders, tab_id.clone(), ssh_config.clone());
+            assigned
         }
         ConnectionKind::Shell(shell_config) => {
             let msg = format!("\r\nStarting shell...\r\n");
@@ -4879,14 +5517,9 @@ fn open_connection(
                 hostname: Some("local".to_string()),
                 cwd: None,
             });
-            if let Some(idx) = target_pane_idx {
-                if !set_pane_session_for_active(&mut state.write(), idx, tab_id.clone()) {
-                    state.write().active_session = Some(tab_id.clone());
-                }
-            } else {
-                state.write().active_session = Some(tab_id.clone());
-            }
+            let assigned = assign_opened_session(&mut state.write(), target.as_ref(), &tab_id);
             start_shell_connection(state, input_senders, tab_id.clone(), shell_config.clone());
+            assigned
         }
         _ => {
             let msg = format!("\r\nConnection type not yet supported\r\n");
@@ -4907,23 +5540,19 @@ fn open_connection(
                     hostname: None,
                     cwd: None,
                 });
-                if let Some(idx) = target_pane_idx {
-                    if !set_pane_session_for_active(&mut state.write(), idx, tab_id.clone()) {
-                        state.write().active_session = Some(tab_id.clone());
-                    }
-                } else {
-                    state.write().active_session = Some(tab_id.clone());
-                }
+                assign_opened_session(&mut state.write(), target.as_ref(), &tab_id)
+            } else {
+                false
             }
         }
-    }
+    };
 
-    tab_id
+    OpenConnectionResult {
+        session_id: tab_id,
+        assigned_to_target,
+    }
 }
 
-/// Reconnect a disconnected session: tear down the dead PTY/senders, create a
-/// fresh terminal, and re-run the SSH/shell connection using the stored config.
-/// Triggered by pressing Enter while a session is in `disconnected_sessions`.
 fn reconnect_session(
     mut state: Signal<AppState>,
     mut input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
@@ -4938,18 +5567,36 @@ fn reconnect_session(
         return;
     };
 
-    // Clear the disconnected flag + tear down the dead session's senders/terminal.
+    // Preserve the pane-specific terminal size before replacing the dead
+    // terminal model. This is also the size `start_ssh_connection` will use if
+    // TerminalView's ResizeObserver does not fire again for unchanged geometry.
+    let previous_size = state
+        .read()
+        .terminals
+        .get(&tab_id)
+        .map(|handle| handle.lock().terminal.size())
+        .unwrap_or_default();
+
+    // Disconnected -> Reconnecting is an atomic, one-way transition. Repeated
+    // Enter presses while the async connection attempt is running are no-ops.
     {
         let mut s = state.write();
-        s.disconnected_sessions.remove(&tab_id);
+        if !begin_reconnect(&mut s, &tab_id) {
+            tracing::debug!(
+                "[Reconnect] ignored duplicate or non-disconnected session {}",
+                &tab_id[..tab_id.len().min(8)]
+            );
+            return;
+        }
         s.close_senders.retain(|(sid, _)| sid != &tab_id);
         s.resize_senders.remove(&tab_id);
         s.terminals.remove(&tab_id);
+        s.onekey_popups.remove(&tab_id);
+        s.pending_exit_check.remove(&tab_id);
     }
     input_senders.write().remove(&tab_id);
 
-    // Fresh terminal + "Reconnecting..." message.
-    create_terminal(tab_id.clone(), &mut state);
+    create_terminal_with_size(tab_id.clone(), previous_size, &mut state);
     {
         let terminals = state.read().terminals.clone();
         if let Some(handle) = terminals.get(&tab_id) {
@@ -4962,6 +5609,12 @@ fn reconnect_session(
         }
     }
 
+    tracing::info!(
+        "[Reconnect] starting session={} cols={} rows={}",
+        &tab_id[..tab_id.len().min(8)],
+        previous_size.cols,
+        previous_size.rows
+    );
     match conn.kind {
         ConnectionKind::Ssh(ssh_config) => {
             start_ssh_connection(state, input_senders, tab_id, ssh_config);
@@ -4970,6 +5623,10 @@ fn reconnect_session(
             start_shell_connection(state, input_senders, tab_id, shell_config);
         }
         _ => {
+            state
+                .write()
+                .session_connection_states
+                .insert(tab_id.clone(), SessionConnectionState::Disconnected);
             tracing::warn!(
                 "[Reconnect] unsupported connection kind for {}",
                 &tab_id[..tab_id.len().min(8)]
@@ -5271,7 +5928,7 @@ pub fn App() -> Element {
                         let (cw, ch) = container_size().unwrap_or((1200.0, 800.0));
                         let active_layout = state
                             .read()
-                            .active_session
+                            .active_tab
                             .as_ref()
                             .and_then(|aid| state.read().layouts.get(aid).cloned());
                         let hit = if let Some(layout) = active_layout.as_ref() {
@@ -5618,6 +6275,7 @@ pub fn App() -> Element {
                                 // settings.json so we know whether to even
                                 // attempt loading `session_state.enc`.
                                 s.restore_disabled = cm.load_restore_disabled();
+                                s.focused_tab_appearance = cm.load_focused_tab_appearance();
                                 s.config_manager = Some(cm);
                                 s.connections = connections;
                                 s.onekeys = onekeys;
@@ -5699,24 +6357,83 @@ pub fn App() -> Element {
             ",
             tabindex: "0",
             onkeydown: move |e: KeyboardEvent| {
-                // Cmd+1..9 (macOS) or Ctrl+1..9 (Linux/Windows) to switch tabs
                 let mods = e.modifiers();
+                // Close-focused-pane-session hotkey — macOS ONLY.
+                //
+                // On macOS, Cmd+W is WKWebView's default "close window"
+                // shortcut. We intercept it to instead close the focused
+                // pane session (preserving the rest of the window/tab).
+                // When no pane session exists we let the event fall through
+                // so the OS closes the window — standard last-tab-closes-
+                // app behaviour.
+                //
+                // On Linux/Windows we deliberately do NOT bind any W-based
+                // close shortcut. Plain Ctrl+W is a STANDARD terminal
+                // shortcut (shell: delete word backward; vim: window-switch
+                // prefix; emacs: kill-region) — the TerminalView's own
+                // `onkeydown` handles it by sending `0x17` to the PTY.
+                // Even Ctrl+Shift+W is intentionally left alone: some
+                // terminals use it as "close tab", but binding it here
+                // would require `stop_propagation` in TerminalView (since
+                // dioxus bubbles events even after `prevent_default`),
+                // and the cost (race between PTY-send and close_session)
+                // isn't worth it. Users on Linux/Windows close panes via
+                // the TabBar close button or the Cmd/Ctrl+Shift+L preset
+                // cycle (which collapses to Single and drops empty panes).
+                if cfg!(target_os = "macos")
+                    && mods.meta()
+                    && !mods.ctrl()
+                    && !mods.alt()
+                    && !mods.shift()
+                {
+                    if let Key::Character(ref s) = e.key() {
+                        if s.eq_ignore_ascii_case("w") {
+                            let snapshot = state.read();
+                            let target =
+                                focused_pane_session(&snapshot)
+                                    .or_else(|| snapshot.active_session.clone());
+                            drop(snapshot);
+                            if let Some(session_id) = target {
+                                e.prevent_default();
+                                close_session(
+                                    &mut state.write(),
+                                    &mut input_senders.write(),
+                                    &session_id,
+                                );
+                                // Restore focus to whatever is now the active
+                                // session's input. After a close, the active
+                                // session may have switched (if the closed
+                                // session was the active tab); a small delay
+                                // lets the renderer mount the new focus target
+                                // before we try to focus it.
+                                restore_focus_to_active_session(state, 50);
+                            }
+                            // else: no session to close — let the event
+                            // propagate so the OS handles Cmd+W (closes the
+                            // window on macOS).
+                        }
+                    }
+                }
+                // Cmd+1..9 (macOS) or Ctrl+1..9 (Linux/Windows) to switch tabs
                 if (mods.meta() || mods.ctrl()) && !mods.alt() && !mods.shift() {
                     if let Key::Character(ref s) = e.key() {
                         if let Ok(idx) = s.parse::<usize>() {
                             if idx >= 1 && idx <= 9 {
                                 e.prevent_default();
-                                let tabs = state.read().sessions.clone();
+                                let tabs = state.read().tabs.clone();
                                 if let Some(tab) = tabs.get(idx - 1) {
                                     let tab_id = tab.id.clone();
-                                    state.write().active_session = Some(tab_id.clone());
-                                    let focus_id = format!("terminal-input-{tab_id}");
-                                    spawn(async move {
-                                        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                                        let _ = dioxus::document::eval(&format!(
-                                            "document.getElementById('{focus_id}')?.focus()"
-                                        )).await;
-                                    });
+                                    set_active_tab(&mut state.write(), &tab_id);
+                                    let focus_id = state.read().active_session.as_ref()
+                                        .map(|sid| format!("terminal-input-{sid}"));
+                                    if let Some(focus_id) = focus_id {
+                                        spawn(async move {
+                                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                            let _ = dioxus::document::eval(&format!(
+                                                "document.getElementById('{focus_id}')?.focus()"
+                                            )).await;
+                                        });
+                                    }
                                 }
                             }
                         }
@@ -5768,12 +6485,9 @@ pub fn App() -> Element {
                     on_connect: move |id: String| {
                         let conn = state.read().connections.iter().find(|c| c.id == id).cloned();
                         if let Some(conn) = conn {
-                            // `target_pane_idx: None` → open as a new
-                            // active tab (the legacy "click to connect"
-                            // flow). The drag-and-drop drop handler
-                            // calls `open_connection` with
-                            // `Some(pane_idx)` to open the connection
-                            // in a specific pane instead.
+                            // No explicit pane target means the connection
+                            // opens as a new active tab. Pane-drop flows pass a
+                            // stable layout owner + pane index instead.
                             open_connection(state, input_senders, conn, None);
                         }
                     },
@@ -5823,44 +6537,28 @@ pub fn App() -> Element {
 
                 // Tab bar
                 TabBar {
-                    tabs: state.read().sessions.clone(),
-                    active: state.read().active_session.clone(),
+                    tabs: state.read().tabs.clone(),
+                    sessions: state.read().sessions.clone(),
+                    active: state.read().active_tab.clone(),
+                    focused_session: focused_pane_session(&state.read()),
+                    focused_appearance: state.read().focused_tab_appearance.clone(),
                     on_select: move |id: String| {
-                        state.write().active_session = Some(id.clone());
-                        let focus_id = format!("terminal-input-{id}");
-                        spawn(async move {
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                            let _ = dioxus::document::eval(&format!(
-                                "document.getElementById('{focus_id}')?.focus()"
-                            )).await;
-                        });
+                        // Switching the top TabBar entry: update active_tab
+                        // and derive active_session from the new tab's anchor.
+                        set_active_tab(&mut state.write(), &id);
+                        let focus_id = state.read().active_session.as_ref()
+                            .map(|sid| format!("terminal-input-{sid}"));
+                        if let Some(focus_id) = focus_id {
+                            spawn(async move {
+                                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                                let _ = dioxus::document::eval(&format!(
+                                    "document.getElementById('{focus_id}')?.focus()"
+                                )).await;
+                            });
+                        }
                     },
                     on_close: move |id: String| {
-                        input_senders.write().remove(&id);
-                        if let Some((_, tx)) = state.read().close_senders.iter().find(|(sid, _)| sid == &id).cloned() {
-                            let _ = tx.send(());
-                        }
-                        state.write().close_senders.retain(|(sid, _)| sid != &id);
-                        state.write().resize_senders.remove(&id);
-                        state.write().terminals.remove(&id);
-                        state.write().sessions.retain(|s| s.id != id);
-                        // --- Layout cleanup ---
-                        // Remove the closed session's own layout entry (if it
-                        // was a tab anchor) and clear the session from any
-                        // other tab's layout panes (so a dangling reference
-                        // doesn't try to render a dead session).
-                        state.write().layouts.remove(&id);
-                        for (_, layout) in state.write().layouts.iter_mut() {
-                            for pane in layout.panes.iter_mut() {
-                                if pane.session_id == id {
-                                    pane.session_id = String::new();
-                                }
-                            }
-                        }
-                        let first_id = state.read().sessions.first().map(|s| s.id.clone());
-                        if state.read().active_session.as_ref() == Some(&id) {
-                            state.write().active_session = first_id;
-                        }
+                        close_workspace(&mut state.write(), &mut input_senders.write(), &id);
                     },
                     // Task 22: manual mouse-based tab drag. The tab's
                     // `onmousedown` (with primary button) calls this
@@ -5887,12 +6585,13 @@ pub fn App() -> Element {
                     // we render every pane side-by-side via the multi-pane
                     // path. Otherwise we fall through to the legacy single-
                     // session rendering path below.
-                    {let active_id = state.read().active_session.clone();
-                    let layout_snapshot = active_id.as_ref()
-                        .and_then(|sid| state.read().layouts.get(sid).cloned());
+                    {let active_tab_id = state.read().active_tab.clone();
+                    let active_anchor = state.read().active_tab_anchor_session();
+                    let layout_snapshot = active_tab_id.as_ref()
+                        .and_then(|tid| state.read().layouts.get(tid).cloned());
                     let is_multi = layout_snapshot.as_ref()
                         .is_some_and(|l| l.is_multi_pane());
-                    match (active_id, is_multi) {
+                    match (active_anchor.clone(), is_multi) {
                         (None, _) => rsx! {
                             div {
                                 style: "
@@ -5919,10 +6618,10 @@ pub fn App() -> Element {
                             //
                             // If a layout exists but is zoomed, we look up the
                             // zoomed pane's session_id and render THAT instead
-                            // of `sid` (the active session). This is what makes
-                            // zoom mode actually work: the user's active tab
-                            // is `sid`, but the visible content is the zoomed
-                            // pane's session.
+                            // of `sid` (the active tab's anchor session). This
+                            // is what makes zoom mode actually work: the user's
+                            // active tab anchor is `sid`, but the visible
+                            // content is the zoomed pane's session.
                             //
                             // We wrap `render_terminal_pane` in
                             // `single_pane_with_drop` so that drag-drop from
@@ -5934,7 +6633,7 @@ pub fn App() -> Element {
                             let render_sid = layout_snapshot.as_ref()
                                 .and_then(|l| l.zoomed)
                                 .and_then(|idx| layout_snapshot.as_ref()?.panes.get(idx).map(|p| p.session_id.clone()))
-                                .unwrap_or(sid);
+                                .unwrap_or(sid.clone());
                             single_pane_with_drop(state, input_senders, render_sid, drag_over_pane)
                         }
                         (Some(_sid), true) => {
@@ -6083,7 +6782,7 @@ pub fn App() -> Element {
                         span {
                             style: format!(
                                 "cursor: pointer; font-size: 11px; user-select: none; padding: 0 6px; border-radius: 3px; {};",
-                                if state.read().layouts.get(&state.read().active_session.clone().unwrap_or_default())
+                                if state.read().layouts.get(&state.read().active_tab.clone().unwrap_or_default())
                                     .is_some_and(|l| l.comparison) {
                                     "background: #7aa2f7; color: #1a1b26;"
                                 } else {
@@ -6131,6 +6830,11 @@ pub fn App() -> Element {
                             "OneKeys"
                         }
                         span {
+                            style: "cursor: pointer; color: #7aa2f7;",
+                            onclick: move |_| modal.set(Modal::Settings),
+                            "Settings"
+                        }
+                        span {
                             style: "cursor: pointer; color: #9ece6a;",
                             onclick: move |_| open_local_terminal(state, input_senders),
                             title: "Open a local shell (zsh/bash)",
@@ -6138,6 +6842,27 @@ pub fn App() -> Element {
                         }
                     }
                 }
+            }
+        }
+
+        if matches!(modal(), Modal::Settings) {
+            SettingsDialog {
+                appearance: state.read().focused_tab_appearance.clone(),
+                on_close: move |_| modal.set(Modal::None),
+                on_save: move |appearance: rusterm_core::FocusedTabAppearance| {
+                    let appearance = appearance.normalized();
+                    if let Some(cm) = state.read().config_manager.clone() {
+                        if let Err(e) = cm.save_focused_tab_appearance(appearance.clone()) {
+                            tracing::error!("Failed to save focused tab appearance: {}", e);
+                        }
+                    } else {
+                        tracing::error!(
+                            "ConfigManager not initialized, cannot save focused tab appearance"
+                        );
+                    }
+                    state.write().focused_tab_appearance = appearance;
+                    modal.set(Modal::None);
+                },
             }
         }
 
@@ -6216,7 +6941,8 @@ pub fn App() -> Element {
                         hostname: Some(ssh_config.host.clone()),
                         cwd: None,
                     });
-                    s.active_session = Some(config.id.clone());
+                    // New top-level workspace tab.
+                    push_workspace_tab(&mut s, &config.id);
                 }
                 save_config(&state);
                 modal.set(Modal::None);
