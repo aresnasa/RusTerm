@@ -224,9 +224,23 @@ pub struct PersistedConfig {
     /// Default false for backward compat — existing users get the prompt.
     #[serde(default)]
     pub restore_disabled: bool,
+    /// Whether to show the "是否确实要关闭本软件？" confirmation dialog when the
+    /// user closes the last window. Default true (safe default — always ask).
+    /// When false, closing the last window exits the app immediately.
+    /// Persisted so the user's choice on the dialog's "下次关闭时不再询问"
+    /// checkbox survives across launches.
+    #[serde(default = "default_confirm_close_on_exit")]
+    pub confirm_close_on_exit: bool,
     /// Appearance of the complete outline around the focused pane's top tab.
     #[serde(default)]
     pub focused_tab_appearance: FocusedTabAppearance,
+}
+
+/// Default for `PersistedConfig::confirm_close_on_exit`. Kept as a function
+/// (not a constant) so `#[serde(default = "...")]` can reference it. True
+/// because the safe default is to always ask before closing the app.
+fn default_confirm_close_on_exit() -> bool {
+    true
 }
 
 // --- OneKeys (ZOC-style Expect/Send auto-fill) ---

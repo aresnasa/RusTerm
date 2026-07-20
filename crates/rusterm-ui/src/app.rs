@@ -16,6 +16,7 @@ use rusterm_core::session_log::SessionLog;
 use rusterm_core::terminal::{Terminal, TerminalSize};
 
 use crate::components::AiPanel;
+use crate::components::CloseConfirmationDialog;
 use crate::components::ConnectionDialog;
 use crate::components::DangerousCommandDialog;
 use crate::components::MasterPasswordDialog;
@@ -35,7 +36,7 @@ use crate::state::{
     focus_pane_for_layout, focused_pane_session, move_floating_pane_for_active,
     move_session_to_leftmost, prepare_split_for_sidebar_drop, prepare_split_for_sidebar_drop_at,
     push_workspace_tab, resize_layout_split, set_active_tab, set_pane_session_for_layout,
-    source_pane_for_copy, toggle_comparison_mode, toggle_pane_zoom,
+    source_pane_for_copy, toggle_comparison_mode, toggle_pane_zoom, toggle_split_mode,
 };
 
 fn save_config(state: &Signal<AppState>) {
@@ -59,7 +60,9 @@ fn save_config(state: &Signal<AppState>) {
 ///
 /// Returns "Layout: N panes" (or "Layout: 1 pane" for the singular case)
 /// when a layout exists, or "Layout: 1 pane" when no layout exists yet
-/// (the single-pane default view).
+/// (the single-pane default view). When split mode is OFF, the label
+/// notes the tab-tiled state so the user knows the layout is collapsed
+/// (not gone).
 fn layout_display_label(state: &AppState) -> String {
     let pane_count = state
         .active_tab
@@ -68,7 +71,11 @@ fn layout_display_label(state: &AppState) -> String {
         .map(|l| l.panes.len())
         .unwrap_or(1);
     let noun = if pane_count == 1 { "pane" } else { "panes" };
-    format!("Layout: {pane_count} {noun}")
+    if !state.split_mode_enabled && pane_count > 1 {
+        format!("Layout: {pane_count} {noun} (tab-tiled)")
+    } else {
+        format!("Layout: {pane_count} {noun}")
+    }
 }
 
 /// Render a single TerminalView for the session identified by `session_id`.
@@ -2036,20 +2043,23 @@ pub(crate) fn pane_drop_region_for_cursor(
     }
 }
 
-/// The two CSS style strings for the drop-zone center-line overlay.
 /// Returns `(vertical_line_style, horizontal_line_style)` — each is
 /// `Some` when that line should be drawn, `None` when it should not.
 ///
-/// This is the "用中线作为标记" UX: exactly ONE bright line is drawn for
-/// split regions (vertical for Left/Right = 横着 placement, horizontal for
-/// Top/Bottom = 竖着 placement). For the Center swap/move zone, BOTH lines
-/// are drawn dimmed so the user can see the swap zone without it dominating
+/// This is the "用中线作为标记" UX (crosshair / 田字形): BOTH lines
+/// (vertical + horizontal) are ALWAYS drawn, forming a crosshair so the
+/// user can see the four-quadrant grid and drop into whichever box they
+/// want. For split regions the lines are bright (2px, full-opacity
+/// #7aa2f7 + glow); for the Center swap/move zone the lines are dimmed
+/// (1px, 35% opacity) so the swap zone is visible without dominating
 /// the pane.
 ///
-/// Showing ONE line per region (instead of always both) is the fix for the
-/// "错误的产生多个不需要的四方块" bug — the prior crosshair always drew
-/// both lines forming a 田 shape that was ambiguous about the split
-/// direction and visually competed with the half-rectangle highlight.
+/// The "错误的产生多个不需要的四方块" bug (multiple overlays flickering
+/// at pane boundaries) was NOT caused by drawing both lines — it was
+/// caused by HTML5 `ondragover`/`ondragenter` writing the
+/// `drag_over_pane` signal concurrently with the polling loop. That race
+/// is now fixed by making the polling loop the sole writer, so drawing
+/// both lines (the crosshair) is safe again.
 ///
 /// Extracted as a pure function so the overlay decision can be unit-tested
 /// without a dioxus runtime, and so `single_pane_with_drop` and
@@ -2057,8 +2067,8 @@ pub(crate) fn pane_drop_region_for_cursor(
 pub(crate) fn center_line_styles_for_region(
     region: PaneDropRegion,
 ) -> (Option<&'static str>, Option<&'static str>) {
-    // The bright accent line (2px, full opacity, glow) is used for split
-    // regions; the dimmed line (1px, 35% opacity) is used for Center.
+    // The bright accent lines (2px, full opacity, glow) are used for split
+    // regions; the dimmed lines (1px, 35% opacity) are used for Center.
     const VERTICAL_BRIGHT: &str = "position: absolute; left: 50%; top: 0; width: 2px; height: 100%; \
          background: #7aa2f7; pointer-events: none; z-index: 21; \
          transform: translateX(-1px); box-shadow: 0 0 6px rgba(122,162,247,0.5);";
@@ -2071,16 +2081,22 @@ pub(crate) fn center_line_styles_for_region(
     const HORIZONTAL_DIM: &str = "position: absolute; left: 0; top: 50%; width: 100%; height: 1px; \
          background: rgba(122,162,247,0.35); pointer-events: none; z-index: 21; \
          transform: translateY(-0.5px);";
+    // "用中线作为标记" UX (crosshair / 田字形): ALL regions draw BOTH the
+    // vertical and horizontal center lines so the user can see the four-
+    // quadrant grid and drop into whichever box they want.
+    //
+    // Split regions (Left/Right/Top/Bottom/Center): BOTH lines bright (2px,
+    // full-opacity #7aa2f7 + glow). The half-rectangle highlight (rendered by
+    // the caller) shows which side of the split will receive the new pane, so
+    // the crosshair itself doesn't need to encode the split direction — both
+    // lines are always drawn so the user can aim into any of the 4 boxes.
+    // Center (swap/move zone): both lines dimmed (1px, 35% opacity) so the
+    // swap zone is visible without dominating the pane.
     match region {
-        // Horizontal-axis split (Left/Right): show ONLY the vertical divider.
-        // This is the 横着 placement marker — the new pane sits beside the
-        // existing one, separated by a vertical line.
-        PaneDropRegion::Left | PaneDropRegion::Right => (Some(VERTICAL_BRIGHT), None),
-        // Vertical-axis split (Top/Bottom): show ONLY the horizontal divider.
-        // This is the 竖着 placement marker — the new pane stacks above/below,
-        // separated by a horizontal line.
-        PaneDropRegion::Top | PaneDropRegion::Bottom => (None, Some(HORIZONTAL_BRIGHT)),
-        // Center swap/move zone: both lines dimmed (no split will happen).
+        PaneDropRegion::Left
+        | PaneDropRegion::Right
+        | PaneDropRegion::Top
+        | PaneDropRegion::Bottom => (Some(VERTICAL_BRIGHT), Some(HORIZONTAL_BRIGHT)),
         PaneDropRegion::Center => (Some(VERTICAL_DIM), Some(HORIZONTAL_DIM)),
     }
 }
@@ -2549,8 +2565,13 @@ fn empty_pane_title_actions(
                 button {
                     style: "height: 18px; min-width: 24px; padding: 0 6px; border: 1px solid #414868; border-radius: 3px; background: #24283b; color: #7aa2f7; cursor: pointer; font-size: 12px; line-height: 16px; transition: background 0.12s ease, color 0.12s ease;",
                     title: "复制当前焦点会话：{source_name}",
+                    // stop_propagation on mousedown prevents the pane title
+                    // bar's onmousedown (which starts a tab drag) from firing.
+                    // We do NOT call prevent_default here — in some webview
+                    // implementations (notably macOS webkit via wry), calling
+                    // prevent_default on mousedown prevents the subsequent
+                    // click event from firing, leaving the button unresponsive.
                     onmousedown: move |e: MouseEvent| {
-                        e.prevent_default();
                         e.stop_propagation();
                     },
                     onclick: move |e: MouseEvent| {
@@ -2590,8 +2611,9 @@ fn empty_pane_title_actions(
             button {
                 style: "height: 18px; min-width: 24px; padding: 0 6px; border: 1px solid #414868; border-radius: 3px; background: #24283b; color: #9ece6a; cursor: pointer; font-size: 13px; line-height: 16px; transition: background 0.12s ease, color 0.12s ease;",
                 title: "打开侧栏，将自定义连接拖入此窗格",
+                // Same as the copy button: stop_propagation only, NO
+                // prevent_default (prevent_default blocks click in webkit).
                 onmousedown: move |e: MouseEvent| {
-                    e.prevent_default();
                     e.stop_propagation();
                 },
                 onclick: move |e: MouseEvent| {
@@ -2604,6 +2626,63 @@ fn empty_pane_title_actions(
                     state.write().sidebar_open = true;
                 },
                 "+"
+            }
+        }
+    }
+}
+
+/// Title-bar action buttons for an OCCUPIED pane (a pane with a live session).
+///
+/// Mirrors `empty_pane_title_actions` in shape (returns a right-aligned
+/// inline-flex div) but contains only a single "✕" close button. Clicking it
+/// closes the pane's session via `close_session` and restores focus to the
+/// next available session.
+///
+/// ## Why a dedicated function (not inline `rsx!`)
+///
+/// `rsx!` in dioxus 0.7 does not allow `let` bindings as direct children of
+/// an `if`/`else` block inside another `rsx!` — so the `else` branch of
+/// `pane_actions` cannot bind a local `sid_for_close` clone inline. Extracting
+/// the button into a function takes the clone as a parameter instead, keeping
+/// the call site a single expression.
+///
+/// ## Mouse handling
+///
+/// `onmousedown` calls ONLY `e.stop_propagation()` — it does NOT call
+/// `e.prevent_default()`. In webkit (macOS wry), calling `prevent_default` on
+/// mousedown blocks the subsequent `click` event, leaving the button
+/// unresponsive. This is the same lesson learned from the empty-pane button
+/// fix. `stop_propagation` alone is enough to prevent the title bar's
+/// `onmousedown` (which starts a tab drag) from firing.
+///
+/// `onclick` also calls `e.stop_propagation()` so the pane div's `onclick`
+/// (which changes focus) doesn't fire after the session is already closed —
+/// the close action should be atomic.
+fn occupied_pane_title_actions(
+    mut state: Signal<AppState>,
+    mut input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    session_id: String,
+) -> Element {
+    let sid_for_close = session_id.clone();
+    rsx! {
+        div {
+            style: "display: inline-flex; align-items: center; gap: 4px; margin-left: 6px;",
+            button {
+                style: "height: 18px; min-width: 24px; padding: 0 6px; border: 1px solid #414868; border-radius: 3px; background: #24283b; color: #f7768e; cursor: pointer; font-size: 13px; line-height: 16px; transition: background 0.12s ease, color 0.12s ease;",
+                title: "关闭此窗格的会话（Cmd+W / Ctrl+Shift+W 亦可）",
+                onmousedown: move |e: MouseEvent| {
+                    e.stop_propagation();
+                },
+                onclick: move |e: MouseEvent| {
+                    e.stop_propagation();
+                    close_session(
+                        &mut state.write(),
+                        &mut input_senders.write(),
+                        &sid_for_close,
+                    );
+                    restore_focus_to_active_session(state, 50);
+                },
+                "✕"
             }
         }
     }
@@ -2775,8 +2854,14 @@ fn multi_pane_container(
             let is_focused = focused_pane.as_ref().is_some_and(|focused| {
                 focused.layout_owner_tab_id == layout_owner_tab_id && focused.pane_idx == idx
             });
+            // Border + glow — drag-over state gets a THICKER border AND a
+            // box-shadow ring so the target pane pops in multi-pane layouts
+            // (the user explicitly asked for "高亮这个窗格提示用户"). The
+            // 2px border alone was too subtle on large panes; the outer glow
+            // is what makes the highlight visible at any size.
             let border = if is_drag_over {
-                "border: 2px solid #7aa2f7; box-sizing: border-box;"
+                "border: 3px solid #7aa2f7; box-sizing: border-box; \
+                 box-shadow: 0 0 0 1px rgba(122,162,247,0.55), 0 0 18px rgba(122,162,247,0.55);"
             } else if is_focused {
                 "border: 2px solid #bb9af7; box-sizing: border-box;"
             } else if layout_floating {
@@ -2800,8 +2885,12 @@ fn multi_pane_container(
             //                      explicitly asked for "高亮会话的小框").
             //   drag-over #7aa2f7 — bright blue accent; unambiguous drop
             //                      target, mirrors the splitter hover color.
+            //                      A 1px inner ring + drop shadow makes the
+            //                      title bar glow so the drop target is
+            //                      unmistakable even on dim displays.
             let title_chrome = if is_drag_over {
-                "background: #7aa2f7; border-bottom: 2px solid #bb9af7;"
+                "background: #7aa2f7; border-bottom: 2px solid #bb9af7; \
+                 box-shadow: inset 0 0 0 1px rgba(187,154,247,0.6), 0 2px 10px rgba(122,162,247,0.55);"
             } else if is_focused {
                 "background: linear-gradient(180deg, #565f89 0%, #414868 100%); \
                  border-bottom: 2px solid #7aa2f7; \
@@ -2896,7 +2985,7 @@ fn multi_pane_container(
                     copy_source,
                 )
             } else {
-                rsx! {}
+                occupied_pane_title_actions(state, input_senders, sid.clone())
             };
             (
                 idx,
@@ -3391,6 +3480,26 @@ fn multi_pane_container(
                     // looked like "the window can't be filled".
                     div {
                         style: "flex: 1; position: relative; overflow: hidden; min-height: 0;",
+                        // Pane-level drag-over tint: a faint blue wash across
+                        // the WHOLE content area that says "this is the drop
+                        // pane". This is distinct from the 4-quadrant
+                        // overlay below — that one says "this HALF of the
+                        // pane is where the split will land". The tint sits
+                        // under the overlay (z 5 vs z 20) and the terminal
+                        // content (z 0) so it never obscures the text.
+                        // `pointer-events: none` so it doesn't intercept drops.
+                        //
+                        // NOTE: `drag_over_region.is_some()` is the loop-body
+                        // equivalent of the `is_drag_over` flag computed in
+                        // the `pane_items` map closure — both are `Some` iff
+                        // `drag_over_pane` points at THIS pane.
+                        {drag_over_region.is_some().then(|| rsx! {
+                            div {
+                                style: "position: absolute; inset: 0; \
+                                 background: rgba(122,162,247,0.08); \
+                                 pointer-events: none; z-index: 5;"
+                            }
+                        })}
                         // Drop hint overlay: translucent blue rectangle on
                         // the target half plus the SINGLE center line that
                         // marks the dividing axis (the "用中线作为标记"
@@ -6775,6 +6884,100 @@ pub fn App() -> Element {
         }
     });
 
+    // ── Last-window close interception ─────────────────────────────────
+    //
+    // dioxus-desktop 0.7's `handle_close_requested` ALWAYS processes the close
+    // (there is no prevent_default mechanism exposed to wry event handlers).
+    // Our config sets `with_close_behaviour(WindowHides)` so the default action
+    // is to hide the window (not destroy it). This wry handler runs in
+    // `app.tick(event)` BEFORE `handle_close_requested`, so we can decide the
+    // fate of the close here by mutating `close_behaviour` on the DesktopContext:
+    //
+    //   - confirm_close_on_exit == true  → show the dialog. Leave the close
+    //     behaviour as WindowHides so `handle_close_requested` hides the window.
+    //     A `use_future` below watches `close_dialog_visible` and re-shows the
+    //     window (with the dialog now rendered) on the next poll. The dialog's
+    //     "确认" button flips the behaviour to WindowCloses + calls
+    //     `window.close()` to actually exit.
+    //   - confirm_close_on_exit == false → the user previously picked "下次
+    //     关闭时不再询问" + confirmed. Flip the behaviour to WindowCloses HERE
+    //     so `handle_close_requested` (which runs right after us in the same
+    //     event-loop iteration) actually closes the window and exits the app.
+    //
+    // The handler only fires on the OS-level CloseRequested event (close
+    // button, Cmd+Q on macOS with a single window, Alt+F4 on Linux/Windows).
+    // It does NOT fire on `desktop.close()` — that sends `UserWindowEvent::CloseWindow`,
+    // which re-enters `handle_close_requested` directly (as a `UserEvent`, not
+    // a `WindowEvent::CloseRequested`), so there's no infinite dialog loop
+    // when the 确认关闭 button calls `desktop.close()`.
+    let mut state_for_close = state.clone();
+    let desktop_for_close = dioxus::desktop::window();
+    use dioxus::desktop::tao::event::{Event as WryEvent, WindowEvent as WryWindowEvent};
+    use dioxus::desktop::{WindowCloseBehaviour, use_wry_event_handler};
+    use_wry_event_handler(move |event, _| {
+        let WryEvent::WindowEvent {
+            event: WryWindowEvent::CloseRequested,
+            ..
+        } = event
+        else {
+            return;
+        };
+        let s = state_for_close.read();
+        // If the user has already opted out of the confirmation dialog,
+        // flip the close behaviour to WindowCloses so `handle_close_requested`
+        // (which runs right after this handler in the same event-loop tick)
+        // actually destroys the window and exits the app.
+        if !s.confirm_close_on_exit {
+            desktop_for_close.set_close_behavior(WindowCloseBehaviour::WindowCloses);
+            return;
+        }
+        // Otherwise, show the dialog. Leave close_behaviour as WindowHides so
+        // the window is hidden (not destroyed) — the `use_future` below will
+        // re-show it with the dialog rendered.
+        //
+        // We reset the checkbox to its default (checked) each time the dialog
+        // opens so the user can change their mind.
+        drop(s);
+        let mut s = state_for_close.write();
+        s.close_dialog_visible = true;
+        s.close_dialog_dont_ask_again = true;
+    });
+
+    // Re-show the window when the close-confirmation dialog becomes visible.
+    // The wry handler above sets `close_dialog_visible = true`, and dioxus's
+    // `handle_close_requested` then hides the window (because the close
+    // behaviour is WindowHides). This future polls the signal and re-shows
+    // the window so the user can see + interact with the dialog.
+    //
+    // The brief hide→show flicker is unavoidable given dioxus-desktop 0.7's
+    // architecture (the close is always processed; we can't prevent it). The
+    // flicker is one event-loop iteration (~16ms at 60Hz) and is barely
+    // perceptible.
+    let desktop_for_reshow = dioxus::desktop::window();
+    let state_for_reshow = state.clone();
+    let _close_dialog_reshow_future = use_future(move || {
+        let desktop_for_reshow = desktop_for_reshow.clone();
+        let state_for_reshow = state_for_reshow.clone();
+        async move {
+            let mut was_visible = false;
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                let dialog_visible = state_for_reshow.read().close_dialog_visible;
+                if dialog_visible && !was_visible {
+                    // The dialog just became visible. The window was hidden by
+                    // `handle_close_requested` — re-show it so the user can see
+                    // the dialog. set_visible(true) is a no-op if the window is
+                    // already visible (e.g. the close was cancelled before the
+                    // hide took effect).
+                    desktop_for_reshow.set_visible(true);
+                    was_visible = true;
+                } else if !dialog_visible {
+                    was_visible = false;
+                }
+            }
+        }
+    });
+
     // Window state persistence: poll the live window geometry (size, position,
     // maximized) every 250ms and save it to window_state.json when it changes.
     // This is how the app "remembers" the user's preferred window configuration
@@ -6924,6 +7127,7 @@ pub fn App() -> Element {
                                 // settings.json so we know whether to even
                                 // attempt loading `session_state.enc`.
                                 s.restore_disabled = cm.load_restore_disabled();
+                                s.confirm_close_on_exit = cm.load_confirm_close_on_exit();
                                 s.focused_tab_appearance = cm.load_focused_tab_appearance();
                                 s.config_manager = Some(cm);
                                 s.connections = connections;
@@ -7164,10 +7368,17 @@ pub fn App() -> Element {
                 // (1 → 2 → 3 → 4 → …), matching the toolbar's "⊕ Split" button.
                 // This replaces the old preset-cycling behaviour (1 → 2H → 2V → 4
                 // → 8 → 1) per the user's request to not use 2/4/8 jumps.
+                //
+                // If split mode is currently OFF (tab-tiled), this hotkey
+                // first turns it ON (revealing the layout), then appends.
                 if (mods.meta() || mods.ctrl()) && mods.shift() && !mods.alt() {
                     if let Key::Character(ref s) = e.key() {
                         if s.eq_ignore_ascii_case("l") {
                             e.prevent_default();
+                            // Ensure split mode is ON before appending.
+                            if !state.read().split_mode_enabled {
+                                let _ = toggle_split_mode(&mut state.write());
+                            }
                             let new_idx = append_pane_to_active(&mut state.write());
                             tracing::info!(
                                 "[LAYOUT] hotkey appended pane idx={:?}",
@@ -7318,16 +7529,26 @@ pub fn App() -> Element {
                     style: "flex: 1; position: relative; overflow: hidden; min-height: 0; width: 100%; min-width: 0;",
 
                     // Check whether the active tab has a multi-pane layout
-                    // applied. If it does (and isn't zoomed to a single pane),
-                    // we render every pane side-by-side via the multi-pane
-                    // path. Otherwise we fall through to the legacy single-
-                    // session rendering path below.
+                    // applied. If it does (and isn't zoomed to a single pane
+                    // AND split mode is enabled), we render every pane
+                    // side-by-side via the multi-pane path. Otherwise we fall
+                    // through to the legacy single-session rendering path below.
+                    //
+                    // `split_mode_enabled == false` forces the single-pane path
+                    // ("标签页平铺" — tab tiling) even if a multi-pane layout
+                    // exists, by treating the layout as if it were zoomed.
+                    // The toggle_split_mode function handles zooming/unzooming
+                    // the actual layout, but this check is a safety net for
+                    // tab switches (a newly-switched tab's layout may not be
+                    // zoomed yet even when split_mode is globally off).
                     {let active_tab_id = state.read().active_tab.clone();
                     let active_anchor = state.read().active_tab_anchor_session();
+                    let split_mode_on = state.read().split_mode_enabled;
                     let layout_snapshot = active_tab_id.as_ref()
                         .and_then(|tid| state.read().layouts.get(tid).cloned());
                     let is_multi = layout_snapshot.as_ref()
-                        .is_some_and(|l| l.is_multi_pane());
+                        .is_some_and(|l| l.is_multi_pane())
+                        && split_mode_on;
                     match (active_anchor.clone(), is_multi) {
                         (None, _) => rsx! {
                             div {
@@ -7367,9 +7588,35 @@ pub fn App() -> Element {
                             // tab onto the active pane to create a split).
                             // Without the wrapper, drops go nowhere because
                             // `render_terminal_pane` has no drop handlers.
+                            // Determine which session to render in the
+                            // single-pane view. Priority:
+                            // 1. If the layout is zoomed (either by the user's
+                            //    zoom-toggle button or by split_mode OFF),
+                            //    render the zoomed pane's session.
+                            // 2. If split_mode is OFF but no pane is zoomed
+                            //    (e.g. a freshly-switched tab whose layout
+                            //    hasn't been zoomed yet), render the focused
+                            //    pane's session (or pane 0 if no focus).
+                            // 3. Fall back to the active tab's anchor session.
                             let render_sid = layout_snapshot.as_ref()
                                 .and_then(|l| l.zoomed)
                                 .and_then(|idx| layout_snapshot.as_ref()?.panes.get(idx).map(|p| p.session_id.clone()))
+                                .or_else(|| {
+                                    // Split mode OFF but no zoom: show the
+                                    // focused pane's session.
+                                    if !split_mode_on {
+                                        let focused = state.read().focused_pane.clone();
+                                        let active_tid = active_tab_id.clone();
+                                        focused
+                                            .filter(|fp| Some(&fp.layout_owner_tab_id) == active_tid.as_ref())
+                                            .and_then(|fp| {
+                                                layout_snapshot.as_ref()?.panes.get(fp.pane_idx).map(|p| p.session_id.clone())
+                                            })
+                                            .filter(|sid| !sid.is_empty())
+                                    } else {
+                                        None
+                                    }
+                                })
                                 .unwrap_or(sid.clone());
                             single_pane_with_drop(state, input_senders, render_sid, drag_over_pane)
                         }
@@ -7585,44 +7832,97 @@ pub fn App() -> Element {
                             title: "Number of panes in the active tab's layout",
                             { layout_display_label(&state.read()) }
                         }
-                        // "Split" button — appends exactly ONE new pane to the
-                        // active tab's layout (on-demand split, not a preset
-                        // jump). Direction is picked from the layout's shape
-                        // (wide layouts grow a column, tall layouts grow a row).
-                        // The new pane starts EMPTY; the user fills it via the
-                        // empty-pane hint buttons (⧉ copy focused / + sidebar)
-                        // or by dragging a session/sidebar connection into it.
-                        // This is the explicit "create new pane" affordance for
-                        // the "一个新的会话支持多分屏" requirement — each click adds
-                        // exactly one pane, growing 1 → 2 → 3 → 4 → … → MAX_PANES.
+                        // "Split" button — toggles the split-pane mode.
+                        // ON (highlighted): show the multi-pane layout (all panes
+                        // visible side-by-side). If no layout exists yet,
+                        // creates a Split2H (1×2) as the starting point.
+                        // OFF (dimmed): collapse to "标签页平铺" — zoom the
+                        // layout to the focused pane so only one pane is
+                        // visible (all sessions remain accessible via the
+                        // workspace tab bar). The underlying split tree is
+                        // preserved, so toggling back ON restores the exact
+                        // configuration.
+                        //
+                        // When turning ON and no layout exists, this also
+                        // appends one new pane (creating the initial Split2H
+                        // layout) so the user immediately sees a split. The
+                        // new pane starts EMPTY; the user fills it via the
+                        // empty-pane hint buttons (⧉ copy / + sidebar) or
+                        // by dragging a session into it.
                         span {
-                            style: "cursor: pointer; color: #9ece6a; font-size: 11px; user-select: none; border: 1px solid #414868; border-radius: 3px; padding: 1px 6px; line-height: 16px;",
+                            style: if state.read().split_mode_enabled {
+                                "cursor: pointer; color: #9ece6a; font-size: 11px; user-select: none; border: 1px solid #9ece6a; border-radius: 3px; padding: 1px 6px; line-height: 16px; background: rgba(158,206,106,0.15);"
+                            } else {
+                                "cursor: pointer; color: #565f89; font-size: 11px; user-select: none; border: 1px solid #414868; border-radius: 3px; padding: 1px 6px; line-height: 16px;"
+                            },
                             onclick: move |_| {
-                                let new_idx = append_pane_to_active(&mut state.write());
+                                let _on = toggle_split_mode(&mut state.write());
+                                // If just turned ON and no layout existed, the
+                                // toggle is a no-op (returns None or true with
+                                // no panes). In that case, append a pane to
+                                // create the initial Split2H layout.
+                                if state.read().split_mode_enabled {
+                                    let needs_init = state.read()
+                                        .active_tab.as_ref()
+                                        .and_then(|tid| state.read().layouts.get(tid).map(|l| l.panes.len()))
+                                        .map(|len| len <= 1)
+                                        .unwrap_or(true);
+                                    if needs_init {
+                                        let new_idx = append_pane_to_active(&mut state.write());
+                                        tracing::info!(
+                                            "[LAYOUT] split toggle: initialized layout, appended pane idx={:?}",
+                                            new_idx
+                                        );
+                                    }
+                                }
                                 tracing::info!(
-                                    "[LAYOUT] split button: appended pane idx={:?}",
-                                    new_idx
+                                    "[LAYOUT] split toggle: split_mode_enabled={}",
+                                    state.read().split_mode_enabled
                                 );
                                 restore_focus_to_active_session(state, 100);
                             },
-                            title: "Split — append one pane (1 → 2 → 3 → 4 → …)",
+                            title: "Split — toggle multi-pane layout on/off (off = tab tiling)",
                             "⊕ Split"
                         }
-                        // "Distribute" button — fills the active tab's panes
-                        // with all open sessions (in tab order, active first).
+                        // "Distribute" button — toggles the split-pane mode AND
+                        // distributes all open sessions across the panes when
+                        // turning ON. When OFF, collapses to tab tiling (same
+                        // as Split OFF). When ON, fills the active tab's panes
+                        // with all open sessions (in tab order, active first),
+                        // so every pane shows a session instead of being empty.
+                        //
                         // This is the explicit "多个会话放到多个分屏中" affordance:
-                        // a one-click way to populate the current on-demand layout
-                        // after the user has opened several sessions. Sessions beyond
-                        // the pane count remain in `state.sessions` and can be
-                        // placed by growing the layout further.
+                        // a one-click way to populate the layout after opening
+                        // several sessions. Sessions beyond the pane count
+                        // remain in `state.sessions` and can be placed by
+                        // growing the layout further (click Split to append).
                         span {
-                            style: "cursor: pointer; color: #bb9af7; font-size: 11px; user-select: none; border: 1px solid #414868; border-radius: 3px; padding: 1px 6px; line-height: 16px;",
+                            style: if state.read().split_mode_enabled {
+                                "cursor: pointer; color: #bb9af7; font-size: 11px; user-select: none; border: 1px solid #bb9af7; border-radius: 3px; padding: 1px 6px; line-height: 16px; background: rgba(187,154,247,0.15);"
+                            } else {
+                                "cursor: pointer; color: #565f89; font-size: 11px; user-select: none; border: 1px solid #414868; border-radius: 3px; padding: 1px 6px; line-height: 16px;"
+                            },
                             onclick: move |_| {
+                                // If split mode is currently OFF, turn it ON
+                                // first (creates/reveals the layout), then
+                                // distribute sessions.
+                                if !state.read().split_mode_enabled {
+                                    let _ = toggle_split_mode(&mut state.write());
+                                    // If no layout existed, create one.
+                                    let needs_init = state.read()
+                                        .active_tab.as_ref()
+                                        .and_then(|tid| state.read().layouts.get(tid).map(|l| l.panes.len()))
+                                        .map(|len| len <= 1)
+                                        .unwrap_or(true);
+                                    if needs_init {
+                                        append_pane_to_active(&mut state.write());
+                                    }
+                                }
                                 let placed = distribute_sessions_across_panes(&mut state.write());
                                 tracing::info!("[LAYOUT] distribute button: placed {} sessions", placed);
                                 restore_focus_to_active_session(state, 100);
                             },
-                            title: "Distribute — fill panes with all open sessions",
+                            title: "Distribute — toggle split + fill panes with all sessions (off = tab tiling)",
                             "⇶ Distribute"
                         }
                         span {
@@ -7959,6 +8259,82 @@ pub fn App() -> Element {
                     // user's input line stays intact (we never sent the Enter),
                     // so they can edit or backspace.
                     state.write().pending_dangerous_command = None;
+                },
+            }
+        }
+
+        // ── Last-window close confirmation modal ────────────────────────────
+        // Shown when the user closes the last window and `confirm_close_on_exit`
+        // is true (the safe default). The wry event handler above sets
+        // `close_dialog_visible = true`; the reshow `use_future` re-shows the
+        // (hidden-by-dioxus) window so the user can see this dialog.
+        //
+        // Both buttons are always visible ("都要显示给用户选择"):
+        //   取消 (Cancel, primary/default) → hide dialog, keep app running
+        //   确认关闭 (Confirm Close)       → flip close_behaviour to
+        //     WindowCloses + call window.close() to actually exit the app
+        //
+        // The checkbox "下次关闭时不再询问" is checked by default ("默认勾选").
+        // When checked, the user's button choice is persisted via
+        // `confirm_close_on_exit` so next time the close is auto-cancelled
+        // (取消 path) or auto-exits (确认 path) without asking.
+        if state.read().close_dialog_visible {
+            CloseConfirmationDialog {
+                dont_ask_again: state.read().close_dialog_dont_ask_again,
+                on_toggle_dont_ask: move |checked: bool| {
+                    state.write().close_dialog_dont_ask_again = checked;
+                },
+                on_cancel: move |_| {
+                    // 取消: the user doesn't want to close. If the checkbox is
+                    // checked, persist confirm_close_on_exit=false so next
+                    // time the close is auto-cancelled (the close button does
+                    // nothing visible — the window stays open).
+                    let mut s = state.write();
+                    if s.close_dialog_dont_ask_again {
+                        s.confirm_close_on_exit = false;
+                        // Persist the change before clearing the dialog flag
+                        // so we don't lose it if the app exits unexpectedly.
+                        let cm_clone = s.config_manager.clone();
+                        s.close_dialog_visible = false;
+                        drop(s);
+                        if let Some(cm) = cm_clone {
+                            if let Err(e) = cm.save_confirm_close_on_exit(false) {
+                                tracing::error!(
+                                    "Failed to persist confirm_close_on_exit=false (cancel path): {}",
+                                    e
+                                );
+                            }
+                        }
+                    } else {
+                        s.close_dialog_visible = false;
+                    }
+                },
+                on_confirm: move |_| {
+                    // 确认关闭: actually exit. If the checkbox is checked,
+                    // persist confirm_close_on_exit=false so next time the
+                    // close exits immediately without asking.
+                    let (should_persist, cm_clone) = {
+                        let s = state.read();
+                        (s.close_dialog_dont_ask_again, s.config_manager.clone())
+                    };
+                    if should_persist {
+                        if let Some(cm) = cm_clone {
+                            if let Err(e) = cm.save_confirm_close_on_exit(false) {
+                                tracing::error!(
+                                    "Failed to persist confirm_close_on_exit=false (confirm path): {}",
+                                    e
+                                );
+                            }
+                        }
+                        state.write().confirm_close_on_exit = false;
+                    }
+                    state.write().close_dialog_visible = false;
+                    // Flip the close behaviour to WindowCloses and call
+                    // window.close() so handle_close_requested actually destroys
+                    // the window + exits the app (since this is the last window).
+                    let desktop = dioxus::desktop::window();
+                    desktop.set_close_behavior(dioxus::desktop::WindowCloseBehaviour::WindowCloses);
+                    desktop.close();
                 },
             }
         }
@@ -9394,92 +9770,94 @@ mod tab_drag_tests {
         assert_eq!(pane_drop_region_for_cursor(0.1, -0.2), PaneDropRegion::Top);
     }
 
-    /// The overlay must show EXACTLY ONE bright center line for split regions
-    /// (vertical for Left/Right = 横着 placement, horizontal for Top/Bottom =
-    /// 竖着 placement). This is the fix for the "错误的产生多个不需要的
-    /// 四方块" bug — the prior crosshair always drew BOTH lines, forming a
-    /// 田 shape that was ambiguous about the split direction.
+    /// The overlay must show BOTH lines (vertical + horizontal) for every
+    /// region — this is the crosshair / 田字形 grid so the user can drop
+    /// into whichever of the 4 boxes they want. The split direction is
+    /// communicated by the half-rectangle highlight (rendered by the
+    /// caller), not by omitting a line.
     ///
     /// For Center (swap/move zone), BOTH lines are drawn dimmed so the user
     /// can see the swap zone without it dominating the pane.
     #[test]
-    fn center_line_styles_for_region_shows_one_line_per_split_axis() {
-        // Left/Right (horizontal split): vertical line ONLY.
-        let (v, h) = center_line_styles_for_region(PaneDropRegion::Left);
-        assert!(
-            v.is_some(),
-            "Left region must show the vertical divider line"
-        );
-        assert!(h.is_none(), "Left region must NOT show the horizontal line");
-        let (v, h) = center_line_styles_for_region(PaneDropRegion::Right);
-        assert!(
-            v.is_some(),
-            "Right region must show the vertical divider line"
-        );
-        assert!(
-            h.is_none(),
-            "Right region must NOT show the horizontal line"
-        );
-
-        // Top/Bottom (vertical split): horizontal line ONLY.
-        let (v, h) = center_line_styles_for_region(PaneDropRegion::Top);
-        assert!(v.is_none(), "Top region must NOT show the vertical line");
-        assert!(
-            h.is_some(),
-            "Top region must show the horizontal divider line"
-        );
-        let (v, h) = center_line_styles_for_region(PaneDropRegion::Bottom);
-        assert!(v.is_none(), "Bottom region must NOT show the vertical line");
-        assert!(
-            h.is_some(),
-            "Bottom region must show the horizontal divider line"
-        );
-
-        // Center: both lines (dimmed) — the swap zone.
-        let (v, h) = center_line_styles_for_region(PaneDropRegion::Center);
-        assert!(
-            v.is_some(),
-            "Center region must show the (dimmed) vertical line"
-        );
-        assert!(
-            h.is_some(),
-            "Center region must show the (dimmed) horizontal line"
-        );
+    fn center_line_styles_for_region_shows_both_lines() {
+        // Every region must draw BOTH the vertical and horizontal lines.
+        for region in [
+            PaneDropRegion::Left,
+            PaneDropRegion::Right,
+            PaneDropRegion::Top,
+            PaneDropRegion::Bottom,
+            PaneDropRegion::Center,
+        ] {
+            let (v, h) = center_line_styles_for_region(region);
+            assert!(
+                v.is_some(),
+                "{:?} region must show the vertical center line",
+                region
+            );
+            assert!(
+                h.is_some(),
+                "{:?} region must show the horizontal center line",
+                region
+            );
+        }
     }
 
     /// The bright accent lines for split regions must be visually distinct
     /// from the dimmed Center lines (bright = 2px solid #7aa2f7 with glow,
-    /// dimmed = 1px rgba(122,162,247,0.35)). This is what makes the split
-    /// direction immediately readable: a bright line jumps out, a dimmed
-    /// line recedes.
+    /// dimmed = 1px rgba(122,162,247,0.35)). Both lines (vertical +
+    /// horizontal) are bright for splits; both are dimmed for Center. This
+    /// is what makes the split regions jump out and the swap zone recede.
     #[test]
     fn center_line_styles_for_region_uses_bright_line_for_splits_dimmed_for_center() {
-        // Split regions use the bright (2px, full-opacity, glow) line.
-        let (v, _) = center_line_styles_for_region(PaneDropRegion::Left);
-        let v = v.expect("Left region has a vertical line");
-        assert!(
-            v.contains("width: 2px"),
-            "split line must be 2px wide (bright): got {v}"
-        );
-        assert!(
-            v.contains("background: #7aa2f7"),
-            "split line must be full-opacity #7aa2f7: got {v}"
-        );
-        assert!(
-            v.contains("box-shadow"),
-            "split line must have a glow (box-shadow): got {v}"
-        );
-
-        let (_, h) = center_line_styles_for_region(PaneDropRegion::Top);
-        let h = h.expect("Top region has a horizontal line");
-        assert!(
-            h.contains("height: 2px"),
-            "split line must be 2px wide (bright): got {h}"
-        );
-        assert!(
-            h.contains("background: #7aa2f7"),
-            "split line must be full-opacity #7aa2f7: got {h}"
-        );
+        // Split regions: BOTH lines must be bright (2px, full-opacity, glow).
+        // Check all four split regions to guard against accidentally dimming
+        // one axis.
+        for region in [
+            PaneDropRegion::Left,
+            PaneDropRegion::Right,
+            PaneDropRegion::Top,
+            PaneDropRegion::Bottom,
+        ] {
+            let (v, h) = center_line_styles_for_region(region);
+            let v = v.expect("split region must have a bright vertical line");
+            let h = h.expect("split region must have a bright horizontal line");
+            assert!(
+                v.contains("width: 2px"),
+                "{:?} split vertical must be 2px wide (bright): got {}",
+                region,
+                v
+            );
+            assert!(
+                v.contains("background: #7aa2f7"),
+                "{:?} split vertical must be full-opacity #7aa2f7: got {}",
+                region,
+                v
+            );
+            assert!(
+                v.contains("box-shadow"),
+                "{:?} split vertical must have a glow (box-shadow): got {}",
+                region,
+                v
+            );
+            assert!(
+                h.contains("height: 2px"),
+                "{:?} split horizontal must be 2px wide (bright): got {}",
+                region,
+                h
+            );
+            assert!(
+                h.contains("background: #7aa2f7"),
+                "{:?} split horizontal must be full-opacity #7aa2f7: got {}",
+                region,
+                h
+            );
+            assert!(
+                h.contains("box-shadow"),
+                "{:?} split horizontal must have a glow (box-shadow): got {}",
+                region,
+                h
+            );
+        }
 
         // Center uses the dimmed (1px, 35% opacity, no glow) lines.
         let (v, h) = center_line_styles_for_region(PaneDropRegion::Center);
@@ -9487,27 +9865,33 @@ mod tab_drag_tests {
         let h = h.expect("Center region has a (dimmed) horizontal line");
         assert!(
             v.contains("width: 1px"),
-            "center line must be 1px wide (dimmed): got {v}"
+            "center vertical must be 1px wide (dimmed): got {}",
+            v
         );
         assert!(
             v.contains("rgba(122,162,247,0.35)"),
-            "center line must be 35% opacity: got {v}"
+            "center vertical must be 35% opacity: got {}",
+            v
         );
         assert!(
             !v.contains("box-shadow"),
-            "center line must NOT have a glow: got {v}"
+            "center vertical must NOT have a glow: got {}",
+            v
         );
         assert!(
             h.contains("height: 1px"),
-            "center line must be 1px wide (dimmed): got {h}"
+            "center horizontal must be 1px wide (dimmed): got {}",
+            h
         );
         assert!(
             h.contains("rgba(122,162,247,0.35)"),
-            "center line must be 35% opacity: got {h}"
+            "center horizontal must be 35% opacity: got {}",
+            h
         );
         assert!(
             !h.contains("box-shadow"),
-            "center line must NOT have a glow: got {h}"
+            "center horizontal must NOT have a glow: got {}",
+            h
         );
     }
 

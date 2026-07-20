@@ -93,17 +93,21 @@ fn main() {
 
     let macos_icon = generate_macos_icon(&tree, out_dir);
 
-    println!(
-        "cargo:warning=Generated app icon PNG: {} ({} bytes)",
+    // Use `eprintln!` (stderr) instead of `cargo:warning=` so the messages
+    // still appear in `cargo run` / `cargo build` output but are NOT classified
+    // as warnings. `cargo:warning=` lines would clutter the build summary with
+    // spurious "warning:" entries for what is purely informational status.
+    eprintln!(
+        "[rusterm-app] generated app icon PNG: {} ({} bytes)",
         png_path.display(),
         png.len()
     );
-    println!(
-        "cargo:warning=Embedded app icon SVG: {} ({} bytes)",
+    eprintln!(
+        "[rusterm-app] embedded app icon SVG: {} ({} bytes)",
         svg_out_path.display(),
         svg.len()
     );
     if let Some(path) = macos_icon {
-        println!("cargo:warning=Generated macOS app icon: {}", path.display());
+        eprintln!("[rusterm-app] generated macOS app icon: {}", path.display());
     }
 }

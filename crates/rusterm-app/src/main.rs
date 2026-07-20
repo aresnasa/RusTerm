@@ -133,7 +133,19 @@ html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#
     let mut cfg = dioxus::desktop::Config::new()
         .with_window(window)
         .with_background_color((26, 27, 38, 255))
-        .with_custom_head(head_html);
+        .with_custom_head(head_html)
+        // Close behaviour: the window HIDES (not closes) when the user clicks
+        // the close button. This lets the App component intercept the
+        // `CloseRequested` wry event via `use_wry_event_handler` and show the
+        // "是否确实要关闭本软件？" confirmation dialog. The dialog's "确认"
+        // button flips the close behaviour to `WindowCloses` (via
+        // `DesktopContext::set_close_behavior`) and calls `window.close()` to
+        // actually exit; "取消" just hides the dialog (the window has already
+        // been hidden by dioxus, so a `use_future` re-shows it). When the user
+        // has previously unchecked "下次关闭时不再询问" + picked "确认", the
+        // wry handler flips the behaviour to `WindowCloses` directly so the
+        // app exits without showing the dialog.
+        .with_close_behaviour(dioxus::desktop::WindowCloseBehaviour::WindowHides);
 
     // Window icon. The PNG embedded below is rasterized at build time
     // from `assets/gemini-svg.svg` by `build.rs` (using resvg/usvg/tiny-skia).

@@ -231,6 +231,18 @@ pub struct AppState {
     /// the default Single state).
     #[serde(skip)]
     pub layout_preset: LayoutPreset,
+    /// Whether the split-pane layout is visible (ON) or collapsed into a
+    /// single-pane tab-tiled view (OFF). When OFF, the active tab's
+    /// `PaneLayout` is temporarily zoomed to the focused pane (or pane 0),
+    /// so `is_multi_pane()` returns false and the rendering path takes
+    /// the `single_pane_with_drop` branch — all sessions remain accessible
+    /// via the workspace tab bar. The underlying layout is preserved, so
+    /// toggling back ON restores the exact split configuration.
+    ///
+    /// This is the "标签页平铺" affordance: close split → single pane +
+    /// tabs; open split → multi-pane grid. Default true (split visible).
+    #[serde(skip)]
+    pub split_mode_enabled: bool,
 
     // ── Session-state restore (feature #17) ─────────────────────────────
     //
@@ -250,6 +262,25 @@ pub struct AppState {
     /// choice survives across launches. The user can re-enable via the
     /// settings panel (future work).
     pub restore_disabled: bool,
+    /// Whether to show the "是否确实要关闭本软件？" confirmation dialog when
+    /// the user closes the last window. Default true (safe default — always
+    /// ask). Persisted in `settings.json` so the user's choice on the
+    /// dialog's "下次关闭时不再询问" checkbox survives across launches.
+    /// Loaded from settings on unlock (see the unlock handler in `app.rs`).
+    pub confirm_close_on_exit: bool,
+    /// Whether the close-confirmation dialog is currently visible. This is a
+    /// transient UI flag (not persisted) — it's set by the `CloseRequested`
+    /// wry event handler and cleared by the dialog's "取消" / "确认" buttons.
+    #[serde(skip)]
+    pub close_dialog_visible: bool,
+    /// The checkbox state on the close-confirmation dialog. Default true
+    /// ("下次关闭时不再询问" is checked by default — the user wants to be
+    /// asked again next time). When the user confirms or cancels, this value
+    /// is applied: if checked, `confirm_close_on_exit` is set to false (don't
+    /// ask again) and persisted; if unchecked, `confirm_close_on_exit` stays
+    /// true (ask again next time).
+    #[serde(skip)]
+    pub close_dialog_dont_ask_again: bool,
 
     // ── Dangerous-command protection (feature #17 part 2) ──────────────
     //
@@ -387,8 +418,12 @@ impl Default for AppState {
             layouts: HashMap::new(),
             focused_pane: None,
             layout_preset: LayoutPreset::default(),
+            split_mode_enabled: true,
             restore_pending: None,
             restore_disabled: false,
+            confirm_close_on_exit: true,
+            close_dialog_visible: false,
+            close_dialog_dont_ask_again: true,
             pending_dangerous_command: None,
             safety_checker: rusterm_core::CommandSafetyChecker::new(),
         }
@@ -665,6 +700,58 @@ pub fn toggle_comparison_mode(state: &mut AppState) -> Option<bool> {
     let active_id = state.active_tab.clone()?;
     let layout = state.layouts.get_mut(&active_id)?;
     Some(layout.toggle_comparison())
+}
+
+/// Toggle the split-pane mode for the active tab.
+///
+/// When turning OFF: zooms the layout to the focused pane (or pane 0 if no
+/// pane has focus), so `is_multi_pane()` returns false and the rendering
+/// path takes the single-pane branch ("标签页平铺" — all sessions remain
+/// accessible via the workspace tab bar). The underlying split tree is
+/// preserved, so toggling back ON restores the exact configuration.
+///
+/// When turning ON: unzooms (clears `layout.zoomed`), restoring the
+/// multi-pane grid view.
+///
+/// Returns the new state (`true` = split visible, `false` = tab-tiled).
+/// Returns `None` only if there's no active tab. If there's no layout yet
+/// (Single preset), the toggle still flips `split_mode_enabled` but is
+/// visually a no-op until the caller creates a layout (e.g. via
+/// `append_pane_to_active`).
+pub fn toggle_split_mode(state: &mut AppState) -> Option<bool> {
+    let active_id = state.active_tab.clone()?;
+    let Some(layout) = state.layouts.get_mut(&active_id) else {
+        // No layout exists yet — just flip the flag. The caller (Split
+        // button) will create a layout via `append_pane_to_active` if
+        // needed. There's nothing to zoom/unzoom.
+        state.split_mode_enabled = !state.split_mode_enabled;
+        return Some(state.split_mode_enabled);
+    };
+    // Only meaningful for multi-pane layouts. A Single-preset layout has
+    // nothing to collapse.
+    if layout.panes.len() <= 1 {
+        state.split_mode_enabled = true;
+        return Some(true);
+    }
+    state.split_mode_enabled = !state.split_mode_enabled;
+    if state.split_mode_enabled {
+        // Turning ON: clear zoom to reveal all panes.
+        layout.unzoom();
+    } else {
+        // Turning OFF: zoom to the focused pane (or pane 0) so only one
+        // pane is visible. This makes `is_multi_pane()` return false,
+        // routing the render through `single_pane_with_drop`.
+        let focused_idx = state
+            .focused_pane
+            .as_ref()
+            .filter(|fp| fp.layout_owner_tab_id == active_id)
+            .map(|fp| fp.pane_idx)
+            .unwrap_or(0);
+        // Clamp to valid range (defensive: focused_pane might be stale).
+        let zoom_idx = focused_idx.min(layout.panes.len().saturating_sub(1));
+        layout.zoom(zoom_idx);
+    }
+    Some(state.split_mode_enabled)
 }
 
 /// Resize a column splitter in the active tab's layout by a fractional
@@ -2414,6 +2501,86 @@ mod tests {
         let mut state = state_with_active_session(&["alpha"]);
         // No layout — comparison toggle has nothing to act on.
         assert_eq!(toggle_comparison_mode(&mut state), None);
+    }
+
+    #[test]
+    fn toggle_split_mode_off_zooms_focused_pane() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        assert!(state.split_mode_enabled);
+        assert!(state.layouts.get("alpha").unwrap().is_multi_pane());
+        // Toggle OFF → should zoom to pane 0 and make is_multi_pane false.
+        let on = toggle_split_mode(&mut state);
+        assert_eq!(on, Some(false));
+        assert!(!state.split_mode_enabled);
+        assert!(!state.layouts.get("alpha").unwrap().is_multi_pane());
+        assert_eq!(state.layouts.get("alpha").unwrap().zoomed, Some(0));
+    }
+
+    #[test]
+    fn toggle_split_mode_on_unzooms_layout() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        // Turn OFF first.
+        toggle_split_mode(&mut state);
+        assert!(!state.split_mode_enabled);
+        assert!(state.layouts.get("alpha").unwrap().zoomed.is_some());
+        // Turn ON → should unzoom and restore multi-pane view.
+        let on = toggle_split_mode(&mut state);
+        assert_eq!(on, Some(true));
+        assert!(state.split_mode_enabled);
+        assert!(state.layouts.get("alpha").unwrap().is_multi_pane());
+        assert!(state.layouts.get("alpha").unwrap().zoomed.is_none());
+    }
+
+    #[test]
+    fn toggle_split_mode_with_no_layout_still_flips_flag() {
+        let mut state = state_with_active_session(&["alpha"]);
+        // No layout exists — toggle should still flip split_mode_enabled.
+        assert!(state.split_mode_enabled);
+        let on = toggle_split_mode(&mut state);
+        assert_eq!(on, Some(false));
+        assert!(!state.split_mode_enabled);
+    }
+
+    #[test]
+    fn toggle_split_mode_off_uses_focused_pane_idx() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma", "delta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Grid4);
+        // Set focused pane to pane 2.
+        state.focused_pane = Some(FocusedPane {
+            layout_owner_tab_id: "alpha".to_string(),
+            pane_idx: 2,
+        });
+        // Toggle OFF → should zoom to pane 2 (the focused pane).
+        toggle_split_mode(&mut state);
+        assert_eq!(state.layouts.get("alpha").unwrap().zoomed, Some(2));
+    }
+
+    #[test]
+    fn toggle_split_mode_off_preserves_layout_tree() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        // Resize the splitter so the layout is non-default (0.5 → 0.7).
+        resize_layout_split(&mut state, 0, 0.2);
+        let pane0_width_before = state
+            .layouts
+            .get("alpha")
+            .unwrap()
+            .pane_rect(0, 1000.0, 800.0)
+            .map(|r| r.2)
+            .unwrap();
+        // Toggle OFF then ON — the layout tree + ratios should be intact.
+        toggle_split_mode(&mut state);
+        toggle_split_mode(&mut state);
+        let pane0_width_after = state
+            .layouts
+            .get("alpha")
+            .unwrap()
+            .pane_rect(0, 1000.0, 800.0)
+            .map(|r| r.2)
+            .unwrap();
+        assert!((pane0_width_before - pane0_width_after).abs() < 1e-9);
     }
 
     #[test]

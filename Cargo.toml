@@ -106,3 +106,13 @@ rusterm-proto = { path = "crates/rusterm-proto" }
 rusterm-ui = { path = "crates/rusterm-ui" }
 rusterm-history = { path = "crates/rusterm-history" }
 rusterm-sync = { path = "crates/rusterm-sync" }
+
+# Patched transitive deps
+# `block v0.1.6` (pulled in by `cocoa` via `dioxus-desktop`) declares an
+# uninhabited `static _NSConcreteStackBlock: Class;` which triggers Rust's
+# future-incompat lint (issue #74840). The upstream crate has been
+# unmaintained since 2018, so we vendor a minimal fix: replace the empty
+# `enum Class { }` with a zero-sized inhabited struct. The type is only used
+# as `*const Class` for pointer identity, so this is semantically a no-op.
+[patch.crates-io]
+block = { path = "third_party/block" }

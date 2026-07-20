@@ -1,4 +1,5 @@
 pub mod ai_panel;
+pub mod close_confirmation_dialog;
 pub mod connection_dialog;
 pub mod dangerous_command_dialog;
 pub mod master_password_dialog;
@@ -12,6 +13,7 @@ pub mod tab_bar;
 pub mod terminal_view;
 
 pub use ai_panel::AiPanel;
+pub use close_confirmation_dialog::CloseConfirmationDialog;
 pub use connection_dialog::ConnectionDialog;
 pub use dangerous_command_dialog::DangerousCommandDialog;
 pub use master_password_dialog::MasterPasswordDialog;

@@ -261,6 +261,7 @@ impl ConfigManager {
             onekeys: existing.onekeys,
             master_password_hash: self.master_password_hash.clone(),
             restore_disabled: existing.restore_disabled,
+            confirm_close_on_exit: existing.confirm_close_on_exit,
             focused_tab_appearance: appearance.normalized(),
         };
 
@@ -286,6 +287,40 @@ impl ConfigManager {
             onekeys: existing.onekeys,
             master_password_hash: self.master_password_hash.clone(),
             restore_disabled,
+            confirm_close_on_exit: existing.confirm_close_on_exit,
+            focused_tab_appearance: existing.focused_tab_appearance,
+        };
+
+        let json =
+            serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
+
+        let temp_path = self.config_path.with_extension("json.tmp");
+        fs::write(&temp_path, &json).context("Failed to write config file")?;
+        fs::rename(&temp_path, &self.config_path).context("Failed to rename temp config file")?;
+
+        Ok(())
+    }
+
+    /// Read the `confirm_close_on_exit` flag from settings.json. Used on unlock
+    /// to decide whether to show the "是否确实要关闭本软件？" dialog when the
+    /// user closes the last window. Defaults to true (safe default — always
+    /// ask) for older settings files that predate the field.
+    pub fn load_confirm_close_on_exit(&self) -> bool {
+        self.read_persisted().confirm_close_on_exit
+    }
+
+    /// Persist the `confirm_close_on_exit` flag to settings.json. Used when the
+    /// user toggles the "下次关闭时不再询问" checkbox on the close-confirmation
+    /// dialog. Preserves existing connections + OneKeys (read-modify-write).
+    pub fn save_confirm_close_on_exit(&self, confirm_close_on_exit: bool) -> Result<()> {
+        let existing = self.read_persisted();
+        let persisted = PersistedConfig {
+            version: CONFIG_VERSION,
+            connections: existing.connections,
+            onekeys: existing.onekeys,
+            master_password_hash: self.master_password_hash.clone(),
+            restore_disabled: existing.restore_disabled,
+            confirm_close_on_exit,
             focused_tab_appearance: existing.focused_tab_appearance,
         };
 
@@ -356,6 +391,7 @@ impl ConfigManager {
             onekeys: existing.onekeys,
             master_password_hash: self.master_password_hash.clone(),
             restore_disabled: existing.restore_disabled,
+            confirm_close_on_exit: existing.confirm_close_on_exit,
             focused_tab_appearance: existing.focused_tab_appearance,
         };
 
@@ -378,6 +414,7 @@ impl ConfigManager {
                 onekeys: vec![],
                 master_password_hash: None,
                 restore_disabled: false,
+                confirm_close_on_exit: true,
                 focused_tab_appearance: FocusedTabAppearance::default(),
             };
         }
@@ -390,6 +427,7 @@ impl ConfigManager {
                 onekeys: vec![],
                 master_password_hash: None,
                 restore_disabled: false,
+                confirm_close_on_exit: true,
                 focused_tab_appearance: FocusedTabAppearance::default(),
             })
     }
@@ -406,6 +444,7 @@ impl ConfigManager {
                 .collect::<Result<Vec<_>>>()?,
             master_password_hash: self.master_password_hash.clone(),
             restore_disabled: existing.restore_disabled,
+            confirm_close_on_exit: existing.confirm_close_on_exit,
             focused_tab_appearance: existing.focused_tab_appearance,
         };
 
@@ -641,6 +680,35 @@ mod tests {
 
         assert_eq!(cm.load_focused_tab_appearance(), appearance);
         assert!(cm.load_restore_disabled());
+    }
+
+    #[test]
+    fn confirm_close_on_exit_defaults_to_true_and_roundtrips() {
+        let (cm, _dir) = test_config_manager();
+        // Default must be true (safe default — always ask) for a brand-new
+        // settings file that has never set the field.
+        assert!(
+            cm.load_confirm_close_on_exit(),
+            "confirm_close_on_exit must default to true"
+        );
+
+        // Saving other fields must NOT clobber confirm_close_on_exit.
+        cm.save_confirm_close_on_exit(false).unwrap();
+        assert!(!cm.load_confirm_close_on_exit());
+
+        cm.save_connections(&[]).unwrap();
+        cm.save_onekeys(&[]).unwrap();
+        cm.save_restore_disabled(true).unwrap();
+        cm.save_focused_tab_appearance(FocusedTabAppearance::default())
+            .unwrap();
+        assert!(
+            !cm.load_confirm_close_on_exit(),
+            "confirm_close_on_exit must survive other saves"
+        );
+
+        // And flipping it back to true also roundtrips.
+        cm.save_confirm_close_on_exit(true).unwrap();
+        assert!(cm.load_confirm_close_on_exit());
     }
 
     #[test]
