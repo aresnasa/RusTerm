@@ -2946,6 +2946,7 @@ fn multi_pane_container(
         String,
         String,
         &'static str,
+        &'static str,
     )> = visible
         .into_iter()
         .map(|(idx, sid, rect)| {
@@ -2957,6 +2958,24 @@ fn multi_pane_container(
                 drag_over.and_then(|(i, r)| if i == idx { Some(r) } else { None })
             } else {
                 None
+            };
+            // Read `tab_drag` ONCE here — this subscribes `App` to the
+            // drag start/end signal so the dim appears/disappears the
+            // instant a drag begins or ends. `is_dragging` is true for
+            // ALL panes (it's the global drag state, not per-pane).
+            //
+            // The "虚化" effect: when a drag is active, ALL panes EXCEPT
+            // the hovered drop target get dimmed (opacity 0.35) so the
+            // hovered pane "pops" as the final focus target. The title
+            // bar is NOT dimmed (applied only to the content area div)
+            // so the ✕ / + / copy buttons stay fully readable + clickable.
+            // Using opacity only (not `filter: blur()`) to avoid the GPU
+            // cost of per-frame blur during 60Hz drag polling.
+            let is_dragging = tab_drag().is_some();
+            let content_dim_style = if is_dragging && !is_drag_over {
+                "opacity: 0.35;"
+            } else {
+                ""
             };
             let is_focused = focused_pane.as_ref().is_some_and(|focused| {
                 focused.layout_owner_tab_id == layout_owner_tab_id && focused.pane_idx == idx
@@ -3116,6 +3135,7 @@ fn multi_pane_container(
                 layout_owner_tab_id.clone(),
                 layout_owner_tab_id.clone(),
                 accent_color,
+                content_dim_style,
             )
         })
         .collect();
@@ -3232,7 +3252,7 @@ fn multi_pane_container(
             // when the dragged pane actually changes. This aligns with the
             // user's frequency-vs-feedback preference: fewer re-renders over
             // per-tick feedback.
-            for (idx, session_id, (x, y, w, h), drop_session_id, border_style, drag_over_region, title_chrome, pane_title, drag_sid, z_index, window_chrome, pane_actions, pane_owner_for_click, pane_owner_for_title, accent_color) in pane_items.into_iter() {
+            for (idx, session_id, (x, y, w, h), drop_session_id, border_style, drag_over_region, title_chrome, pane_title, drag_sid, z_index, window_chrome, pane_actions, pane_owner_for_click, pane_owner_for_title, accent_color, content_dim_style) in pane_items.into_iter() {
                 div {
                     key: "pane-{idx}-{session_id}",
                     style: format!(
@@ -3592,7 +3612,16 @@ fn multi_pane_container(
                     // hint instead of nothing — an invisible dead region
                     // looked like "the window can't be filled".
                     div {
-                        style: "flex: 1; position: relative; overflow: hidden; min-height: 0;",
+                        style: "flex: 1; position: relative; overflow: hidden; min-height: 0; {content_dim_style}",
+                        // NOTE: `content_dim_style` applies `opacity: 0.35`
+                        // to this content area (NOT the title bar above)
+                        // when a drag is active and THIS pane is not the
+                        // hovered drop target. This is the "虚化显示"
+                        // effect — all panes dim during drag so the
+                        // hovered pane (full opacity + 3px blue border +
+                        // glow) stands out as the final focus target.
+                        // The title bar stays at full opacity so its
+                        // ✕ / + / copy buttons remain readable + clickable.
                         // Pane-level drag-over tint: a faint blue wash across
                         // the WHOLE content area that says "this is the drop
                         // pane". This is distinct from the 4-quadrant
