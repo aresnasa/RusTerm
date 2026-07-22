@@ -947,20 +947,20 @@ fn single_pane_with_drop(
     // would intercept the drop event and the pane's `ondrop` would never
     // fire.
     //
-    // Visual scheme (single center line, NOT the "田" 4-block shape):
-    //   Left / Right  → VERTICAL center line (divides left from right;
-    //                  tells the user the new pane will sit beside the
-    //                  existing one — a 横着 / horizontal arrangement).
-    //   Top  / Bottom → HORIZONTAL center line (divides top from bottom;
-    //                  tells the user the new pane will stack above/below
-    //                  — a 竖着 / vertical arrangement).
+    // Visual scheme (per-axis brightness, BOTH lines always drawn so the
+    // 4-quadrant grid stays visible — "先显示横线和竖线，让客户放到期望的
+    // 框中"):
+    //   Left / Right  → vertical line BRIGHT (the split axis: left|right
+    //                  = 横着 / horizontal placement), horizontal line DIM.
+    //   Top  / Bottom → horizontal line BRIGHT (the split axis: top|bottom
+    //                  = 竖着 / vertical placement), vertical line DIM.
     //   Center        → both lines dimmed (swap/move zone, no split).
     //
-    // Showing only ONE line (instead of both) is the fix for the
-    // "错误的产生多个不需要的四方块" bug — the prior crosshair always
-    // drew both lines, forming a 田 shape that was ambiguous about which
-    // direction the split would go, and visually stacked with the
-    // half-rectangle highlight into a confusing 4-quadrant mosaic.
+    // The bright line is the "中线" that tells the user the split direction;
+    // the dim line frames the orthogonal box edge so all 4 drop boxes stay
+    // visible. This replaces the prior ambiguous "both bright = 田 shape"
+    // scheme (which didn't communicate direction) and the even-older
+    // "single line only" scheme (which hid the 4-box grid).
     let drop_overlay = if is_drag_over {
         let half_overlay_style = match region {
             Some(PaneDropRegion::Top) => Some(
@@ -982,8 +982,9 @@ fn single_pane_with_drop(
             // Center = swap/move zone — no half overlay.
             Some(PaneDropRegion::Center) | None => None,
         };
-        // Pick the SINGLE center line ("中线") matching the split axis.
-        // See `center_line_styles_for_region` for the visual scheme.
+        // Both center lines are drawn (one BRIGHT = split axis, one DIM =
+        // orthogonal box edge). See `center_line_styles_for_region` for the
+        // per-region brightness scheme.
         let (vertical_line, horizontal_line) = match region {
             Some(r) => center_line_styles_for_region(r),
             None => center_line_styles_for_region(PaneDropRegion::Center),
@@ -991,9 +992,10 @@ fn single_pane_with_drop(
         Some(rsx! {
             // Highlighted target half (only for split regions).
             {half_overlay_style.map(|style| rsx! { div { style: "{style}" } })}
-            // The single relevant center line ("中线"). Only one is
-            // shown for split regions — this is what tells the user
-            // 横着 (horizontal, left/right) vs 竖着 (vertical, top/bottom).
+            // The bright center line ("中线") marks the split axis; the dim
+            // line frames the orthogonal box edge. The bright line tells the
+            // user 横着 (vertical line bright = left/right split) vs 竖着
+            // (horizontal line bright = top/bottom split).
             {vertical_line.map(|style| rsx! { div { style: "{style}" } })}
             {horizontal_line.map(|style| rsx! { div { style: "{style}" } })}
         })
@@ -2077,11 +2079,29 @@ pub(crate) fn pane_drop_region_for_cursor(
 /// Extracted as a pure function so the overlay decision can be unit-tested
 /// without a dioxus runtime, and so `single_pane_with_drop` and
 /// `multi_pane_container` share the SAME line-selection logic.
+///
+/// Visual scheme ("用中线作为标记" + "提示用户是横着还是竖着" + "先显示
+/// 横线和竖线，让客户放到期望的框中"):
+///   - BOTH lines are always drawn so the user can see the 4-quadrant
+///     grid and aim into any box.
+///   - The line matching the split axis is BRIGHT (2px, full opacity,
+///     glow) — this is the "中线" that tells the user 横着 (Left/Right →
+///     vertical center line divides left from right) vs 竖着 (Top/Bottom
+///     → horizontal center line divides top from bottom).
+///   - The orthogonal line is DIM (1px, 35% opacity) — still visible so
+///     the 4 boxes are framed, but clearly secondary so it doesn't
+///     overpower the split-direction signal.
+///   - Center: both lines dim (swap/move zone, no split direction).
+///
+/// This replaces the prior "both bright for all split regions" scheme,
+/// which formed an ambiguous 田 shape that didn't tell the user which
+/// direction the split would actually go.
 pub(crate) fn center_line_styles_for_region(
     region: PaneDropRegion,
 ) -> (Option<&'static str>, Option<&'static str>) {
-    // The bright accent lines (2px, full opacity, glow) are used for split
-    // regions; the dimmed lines (1px, 35% opacity) are used for Center.
+    // The bright accent line (2px, full opacity, glow) marks the split
+    // axis; the dimmed line (1px, 35% opacity) frames the orthogonal box
+    // edge so all 4 quadrants stay visible.
     const VERTICAL_BRIGHT: &str = "position: absolute; left: 50%; top: 0; width: 2px; height: 100%; \
          background: #7aa2f7; pointer-events: none; z-index: 21; \
          transform: translateX(-1px); box-shadow: 0 0 6px rgba(122,162,247,0.5);";
@@ -2094,22 +2114,21 @@ pub(crate) fn center_line_styles_for_region(
     const HORIZONTAL_DIM: &str = "position: absolute; left: 0; top: 50%; width: 100%; height: 1px; \
          background: rgba(122,162,247,0.35); pointer-events: none; z-index: 21; \
          transform: translateY(-0.5px);";
-    // "用中线作为标记" UX (crosshair / 田字形): ALL regions draw BOTH the
-    // vertical and horizontal center lines so the user can see the four-
-    // quadrant grid and drop into whichever box they want.
-    //
-    // Split regions (Left/Right/Top/Bottom/Center): BOTH lines bright (2px,
-    // full-opacity #7aa2f7 + glow). The half-rectangle highlight (rendered by
-    // the caller) shows which side of the split will receive the new pane, so
-    // the crosshair itself doesn't need to encode the split direction — both
-    // lines are always drawn so the user can aim into any of the 4 boxes.
-    // Center (swap/move zone): both lines dimmed (1px, 35% opacity) so the
-    // swap zone is visible without dominating the pane.
+    // Per-region line selection:
+    //   Left / Right  → vertical line BRIGHT (the split axis: left|right),
+    //                   horizontal line dim (frames the top/bottom boxes).
+    //                   This signals 横着 / horizontal placement.
+    //   Top / Bottom  → horizontal line BRIGHT (the split axis: top|bottom),
+    //                   vertical line dim (frames the left/right boxes).
+    //                   This signals 竖着 / vertical placement.
+    //   Center        → both dim (swap zone, no split direction).
     match region {
-        PaneDropRegion::Left
-        | PaneDropRegion::Right
-        | PaneDropRegion::Top
-        | PaneDropRegion::Bottom => (Some(VERTICAL_BRIGHT), Some(HORIZONTAL_BRIGHT)),
+        PaneDropRegion::Left | PaneDropRegion::Right => {
+            (Some(VERTICAL_BRIGHT), Some(HORIZONTAL_DIM))
+        }
+        PaneDropRegion::Top | PaneDropRegion::Bottom => {
+            (Some(VERTICAL_DIM), Some(HORIZONTAL_BRIGHT))
+        }
         PaneDropRegion::Center => (Some(VERTICAL_DIM), Some(HORIZONTAL_DIM)),
     }
 }
@@ -3517,15 +3536,31 @@ fn multi_pane_container(
                                     &pane_owner_for_title,
                                     idx,
                                 );
-                                // Stop the browser from starting a native
-                                // text-selection drag on this mousedown
-                                // (prevents page text getting highlighted
-                                // while dragging the pane title bar).
-                                e.prevent_default();
-                                e.stop_propagation();
+                                // Empty drop-zone pane: do NOT call
+                                // prevent_default — on some webview backends
+                                // (macOS webkit via wry) prevent_default on
+                                // mousedown cancels the subsequent click
+                                // event, leaving the title bar's ✕ / + / ⧉
+                                // buttons dead ("空白窗格右上角的按钮点击
+                                // 无反应"). stop_propagation is still safe
+                                // (it only blocks bubbling to ancestors, not
+                                // the click on the button itself). We return
+                                // early so no drag starts on an empty pane.
                                 if drag_sid.is_empty() {
+                                    e.stop_propagation();
                                     return;
                                 }
+                                // Occupied pane: prevent_default stops the
+                                // browser from starting a native text-
+                                // selection drag while dragging the pane
+                                // title bar. Now that we know a real drag is
+                                // possible this is safe — the title bar's
+                                // buttons are on OCCUPIED panes only, and
+                                // those buttons still call stop_propagation
+                                // on their own mousedown to shield
+                                // themselves.
+                                e.prevent_default();
+                                e.stop_propagation();
                                 let c = e.client_coordinates();
                                 // Look up the session's display name for
                                 // the ghost element. Falls back to the
@@ -3675,9 +3710,10 @@ fn multi_pane_container(
                                 PaneDropRegion::Right => "position: absolute; left: 50%; top: 0; width: 50%; height: 100%; background: rgba(122,162,247,0.18); pointer-events: none; z-index: 20;",
                                 PaneDropRegion::Center => "",
                             };
-                            // Pick the SINGLE center line ("中线") matching the
-                            // split axis. See `center_line_styles_for_region`
-                            // for the visual scheme.
+                            // Both center lines are drawn (one BRIGHT =
+                            // split axis, one DIM = orthogonal box edge).
+                            // See `center_line_styles_for_region` for the
+                            // per-region brightness scheme.
                             let (vertical_line, horizontal_line) =
                                 center_line_styles_for_region(region);
                             rsx! {
@@ -3685,10 +3721,11 @@ fn multi_pane_container(
                                 {(!matches!(region, PaneDropRegion::Center)).then(|| rsx! {
                                     div { style: "{half_style}" }
                                 })}
-                                // The single relevant center line ("中线").
-                                // Only one is shown for split regions — this
-                                // is what tells the user 横着 (left/right)
-                                // vs 竖着 (top/bottom) placement.
+                                // The bright center line ("中线") marks the
+                                // split axis; the dim line frames the
+                                // orthogonal box edge. The bright line tells
+                                // the user 横着 (vertical bright = left/right)
+                                // vs 竖着 (horizontal bright = top/bottom).
                                 {vertical_line.map(|style| rsx! { div { style: "{style}" } })}
                                 {horizontal_line.map(|style| rsx! { div { style: "{style}" } })}
                             }
@@ -8162,12 +8199,23 @@ pub fn App() -> Element {
                                 "cursor: pointer; color: #565f89; font-size: 11px; user-select: none; border: 1px solid #414868; border-radius: 3px; padding: 1px 6px; line-height: 16px;"
                             },
                             onclick: move |_| {
-                                // If split mode is currently OFF, turn it ON
-                                // first (creates/reveals the layout), then
-                                // distribute sessions.
-                                if !state.read().split_mode_enabled {
+                                // Toggle behaviour matching the Split button:
+                                //   - If OFF → turn ON, init layout if needed,
+                                //     then distribute sessions across panes.
+                                //   - If ON  → turn OFF (collapse to tab
+                                //     tiling, same as Split OFF). The layout
+                                //     tree is preserved so toggling back ON
+                                //     restores it.
+                                // This is the explicit "split 和 distribute
+                                // 模式都要支持开启和关闭" contract.
+                                if state.read().split_mode_enabled {
                                     let _ = toggle_split_mode(&mut state.write());
-                                    // If no layout existed, create one.
+                                    tracing::info!(
+                                        "[LAYOUT] distribute toggle: split_mode_enabled={} (collapsed to tab tiling)",
+                                        state.read().split_mode_enabled
+                                    );
+                                } else {
+                                    let _ = toggle_split_mode(&mut state.write());
                                     let needs_init = state.read()
                                         .active_tab.as_ref()
                                         .and_then(|tid| state.read().layouts.get(tid).map(|l| l.panes.len()))
@@ -8176,9 +8224,13 @@ pub fn App() -> Element {
                                     if needs_init {
                                         append_pane_to_active(&mut state.write());
                                     }
+                                    let placed = distribute_sessions_across_panes(&mut state.write());
+                                    tracing::info!(
+                                        "[LAYOUT] distribute toggle: split_mode_enabled={} placed {} sessions",
+                                        state.read().split_mode_enabled,
+                                        placed
+                                    );
                                 }
-                                let placed = distribute_sessions_across_panes(&mut state.write());
-                                tracing::info!("[LAYOUT] distribute button: placed {} sessions", placed);
                                 restore_focus_to_active_session(state, 100);
                             },
                             title: "Distribute — toggle split + fill panes with all sessions (off = tab tiling)",
@@ -10031,9 +10083,9 @@ mod tab_drag_tests {
 
     /// The overlay must show BOTH lines (vertical + horizontal) for every
     /// region — this is the crosshair / 田字形 grid so the user can drop
-    /// into whichever of the 4 boxes they want. The split direction is
-    /// communicated by the half-rectangle highlight (rendered by the
-    /// caller), not by omitting a line.
+    /// into whichever of the 4 boxes they want ("先显示横线和竖线，让客户
+    /// 放到期望的框中"). The split direction is communicated by which line
+    /// is BRIGHT vs DIM (see the next test), not by omitting a line.
     ///
     /// For Center (swap/move zone), BOTH lines are drawn dimmed so the user
     /// can see the swap zone without it dominating the pane.
@@ -10061,60 +10113,102 @@ mod tab_drag_tests {
         }
     }
 
-    /// The bright accent lines for split regions must be visually distinct
-    /// from the dimmed Center lines (bright = 2px solid #7aa2f7 with glow,
-    /// dimmed = 1px rgba(122,162,247,0.35)). Both lines (vertical +
-    /// horizontal) are bright for splits; both are dimmed for Center. This
-    /// is what makes the split regions jump out and the swap zone recede.
+    /// Per-region line brightness encodes the split direction
+    /// ("提示用户是横着还是竖着摆放会话"):
+    ///   Left / Right  → vertical line BRIGHT (the split axis: left|right
+    ///                   = 横着 / horizontal placement), horizontal DIM.
+    ///   Top  / Bottom → horizontal line BRIGHT (the split axis: top|bottom
+    ///                   = 竖着 / vertical placement), vertical DIM.
+    ///   Center        → both DIM (swap zone, no split direction).
+    ///
+    /// Both lines are always present (framing the 4 boxes), but exactly ONE
+    /// is bright for split regions — this replaces the prior ambiguous
+    /// "both bright = 田 shape" scheme that didn't communicate direction.
     #[test]
     fn center_line_styles_for_region_uses_bright_line_for_splits_dimmed_for_center() {
-        // Split regions: BOTH lines must be bright (2px, full-opacity, glow).
-        // Check all four split regions to guard against accidentally dimming
-        // one axis.
-        for region in [
-            PaneDropRegion::Left,
-            PaneDropRegion::Right,
-            PaneDropRegion::Top,
-            PaneDropRegion::Bottom,
-        ] {
+        // Left / Right: vertical BRIGHT, horizontal DIM.
+        for region in [PaneDropRegion::Left, PaneDropRegion::Right] {
             let (v, h) = center_line_styles_for_region(region);
-            let v = v.expect("split region must have a bright vertical line");
-            let h = h.expect("split region must have a bright horizontal line");
+            let v = v.expect("Left/Right must have a vertical line (BRIGHT)");
+            let h = h.expect("Left/Right must have a horizontal line (DIM)");
             assert!(
                 v.contains("width: 2px"),
-                "{:?} split vertical must be 2px wide (bright): got {}",
+                "{:?} vertical must be 2px (bright): got {}",
                 region,
                 v
             );
             assert!(
                 v.contains("background: #7aa2f7"),
-                "{:?} split vertical must be full-opacity #7aa2f7: got {}",
+                "{:?} vertical must be full-opacity #7aa2f7: got {}",
                 region,
                 v
             );
             assert!(
                 v.contains("box-shadow"),
-                "{:?} split vertical must have a glow (box-shadow): got {}",
+                "{:?} vertical must have a glow: got {}",
                 region,
                 v
             );
             assert!(
+                h.contains("height: 1px"),
+                "{:?} horizontal must be 1px (dim): got {}",
+                region,
+                h
+            );
+            assert!(
+                h.contains("rgba(122,162,247,0.35)"),
+                "{:?} horizontal must be 35% opacity (dim): got {}",
+                region,
+                h
+            );
+            assert!(
+                !h.contains("box-shadow"),
+                "{:?} horizontal must NOT have a glow: got {}",
+                region,
+                h
+            );
+        }
+
+        // Top / Bottom: horizontal BRIGHT, vertical DIM.
+        for region in [PaneDropRegion::Top, PaneDropRegion::Bottom] {
+            let (v, h) = center_line_styles_for_region(region);
+            let v = v.expect("Top/Bottom must have a vertical line (DIM)");
+            let h = h.expect("Top/Bottom must have a horizontal line (BRIGHT)");
+            assert!(
                 h.contains("height: 2px"),
-                "{:?} split horizontal must be 2px wide (bright): got {}",
+                "{:?} horizontal must be 2px (bright): got {}",
                 region,
                 h
             );
             assert!(
                 h.contains("background: #7aa2f7"),
-                "{:?} split horizontal must be full-opacity #7aa2f7: got {}",
+                "{:?} horizontal must be full-opacity #7aa2f7: got {}",
                 region,
                 h
             );
             assert!(
                 h.contains("box-shadow"),
-                "{:?} split horizontal must have a glow (box-shadow): got {}",
+                "{:?} horizontal must have a glow: got {}",
                 region,
                 h
+            );
+            assert!(
+                v.contains("width: 1px"),
+                "{:?} vertical must be 1px (dim): got {}",
+                region,
+                v
+            );
+            assert!(
+                v.contains("rgba(122,162,247,0.35)"),
+                "{:?} vertical must be 35% opacity (dim): got {}",
+                region,
+                v
+            );
+            assert!(
+                !v.contains("box-shadow"),
+                "{:?} vertical must NOT have a glow: got {}",
+                region,
+                v
             );
         }
 
