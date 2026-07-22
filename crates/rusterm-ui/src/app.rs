@@ -1885,15 +1885,28 @@ pub(crate) fn parse_tab_drag_poll_response(s: &str) -> Option<(f64, f64, bool, f
 /// from the JS globals set by `install_tab_drag_js_listeners`. Returns
 /// `None` if the globals aren't set (defensive against a stale
 /// `tab_drag` signal after the listeners were already removed).
+///
+/// The container `left`/`top` are re-measured via
+/// `getBoundingClientRect` on EVERY poll (not just at install time) so
+/// the hit-test stays correct if the container shifts mid-drag — e.g.
+/// the sidebar opens/closes, the window is resized, or the tab bar
+/// reflows. The install-time capture in `build_install_tab_drag_script`
+/// is kept as a fallback for the very first poll (before this re-measure
+/// lands) but is overwritten here on every subsequent tick.
 async fn poll_tab_drag_state() -> Option<(f64, f64, bool, f64, f64)> {
     let result = dioxus::document::eval(
         "return (function() {\n\
             var pos = window.__rusterm_tab_drag_pos || '';\n\
             if (!pos) return '';\n\
             var done = window.__rusterm_tab_drag_done ? '1' : '0';\n\
-            var left = window.__rusterm_tab_drag_container_left || 0;\n\
-            var top = window.__rusterm_tab_drag_container_top || 0;\n\
-            return pos + ',' + done + ',' + left + ',' + top;\n\
+            // Re-measure the container offset on every poll so the hit-test\n\
+            // stays correct if the container shifts mid-drag (sidebar\n\
+            // toggle, window resize, tab bar reflow). The install-time\n\
+            // capture is only used on the very first poll before this\n\
+            // re-measure lands.\n\
+            var el = document.getElementById('terminal-content');\n\
+            var r = el ? el.getBoundingClientRect() : { left: window.__rusterm_tab_drag_container_left || 0, top: window.__rusterm_tab_drag_container_top || 0 };\n\
+            return pos + ',' + done + ',' + r.left + ',' + r.top;\n\
         })()",
     )
     .await

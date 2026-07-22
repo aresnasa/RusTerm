@@ -1174,7 +1174,46 @@ pub fn close_pane(
         return ClosePaneOutcome::OutOfRange;
     }
     if pane_count <= 1 {
-        return ClosePaneOutcome::SinglePane;
+        // Last pane in the layout. The user clicked ✕ on the only
+        // remaining pane — they want it gone. Close the pane's session
+        // (which tears down the session's resources and, if it was the
+        // tab's anchor with no other sessions, removes the whole tab +
+        // layout via `close_session`'s existing tab-removal path). If the
+        // pane was empty (no session), just remove the layout directly so
+        // the tab doesn't dangle with a 1-pane empty layout.
+        //
+        // This fixes the "空窗口关闭逻辑没有正确的关闭" report: the prior
+        // code returned `SinglePane` and did NOTHING, so the ✕ button on
+        // the last pane was a no-op and the user couldn't close it.
+        if let Some(sid) = removed_session_id.as_deref().filter(|s| !s.is_empty()) {
+            close_session(state, input_senders, sid);
+            // close_session may have removed the whole tab (anchor closed
+            // + no other sessions). If the tab survived (anchor was
+            // promoted), the layout still has 1 pane — clear it so the
+            // tab is back to the pre-layout single-pane state.
+            if state.layouts.contains_key(layout_owner_tab_id) {
+                state.layouts.remove(layout_owner_tab_id);
+            }
+            // Clear any focused_pane that pointed into this tab.
+            if state
+                .focused_pane
+                .as_ref()
+                .is_some_and(|fp| fp.layout_owner_tab_id == layout_owner_tab_id)
+            {
+                state.focused_pane = None;
+            }
+        } else {
+            // Empty last pane — just remove the layout.
+            state.layouts.remove(layout_owner_tab_id);
+            if state
+                .focused_pane
+                .as_ref()
+                .is_some_and(|fp| fp.layout_owner_tab_id == layout_owner_tab_id)
+            {
+                state.focused_pane = None;
+            }
+        }
+        return ClosePaneOutcome::TabClosed;
     }
 
     // If the pane has a session, tear down its resources first. This also
@@ -3335,6 +3374,50 @@ mod tests {
         let outcome = close_pane(&mut state, &mut senders, "alpha", new_idx);
         assert_eq!(outcome, ClosePaneOutcome::Removed);
         assert_eq!(state.layouts.get("alpha").unwrap().panes.len(), before);
+    }
+
+    #[test]
+    fn close_pane_on_last_pane_with_session_closes_tab() {
+        // Closing the ✕ on the only remaining pane should close the session
+        // and remove the layout (effectively closing the tab). This is the
+        // fix for the "空窗口关闭逻辑没有正确的关闭" report: the prior code
+        // returned `SinglePane` and did nothing.
+        let (mut state, mut senders) = state_with_senders(&["alpha"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        // Close pane 1 first (back to 1 pane with alpha).
+        let _ = close_pane(&mut state, &mut senders, "alpha", 1);
+        assert_eq!(state.layouts.get("alpha").unwrap().panes.len(), 1);
+
+        // Now close the last pane (pane 0, holding alpha).
+        let outcome = close_pane(&mut state, &mut senders, "alpha", 0);
+        assert_eq!(outcome, ClosePaneOutcome::TabClosed);
+        // Layout is gone.
+        assert!(!state.layouts.contains_key("alpha"));
+        // Session is gone.
+        assert!(state.terminals.get("alpha").is_none());
+        assert!(!senders.contains_key("alpha"));
+        // focused_pane is cleared.
+        assert!(state.focused_pane.is_none());
+    }
+
+    #[test]
+    fn close_pane_on_last_empty_pane_removes_layout() {
+        // Closing the ✕ on the only remaining EMPTY pane should remove the
+        // layout without trying to close a session (there is none).
+        let (mut state, mut senders) = state_with_senders(&["alpha"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        // Move alpha out of pane 0 so pane 0 is empty, then close pane 1.
+        // Easier: just close pane 1 (which holds alpha after Split2H), then
+        // we have 1 pane (pane 0, empty). Closing pane 0 should remove the
+        // layout.
+        // Actually Split2H puts alpha in pane 0 and empty in pane 1. Close
+        // pane 1 (empty) first → 1 pane (alpha). Then close pane 0 (alpha).
+        let _ = close_pane(&mut state, &mut senders, "alpha", 1);
+        assert_eq!(state.layouts.get("alpha").unwrap().panes.len(), 1);
+        // Close the last pane (alpha).
+        let outcome = close_pane(&mut state, &mut senders, "alpha", 0);
+        assert_eq!(outcome, ClosePaneOutcome::TabClosed);
+        assert!(!state.layouts.contains_key("alpha"));
     }
 
     #[test]
