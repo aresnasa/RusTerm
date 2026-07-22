@@ -1854,16 +1854,20 @@ pub fn execute_tab_drop_on_pane_at(
     target_pane_session: &str,
     direction: SplitDirection,
 ) -> TabDropOutcome {
-    // Self-drop means "clone this session into one additional pane". Runtime
-    // connection creation stays in app.rs; this function reserves one slot.
+    // Self-drop (dropping a pane's session back onto its OWN pane) is a
+    // no-op. The prior behaviour cloned the session into a new pane, but
+    // that was the root cause of the "错误的产生多个不需要的四方块" bug:
+    // every time the user released a pane-title drag over the same pane
+    // (a very easy accidental drop), a clone + new pane appeared. Users
+    // reported they "没法正确的拖动窗口" because the layout kept growing
+    // unintentionally. Drop-back-on-self now does nothing — to duplicate
+    // a session the user should drag from the sidebar.
+    //
+    // We deliberately ignore `direction` here: no matter which drop zone
+    // (Center/Left/Right/Top/Bottom) the cursor was in when released over
+    // the source pane, the intent is "put it back".
     if dragged_sid == target_pane_session {
-        let Some(first_pane_idx) = split_pane_to_active(state, target_pane_idx, direction) else {
-            return TabDropOutcome::NoOpSelfDrop;
-        };
-        return TabDropOutcome::SelfDropExpanded {
-            first_pane_idx,
-            pane_count: 1,
-        };
+        return TabDropOutcome::NoOpSelfDrop;
     }
 
     let src_pane = pane_index_for_active_session(state, dragged_sid);
@@ -4601,31 +4605,27 @@ mod tests {
     // mouse-based tab-drag finisher rely on.
     // ------------------------------------------------------------------
 
-    /// A self-drop reserves exactly one pane for one independent cloned session.
+    /// A self-drop (dropping a pane's session back onto its own pane) is a
+    /// no-op: no clone, no new pane. This is the fix for the
+    /// "错误的产生多个不需要的四方块" bug where accidental self-drops kept
+    /// growing the layout with cloned sessions.
     #[test]
-    fn execute_tab_drop_self_drop_multi_pane_requests_one_cloned_session() {
+    fn execute_tab_drop_self_drop_multi_pane_is_noop() {
         let mut state = state_with_active_session(&["alpha", "beta"]);
         apply_layout_preset(&mut state, LayoutPreset::Split2H);
 
         let outcome = execute_tab_drop_on_pane(&mut state, "alpha", 0, "alpha");
 
-        assert_eq!(
-            outcome,
-            TabDropOutcome::SelfDropExpanded {
-                first_pane_idx: 2,
-                pane_count: 1,
-            }
-        );
+        assert_eq!(outcome, TabDropOutcome::NoOpSelfDrop);
         let layout = state.layouts.get("alpha").unwrap();
-        assert_eq!(layout.panes.len(), 3);
+        assert_eq!(layout.panes.len(), 2);
         assert_eq!(layout.panes[0].session_id, "alpha");
         assert_eq!(layout.panes[1].session_id, "beta");
-        assert_eq!(layout.panes[2].session_id, "");
         assert_eq!(state.active_session.as_deref(), Some("alpha"));
     }
 
     #[test]
-    fn self_drop_growth_preserves_existing_floating_window_positions() {
+    fn self_drop_is_noop_and_preserves_existing_floating_window_positions() {
         let mut state = state_with_active_session(&["alpha", "beta"]);
         apply_layout_preset(&mut state, LayoutPreset::Split2H);
         assert!(begin_floating_pane_move(&mut state, 0));
@@ -4636,22 +4636,16 @@ mod tests {
 
         let outcome = execute_tab_drop_on_pane(&mut state, "alpha", 0, "alpha");
 
-        assert_eq!(
-            outcome,
-            TabDropOutcome::SelfDropExpanded {
-                first_pane_idx: 2,
-                pane_count: 1,
-            }
-        );
-        assert_eq!(state.layouts["alpha"].panes.len(), 3);
+        assert_eq!(outcome, TabDropOutcome::NoOpSelfDrop);
+        assert_eq!(state.layouts["alpha"].panes.len(), 2);
         assert_eq!(state.layouts["alpha"].panes[0].floating, before);
         assert!(state.layouts["alpha"].is_floating());
     }
 
-    /// Existing background tabs must not be silently reused for a self-drop; the
-    /// one new pane is reserved for a fresh clone of the dragged session.
+    /// A self-drop is a no-op regardless of how many background tabs exist —
+    /// no pane is reserved, no background tab is touched.
     #[test]
-    fn execute_tab_drop_self_drop_does_not_reuse_background_tabs() {
+    fn execute_tab_drop_self_drop_does_not_touch_background_tabs() {
         let mut state = state_with_active_session(&["alpha", "beta", "gamma", "delta"]);
         state.layouts.insert(
             "alpha".to_string(),
@@ -4663,89 +4657,57 @@ mod tests {
 
         let outcome = execute_tab_drop_on_pane(&mut state, "alpha", 0, "alpha");
 
-        assert_eq!(
-            outcome,
-            TabDropOutcome::SelfDropExpanded {
-                first_pane_idx: 2,
-                pane_count: 1,
-            }
-        );
+        assert_eq!(outcome, TabDropOutcome::NoOpSelfDrop);
         let layout = state.layouts.get("alpha").unwrap();
-        assert_eq!(layout.panes.len(), 3);
+        assert_eq!(layout.panes.len(), 2);
         assert_eq!(layout.panes[0].session_id, "alpha");
         assert_eq!(layout.panes[1].session_id, "beta");
-        assert_eq!(layout.panes[2].session_id, "");
     }
 
-    /// Repeated self-drops grow 1→2→3→…→MAX_PANES, exactly one pane per
-    /// operation, and then no-op at the real cap.
+    /// Repeated self-drops are all no-ops: the layout never grows from a
+    /// self-drop. (Previously it grew 1→2→…→MAX_PANES; that was the bug.)
     #[test]
-    fn execute_tab_drop_repeated_self_drops_add_one_until_max() {
+    fn execute_tab_drop_repeated_self_drops_are_all_noops() {
         let mut state = state_with_active_session(&["alpha"]);
 
-        for expected_count in 2..=MAX_PANES {
+        for _ in 0..(MAX_PANES + 2) {
             assert_eq!(
                 execute_tab_drop_on_pane(&mut state, "alpha", 0, "alpha"),
-                TabDropOutcome::SelfDropExpanded {
-                    first_pane_idx: expected_count - 1,
-                    pane_count: 1,
-                }
+                TabDropOutcome::NoOpSelfDrop
             );
-            let layout = state.layouts.get("alpha").unwrap();
-            assert_eq!(layout.panes.len(), expected_count);
-            assert_eq!(layout.visible_panes(1000.0, 800.0).count(), expected_count);
         }
-
-        assert_eq!(
-            execute_tab_drop_on_pane(&mut state, "alpha", 0, "alpha"),
-            TabDropOutcome::NoOpSelfDrop
-        );
-        assert_eq!(state.layouts["alpha"].panes.len(), MAX_PANES);
-        assert_eq!(state.layouts["alpha"].panes[0].session_id, "alpha");
+        // Layout was never created (single-pane default), or if it existed
+        // it still has exactly one pane.
+        if let Some(layout) = state.layouts.get("alpha") {
+            assert_eq!(layout.panes.len(), 1);
+            assert_eq!(layout.panes[0].session_id, "alpha");
+        }
         assert_eq!(state.active_session.as_deref(), Some("alpha"));
     }
 
-    /// Dragging the active tab into its own single-pane view reserves pane 1
-    /// for a newly cloned runtime session, even when other tabs exist.
+    /// Dragging the active tab into its own single-pane view is a no-op —
+    /// no clone, no new pane, even when other tabs exist.
     #[test]
-    fn execute_tab_drop_active_tab_self_drop_single_pane_requests_clone() {
+    fn execute_tab_drop_active_tab_self_drop_single_pane_is_noop() {
         let mut state = state_with_active_session(&["alpha", "beta"]);
         assert!(!state.layouts.contains_key("alpha"));
 
         let outcome = execute_tab_drop_on_pane(&mut state, "alpha", 0, "alpha");
 
-        assert_eq!(
-            outcome,
-            TabDropOutcome::SelfDropExpanded {
-                first_pane_idx: 1,
-                pane_count: 1,
-            }
-        );
-        let layout = state.layouts.get("alpha").unwrap();
-        assert_eq!(layout.panes.len(), 2);
-        assert_eq!(layout.panes[0].session_id, "alpha");
-        assert_eq!(layout.panes[1].session_id, "");
+        assert_eq!(outcome, TabDropOutcome::NoOpSelfDrop);
+        assert!(!state.layouts.contains_key("alpha"));
         assert_eq!(state.active_session.as_deref(), Some("alpha"));
     }
 
     #[test]
-    fn execute_tab_drop_active_tab_self_drop_only_tab_requests_clone() {
+    fn execute_tab_drop_active_tab_self_drop_only_tab_is_noop() {
         let mut state = state_with_active_session(&["alpha"]);
         assert!(!state.layouts.contains_key("alpha"));
 
         let outcome = execute_tab_drop_on_pane(&mut state, "alpha", 0, "alpha");
 
-        assert_eq!(
-            outcome,
-            TabDropOutcome::SelfDropExpanded {
-                first_pane_idx: 1,
-                pane_count: 1,
-            }
-        );
-        let layout = state.layouts.get("alpha").unwrap();
-        assert_eq!(layout.panes.len(), 2);
-        assert_eq!(layout.panes[0].session_id, "alpha");
-        assert_eq!(layout.panes[1].session_id, "");
+        assert_eq!(outcome, TabDropOutcome::NoOpSelfDrop);
+        assert!(!state.layouts.contains_key("alpha"));
     }
 
     /// Pane-to-pane swap: dragging one pane's session onto another pane
@@ -4919,20 +4881,22 @@ mod tests {
         assert_eq!(state.layouts["alpha"].panes.len(), MAX_PANES);
     }
 
-    /// Runtime clone creation may trigger unrelated state updates between
-    /// reserving a pane and assigning the new session. Explicit ownership
-    /// keeps that one clone in the layout that requested it.
+    /// `set_pane_session_for_layout` writes the session id into the requested
+    /// pane of the requested layout, regardless of which session is active.
+    /// This is the contract `open_cloned_sessions_for_self_drop` (now unused
+    /// by the self-drop path, but retained for future explicit-clone flows)
+    /// and sidebar-drop replacement rely on.
     #[test]
-    fn explicit_layout_target_fills_self_drop_slot_after_active_tab_changes() {
+    fn explicit_layout_target_writes_session_into_requested_pane() {
         let mut state = state_with_active_session(&["alpha", "beta"]);
         apply_layout_preset(&mut state, LayoutPreset::Split2H);
-        assert_eq!(
-            execute_tab_drop_on_pane(&mut state, "alpha", 0, "alpha"),
-            TabDropOutcome::SelfDropExpanded {
-                first_pane_idx: 2,
-                pane_count: 1,
-            }
-        );
+        // Grow to 3 panes so pane 2 exists.
+        state
+            .layouts
+            .get_mut("alpha")
+            .unwrap()
+            .append_pane(true)
+            .expect("grow to 3");
 
         state.active_session = Some("beta".to_string());
         assert!(set_pane_session_for_layout(
