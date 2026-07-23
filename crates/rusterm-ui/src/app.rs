@@ -2996,7 +2996,15 @@ fn multi_pane_container(
             } else {
                 ""
             };
-            let is_focused = focused_pane.as_ref().is_some_and(|focused| {
+            // In Compare mode, ALL panes get the focused visual treatment
+            // (no single focus) — the user explicitly asked for "所有窗口都要
+            // 高亮了，不用焦点了". When Compare is OFF, single-pane focus
+            // behavior is preserved (only the pane matching focused_pane is
+            // highlighted). Note: `is_drag_over` still takes precedence over
+            // `is_focused` in the border/title_chrome chains below, so during
+            // a drag the drop-target pane shows the blue drag style rather
+            // than the focused purple style.
+            let is_focused = comparison_on || focused_pane.as_ref().is_some_and(|focused| {
                 focused.layout_owner_tab_id == layout_owner_tab_id && focused.pane_idx == idx
             });
             // Border + glow — drag-over state gets a THICKER border AND a
