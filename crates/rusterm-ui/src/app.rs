@@ -2133,6 +2133,50 @@ pub(crate) fn center_line_styles_for_region(
     }
 }
 
+/// Decide whether a pane's terminal content area should be dimmed
+/// (opacity 0.35) during a drag.
+///
+/// This is the "虚化显示" effect: when a drag is active, all panes
+/// EXCEPT the hovered drop target get dimmed so the hovered pane
+/// "pops" as the final focus target. The dim is applied only to the
+/// content area (NOT the title bar) so the ✕ / + / copy buttons stay
+/// fully readable + clickable.
+///
+/// # Compare-mode override
+///
+/// When `comparison_on` is true, the dim is suppressed entirely — every
+/// pane renders its terminal text at full brightness so the user can
+/// visually diff outputs across panes (the user explicitly asked for
+/// "compare 模式的其他窗口字符需要和焦点窗口的一致，不要用暗色"). The
+/// drag-over pane is still distinguishable via its blue border + title
+/// chrome (those styles are gated on `is_drag_over`, NOT on this dim
+/// toggle, so they take precedence regardless).
+///
+/// Extracted as a pure function so the decision can be unit-tested
+/// without a dioxus runtime, mirroring `center_line_styles_for_region`.
+///
+/// # Arguments
+/// * `is_dragging` — global drag state (true for ALL panes while a drag
+///   is active, not per-pane).
+/// * `is_drag_over` — true iff THIS pane is the hovered drop target.
+/// * `comparison_on` — true iff compare mode is toggled on for the
+///   active tab's layout.
+///
+/// # Returns
+/// A CSS style string — `"opacity: 0.35;"` to dim, `""` for full
+/// brightness.
+pub(crate) fn pane_content_dim_style(
+    is_dragging: bool,
+    is_drag_over: bool,
+    comparison_on: bool,
+) -> &'static str {
+    if is_dragging && !is_drag_over && !comparison_on {
+        "opacity: 0.35;"
+    } else {
+        ""
+    }
+}
+
 /// Start a tab drag: set the `tab_drag` signal (with `dragging: false` —
 /// the polling loop promotes it to `true` once the cursor crosses the
 /// threshold) and install the document-level JS listeners.
@@ -2991,11 +3035,21 @@ fn multi_pane_container(
             // Using opacity only (not `filter: blur()`) to avoid the GPU
             // cost of per-frame blur during 60Hz drag polling.
             let is_dragging = tab_drag().is_some();
-            let content_dim_style = if is_dragging && !is_drag_over {
-                "opacity: 0.35;"
-            } else {
-                ""
-            };
+            // Compare mode short-circuit: when comparison is ON, ALL panes
+            // are equally important (the user wants to see every pane's
+            // output at full brightness to diff them). So we skip the
+            // drag-time "虚化" dim even on non-drop-target panes — this
+            // is the text-content counterpart to the `is_focused =
+            // comparison_on || ...` fix already applied to borders /
+            // title chrome in commit 690f1c8. The drag-over pane's blue
+            // border + glow still take precedence visually (handled by
+            // the `is_drag_over` branch of `border` below), so the drop
+            // target remains unmistakable.
+            let content_dim_style = pane_content_dim_style(
+                is_dragging,
+                is_drag_over,
+                comparison_on,
+            );
             // In Compare mode, ALL panes get the focused visual treatment
             // (no single focus) — the user explicitly asked for "所有窗口都要
             // 高亮了，不用焦点了". When Compare is OFF, single-pane focus
@@ -3658,13 +3712,22 @@ fn multi_pane_container(
                         style: "flex: 1; position: relative; overflow: hidden; min-height: 0; {content_dim_style}",
                         // NOTE: `content_dim_style` applies `opacity: 0.35`
                         // to this content area (NOT the title bar above)
-                        // when a drag is active and THIS pane is not the
-                        // hovered drop target. This is the "虚化显示"
-                        // effect — all panes dim during drag so the
-                        // hovered pane (full opacity + 3px blue border +
-                        // glow) stands out as the final focus target.
-                        // The title bar stays at full opacity so its
-                        // ✕ / + / copy buttons remain readable + clickable.
+                        // when a drag is active, THIS pane is not the
+                        // hovered drop target, AND comparison mode is OFF.
+                        // This is the "虚化显示" effect — all panes dim
+                        // during drag so the hovered pane (full opacity +
+                        // 3px blue border + glow) stands out as the final
+                        // focus target. The title bar stays at full opacity
+                        // so its ✕ / + / copy buttons remain readable +
+                        // clickable.
+                        //
+                        // Compare-mode override: when `comparison_on` is
+                        // true, the dim is suppressed entirely — every
+                        // pane renders its terminal text at full brightness
+                        // so the user can visually diff outputs across
+                        // panes. The drag-over pane is still distinguishable
+                        // via its blue border + title chrome (those styles
+                        // are NOT affected by this dim toggle).
                         // Pane-level drag-over tint: a faint blue wash across
                         // the WHOLE content area that says "this is the drop
                         // pane". This is distinct from the 4-quadrant
@@ -9641,7 +9704,8 @@ mod tab_drag_tests {
     use super::{
         PaneDropRegion, TAB_DRAG_THRESHOLD, build_install_tab_drag_script,
         center_line_styles_for_region, hit_test_pane_at, hit_test_pane_drop_target_at,
-        pane_drop_region_for_cursor, parse_tab_drag_poll_response, tab_drag_threshold_exceeded,
+        pane_content_dim_style, pane_drop_region_for_cursor, parse_tab_drag_poll_response,
+        tab_drag_threshold_exceeded,
     };
     use crate::layout::{LayoutPreset, PaneLayout};
 
@@ -10284,6 +10348,81 @@ mod tab_drag_tests {
         assert_eq!(
             top_h, bot_h,
             "Top and Bottom must share the same horizontal-line style"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // pane_content_dim_style tests
+    // ------------------------------------------------------------------
+    //
+    // These pin the compare-mode text-brightness contract: in compare
+    // mode, ALL panes render terminal text at full brightness (no dim),
+    // even during a drag. Out of compare mode, the "虚化显示" effect dims
+    // non-drop-target panes during a drag so the drop target pops.
+
+    /// No drag → no dim, regardless of compare state. The dim is purely a
+    /// drag-time affordance.
+    #[test]
+    fn pane_content_dim_style_no_drag_is_never_dim() {
+        assert_eq!(pane_content_dim_style(false, false, false), "");
+        assert_eq!(pane_content_dim_style(false, true, false), "");
+        assert_eq!(pane_content_dim_style(false, false, true), "");
+        assert_eq!(pane_content_dim_style(false, true, true), "");
+    }
+
+    /// Drag + non-compare + non-drop-target pane → DIM. This is the
+    /// standard "虚化显示" behaviour: all panes except the hovered drop
+    /// target get opacity 0.35 so the drop target stands out.
+    #[test]
+    fn pane_content_dim_style_drag_non_compare_non_target_dims() {
+        assert_eq!(
+            pane_content_dim_style(true, false, false),
+            "opacity: 0.35;",
+            "non-target pane must dim during drag when compare is off"
+        );
+    }
+
+    /// Drag + non-compare + drop-target pane → NOT dim. The drop target
+    /// stays at full opacity + gets the blue border + glow (handled by
+    /// the `is_drag_over` branch of `border`). The text-brightness logic
+    /// must NOT dim the drop target.
+    #[test]
+    fn pane_content_dim_style_drag_non_compare_drop_target_not_dim() {
+        assert_eq!(
+            pane_content_dim_style(true, true, false),
+            "",
+            "drop-target pane must NOT dim during drag (it should pop)"
+        );
+    }
+
+    /// Drag + compare + non-drop-target pane → NOT dim. This is the key
+    /// compare-mode override: even during a drag, compare mode keeps
+    /// every pane at full brightness so the user can visually diff
+    /// outputs across panes. The drop target is still distinguishable
+    /// via its blue border + title chrome (those styles are gated on
+    /// `is_drag_over`, not on this dim toggle).
+    ///
+    /// This test is the regression guard for the user's request:
+    /// "compare 模式的其他窗口字符需要和焦点窗口的一致，不要用暗色".
+    #[test]
+    fn pane_content_dim_style_drag_compare_non_target_not_dim() {
+        assert_eq!(
+            pane_content_dim_style(true, false, true),
+            "",
+            "compare mode must NOT dim non-target panes during drag"
+        );
+    }
+
+    /// Drag + compare + drop-target pane → NOT dim. (Trivially true
+    /// since the `!is_drag_over` gate already prevents dimming the drop
+    /// target, and `!comparison_on` adds another reason not to dim.)
+    /// Pinned for completeness so the truth table is fully covered.
+    #[test]
+    fn pane_content_dim_style_drag_compare_drop_target_not_dim() {
+        assert_eq!(
+            pane_content_dim_style(true, true, true),
+            "",
+            "drop-target pane in compare mode must NOT dim"
         );
     }
 
