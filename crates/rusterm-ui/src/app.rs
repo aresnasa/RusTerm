@@ -2171,16 +2171,16 @@ pub(crate) fn center_line_styles_for_region(
 ///    affordance)
 /// 4. drag + focused       → full brightness (focused stays readable
 ///    during drag; no boost so user attention goes to drop target)
-/// 5. !drag + !focused     → `opacity: 0.65` (subtle dim for focus
-///    highlighting)
-/// 6. !drag + focused      → `filter: brightness(1.15) saturate(1.2)`
+/// 5. !drag + !focused     → `opacity: 0.82` (light dim for focus
+///    highlighting — kept light so overall UI doesn't feel dark)
+/// 6. !drag + focused      → `filter: brightness(1.25) saturate(1.3)`
 ///    (POSITIVE character highlight — the user asked for "字符高亮",
 ///    so the focused pane's ANSI text colors pop more vividly than
 ///    the default render)
 ///
 /// # Returns
 /// A CSS style string — `"opacity: 0.35;"` for drag dim, `"opacity:
-/// 0.65;"` for focus dim, `"filter: brightness(1.15) saturate(1.2);"`
+/// 0.82;"` for focus dim, `"filter: brightness(1.25) saturate(1.3);"`
 /// for focused character highlight, or `""` for full default brightness.
 pub(crate) fn pane_content_dim_style(
     is_dragging: bool,
@@ -2209,13 +2209,14 @@ pub(crate) fn pane_content_dim_style(
         // `filter` (not `opacity`) so colors get richer, not just
         // lighter — opacity would wash out bright ANSI colors toward
         // white, while brightness+saturate intensifies them.
-        "filter: brightness(1.15) saturate(1.2);"
+        "filter: brightness(1.25) saturate(1.3);"
     } else {
-        // Non-drag, non-focused pane → subtle dim for focus highlighting.
-        // The focused pane's `filter` boost + this dim together make the
-        // focus state unmistakable without making non-focused content
-        // unreadable.
-        "opacity: 0.65;"
+        // Non-drag, non-focused pane → light dim for focus highlighting.
+        // The focused pane's `filter` boost + this light dim together
+        // make the focus state unmistakable without making non-focused
+        // content unreadable OR dragging overall brightness down (user
+        // reported opacity 0.65 made the UI feel too dark).
+        "opacity: 0.82;"
     }
 }
 
@@ -10403,18 +10404,18 @@ mod tab_drag_tests {
     // multi-pane layouts. The helper's precedence (first match wins):
     //   drag-over → full, compare-on → full, drag + !focused → opacity
     //   0.35, drag + focused → full, !drag + focused → positive
-    //   highlight (filter: brightness(1.15) saturate(1.2)), !drag +
-    //   !focused → opacity 0.65.
+    //   highlight (filter: brightness(1.25) saturate(1.3)), !drag +
+    //   !focused → opacity 0.82.
 
     /// 字符高亮 — no drag, no compare, focused pane → POSITIVE
-    /// highlight via `filter: brightness(1.15) saturate(1.2);` so the
+    /// highlight via `filter: brightness(1.25) saturate(1.3);` so the
     /// focused pane's ANSI text colors pop more vividly than the
     /// default render (the user asked for "字符高亮").
     #[test]
     fn pane_content_dim_style_focused_no_drag_highlighted() {
         assert_eq!(
             pane_content_dim_style(false, false, false, true),
-            "filter: brightness(1.15) saturate(1.2);",
+            "filter: brightness(1.25) saturate(1.3);",
             "focused pane must get a positive brightness+saturate highlight when not dragging"
         );
         // drag-over case is pinned separately below; included here only
@@ -10428,7 +10429,7 @@ mod tab_drag_tests {
     fn pane_content_dim_style_non_focused_no_drag_dims() {
         assert_eq!(
             pane_content_dim_style(false, false, false, false),
-            "opacity: 0.65;",
+            "opacity: 0.82;",
             "non-focused pane must dim subtly when not dragging"
         );
     }
