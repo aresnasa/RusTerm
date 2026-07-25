@@ -4083,28 +4083,62 @@ fn first_matching_step<'a>(ok: &'a OneKey, line: &str) -> Option<&'a OneKeyStep>
 }
 
 fn onekey_prompt_text(state: &AppState, session_id: &str, data: &[u8]) -> String {
-    let terminal_line = state
-        .terminals
-        .get(session_id)
-        .map(|handle| handle.lock().terminal.extract_current_line())
-        .unwrap_or_default();
-    if terminal_line.trim().is_empty() {
-        strip_ansi(&String::from_utf8_lossy(data))
-    } else {
-        terminal_line
+    // Prefer the terminal's own view of the current line: it accumulates
+    // across split SSH chunks ("Pass" + "word:"), so it's the correct
+    // pane-local matching boundary. When the cursor has wrapped to col 0 of
+    // the next row (e.g. a prompt that ended with \r\n), the current line is
+    // empty — fall back to scanning the rows ABOVE the cursor (the prompt
+    // text is still there) and finally to the stripped raw chunk.
+    let terminal = state.terminals.get(session_id).map(|h| h.lock());
+    if let Some(entry) = terminal {
+        let cur = entry.terminal.extract_current_line();
+        if !cur.trim().is_empty() {
+            return cur;
+        }
+        // Cursor wrapped past the prompt. Walk a few rows upward to find the
+        // most recent non-empty line (the prompt). 3 rows is enough for a
+        // prompt + a blank separator without re-entering scrollback history
+        // where stale credentials could live.
+        let recent = entry.terminal.extract_recent_non_empty_lines(3);
+        if let Some(last) = recent.last() {
+            return last.clone();
+        }
     }
+    // Last-resort fallback: the raw stripped chunk. Only useful for prompts
+    // that arrive in a single chunk AND move the cursor off the prompt row.
+    strip_ansi(&String::from_utf8_lossy(data))
 }
 
 /// Scan new terminal output for OneKey expect-pattern matches. If any OneKey's
 /// expect regex matches and the session's popup isn't already showing, show the
 /// popup with the matching entries. Persists across focus changes (only new
 /// output triggers this — focus changes produce no output, so no re-scan).
+///
+/// Diagnostic logging: every early-return path emits a `[ONEKEY-SKIP]` line so
+/// the user can see WHY the popup didn't fire (OneKey disabled, vault locked,
+/// popup already visible, alt-screen active, or no expect matched the prompt).
+/// The successful-match path keeps its existing `[ONEKEY-MATCH]` log.
 fn check_onekey_match(mut state: Signal<AppState>, session_id: &str, data: &[u8]) {
+    let sid_short = &session_id[..session_id.len().min(8)];
     if !onekey_enabled_for_session(&state.read(), session_id) {
+        tracing::debug!(
+            "[ONEKEY-SKIP] session={} reason=disabled_for_session \
+             (toggle 'One-Key Connect' on the connection)",
+            sid_short
+        );
         return;
     }
     let onekeys = state.read().onekeys.clone();
     if onekeys.is_empty() {
+        // Most common real-world cause: the master password hasn't been
+        // unlocked, so AppState.onekeys is still empty even though the user
+        // saved OneKeys to disk. Logging at info (not debug) because users hit
+        // this regularly and it's not obvious from the UI.
+        tracing::info!(
+            "[ONEKEY-SKIP] session={} reason=onekeys_empty \
+             (unlock the master password to load saved OneKeys)",
+            sid_short
+        );
         return;
     }
     // Don't re-trigger while the popup is already showing (persist).
@@ -4115,14 +4149,36 @@ fn check_onekey_match(mut state: Signal<AppState>, session_id: &str, data: &[u8]
         .map(|p| p.visible)
         .unwrap_or(false);
     if already_visible {
+        tracing::debug!(
+            "[ONEKEY-SKIP] session={} reason=popup_already_visible",
+            sid_short
+        );
+        return;
+    }
+    // Suppress matching while a full-screen app (vim/less/man/tmux copy-mode)
+    // owns the alternate screen: the cursor line is not a shell prompt and
+    // matching against it would surface credentials inside the editor.
+    let on_alt_screen = state
+        .read()
+        .terminals
+        .get(session_id)
+        .map(|h| h.lock().terminal.is_alt_screen())
+        .unwrap_or(false);
+    if on_alt_screen {
+        tracing::debug!(
+            "[ONEKEY-SKIP] session={} reason=alt_screen_active \
+             (a full-screen app like vim/less owns the terminal)",
+            sid_short
+        );
         return;
     }
     // Read the assembled current line from this session's own terminal model.
     // Credential prompts are frequently split across SSH output chunks; matching
     // only `data` would miss `"Pass" + "word:"`. The terminal has already
     // processed this output at both call sites, so its current line is the
-    // correct pane-local matching boundary. Fall back to stripped chunk text
-    // when the terminal line is empty (for unusual newline-terminated prompts).
+    // correct pane-local matching boundary. `onekey_prompt_text` also walks a
+    // few rows above the cursor when the prompt left the cursor on col 0 of
+    // the next row (newline-terminated prompts).
     let text = onekey_prompt_text(&state.read(), session_id, data);
     // Match only the final non-empty line. Matching full scrollback/history
     // output could surface credentials for an old command in the wrong prompt.
@@ -4162,7 +4218,7 @@ fn check_onekey_match(mut state: Signal<AppState>, session_id: &str, data: &[u8]
             .collect();
         tracing::info!(
             "[ONEKEY-MATCH] session={} onekey={} matched_expect={:?} send_len={} all_steps=[{}]",
-            &session_id[..session_id.len().min(8)],
+            sid_short,
             ok.name,
             step.expect,
             step.send.len(),
@@ -4173,17 +4229,31 @@ fn check_onekey_match(mut state: Signal<AppState>, session_id: &str, data: &[u8]
             send: step.send.clone(),
         });
     }
-    if !matches.is_empty() {
-        state.write().onekey_popups.insert(
-            session_id.to_string(),
-            OneKeyPopupState {
-                visible: true,
-                matches,
-                selected: 0,
-                matched_expect,
-            },
+    if matches.is_empty() {
+        // Log the prompt we couldn't match, so the user can see what the
+        // terminal actually had on the current line and adjust their OneKey's
+        // `expect` accordingly. Truncate to avoid flooding the log with long
+        // MOTD/banner lines. Don't log the raw `data` chunk — it could be
+        // huge and the current-line view is what we match against.
+        let preview: String = last_line.chars().take(120).collect();
+        tracing::debug!(
+            "[ONEKEY-SKIP] session={} reason=no_match last_line_preview={:?} \
+             onekeys_count={}",
+            sid_short,
+            preview,
+            onekeys.len()
         );
+        return;
     }
+    state.write().onekey_popups.insert(
+        session_id.to_string(),
+        OneKeyPopupState {
+            visible: true,
+            matches,
+            selected: 0,
+            matched_expect,
+        },
+    );
 }
 
 const SHELL_INTEGRATION_QUIET_PERIOD: std::time::Duration = std::time::Duration::from_millis(1_200);
@@ -9192,6 +9262,87 @@ mod onekey_tests {
             step.send, "pass",
             "after migration, git's password prompt must pick the password step"
         );
+    }
+
+    // ── onekey_prompt_text regression tests ──────────────────────────
+    //
+    // These pin the text-extraction logic that feeds `first_matching_step`.
+    // The matcher can only fire if `onekey_prompt_text` returns the prompt;
+    // these tests guard the two paths (cursor-on-prompt vs cursor-wrapped-
+    // past-prompt) and the fallback to the raw chunk.
+
+    use std::sync::Arc;
+
+    use crate::state::{AppState, TerminalEntry};
+    use parking_lot::Mutex;
+    use rusterm_core::terminal::{Terminal, TerminalSize};
+
+    /// Build an AppState with one terminal session whose grid has been fed
+    /// `bytes` (simulating SSH/shell output). The session id is "s1".
+    fn state_with_terminal(bytes: &[u8]) -> AppState {
+        let mut state = AppState::default();
+        let mut entry = TerminalEntry {
+            terminal: Terminal::new(TerminalSize {
+                cols: 80,
+                rows: 24,
+                ..Default::default()
+            }),
+            parser: vte::ansi::Processor::new(),
+            scroll_offset: 0,
+        };
+        entry.terminal.process(bytes, &mut entry.parser);
+        state
+            .terminals
+            .insert("s1".to_string(), Arc::new(Mutex::new(entry)));
+        state
+    }
+
+    #[test]
+    fn onekey_prompt_text_returns_cursor_line_when_cursor_on_prompt() {
+        // Happy path: SSH writes "Username for 'host': " and the cursor sits
+        // at the end. `onekey_prompt_text` must return the prompt verbatim.
+        let state = state_with_terminal(b"Username for 'host': ");
+        let text = super::onekey_prompt_text(&state, "s1", b"");
+        assert_eq!(text, "Username for 'host': ");
+    }
+
+    #[test]
+    fn onekey_prompt_text_walks_above_cursor_when_prompt_ended_with_newline() {
+        // The bug this guards: a credential prompt arrived with a trailing
+        // \r\n, the cursor wrapped to col 0 of the next row, and the OLD
+        // `onekey_prompt_text` fell straight through to `strip_ansi(data)` —
+        // which only sees the current SSH chunk, not the accumulated prompt.
+        // If the prompt was split across chunks the popup never fired. The
+        // new path walks rows above the cursor and finds the prompt.
+        let state = state_with_terminal(b"Username for 'host': \r\n");
+        // Pass an EMPTY data slice to prove we're reading from the terminal
+        // grid (not from `data`). The old code returned "" here.
+        let text = super::onekey_prompt_text(&state, "s1", b"");
+        assert_eq!(
+            text, "Username for 'host':",
+            "must find the prompt on the row above the cursor, not return empty"
+        );
+    }
+
+    #[test]
+    fn onekey_prompt_text_falls_back_to_raw_chunk_when_grid_has_nothing() {
+        // If the terminal has no current line AND no non-empty rows above the
+        // cursor (e.g. a freshly-created session that hasn't rendered yet),
+        // fall back to the stripped raw chunk. This is the last-resort path.
+        let state = AppState::default(); // no terminals at all
+        let text = super::onekey_prompt_text(&state, "s1", b"Password for 'h': ");
+        assert_eq!(text, "Password for 'h': ");
+    }
+
+    #[test]
+    fn onekey_prompt_text_strips_ansi_from_fallback_chunk() {
+        // Bastion/network-device prompts are often colored. The fallback path
+        // must strip ANSI before returning, otherwise the expect regex won't
+        // match (the ESC bytes sit between "Password" and "for").
+        let state = AppState::default();
+        let raw = b"\x1b[1;36mPassword\x1b[0m for 'https://host': ";
+        let text = super::onekey_prompt_text(&state, "s1", raw);
+        assert_eq!(text, "Password for 'https://host': ");
     }
 }
 

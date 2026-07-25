@@ -652,6 +652,51 @@ impl Terminal {
             .collect()
     }
 
+    /// Return up to `max_lines` non-empty lines ending at the cursor row, ordered
+    /// from oldest to newest (so the last element is the cursor's own line).
+    ///
+    /// `extract_current_line` only sees the cursor's own row, which breaks
+    /// OneKey expect-matching when a credential prompt arrives with a trailing
+    /// `\r\n` (the cursor moves to col 0 of the next row, so the prompt ends up
+    /// on the row *above* the cursor and `extract_current_line` returns "").
+    /// Scanning a few rows above the cursor catches this case while still
+    /// ignoring scrollback history that could surface stale credentials.
+    ///
+    /// Trailing whitespace is trimmed from each line: blank-padded grid rows
+    /// would otherwise leave 60+ trailing spaces that confuse regex matching
+    /// and log output. Meaningful trailing spaces (e.g. the ": " in a prompt)
+    /// are preserved because we trim_end (not trim) — only the grid's right-side
+    /// padding is dropped.
+    pub fn extract_recent_non_empty_lines(&self, max_lines: usize) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        // Walk upward from the cursor row, collecting non-empty rows. We stop
+        // early once we have `max_lines` entries. `cursor_row + 1` is safe
+        // because cursor_row is always < grid.len().
+        let start = self.cursor_row;
+        for r in (0..=start).rev() {
+            if out.len() == max_lines {
+                break;
+            }
+            let row = &self.grid[r];
+            let s: String = row
+                .cells
+                .iter()
+                .filter(|c| !c.wide_next)
+                .map(|c| c.character)
+                .collect();
+            // Trim the grid's right-side padding (cells beyond the last written
+            // column are blank spaces). trim_end preserves meaningful trailing
+            // spaces like the ": " in a credential prompt.
+            let trimmed = s.trim_end();
+            if !trimmed.is_empty() {
+                out.push(trimmed.to_string());
+            }
+        }
+        // Reverse so the most-recent line is last (callers take `.last()`).
+        out.reverse();
+        out
+    }
+
     pub fn is_tmux_detected(&self) -> bool {
         self.tmux_detected
     }
@@ -1822,5 +1867,104 @@ mod tests {
     fn parse_osc7_payload_rejects_host_only() {
         // `file://localhost` with no path after the host — not useful.
         assert!(parse_osc7_payload(b"file://localhost").is_none());
+    }
+
+    /// Helper: feed bytes into a fresh terminal and return it.
+    fn term_from_bytes(bytes: &[u8]) -> Terminal {
+        let mut term = Terminal::new(TerminalSize {
+            cols: 80,
+            rows: 24,
+            ..Default::default()
+        });
+        let mut parser = vte::ansi::Processor::new();
+        term.process(bytes, &mut parser);
+        term
+    }
+
+    #[test]
+    fn extract_current_line_returns_prompt_when_cursor_at_end() {
+        // SSH-style credential prompt: cursor sits right after the ": ".
+        // This is the happy path — `extract_current_line` returns the prompt
+        // text and the OneKey matcher sees it directly.
+        let term = term_from_bytes(b"Username for 'host': ");
+        assert_eq!(term.extract_current_line(), "Username for 'host': ");
+    }
+
+    #[test]
+    fn extract_current_line_is_empty_when_prompt_ended_with_newline() {
+        // Some prompts arrive with a trailing \r\n (rare for credential
+        // prompts, but happens for some PAM flows). The cursor moves to col 0
+        // of the NEXT row, so `extract_current_line` returns "" — the prompt
+        // text is on the row ABOVE the cursor. This is the case the OneKey
+        // matcher's `extract_recent_non_empty_lines` fallback exists to handle.
+        let term = term_from_bytes(b"Username for 'host': \r\n");
+        assert_eq!(term.extract_current_line(), "");
+    }
+
+    #[test]
+    fn extract_recent_non_empty_lines_finds_prompt_above_cursor() {
+        // The bug this guards: a credential prompt ended with \r\n, the cursor
+        // wrapped to col 0 of the next row, and `extract_current_line` returned
+        // "" — so the OneKey matcher had nothing to match against and the popup
+        // never fired. `extract_recent_non_empty_lines` walks upward and finds
+        // the prompt on the row above. Trailing grid-padding (blank cells past
+        // the last written column) is trimmed; the meaningful ":" is preserved.
+        let term = term_from_bytes(b"Username for 'host': \r\n");
+        let recent = term.extract_recent_non_empty_lines(3);
+        assert_eq!(
+            recent.last(),
+            Some(&"Username for 'host':".to_string()),
+            "when the cursor is on col 0, the prompt must be found on the row above"
+        );
+    }
+
+    #[test]
+    fn extract_recent_non_empty_lines_returns_cursor_line_first_when_non_empty() {
+        // Normal case: cursor is mid-line on a non-empty row. The most-recent
+        // entry should be the cursor's own line (built from the full row, not
+        // just `..cursor_col` — but for a prompt with cursor at end they match).
+        // Trailing grid padding is trimmed.
+        let term = term_from_bytes(b"Password for 'git': ");
+        let recent = term.extract_recent_non_empty_lines(3);
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0], "Password for 'git':");
+    }
+
+    #[test]
+    fn extract_recent_non_empty_lines_skips_blank_rows_between_prompt_and_cursor() {
+        // MOTD with a blank line between the banner and the prompt. The walker
+        // must skip the blank row and still surface the prompt.
+        let term = term_from_bytes(b"Welcome\r\n\r\nPassword for 'h': \r\n");
+        let recent = term.extract_recent_non_empty_lines(3);
+        // Most-recent non-empty first (oldest→newest ordering): Welcome, then
+        // the prompt. Cursor is on col 0 of the row after the prompt, so the
+        // prompt row is the last non-empty row.
+        assert_eq!(recent.last(), Some(&"Password for 'h':".to_string()));
+        assert!(recent.contains(&"Welcome".to_string()));
+    }
+
+    #[test]
+    fn extract_recent_non_empty_lines_caps_at_max_lines() {
+        // Many lines of output before the prompt — we only want the last few,
+        // not the whole scrollback (which could surface stale credentials).
+        let mut bytes = Vec::new();
+        for i in 0..10 {
+            bytes.extend_from_slice(format!("line {}\r\n", i).as_bytes());
+        }
+        bytes.extend_from_slice(b"Password for 'h': ");
+        let term = term_from_bytes(&bytes);
+        let recent = term.extract_recent_non_empty_lines(3);
+        assert_eq!(
+            recent.len(),
+            3,
+            "must cap at max_lines even when more non-empty rows exist above"
+        );
+        assert_eq!(recent.last(), Some(&"Password for 'h':".to_string()));
+    }
+
+    #[test]
+    fn extract_recent_non_empty_lines_returns_empty_for_blank_grid() {
+        let term = Terminal::new(TerminalSize::default());
+        assert!(term.extract_recent_non_empty_lines(3).is_empty());
     }
 }
