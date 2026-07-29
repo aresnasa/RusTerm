@@ -190,14 +190,19 @@ fn named_color_hex(nc: vte::ansi::NamedColor) -> &'static str {
         vte::ansi::NamedColor::Magenta => "#bb9af7",
         vte::ansi::NamedColor::Cyan => "#7dcfff",
         vte::ansi::NamedColor::White => "#c0caf5",
-        vte::ansi::NamedColor::BrightBlack => "#565f89",
-        vte::ansi::NamedColor::BrightRed => "#f7768e",
-        vte::ansi::NamedColor::BrightGreen => "#9ece6a",
-        vte::ansi::NamedColor::BrightYellow => "#e0af68",
-        vte::ansi::NamedColor::BrightBlue => "#7aa2f7",
-        vte::ansi::NamedColor::BrightMagenta => "#bb9af7",
-        vte::ansi::NamedColor::BrightCyan => "#7dcfff",
-        vte::ansi::NamedColor::BrightWhite => "#c0caf5",
+        // Bright variants are intentionally LIGHTER than their normal
+        // counterparts so bold text (which typically uses the bright color)
+        // pops on the dark background. Previously bright == normal, which
+        // made bold text indistinguishable from regular text — the root
+        // cause of the "颜色太暗" (colors too dim) report.
+        vte::ansi::NamedColor::BrightBlack => "#7c89a3",
+        vte::ansi::NamedColor::BrightRed => "#ff9eb3",
+        vte::ansi::NamedColor::BrightGreen => "#c3f08c",
+        vte::ansi::NamedColor::BrightYellow => "#ffd28a",
+        vte::ansi::NamedColor::BrightBlue => "#a9c2ff",
+        vte::ansi::NamedColor::BrightMagenta => "#d4b8ff",
+        vte::ansi::NamedColor::BrightCyan => "#a3e5ff",
+        vte::ansi::NamedColor::BrightWhite => "#e8edff",
         vte::ansi::NamedColor::Foreground => "#c0caf5",
         vte::ansi::NamedColor::Background => "#1a1b26",
         vte::ansi::NamedColor::Cursor => "#c0caf5",
@@ -216,14 +221,16 @@ fn indexed_color_hex(idx: u8) -> String {
             5 => "#bb9af7",
             6 => "#7dcfff",
             7 => "#c0caf5",
-            8 => "#565f89",
-            9 => "#f7768e",
-            10 => "#9ece6a",
-            11 => "#e0af68",
-            12 => "#7aa2f7",
-            13 => "#bb9af7",
-            14 => "#7dcfff",
-            15 => "#c0caf5",
+            // 8-15 are the bright variants — must match `named_color_hex`
+            // so bold text is lighter, not identical to normal text.
+            8 => "#7c89a3",
+            9 => "#ff9eb3",
+            10 => "#c3f08c",
+            11 => "#ffd28a",
+            12 => "#a9c2ff",
+            13 => "#d4b8ff",
+            14 => "#a3e5ff",
+            15 => "#e8edff",
             _ => "#c0caf5",
         }
         .to_string()

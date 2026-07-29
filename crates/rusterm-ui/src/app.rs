@@ -4162,8 +4162,17 @@ fn onekey_prompt_text(state: &AppState, session_id: &str, data: &[u8]) -> String
         }
     }
     // Last-resort fallback: the raw stripped chunk. Only useful for prompts
-    // that arrive in a single chunk AND move the cursor off the prompt row.
-    strip_ansi(&String::from_utf8_lossy(data))
+    // that arrive in a single chunk AND move the cursor off the prompt row
+    // (so the terminal model's current-line view is empty). We return only
+    // the LAST non-empty line of the chunk — returning the whole chunk would
+    // let `check_onekey_match` match a stale prompt buried in a large MOTD
+    // banner instead of the actual current prompt.
+    let raw = strip_ansi(&String::from_utf8_lossy(data));
+    raw.lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .map(|s| s.to_string())
+        .unwrap_or_default()
 }
 
 /// Scan new terminal output for OneKey expect-pattern matches. If any OneKey's
