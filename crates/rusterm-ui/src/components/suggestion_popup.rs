@@ -12,10 +12,14 @@ use dioxus::prelude::*;
 ///   - Click on an item        : accept it (same as Tab)
 ///   - Click on the × button   : delete that item from history (dirty-data
 ///                                cleanup — typos / broken commands)
-///   - ArrowUp / ArrowDown     : navigate (handled by parent `TerminalView`)
 ///   - Tab                     : accept selected (parent)
 ///   - Escape                  : dismiss (parent)
 ///   - Shift+Delete            : delete selected from history (parent)
+///   - Arrow keys              : dismiss panel + forward to PTY (parent)
+///                                — arrows always move the cursor / browse
+///                                history, never navigate the suggestion
+///                                list, so the user retains full terminal
+///                                cursor control even while the panel is up.
 ///
 /// The × button is the discoverable affordance for deletion — it's always
 /// visible on the selected item and on hover for the others. The

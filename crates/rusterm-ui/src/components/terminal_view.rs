@@ -608,26 +608,29 @@ pub fn TerminalView(
             return;
         }
 
-        // ── Suggestion panel navigation ──
+        // ── Suggestion panel ──
+        //
+        // Arrow keys are intentionally NOT intercepted by the suggestion
+        // panel. In a terminal, arrow keys are the primary cursor-movement
+        // and history-navigation mechanism (Left/Right move within the line,
+        // Up/Down traverse command history). If the suggestion panel hijacked
+        // them for list navigation, the user would lose the ability to move
+        // the cursor or browse history whenever a suggestion happened to be
+        // visible — which is almost always, because the suggestion query
+        // fires on every keystroke.
+        //
+        // Instead, when an arrow key is pressed while the panel is visible,
+        // we dismiss the panel and let the key fall through to the PTY (so
+        // the shell moves the cursor / changes history as expected). The
+        // panel can still be driven via Tab (accept), Escape (dismiss), and
+        // Shift+Delete (purge entry).
         if current_suggestion_visible && !closure_suggestions.is_empty() {
             match &key {
-                Key::ArrowDown => {
-                    let next = if current_suggestion_selected + 1 >= closure_suggestions.len() {
-                        0
-                    } else {
-                        current_suggestion_selected + 1
-                    };
-                    on_suggestion_navigate.call(Some(next));
-                    return;
-                }
-                Key::ArrowUp => {
-                    let prev = if current_suggestion_selected == 0 {
-                        closure_suggestions.len().saturating_sub(1)
-                    } else {
-                        current_suggestion_selected - 1
-                    };
-                    on_suggestion_navigate.call(Some(prev));
-                    return;
+                // Arrow keys dismiss the panel and fall through to the PTY
+                // so the shell handles cursor movement / history navigation.
+                Key::ArrowDown | Key::ArrowUp | Key::ArrowLeft | Key::ArrowRight => {
+                    on_suggestion_dismiss.call(());
+                    // Don't return — let the key continue to the PTY.
                 }
                 Key::Tab => {
                     // Tab accepts the selected suggestion
@@ -667,10 +670,16 @@ pub fn TerminalView(
             }
         }
 
-        // ── Auto-completion: accept inline suggestion with Right/End/Ctrl+E/Tab ──
+        // ── Auto-completion: accept inline suggestion with End/Ctrl+E/Tab ──
+        //
+        // ArrowRight is intentionally excluded — in a terminal, Right moves
+        // the cursor forward within the command line. If an inline ghost-text
+        // suggestion were accepted on Right, the user could never move the
+        // cursor rightward without accidentally swallowing the suggestion.
+        // End, Tab, and Ctrl+E remain as accept keys (they naturally land at
+        // end-of-line or are explicit "accept" affordances).
         if current_suggestion.is_some() {
             let is_accept = match &key {
-                Key::ArrowRight => true,
                 Key::End => true,
                 Key::Tab => true,
                 Key::Character(s) if ctrl && !alt && !shift && s.eq_ignore_ascii_case("e") => true,

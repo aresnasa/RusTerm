@@ -78,6 +78,41 @@ fn layout_display_label(state: &AppState) -> String {
     }
 }
 
+/// Detect whether a byte sequence sent to the PTY is an arrow-key
+/// (cursor-key) escape sequence. These come in two families:
+///
+/// - **CSI form** (`ESC [ ... final`): normal cursor mode, or any cursor
+///   key with a modifier (e.g. `ESC [ 1 ; 5 A` = Ctrl+Up).
+/// - **SS3 form** (`ESC O final`): application cursor mode (vim, nano,
+///   less, etc.).
+///
+/// The final byte distinguishes arrow keys (`A`/`B`/`C`/`D`) from other
+/// CSI/SS3 sequences (Home=`H`, End=`F`, F1-F4=`P`/`Q`/`R`/`S`, etc.). We
+/// only want to skip suggestion refreshes for arrow keys, not for every
+/// escape sequence (e.g. Delete should still refresh because it edits the
+/// line).
+///
+/// Used by `render_terminal_pane`'s `on_input` handler to avoid firing the
+/// debounced suggestion query after a pure cursor-movement / history-
+/// navigation keystroke — otherwise the popup would surface mid-navigation
+/// and steal the next arrow key.
+fn is_arrow_key_seq(data: &[u8]) -> bool {
+    if data.len() < 3 {
+        return false;
+    }
+    // SS3 form: ESC O <final>
+    if data[0] == 0x1b && data[1] == 0x4f {
+        return matches!(data[2], b'A' | b'B' | b'C' | b'D');
+    }
+    // CSI form: ESC [ ... <final>  (the middle may be "1;5" etc.)
+    if data[0] == 0x1b && data[1] == 0x5b {
+        if let Some(&final_byte) = data.last() {
+            return matches!(final_byte, b'A' | b'B' | b'C' | b'D');
+        }
+    }
+    false
+}
+
 /// Render a single TerminalView for the session identified by `session_id`.
 ///
 /// This is the shared rendering helper used by both the single-pane path
@@ -250,6 +285,13 @@ fn render_terminal_pane(
                         // exactly `[active_session]` (len 1), so we fall
                         // through to the per-pane path and send to
                         // `sid_clone` (this pane's own session).
+                        // Capture whether this is a pure arrow-key sequence
+                        // BEFORE `data` is moved into the sender. Arrow keys
+                        // are cursor-movement / history-navigation inputs —
+                        // they should not trigger the suggestion query (which
+                        // would surface a popup mid-navigation and hijack the
+                        // next arrow keypress).
+                        let is_arrow = is_arrow_key_seq(&data);
                         let broadcast_targets = crate::state::broadcast_targets(&state_for_cmd.read());
                         let is_broadcast = broadcast_targets.len() > 1;
                         if is_broadcast {
@@ -284,8 +326,14 @@ fn render_terminal_pane(
                                 tracing::warn!("[INPUT] no sender for session — PTY channel is dead");
                             }
                         }
-                        // Query history for suggestion (on non-Enter input)
-                        if !is_enter {
+                        // Query history for suggestion (on non-Enter input).
+                        //
+                        // Arrow-key CSI/SS3 sequences are skipped so that
+                        // history navigation (Up/Down) and cursor movement
+                        // (Left/Right) don't trigger a suggestion popup that
+                        // would then hijack the next arrow keypress. Only
+                        // actual text input should refresh suggestions.
+                        if !is_enter && !is_arrow {
                             let sid_sug = sid_clone.clone();
                             let epoch = {
                                 let mut s = state_for_cmd.write();
@@ -611,7 +659,10 @@ fn render_terminal_pane(
                     on_suggestion_dismiss: move |_: ()| {
                         state_for_cmd.write().sessions.iter_mut()
                             .find(|t| t.id == sid_for_sug_dismiss)
-                            .map(|tab| tab.suggestion_visible = false);
+                            .map(|tab| {
+                                tab.suggestion_visible = false;
+                                tab.suggestion = None;
+                            });
                     },
                     on_suggestion_delete: move |cmd: String| {
                         // Shift+Delete on a suggestion item: the user wants
@@ -2171,16 +2222,16 @@ pub(crate) fn center_line_styles_for_region(
 ///    affordance)
 /// 4. drag + focused       → full brightness (focused stays readable
 ///    during drag; no boost so user attention goes to drop target)
-/// 5. !drag + !focused     → `opacity: 0.82` (light dim for focus
+/// 5. !drag + !focused     → `opacity: 0.90` (light dim for focus
 ///    highlighting — kept light so overall UI doesn't feel dark)
-/// 6. !drag + focused      → `filter: brightness(1.25) saturate(1.3)`
+/// 6. !drag + focused      → `filter: brightness(1.45) saturate(1.5)`
 ///    (POSITIVE character highlight — the user asked for "字符高亮",
 ///    so the focused pane's ANSI text colors pop more vividly than
 ///    the default render)
 ///
 /// # Returns
 /// A CSS style string — `"opacity: 0.35;"` for drag dim, `"opacity:
-/// 0.82;"` for focus dim, `"filter: brightness(1.25) saturate(1.3);"`
+/// 0.90;"` for focus dim, `"filter: brightness(1.45) saturate(1.5);"`
 /// for focused character highlight, or `""` for full default brightness.
 pub(crate) fn pane_content_dim_style(
     is_dragging: bool,
@@ -2208,15 +2259,21 @@ pub(crate) fn pane_content_dim_style(
         // drawn to the focused pane's content ("字符高亮" request).
         // `filter` (not `opacity`) so colors get richer, not just
         // lighter — opacity would wash out bright ANSI colors toward
-        // white, while brightness+saturate intensifies them.
-        "filter: brightness(1.25) saturate(1.3);"
+        // white, while brightness+saturate intensifies them. The values
+        // were raised from brightness(1.25) saturate(1.3) after the user
+        // reported the focused pane was still too dim compared to the
+        // non-focused panes (the relative contrast wasn't strong enough).
+        "filter: brightness(1.45) saturate(1.5);"
     } else {
         // Non-drag, non-focused pane → light dim for focus highlighting.
         // The focused pane's `filter` boost + this light dim together
         // make the focus state unmistakable without making non-focused
         // content unreadable OR dragging overall brightness down (user
-        // reported opacity 0.65 made the UI feel too dark).
-        "opacity: 0.82;"
+        // reported opacity 0.65 made the UI feel too dark; 0.82 was then
+        // reported as still too dark alongside the focused pane, so we
+        // raise to 0.90 — the focused pane's brightness(1.45) still
+        // provides ample contrast).
+        "opacity: 0.90;"
     }
 }
 
@@ -9900,8 +9957,8 @@ mod tab_drag_tests {
     use super::{
         PaneDropRegion, TAB_DRAG_THRESHOLD, build_install_tab_drag_script,
         center_line_styles_for_region, hit_test_pane_at, hit_test_pane_drop_target_at,
-        pane_content_dim_style, pane_drop_region_for_cursor, parse_tab_drag_poll_response,
-        tab_drag_threshold_exceeded,
+        is_arrow_key_seq, pane_content_dim_style, pane_drop_region_for_cursor,
+        parse_tab_drag_poll_response, tab_drag_threshold_exceeded,
     };
     use crate::layout::{LayoutPreset, PaneLayout};
 
@@ -10555,18 +10612,18 @@ mod tab_drag_tests {
     // multi-pane layouts. The helper's precedence (first match wins):
     //   drag-over → full, compare-on → full, drag + !focused → opacity
     //   0.35, drag + focused → full, !drag + focused → positive
-    //   highlight (filter: brightness(1.25) saturate(1.3)), !drag +
-    //   !focused → opacity 0.82.
+    //   highlight (filter: brightness(1.45) saturate(1.5)), !drag +
+    //   !focused → opacity 0.90.
 
     /// 字符高亮 — no drag, no compare, focused pane → POSITIVE
-    /// highlight via `filter: brightness(1.25) saturate(1.3);` so the
+    /// highlight via `filter: brightness(1.45) saturate(1.5);` so the
     /// focused pane's ANSI text colors pop more vividly than the
     /// default render (the user asked for "字符高亮").
     #[test]
     fn pane_content_dim_style_focused_no_drag_highlighted() {
         assert_eq!(
             pane_content_dim_style(false, false, false, true),
-            "filter: brightness(1.25) saturate(1.3);",
+            "filter: brightness(1.45) saturate(1.5);",
             "focused pane must get a positive brightness+saturate highlight when not dragging"
         );
         // drag-over case is pinned separately below; included here only
@@ -10580,7 +10637,7 @@ mod tab_drag_tests {
     fn pane_content_dim_style_non_focused_no_drag_dims() {
         assert_eq!(
             pane_content_dim_style(false, false, false, false),
-            "opacity: 0.82;",
+            "opacity: 0.90;",
             "non-focused pane must dim subtly when not dragging"
         );
     }
@@ -10820,5 +10877,54 @@ mod tab_drag_tests {
             hit_test_pane_at(300.0, 240.0, 0.0, 0.0, 1000.0, 800.0, &layout),
             Some((1, "front".to_string()))
         );
+    }
+
+    // ------------------------------------------------------------------
+    // is_arrow_key_seq tests
+    // ------------------------------------------------------------------
+    //
+    // Pins the detection of arrow-key escape sequences so the suggestion
+    // query can skip them (preventing the popup from surfacing during
+    // history navigation / cursor movement and hijacking the next arrow
+    // keypress).
+
+    #[test]
+    fn arrow_key_csi_normal_mode_detected() {
+        // ESC [ A/B/C/D — normal cursor mode (bash readline default)
+        assert!(is_arrow_key_seq(&[0x1b, 0x5b, b'A'])); // Up
+        assert!(is_arrow_key_seq(&[0x1b, 0x5b, b'B'])); // Down
+        assert!(is_arrow_key_seq(&[0x1b, 0x5b, b'C'])); // Right
+        assert!(is_arrow_key_seq(&[0x1b, 0x5b, b'D'])); // Left
+    }
+
+    #[test]
+    fn arrow_key_ss3_app_mode_detected() {
+        // ESC O A/B/C/D — application cursor mode (vim, nano, less)
+        assert!(is_arrow_key_seq(&[0x1b, 0x4f, b'A']));
+        assert!(is_arrow_key_seq(&[0x1b, 0x4f, b'B']));
+        assert!(is_arrow_key_seq(&[0x1b, 0x4f, b'C']));
+        assert!(is_arrow_key_seq(&[0x1b, 0x4f, b'D']));
+    }
+
+    #[test]
+    fn arrow_key_csi_with_modifier_detected() {
+        // ESC [ 1 ; 5 A — Ctrl+Up (modifier byte 5 = Ctrl)
+        assert!(is_arrow_key_seq(&[0x1b, 0x5b, b'1', b';', b'5', b'A']));
+        // ESC [ 1 ; 2 D — Shift+Left
+        assert!(is_arrow_key_seq(&[0x1b, 0x5b, b'1', b';', b'2', b'D']));
+    }
+
+    #[test]
+    fn non_arrow_sequences_not_detected() {
+        // Home (ESC [ H), End (ESC [ F), Delete (ESC [ 3 ~),
+        // F1 SS3 (ESC O P), plain Enter (0x0d), plain text — none
+        // of these should trigger the arrow-key skip.
+        assert!(!is_arrow_key_seq(&[0x1b, 0x5b, b'H']));
+        assert!(!is_arrow_key_seq(&[0x1b, 0x5b, b'F']));
+        assert!(!is_arrow_key_seq(&[0x1b, 0x5b, b'3', b'~']));
+        assert!(!is_arrow_key_seq(&[0x1b, 0x4f, b'P']));
+        assert!(!is_arrow_key_seq(&[0x0d]));
+        assert!(!is_arrow_key_seq(b"ls"));
+        assert!(!is_arrow_key_seq(&[]));
     }
 }
