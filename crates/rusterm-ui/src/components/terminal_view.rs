@@ -1,10 +1,90 @@
 use dioxus::prelude::*;
+// `MouseButton` lives in `dioxus::html::input_data` (not re-exported by
+// dioxus::prelude) — same import pattern as tab_bar.rs.
+use dioxus::html::input_data::MouseButton;
 
-use rusterm_core::terminal::{CellColor, CellFlags, RenderOutput, RenderRow};
+use rusterm_core::terminal::{
+    CellColor, CellFlags, MouseReportKind, RenderOutput, RenderRow, encode_mouse_report,
+    extract_selection,
+};
 
 use crate::components::OneKeyPopup;
 use crate::components::SuggestionPopup;
 use crate::state::OneKeyMatch;
+
+// ── Clipboard helpers ───────────────────────────────────────────────
+
+/// Copy text to the OS clipboard (async, fire-and-forget from the caller's
+/// perspective — `spawn` this).
+async fn copy_text_to_clipboard(text: String) {
+    let escaped = text
+        .replace('\\', "\\\\")
+        .replace('`', "\\`")
+        .replace("${", "\\${");
+    // Script is the dioxus eval AsyncFunction body: `return` the promise so
+    // the eval result tells us whether the write actually landed (WKWebView
+    // needs a secure context + user gesture — the dioxus: protocol counts).
+    // An IIFE-expression version would resolve to `undefined` instead.
+    let js = format!(
+        "if (!(navigator.clipboard && navigator.clipboard.writeText)) {{ return 'no-clipboard-API'; }}\
+         return navigator.clipboard.writeText(`{escaped}`).then(\
+             function() {{ return 'ok'; }},\
+             function(err) {{ return 'err:' + (err && err.message ? err.message : String(err)); }}\
+         );"
+    );
+    match dioxus::document::eval(&js).await {
+        Ok(v) => {
+            let status = v.as_str().unwrap_or("<non-string>");
+            if status != "ok" {
+                tracing::info!(
+                    "[COPY] writeText status={status} chars={}",
+                    text.chars().count()
+                );
+            }
+        }
+        Err(e) => {
+            tracing::info!(
+                "[COPY] writeText eval failed: {e:?} chars={}",
+                text.chars().count()
+            );
+        }
+    }
+}
+
+/// Read the OS clipboard and send it to the PTY (with bracketed-paste
+/// wrapping when the application asked for it, mode 2004).
+async fn paste_from_clipboard(on_input: EventHandler<Vec<u8>>, bracketed: bool) {
+    // `return` the promise: dioxus eval scripts are AsyncFunction bodies, so
+    // an expression statement would resolve to `undefined`, not the text.
+    if let Ok(result) = dioxus::document::eval("return navigator.clipboard.readText();").await {
+        if let Some(text) = result.as_str() {
+            if !text.is_empty() {
+                let data = if bracketed {
+                    let mut buf = Vec::with_capacity(text.len() + 12);
+                    buf.extend_from_slice(b"\x1b[200~");
+                    buf.extend_from_slice(text.as_bytes());
+                    buf.extend_from_slice(b"\x1b[201~");
+                    buf
+                } else {
+                    text.as_bytes().to_vec()
+                };
+                on_input.call(data);
+            }
+        }
+    }
+}
+
+// ── Mouse selection ──────────────────────────────────────────────────
+
+/// A mouse-drag text selection over the rendered rows. Coordinates are
+/// (row, col) cell indices into `render_output.rows` at the moment the
+/// drag happened; `text` is captured at mouseup so Ctrl+Shift+C and Cmd+C
+/// can re-copy without re-hit-testing a possibly-shifted buffer.
+#[derive(Clone, Copy)]
+struct TextSelection {
+    anchor: (usize, usize),
+    head: (usize, usize),
+}
 
 // ── Terminal key encoding helpers ──────────────────────────────────
 
@@ -301,37 +381,107 @@ fn cell_style(fg: &CellColor, bg: &CellColor, flags: CellFlags) -> String {
     parts.join(";")
 }
 
+/// Background applied to cells inside the active mouse-drag selection.
+/// Matches the search-match highlight hue so all accent overlays read as
+/// one system. Applied over the cell's own background (selection bg wins).
+const SELECTION_BG: &str = "background:rgba(122,162,247,0.30)";
+
+/// Convert client-viewport px coords to a `(row, col)` terminal cell using
+/// the live `getBoundingClientRect` origin of the content div and the
+/// measured monospace cell size. Coordinates OUTSIDE the grid clamp to the
+/// nearest edge cell.
+///
+/// IMPORTANT: this must be fed `client_coordinates()` — NOT
+/// `element_coordinates()`. On dioxus desktop the latter is DOM
+/// `offsetX/offsetY`, which is relative to the event TARGET. Terminal rows
+/// are raw HTML (`dangerous_inner_html`), so the target moves between
+/// spans/row-divs as the cursor moves, producing garbage offsets
+/// (client-rect math is target-independent). The content div is also the
+/// cell-grid origin: the line-number gutter is a sibling column.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "geometry tuple unpacked + grid bounds"
+)]
+fn event_cell_from_coords(
+    x: f64,
+    y: f64,
+    left: f64,
+    top: f64,
+    cw: f64,
+    ch: f64,
+    rows_len: usize,
+    max_col: usize,
+) -> (usize, usize) {
+    let x = x - left;
+    let y = y - top;
+    let col = if x <= 0.0 {
+        0
+    } else {
+        (x / cw).floor() as usize
+    };
+    let row = if y <= 0.0 {
+        0
+    } else {
+        (y / ch).floor() as usize
+    };
+    (
+        row.min(rows_len.saturating_sub(1)),
+        col.min(max_col.saturating_sub(1)),
+    )
+}
+
 /// Render a terminal row to an HTML string. Uses `dangerous_inner_html`
 /// for fast DOM updates — avoids Dioxus per-span VDOM diffing overhead.
 ///
 /// When a suggestion is shown, we only render cells up to the cursor position,
 /// then append the suggestion right after it. Cells after the cursor are
 /// typically empty spaces and would push the suggestion to the end of the row.
-fn row_to_html(row: &RenderRow, cursor_col: Option<usize>, suggestion: Option<&str>) -> String {
+///
+/// `sel` is the inclusive cell-column range `(start, end)` inside the active
+/// mouse selection for this row, if any; covered cells get [`SELECTION_BG`].
+fn row_to_html(
+    row: &RenderRow,
+    cursor_col: Option<usize>,
+    suggestion: Option<&str>,
+    sel: Option<(usize, usize)>,
+) -> String {
     let mut html = String::with_capacity(row.cells.len() * 4);
 
     let mut cur_fg = CellColor::Default;
     let mut cur_bg = CellColor::Default;
     let mut cur_flags = CellFlags::empty();
+    let mut cur_sel = false;
     let mut cur_text = String::new();
 
-    let flush =
-        |html: &mut String, text: &str, fg: &CellColor, bg: &CellColor, flags: CellFlags| {
-            if text.is_empty() {
-                return;
-            }
-            let style = cell_style(fg, bg, flags);
-            let escaped = html_escape(text);
+    let flush = |html: &mut String,
+                 text: &str,
+                 fg: &CellColor,
+                 bg: &CellColor,
+                 flags: CellFlags,
+                 sel: bool| {
+        if text.is_empty() {
+            return;
+        }
+        let mut style = cell_style(fg, bg, flags);
+        if sel {
             if style.is_empty() {
-                html.push_str(&escaped);
+                style = SELECTION_BG.to_string();
             } else {
-                html.push_str("<span style=\"");
-                html.push_str(&style);
-                html.push_str("\">");
-                html.push_str(&escaped);
-                html.push_str("</span>");
+                style.push(';');
+                style.push_str(SELECTION_BG);
             }
-        };
+        }
+        let escaped = html_escape(text);
+        if style.is_empty() {
+            html.push_str(&escaped);
+        } else {
+            html.push_str("<span style=\"");
+            html.push_str(&style);
+            html.push_str("\">");
+            html.push_str(&escaped);
+            html.push_str("</span>");
+        }
+    };
 
     // If we have a suggestion, stop rendering after the cursor position
     // so the suggestion appears immediately after the typed text.
@@ -354,7 +504,7 @@ fn row_to_html(row: &RenderRow, cursor_col: Option<usize>, suggestion: Option<&s
 
         let is_cursor = cursor_col == Some(i);
         if is_cursor {
-            flush(&mut html, &cur_text, &cur_fg, &cur_bg, cur_flags);
+            flush(&mut html, &cur_text, &cur_fg, &cur_bg, cur_flags, cur_sel);
             cur_text.clear();
 
             let ch = if cell.character == ' ' {
@@ -380,22 +530,27 @@ fn row_to_html(row: &RenderRow, cursor_col: Option<usize>, suggestion: Option<&s
             cur_fg = CellColor::Default;
             cur_bg = CellColor::Default;
             cur_flags = CellFlags::empty();
+            // cur_sel persists across the cursor — the selection underneath
+            // the cursor cell continues after it.
             continue;
         }
 
-        let same_style = cell.fg == cur_fg && cell.bg == cur_bg && cell.flags == cur_flags;
+        let in_sel = sel.is_some_and(|(a, b)| i >= a && i <= b);
+        let same_style =
+            cell.fg == cur_fg && cell.bg == cur_bg && cell.flags == cur_flags && in_sel == cur_sel;
         if !cur_text.is_empty() && !same_style {
-            flush(&mut html, &cur_text, &cur_fg, &cur_bg, cur_flags);
+            flush(&mut html, &cur_text, &cur_fg, &cur_bg, cur_flags, cur_sel);
             cur_text.clear();
         }
 
         cur_fg = cell.fg.clone();
         cur_bg = cell.bg.clone();
         cur_flags = cell.flags;
+        cur_sel = in_sel;
         cur_text.push(cell.character);
     }
 
-    flush(&mut html, &cur_text, &cur_fg, &cur_bg, cur_flags);
+    flush(&mut html, &cur_text, &cur_fg, &cur_bg, cur_flags, cur_sel);
 
     // Insert suggestion right after the cursor content
     if let Some(sug) = suggestion {
@@ -455,6 +610,20 @@ pub fn TerminalView(
     let mut search_match_index = use_signal(|| 0usize);
     let mut search_matches: Signal<Vec<(usize, usize)>> = use_signal(Vec::new);
 
+    // ── Mouse selection & reporting state ──
+    let mut selection: Signal<Option<TextSelection>> = use_signal(|| None);
+    // Text captured for the current selection at mouseup (kept so
+    // Ctrl+Shift+C / Cmd+C can re-copy it without re-hit-testing).
+    let mut selection_text: Signal<String> = use_signal(String::new);
+    let mut selecting = use_signal(|| false);
+    let mut mouse_button_down: Signal<Option<u8>> = use_signal(|| None);
+    let mut last_motion_cell: Signal<Option<(usize, usize)>> = use_signal(|| None);
+    // (content-left, content-top, cell-width, cell-height), in client px.
+    // Polled by the geometry effect: the rect changes on resize/pane drags,
+    // the cell metrics only change with a font (re)load. NONE until the first
+    // successful poll — mouse/wheel hit-testing ignores events before that.
+    let mut content_geo: Signal<Option<(f64, f64, f64, f64)>> = use_signal(|| None);
+
     let current_suggestion = suggestion.clone();
     let current_suggestions = suggestions.clone();
     let current_suggestion_visible = suggestion_visible;
@@ -486,6 +655,32 @@ pub fn TerminalView(
             meta,
             shift
         );
+
+        // macOS conventions: Cmd+C copies the terminal-owned selection text
+        // (falls through if there is none so other focused inputs keep their
+        // native copy), Cmd+V always pastes into the PTY.
+        if meta && !ctrl && !alt {
+            if let Key::Character(ref s) = key {
+                if s.eq_ignore_ascii_case("v") {
+                    e.prevent_default();
+                    let bracketed = render_output.mode_bracketed_paste;
+                    spawn(async move {
+                        paste_from_clipboard(on_input, bracketed).await;
+                    });
+                    return;
+                }
+                if s.eq_ignore_ascii_case("c") {
+                    let text = selection_text();
+                    if !text.is_empty() {
+                        e.prevent_default();
+                        spawn(async move {
+                            copy_text_to_clipboard(text).await;
+                        });
+                    }
+                    return;
+                }
+            }
+        }
 
         if meta {
             return;
@@ -578,16 +773,24 @@ pub fn TerminalView(
             return;
         }
 
-        // Ctrl+Shift+C: copy selection. We use a JS helper that tries
-        // `window.getSelection().toString()` first (works for native drag-
-        // selections on the terminal content), and falls back to reading
-        // the active INPUT/TEXTAREA's selection (covers the rare case where
-        // focus is on the hidden terminal-input element). The clipboard write
-        // is fire-and-forget; we log the char count for debugging.
+        // Ctrl+Shift+C: copy selection. The terminal-owned drag selection's
+        // captured text takes priority; fall back to the native DOM selection
+        // (or an active INPUT/TEXTAREA) for non-terminal focus cases.
         if ctrl && shift && matches!(key, Key::Character(ref s) if s == "c" || s == "C") {
+            let text = selection_text();
+            if !text.is_empty() {
+                let n = text.chars().count();
+                spawn(async move {
+                    copy_text_to_clipboard(text).await;
+                });
+                tracing::info!("[COPY] Ctrl+Shift+C copied {n} chars (terminal selection)");
+                return;
+            }
             let sid_for_copy_log = sid_for_copy.clone();
             spawn(async move {
-                let js = "(function() {\
+                // AsyncFunction body (see copy_text_to_clipboard): explicit
+                // `return`s, no IIFE wrapper, else the counts read as 0.
+                let js = "\
                     var sel = window.getSelection();\
                     var text = sel ? sel.toString() : '';\
                     if (!text) {\
@@ -596,14 +799,11 @@ pub fn TerminalView(
                             text = a.value.substring(a.selectionStart, a.selectionEnd);\
                         }\
                     }\
-                    if (text) {\
-                        if (navigator.clipboard && navigator.clipboard.writeText) {\
-                            navigator.clipboard.writeText(text);\
-                        }\
-                        return String(text.length);\
+                    if (!text) { return '0'; }\
+                    if (navigator.clipboard && navigator.clipboard.writeText) {\
+                        navigator.clipboard.writeText(text);\
                     }\
-                    return '0';\
-                })()";
+                    return String(text.length);";
                 let result = dioxus::document::eval(js).await;
                 let n: usize = result
                     .ok()
@@ -632,7 +832,10 @@ pub fn TerminalView(
             let input_cb = on_input;
             let bracketed = render_output.mode_bracketed_paste;
             spawn(async move {
-                if let Ok(result) = dioxus::document::eval("navigator.clipboard.readText()").await {
+                // `return` the promise (see paste_from_clipboard).
+                if let Ok(result) =
+                    dioxus::document::eval("return navigator.clipboard.readText();").await
+                {
                     if let Some(text) = result.as_str() {
                         if !text.is_empty() {
                             let data = if bracketed {
@@ -1088,11 +1291,14 @@ pub fn TerminalView(
     // menu — the terminal owns right-click for its own affordances. When the
     // session is disconnected, right-click triggers reconnect (mirrors the
     // Enter-to-reconnect path in `handle_keydown`). When the session is live,
-    // right-click is silently swallowed; we intentionally do NOT show a
-    // custom menu here, because the existing copy/paste shortcuts
-    // (Ctrl+Shift+C / Ctrl+Shift+V) cover the common case and adding a popup
-    // would steal focus from the terminal input.
+    // right-click PASTES (the WindTerm/xterm convention; Ctrl+Shift+V and
+    // Cmd+V also work). While the app has mouse reporting enabled the
+    // right-button press was already forwarded to the PTY by `on_mousedown`,
+    // so we only suppress the native menu here.
     let reconnect_sid = session_id.clone();
+    let contextmenu_on_input = on_input;
+    let contextmenu_bracketed = render_output.mode_bracketed_paste;
+    let contextmenu_reporting = render_output.mode_mouse_reporting;
     let oncontextmenu_reconnect = move |e: MouseEvent| {
         e.prevent_default();
         if current_disconnected {
@@ -1101,66 +1307,281 @@ pub fn TerminalView(
                 &reconnect_sid[..reconnect_sid.len().min(8)]
             );
             on_reconnect.call(());
-        } else {
-            tracing::debug!(
-                "[RECONNECT] right-click ignored (session {:?} is live)",
-                &reconnect_sid[..reconnect_sid.len().min(8)]
-            );
+        } else if !contextmenu_reporting {
+            spawn(async move {
+                paste_from_clipboard(contextmenu_on_input, contextmenu_bracketed).await;
+            });
         }
-    };
-
-    // Select-to-copy: when the user finishes a mouse drag selection inside
-    // the terminal, automatically copy the selected text to the clipboard.
-    // This matches the behavior of most modern terminals (Windows Terminal,
-    // iTerm2 with select-to-clipboard, gnome-terminal with copy-on-select).
-    // A plain click (no drag) produces an empty selection, so nothing is
-    // copied — the click still falls through to `onclick_focus` to focus
-    // the terminal. We intentionally do NOT clear the selection after
-    // copying, so the user can see what was captured.
-    let copy_sid = session_id.clone();
-    let onmouseup_copy = move |_: MouseEvent| {
-        let sid = copy_sid.clone();
-        spawn(async move {
-            let js = "(function() {\
-                var sel = window.getSelection();\
-                var text = sel ? sel.toString() : '';\
-                if (text) {\
-                    if (navigator.clipboard && navigator.clipboard.writeText) {\
-                        navigator.clipboard.writeText(text);\
-                    }\
-                    return String(text.length);\
-                }\
-                return '0';\
-            })()";
-            let result = dioxus::document::eval(js).await;
-            let n: usize = result
-                .ok()
-                .and_then(|r| r.as_str().and_then(|s| s.parse::<usize>().ok()))
-                .unwrap_or(0);
-            if n > 0 {
-                tracing::info!(
-                    "[COPY] select-to-copy {} chars for session {:?}",
-                    n,
-                    &sid[..sid.len().min(8)]
-                );
-            }
-        });
     };
 
     // Gutter width is based on the STABLE maximum line number (scrollback
     // capacity + visible rows), not the current line count — otherwise the
     // gutter widens at 10/100/1000/10000-line thresholds as scrollback fills,
-    // shifting all content horizontally (a display anomaly).
-    //
-    // We floor `scrollback_capacity` at 10_000 (the Terminal's default capacity)
-    // so the initial render — where `render_output` is `Default::default()`
-    // (scrollback_capacity=0) — still sizes the gutter at 6ch. Without this
-    // floor the first poll of the resize future measures a 2ch gutter, computes
-    // an over-wide `cols`, and fires an `on_resize` that the next poll (after
-    // the real render lands with capacity=10_000 → 6ch gutter) immediately
-    // contradicts — remote output briefly re-wraps at the wrong column count.
+    // shifting all content horizontally (a display anomaly). Computed before
+    // the mouse-handling closures because hit-testing needs it to convert
+    // pixel X into a cell column.
     let max_line_num = (render_output.scrollback_capacity.max(10_000) + total_rows).max(1);
     let gutter_width = (max_line_num.ilog10() as usize + 1) + 1; // digits + 1 padding
+
+    // ── Mouse handling: text selection (WindTerm-style) & app reporting ──
+    //
+    // Selection is terminal-owned (cell-coordinate based), NOT the native
+    // DOM selection: the DOM selection can't distinguish wide-char boundary
+    // cells, dragged-overline raggedness across the monospace grid, or the
+    // line-wrap joins we reconstruct at copy time via `wrapped` flags. The
+    // content div uses `user-select:none` so the two never compete.
+    //
+    let max_col_cached = render_output
+        .rows
+        .iter()
+        .map(|r| r.cells.len())
+        .max()
+        .unwrap_or(80);
+    let rows_len_cached = render_output.rows.len();
+    let event_cell = move |e: &MouseEvent| -> Option<(usize, usize)> {
+        let (left, top, cw, ch) = content_geo()?;
+        let pt = e.client_coordinates();
+        Some(event_cell_from_coords(
+            pt.x,
+            pt.y,
+            left,
+            top,
+            cw,
+            ch,
+            rows_len_cached,
+            max_col_cached,
+        ))
+    };
+
+    let sel_on_input = on_input;
+    let down_reporting = render_output.mode_mouse_reporting && render_output.scrollback_offset == 0;
+    let down_sgr = render_output.mode_mouse_sgr;
+    let on_mouse_down = move |e: MouseEvent| {
+        if current_disconnected {
+            return;
+        }
+        let button = match e.trigger_button() {
+            Some(MouseButton::Primary) => 0u8,
+            Some(MouseButton::Auxiliary) => 1u8,
+            Some(MouseButton::Secondary) => 2u8,
+            _ => return,
+        };
+        let mods = e.modifiers();
+        let shift = mods.shift();
+
+        if down_reporting && !shift {
+            // App owns the mouse (vim `set mouse=a`, htop, tmux): forward a
+            // press report and arm release tracking. Motion (1002) is only
+            // reported for the primary button, but EVERY pressed button must
+            // get its release report or the app sees a stuck click.
+            let Some((row, col)) = event_cell(&e) else {
+                return;
+            };
+            sel_on_input.call(encode_mouse_report(
+                MouseReportKind::Press,
+                button,
+                col,
+                row,
+                shift,
+                mods.alt(),
+                mods.ctrl(),
+                down_sgr,
+            ));
+            mouse_button_down.set(Some(button));
+            if button == 0 {
+                last_motion_cell.set(Some((row, col)));
+            }
+            return;
+        }
+
+        if button == 0 {
+            // Local selection (Shift forces it even when the app reports).
+            let Some(cell) = event_cell(&e) else { return };
+            selection.set(Some(TextSelection {
+                anchor: cell,
+                head: cell,
+            }));
+            selection_text.set(String::new());
+            selecting.set(true);
+        } else if button == 1 {
+            // Middle-click paste (xterm convention; consistent with
+            // copy-on-select, the OS clipboard carries the selection).
+            let bracketed = render_output.mode_bracketed_paste;
+            spawn(async move {
+                paste_from_clipboard(on_input, bracketed).await;
+            });
+        }
+    };
+
+    let move_on_input = on_input;
+    let move_reporting = down_reporting;
+    let move_button_motion = render_output.mode_mouse_button_motion;
+    let move_sgr = render_output.mode_mouse_sgr;
+    let on_mouse_move = move |e: MouseEvent| {
+        if selecting() {
+            if let Some(ts) = selection() {
+                let Some(cell) = event_cell(&e) else { return };
+                if cell != ts.head {
+                    selection.set(Some(TextSelection { head: cell, ..ts }));
+                }
+            }
+            return;
+        }
+
+        // App-button-drag motion (1002): only while button 0 is held and the
+        // app asked for button-event motion tracking.
+        if move_reporting && move_button_motion {
+            if mouse_button_down().is_some() {
+                let Some((row, col)) = event_cell(&e) else {
+                    return;
+                };
+                if last_motion_cell() != Some((row, col)) {
+                    last_motion_cell.set(Some((row, col)));
+                    let mods = e.modifiers();
+                    move_on_input.call(encode_mouse_report(
+                        MouseReportKind::Motion,
+                        0,
+                        col,
+                        row,
+                        mods.shift(),
+                        mods.alt(),
+                        mods.ctrl(),
+                        move_sgr,
+                    ));
+                }
+            }
+        }
+    };
+
+    let up_on_input = on_input;
+    let up_reporting = down_reporting;
+    let up_sgr = render_output.mode_mouse_sgr;
+    let up_rows = render_output.rows.clone();
+    let on_mouse_up = move |e: MouseEvent| {
+        if up_reporting {
+            if let Some(button) = mouse_button_down.take() {
+                let Some((row, col)) = event_cell(&e) else {
+                    return;
+                };
+                let mods = e.modifiers();
+                up_on_input.call(encode_mouse_report(
+                    MouseReportKind::Release,
+                    button,
+                    col,
+                    row,
+                    mods.shift(),
+                    mods.alt(),
+                    mods.ctrl(),
+                    up_sgr,
+                ));
+                last_motion_cell.set(None);
+            }
+            return;
+        }
+
+        if !selecting() {
+            return;
+        }
+        selecting.set(false);
+        let Some(ts) = selection() else { return };
+        if ts.anchor == ts.head {
+            // Plain click, no drag → clear any prior selection.
+            selection.set(None);
+            selection_text.set(String::new());
+            return;
+        }
+        let text = extract_selection(&up_rows, ts.anchor, ts.head);
+        if !text.is_empty() {
+            selection_text.set(text.clone());
+            // Copy-on-select (WindTerm default): the selection text is in
+            // the clipboard the moment the button is released.
+            spawn(async move {
+                copy_text_to_clipboard(text).await;
+            });
+        }
+    };
+
+    // Extract in screen reading order (top-left → bottom-right regardless
+    // of drag direction), then produce the clipboard text —
+    // `extract_selection` already normalizes endpoints, so callers pass
+    // anchor/head directly.
+    //
+    // Wheel reporting to app-mouse modes. `wheel_report_seq` builds N
+    // repeated reports for one wheel notch batch.
+    let wheel_reporting = render_output.mode_mouse_reporting;
+    let wheel_sgr = render_output.mode_mouse_sgr;
+    #[expect(clippy::too_many_arguments, reason = "xterm mouse report fields")]
+    fn wheel_report_seq(
+        button: u8,
+        notches: usize,
+        col: usize,
+        row: usize,
+        shift: bool,
+        alt: bool,
+        ctrl: bool,
+        sgr: bool,
+    ) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(16 * notches);
+        for _ in 0..notches {
+            buf.extend_from_slice(&encode_mouse_report(
+                MouseReportKind::Press,
+                button,
+                col,
+                row,
+                shift,
+                alt,
+                ctrl,
+                sgr,
+            ));
+        }
+        buf
+    }
+
+    // Poll the content div's geometry: client-rect origin + measured
+    // monospace cell size. `getBoundingClientRect` must be read live — it
+    // shifts whenever panes are resized/dragged or the window moves. The
+    // effect re-renders only when the tuple actually changes. NOTE: dioxus
+    // desktop eval wraps scripts in an AsyncFunction body, so results must be
+    // returned explicitly (`return ...`), not via an IIFE expression.
+    {
+        let scroll_id_geo = scroll_id.clone();
+        use_effect(move || {
+            let scroll_id_geo = scroll_id_geo.clone();
+            spawn(async move {
+                loop {
+                    let js = format!(
+                        "var el = document.querySelector('#{scroll_id_geo} > div:last-child');\
+                         if (!el) {{ return null; }}\
+                         var r = el.getBoundingClientRect();\
+                         var test = document.createElement('span');\
+                         test.textContent = 'MMMMMMMMMM';\
+                         test.style.cssText = 'font-family:JetBrains Mono,Fira Code,Cascadia Code,monospace;font-size:13px;line-height:1.5;position:absolute;visibility:hidden;white-space:pre;';\
+                         document.body.appendChild(test);\
+                         var tr = test.getBoundingClientRect();\
+                         document.body.removeChild(test);\
+                         if (tr.width <= 0 || tr.height <= 0) {{ return null; }}\
+                         return r.left.toFixed(2) + ',' + r.top.toFixed(2) + ',' + (tr.width / 10).toFixed(2) + ',' + tr.height.toFixed(2);"
+                    );
+                    if let Ok(v) = dioxus::document::eval(&js).await {
+                        if let Some(s) = v.as_str() {
+                            let parts: Vec<&str> = s.split(',').collect();
+                            if let (Some(l), Some(t), Some(w), Some(h)) = (
+                                parts.first().and_then(|p| p.parse::<f64>().ok()),
+                                parts.get(1).and_then(|p| p.parse::<f64>().ok()),
+                                parts.get(2).and_then(|p| p.parse::<f64>().ok()),
+                                parts.get(3).and_then(|p| p.parse::<f64>().ok()),
+                            ) {
+                                if w > 0.0 && h > 0.0 && content_geo() != Some((l, t, w, h)) {
+                                    content_geo.set(Some((l, t, w, h)));
+                                }
+                            }
+                        }
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+                }
+            });
+        });
+    }
 
     // Pre-render line numbers as a single HTML block (gutter column)
     let gutter_html = render_output
@@ -1176,6 +1597,23 @@ pub fn TerminalView(
         })
         .collect::<Vec<_>>()
         .join("");
+
+    // Per-row selection ranges for the mouse-drag highlight. `usize::MAX`
+    // means "to end of row" (extraction clamps per-row anyway).
+    let selection_read = selection();
+    let sel_range = selection_read
+        .as_ref()
+        .map(|ts| rusterm_core::terminal::normalize_selection(ts.anchor, ts.head));
+    let sel_for_row = |row_idx: usize| -> Option<(usize, usize)> {
+        let ((sr, sc), (er, ec)) = sel_range?;
+        if row_idx < sr || row_idx > er {
+            None
+        } else {
+            let a = if row_idx == sr { sc } else { 0 };
+            let b = if row_idx == er { ec } else { usize::MAX };
+            Some((a, b))
+        }
+    };
 
     // Pre-render content rows to HTML (no line numbers, no flex per-row)
     let row_htmls: Vec<String> = render_output
@@ -1208,7 +1646,7 @@ pub fn TerminalView(
                 ""
             };
 
-            let content_html = row_to_html(row, cur_col, sug);
+            let content_html = row_to_html(row, cur_col, sug, sel_for_row(row_idx));
 
             let mut html = String::with_capacity(content_html.len() + 80);
             html.push_str("<div style=\"white-space:pre;line-height:1.5;");
@@ -1254,18 +1692,61 @@ pub fn TerminalView(
             },
             tabindex: "0",
             onclick: onclick_focus,
-            onmouseup: onmouseup_copy,
             oncontextmenu: oncontextmenu_reconnect,
             onfocus: move |_| focused.set(true),
             onblur: move |_| focused.set(false),
             onkeydown: handle_keydown,
+            onmousedown: on_mouse_down,
+            onmousemove: on_mouse_move,
+            onmouseup: on_mouse_up,
             onwheel: move |e: WheelEvent| {
                 e.prevent_default();
                 let v = e.delta().strip_units();
+                if v.y == 0.0 {
+                    return;
+                }
+                // While the app tracks the mouse (and we're at the live view),
+                // the wheel scrolls the APP (vim, less, tmux); otherwise it
+                // scrolls our local scrollback. One report per ~40px notch.
+                if wheel_reporting && render_output.scrollback_offset == 0 {
+                    let button: u8 = if v.y < 0.0 { 64 } else { 65 };
+                    let notches = ((v.y.abs() / 40.0).ceil() as usize).max(1);
+                    let Some((left, top, cw, ch)) = content_geo() else { return };
+                    let pt = e.client_coordinates();
+                    let max_col = render_output
+                        .rows
+                        .iter()
+                        .map(|r| r.cells.len())
+                        .max()
+                        .unwrap_or(80);
+                    let (row, col) = event_cell_from_coords(
+                        pt.x,
+                        pt.y,
+                        left,
+                        top,
+                        cw,
+                        ch,
+                        render_output.rows.len(),
+                        max_col,
+                    );
+                    let mods = e.modifiers();
+                    let bytes = wheel_report_seq(
+                        button,
+                        notches,
+                        col,
+                        row,
+                        mods.shift(),
+                        mods.alt(),
+                        mods.ctrl(),
+                        wheel_sgr,
+                    );
+                    on_input.call(bytes);
+                    return;
+                }
                 if v.y < 0.0 {
                     let rows = ((-v.y / 40.0).ceil() as usize).max(1);
                     on_scroll_up.call(rows);
-                } else if v.y > 0.0 {
+                } else {
                     let rows = ((v.y / 40.0).ceil() as usize).max(1);
                     on_scroll_down.call(rows);
                 }
@@ -1380,14 +1861,13 @@ pub fn TerminalView(
                     dangerous_inner_html: "{gutter_html}",
                 }
 
-                // Terminal content
-                // Terminal content. `user-select: text` is explicitly declared
-                // here (the container default is `auto`, but some parent styles
-                // and drag-time body-level `userSelect: none` toggles can leak).
-                // Ensures mouse drag selection always works so users can select
-                // terminal output and copy it via Ctrl+Shift+C or select-to-copy.
+                // Terminal content. Selection is terminal-owned (cell-based
+                // drag → in-render highlight → copy on release), so the native
+                // DOM selection must stay OFF here: `user-select:none` keeps
+                // the two from competing. Re-copy with Ctrl+Shift+C / Cmd+C;
+                // paste with right-click / Ctrl+Shift+V / Cmd+V.
                 div {
-                    style: "flex:1;min-width:0;overflow:hidden;user-select:text;-webkit-user-select:text;",
+                    style: "flex:1;min-width:0;overflow:hidden;user-select:none;-webkit-user-select:none;",
 
                     for (row_idx, row_html) in row_htmls.iter().enumerate() {
                         div {
@@ -1449,8 +1929,58 @@ pub fn TerminalView(
 
 #[cfg(test)]
 mod tests {
-    use super::{OneKeyKeyAction, onekey_popup_key_action, scroll_thumb_geometry};
+    use super::{
+        OneKeyKeyAction, event_cell_from_coords, onekey_popup_key_action, scroll_thumb_geometry,
+    };
     use dioxus::prelude::Key;
+
+    #[test]
+    fn event_cell_maps_client_coords_to_grid() {
+        // Content rect at (320, 47), cell 7.8×19.0: a pixel just inside the
+        // second column of the second row maps to (row=1, col=1).
+        assert_eq!(
+            event_cell_from_coords(
+                320.0 + 7.8 + 1.0,
+                47.0 + 19.0 + 1.0,
+                320.0,
+                47.0,
+                7.8,
+                19.0,
+                24,
+                80
+            ),
+            (1, 1)
+        );
+        // Exactly on the origin → first cell.
+        assert_eq!(
+            event_cell_from_coords(320.0, 47.0, 320.0, 47.0, 7.8, 19.0, 24, 80),
+            (0, 0)
+        );
+    }
+
+    #[test]
+    fn event_cell_clamps_outside_grid_to_edges() {
+        // Left of the content div (over the gutter) → col 0, row 0
+        // (negative offsets clamp, they don't wrap).
+        assert_eq!(
+            event_cell_from_coords(10.0, 10.0, 320.0, 47.0, 7.8, 19.0, 24, 80),
+            (0, 0)
+        );
+        // Below the last row → last row; past the right edge → last col.
+        assert_eq!(
+            event_cell_from_coords(
+                320.0 + 83.0 * 7.8,
+                47.0 + 30.0 * 19.0,
+                320.0,
+                47.0,
+                7.8,
+                19.0,
+                24,
+                80
+            ),
+            (23, 79)
+        );
+    }
 
     #[test]
     fn onekey_popup_navigates_with_arrows_and_wraps() {
@@ -1505,6 +2035,44 @@ mod tests {
             onekey_popup_key_action(&Key::Backspace, 0, 3),
             OneKeyKeyAction::DismissAndForward
         );
+    }
+
+    #[test]
+    fn selection_highlight_wraps_cells_between_endpoints_only() {
+        use super::{SELECTION_BG, row_to_html};
+        use rusterm_core::terminal::{RenderCell, RenderRow};
+        let mk = |s: &str| RenderRow {
+            cells: s
+                .chars()
+                .map(|character| RenderCell {
+                    character,
+                    ..Default::default()
+                })
+                .collect(),
+            wrapped: false,
+        };
+        let row = mk("hello world");
+        // Columns 6..=10 = "world".
+        let html = row_to_html(&row, None, None, Some((6, 10)));
+        assert!(
+            html.contains(SELECTION_BG),
+            "selection highlight style must be present: {html}"
+        );
+        // "hello " stays unhighlighted; "world" is inside a highlight span.
+        let sel_span_start = html.find(SELECTION_BG).unwrap();
+        let span_close = html[sel_span_start..].find("</span>").unwrap() + sel_span_start;
+        let span_body = &html[sel_span_start..span_close];
+        assert!(
+            span_body.contains("world"),
+            "highlight covers 'world': {html}"
+        );
+        assert!(
+            !span_body.contains("hello"),
+            "highlight must not cover cells before the start column: {html}"
+        );
+        // No selection → no highlight style anywhere.
+        let plain = row_to_html(&row, None, None, None);
+        assert!(!plain.contains(SELECTION_BG));
     }
 
     #[test]

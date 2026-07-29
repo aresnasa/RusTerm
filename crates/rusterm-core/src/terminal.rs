@@ -128,6 +128,147 @@ pub struct RenderOutput {
     pub scrollback_capacity: usize,
 }
 
+// ── Mouse reporting (xterm DEC 1000/1002/1003/1015/1006) ──────────
+
+/// The kind of mouse event to encode for the application.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MouseReportKind {
+    /// Button press (`M` in SGR form).
+    Press,
+    /// Button release. Encoded as button-3 in the legacy X10 form, or as the
+    /// pressed button with the `m` final byte in SGR form.
+    Release,
+    /// Motion with a button held (button-event tracking, 1002).
+    Motion,
+}
+
+/// Encode one mouse report for the application.
+///
+/// - `button`: 0=left, 1=middle, 2=right, 64=wheel-up, 65=wheel-down.
+/// - `col`, `row`: 0-based cell coordinates; encoded as 1-based.
+/// - `shift`, `alt`, `ctrl`: add 4/8/16 to the button/flags byte.
+/// - `kind`: adds 32 (motion bit) for [`MouseReportKind::Motion`].
+/// - `sgr`: when true use SGR extended coordinates (`ESC[<btn;col;rowM/m`),
+///   otherwise the legacy X10 encoding (`ESC[M<btn><col+32><row+32>`,
+///   coords clamped to 95 columns/rows per the encoding's limits).
+#[expect(clippy::too_many_arguments, reason = "xterm mouse report fields")]
+pub fn encode_mouse_report(
+    kind: MouseReportKind,
+    button: u8,
+    col: usize,
+    row: usize,
+    shift: bool,
+    alt: bool,
+    ctrl: bool,
+    sgr: bool,
+) -> Vec<u8> {
+    let mut cb: u8 = button;
+    if matches!(kind, MouseReportKind::Motion) {
+        cb |= 32;
+    }
+    if shift {
+        cb |= 4;
+    }
+    if alt {
+        cb |= 8;
+    }
+    if ctrl {
+        cb |= 16;
+    }
+
+    if sgr {
+        let final_byte = if matches!(kind, MouseReportKind::Release) {
+            b'm'
+        } else {
+            b'M'
+        };
+        // Release reports keep the button that was released (so the app can
+        // tell which button came up), unlike the legacy form.
+        let mut buf = Vec::with_capacity(16);
+        buf.extend_from_slice(b"\x1b[<");
+        buf.extend_from_slice(cb.to_string().as_bytes());
+        buf.push(b';');
+        buf.extend_from_slice((col + 1).to_string().as_bytes());
+        buf.push(b';');
+        buf.extend_from_slice((row + 1).to_string().as_bytes());
+        buf.push(final_byte);
+        buf
+    } else {
+        let cb = if matches!(kind, MouseReportKind::Release) {
+            3 // X10: release is always reported as pseudo-button 3
+        } else {
+            cb
+        };
+        let col_enc = (col + 1).min(95) as u8 + 32;
+        let row_enc = (row + 1).min(95) as u8 + 32;
+        vec![0x1b, b'[', b'M', cb + 32, col_enc, row_enc]
+    }
+}
+
+/// Normalize a drag selection's two endpoints so `start` precedes `end` in
+/// reading order. Cell coordinates are (row, col).
+pub fn normalize_selection(
+    a: (usize, usize),
+    b: (usize, usize),
+) -> ((usize, usize), (usize, usize)) {
+    if a <= b { (a, b) } else { (b, a) }
+}
+
+/// Extract the text covered by a cell-range selection from rendered rows.
+///
+/// Both endpoints are inclusive (cell granularity). Soft-wrapped rows
+/// (`wrapped: true`) join the following row WITHOUT a newline — the wrapped
+/// segment was one logical line. Rows not marked wrapped get a `\n`.
+/// Trailing whitespace is trimmed on unwrapped rows (matching xterm), so
+/// selecting across a padded line doesn't drag in the right-margin spaces.
+/// Wide-char continuation cells (`wide_next`) are skipped so a CJK glyph is
+/// emitted once even when the selection range lands on its second cell.
+pub fn extract_selection(rows: &[RenderRow], start: (usize, usize), end: (usize, usize)) -> String {
+    let (start, end) = normalize_selection(start, end);
+    if rows.is_empty() || start.0 >= rows.len() {
+        return String::new();
+    }
+    let end_row = end.0.min(rows.len() - 1);
+
+    let mut out = String::new();
+    for r in start.0..=end_row {
+        let row = &rows[r];
+        if row.cells.is_empty() {
+            if r != end_row && !row.wrapped {
+                out.push('\n');
+            }
+            continue;
+        }
+        let sc = if r == start.0 { start.1 } else { 0 };
+        let ec = if r == end_row && r == end.0 {
+            end.1
+        } else {
+            usize::MAX
+        };
+        let mut line = String::new();
+        for (i, cell) in row.cells.iter().enumerate() {
+            if i < sc || i > ec {
+                continue;
+            }
+            if cell.wide_next {
+                continue;
+            }
+            line.push(cell.character);
+        }
+        if r == end_row && r == end.0 {
+            // Final segment: keep as-is (user ended the drag there).
+            out.push_str(&line);
+        } else {
+            let trimmed = line.trim_end();
+            out.push_str(trimmed);
+            if !row.wrapped {
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
 // ── Reflow helpers ─────────────────────────────────────────────────
 
 /// A grid cell that is purely the default background/foreground (a blank
@@ -1731,6 +1872,161 @@ mod tests {
             ],
             "narrowing a pane must not insert rows made from old right-padding"
         );
+    }
+
+    #[test]
+    fn mouse_report_sgr_press_release_wheel_mods() {
+        // SGR press: ESC[<btn;col;rowM — 1-based coords, left button at (0,0).
+        assert_eq!(
+            encode_mouse_report(MouseReportKind::Press, 0, 0, 0, false, false, false, true),
+            b"\x1b[<0;1;1M".to_vec()
+        );
+        // SGR release keeps the button number but uses the 'm' final byte.
+        assert_eq!(
+            encode_mouse_report(MouseReportKind::Release, 0, 4, 9, false, false, false, true),
+            b"\x1b[<0;5;10m".to_vec()
+        );
+        // Wheel-down with Shift+Ctrl: button 65 | 4 | 16 = 85.
+        assert_eq!(
+            encode_mouse_report(MouseReportKind::Press, 65, 1, 0, true, false, true, true),
+            b"\x1b[<85;2;1M".to_vec()
+        );
+        // Motion adds the 32 bit: left(0) | 32 = 32.
+        assert_eq!(
+            encode_mouse_report(MouseReportKind::Motion, 0, 2, 3, false, false, false, true),
+            b"\x1b[<32;3;4M".to_vec()
+        );
+    }
+
+    #[test]
+    fn mouse_report_legacy_form() {
+        // Legacy X10: ESC[M Cb Cx Cy with +32 offsets; release is pseudo-button 3.
+        assert_eq!(
+            encode_mouse_report(MouseReportKind::Press, 0, 0, 0, false, false, false, false),
+            vec![0x1b, b'[', b'M', 32, 33, 33]
+        );
+        assert_eq!(
+            encode_mouse_report(
+                MouseReportKind::Release,
+                2,
+                0,
+                0,
+                false,
+                false,
+                false,
+                false
+            ),
+            vec![0x1b, b'[', b'M', 35, 33, 33]
+        );
+        // Coordinates beyond the legacy 95-cell limit are clamped.
+        let r = encode_mouse_report(
+            MouseReportKind::Press,
+            0,
+            300,
+            300,
+            false,
+            false,
+            false,
+            false,
+        );
+        assert_eq!(r[4], 95 + 32);
+        assert_eq!(r[5], 95 + 32);
+    }
+
+    #[test]
+    fn mouse_tracking_modes_roundtrip() {
+        let mut term = Terminal::new(TerminalSize::default());
+        let mut parser = vte::ansi::Processor::new();
+        assert!(!term.render().mode_mouse_reporting);
+
+        term.process(b"\x1b[?1000h\x1b[?1006h", &mut parser);
+        let out = term.render();
+        assert!(out.mode_mouse_reporting);
+        assert!(out.mode_mouse_sgr);
+
+        // App enters alt screen — mouse modes are restored on exit.
+        term.process(b"\x1b[?1049h\x1b[?1000l", &mut parser);
+        assert!(!term.render().mode_mouse_reporting);
+        term.process(b"\x1b[?1049l", &mut parser);
+        assert!(term.render().mode_mouse_reporting);
+
+        // 1002 enables button-motion reporting; 1002 still counts as tracking.
+        term.process(b"\x1b[?1002h", &mut parser);
+        assert!(term.render().mode_mouse_button_motion);
+        // Turning 1002 off shuts tracking down (1003 not enabled).
+        term.process(b"\x1b[?1002l", &mut parser);
+        let out = term.render();
+        assert!(!out.mode_mouse_button_motion);
+        // RIS resets everything.
+        term.process(b"\x1b[?1003h\x1bc", &mut parser);
+        assert!(!term.render().mode_mouse_reporting);
+        assert!(!term.render().mode_mouse_sgr);
+    }
+
+    #[test]
+    fn extract_selection_ragged_and_wrapped() {
+        let mk = |s: &str, wrapped: bool| RenderRow {
+            cells: s
+                .chars()
+                .map(|character| RenderCell {
+                    character,
+                    ..Default::default()
+                })
+                .collect(),
+            wrapped,
+        };
+        let rows = vec![
+            mk("hello world  ", false),
+            mk("wrapped-li", true),
+            mk("ne continues", false),
+        ];
+        // Single-line ragged selection.
+        assert_eq!(
+            extract_selection(&rows, (0, 6), (0, 10)),
+            "world".to_string()
+        );
+        // Multi-line: wrapped row 1 joins row 2 without a newline
+        // ("wrapped-li" + "ne " = "wrapped-line "); row 0 trailing spaces
+        // are trimmed.
+        assert_eq!(
+            extract_selection(&rows, (0, 6), (2, 2)),
+            "world\nwrapped-line ".to_string()
+        );
+    }
+
+    #[test]
+    fn extract_selection_skips_wide_continuation_cells() {
+        // A wide char (CJK) occupies two cells: the glyph + a continuation.
+        let row = RenderRow {
+            cells: vec![
+                RenderCell {
+                    character: '好',
+                    wide: true,
+                    ..Default::default()
+                },
+                RenderCell {
+                    character: ' ',
+                    wide_next: true,
+                    ..Default::default()
+                },
+                RenderCell {
+                    character: 'x',
+                    ..Default::default()
+                },
+            ],
+            wrapped: false,
+        };
+        let rows = vec![row];
+        // Selecting the continuation cell as end still emits the glyph once.
+        assert_eq!(extract_selection(&rows, (0, 0), (0, 1)), "好".to_string());
+        assert_eq!(extract_selection(&rows, (0, 0), (0, 2)), "好x".to_string());
+    }
+
+    #[test]
+    fn normalize_selection_orders_endpoints() {
+        assert_eq!(normalize_selection((3, 9), (1, 2)), ((1, 2), (3, 9)));
+        assert_eq!(normalize_selection((1, 5), (1, 2)), ((1, 2), (1, 5)));
+        assert_eq!(normalize_selection((2, 2), (2, 2)), ((2, 2), (2, 2)));
     }
 
     #[test]
