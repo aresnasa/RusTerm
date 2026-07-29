@@ -38,73 +38,85 @@
     </filter>
   </defs>
 
-  <!-- App Icon Base -->
+  <!-- App Icon Base — fills the full canvas (macOS squircle-style background).
+       NOT scaled: the background tile must fill the canvas so macOS renders the
+       icon at the standard Dock/Cmd-Tab tile size. -->
   <g filter="url(#appShadow)">
     <use href="#bg"/>
   </g>
 
-  <!-- Shield Outer Stroke (Dark Gold/Brown) -->
-  <path d="M256 80 
-           L416 110 
-           L416 260 
-           C416 360 330 430 256 460 
-           C182 430 96 360 96 260 
-           L96 110 Z" 
-        fill="url(#shieldOuterGrad)" 
-        stroke="#5C421A" 
-        stroke-width="12" 
-        stroke-linejoin="round"/>
+  <!-- Artwork — scaled to ~80% and centered within the canvas so the shield +
+       elements sit inside the standard macOS app-icon padding (Apple HIG: artwork
+       occupies ~70-80% of the canvas, ~10% margin per side). Previously the
+       shield spanned y=80..460 (74% of canvas height, only 15% top margin),
+       making the icon appear visually larger than other macOS app icons in the
+       Cmd-Tab switcher and Dock. -->
+  <g transform="translate(256, 256) scale(0.8) translate(-256, -256)">
 
-  <!-- Shield Inner Left (Lighter Gold) -->
-  <path d="M256 100 
-           L116 126 
-           L116 260 
-           C116 348 190 408 256 434 Z" 
-        fill="url(#shieldLeftGrad)"/>
-
-  <!-- Shield Inner Right (Darker Gold) -->
-  <path d="M256 100 
-           L396 126 
-           L396 260 
-           C396 348 322 408 256 434 Z" 
-        fill="url(#shieldRightGrad)"/>
-
-  <!-- Stylized Terminal Abstract Elements -->
-  <g transform="translate(136, 150)" stroke="#3E2B10" stroke-linecap="round" stroke-linejoin="round">
-    
-    <!-- Top abstract terminal prompt/input lines -->
-    <polyline points="10,20 30,40 10,60" fill="none" stroke-width="14" stroke-opacity="0.9"/>
-    
-    <!-- Code logic/path abstract lines (Changed to all straight horizontal lines) -->
-    <line x1="60" y1="20" x2="130" y2="20" stroke-width="12" stroke-opacity="0.8"/>
-    <line x1="60" y1="40" x2="100" y2="40" stroke-width="12" stroke-opacity="0.8"/>
-    <line x1="60" y1="60" x2="140" y2="60" stroke-width="12" stroke-opacity="0.8"/>
-    <line x1="60" y1="80" x2="110" y2="80" stroke-width="12" stroke-opacity="0.8"/>
-
-    <!-- Green abstract blocks (Rust speed/success) -->
-    <rect x="10" y="100" width="80" height="24" rx="12" fill="#78D668" stroke-width="8"/>
-    <rect x="10" y="140" width="70" height="24" rx="12" fill="#78D668" stroke-width="8"/>
-    <rect x="10" y="180" width="90" height="24" rx="12" fill="#4CAF50" stroke-width="8"/> 
-    <rect x="30" y="220" width="80" height="24" rx="12" fill="#4CAF50" stroke-width="8"/> 
-
-    <!-- Blue abstract blocks (Memory/Data flow) -->
-    <rect x="100" y="100" width="90" height="24" rx="12" fill="#5AA6F7" stroke-width="8"/>
-    <rect x="90" y="140" width="100" height="24" rx="12" fill="#5AA6F7" stroke-width="8"/>
-    <rect x="110" y="180" width="70" height="24" rx="12" fill="#3B82F6" stroke-width="8"/> 
-    <rect x="120" y="220" width="60" height="24" rx="12" fill="#3B82F6" stroke-width="8"/> 
-  </g>
-
-  <!-- The Smart AI Star (Gemini style) moved to the top right corner inside the shield -->
-  <g transform="translate(290, 120) scale(0.75)" filter="url(#innerShadow)">
-    <path d="M 60 0 
-             C 60 40, 80 60, 120 60 
-             C 80 60, 60 80, 60 120 
-             C 60 80, 40 60, 0 60 
-             C 40 60, 60 40, 60 0 Z" 
-          fill="url(#starGrad)" 
-          stroke="#003366" 
-          stroke-width="8" 
+    <!-- Shield Outer Stroke (Dark Gold/Brown) -->
+    <path d="M256 80 
+             L416 110 
+             L416 260 
+             C416 360 330 430 256 460 
+             C182 430 96 360 96 260 
+             L96 110 Z" 
+          fill="url(#shieldOuterGrad)" 
+          stroke="#5C421A" 
+          stroke-width="12" 
           stroke-linejoin="round"/>
+
+    <!-- Shield Inner Left (Lighter Gold) -->
+    <path d="M256 100 
+             L116 126 
+             L116 260 
+             C116 348 190 408 256 434 Z" 
+          fill="url(#shieldLeftGrad)"/>
+
+    <!-- Shield Inner Right (Darker Gold) -->
+    <path d="M256 100 
+             L396 126 
+             L396 260 
+             C396 348 322 408 256 434 Z" 
+          fill="url(#shieldRightGrad)"/>
+
+    <!-- Stylized Terminal Abstract Elements -->
+    <g transform="translate(136, 150)" stroke="#3E2B10" stroke-linecap="round" stroke-linejoin="round">
+      
+      <!-- Top abstract terminal prompt/input lines -->
+      <polyline points="10,20 30,40 10,60" fill="none" stroke-width="14" stroke-opacity="0.9"/>
+      
+      <!-- Code logic/path abstract lines (Changed to all straight horizontal lines) -->
+      <line x1="60" y1="20" x2="130" y2="20" stroke-width="12" stroke-opacity="0.8"/>
+      <line x1="60" y1="40" x2="100" y2="40" stroke-width="12" stroke-opacity="0.8"/>
+      <line x1="60" y1="60" x2="140" y2="60" stroke-width="12" stroke-opacity="0.8"/>
+      <line x1="60" y1="80" x2="110" y2="80" stroke-width="12" stroke-opacity="0.8"/>
+
+      <!-- Green abstract blocks (Rust speed/success) -->
+      <rect x="10" y="100" width="80" height="24" rx="12" fill="#78D668" stroke-width="8"/>
+      <rect x="10" y="140" width="70" height="24" rx="12" fill="#78D668" stroke-width="8"/>
+      <rect x="10" y="180" width="90" height="24" rx="12" fill="#4CAF50" stroke-width="8"/> 
+      <rect x="30" y="220" width="80" height="24" rx="12" fill="#4CAF50" stroke-width="8"/> 
+
+      <!-- Blue abstract blocks (Memory/Data flow) -->
+      <rect x="100" y="100" width="90" height="24" rx="12" fill="#5AA6F7" stroke-width="8"/>
+      <rect x="90" y="140" width="100" height="24" rx="12" fill="#5AA6F7" stroke-width="8"/>
+      <rect x="110" y="180" width="70" height="24" rx="12" fill="#3B82F6" stroke-width="8"/> 
+      <rect x="120" y="220" width="60" height="24" rx="12" fill="#3B82F6" stroke-width="8"/> 
+    </g>
+
+    <!-- The Smart AI Star (Gemini style) moved to the top right corner inside the shield -->
+    <g transform="translate(290, 120) scale(0.75)" filter="url(#innerShadow)">
+      <path d="M 60 0 
+               C 60 40, 80 60, 120 60 
+               C 80 60, 60 80, 60 120 
+               C 60 80, 40 60, 0 60 
+               C 40 60, 60 40, 60 0 Z" 
+            fill="url(#starGrad)" 
+            stroke="#003366" 
+            stroke-width="8" 
+            stroke-linejoin="round"/>
+    </g>
+
   </g>
 
 </svg>

@@ -4,8 +4,8 @@ use dioxus::prelude::*;
 use dioxus::html::input_data::MouseButton;
 
 use rusterm_core::terminal::{
-    CellColor, CellFlags, MouseReportKind, RenderOutput, RenderRow, encode_mouse_report,
-    extract_selection,
+    CellColor, CellFlags, MouseReportKind, RenderCell, RenderOutput, RenderRow,
+    encode_mouse_report, extract_selection,
 };
 
 use crate::components::OneKeyPopup;
@@ -428,6 +428,82 @@ fn event_cell_from_coords(
         row.min(rows_len.saturating_sub(1)),
         col.min(max_col.saturating_sub(1)),
     )
+}
+
+/// Classify a single character into one of three xterm-style char classes
+/// used for double-click word selection:
+///   - `Word`: identifier characters `[A-Za-z0-9_]`
+///   - `Punct`: any other non-whitespace character (symbols, punctuation)
+///   - `Space`: whitespace (ASCII space — terminal cells never hold \n/\t;
+///     those are encoded as a space in the rendered grid).
+///
+/// Selecting the run of the SAME class as the clicked cell reproduces
+/// WindTerm/xterm behaviour: clicking inside an identifier selects the whole
+/// identifier; clicking on a punctuation glyph selects a run of punctuation;
+/// clicking on whitespace selects the whitespace run.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CharClass {
+    Word,
+    Punct,
+    Space,
+}
+
+fn char_class(c: char) -> CharClass {
+    if c.is_ascii_alphanumeric() || c == '_' {
+        CharClass::Word
+    } else if c.is_whitespace() {
+        CharClass::Space
+    } else {
+        CharClass::Punct
+    }
+}
+
+/// Compute the inclusive `(start_col, end_col)` word range in `cells` for a
+/// double-click at column `col`. The range covers the maximal same-`CharClass`
+/// run containing `col`, matching WindTerm/xterm word selection.
+///
+/// Wide-char continuation cells (`wide_next == true`) are placeholders for the
+/// second column of a CJK/emoticon glyph: they carry no character of their
+/// own and must not break the selection at the glyph boundary. They inherit
+/// the `CharClass` of their parent wide cell (the cell to their left with
+/// `wide == true`), so a double-click on either half of a wide glyph selects
+/// the whole glyph, and a run of same-class wide glyphs extends across both
+/// columns of each.
+///
+/// If `col` is out of range the result is `(col, col)` clamped to the last
+/// valid index (or `(0, 0)` for an empty row).
+pub(crate) fn word_range_in_row(cells: &[RenderCell], col: usize) -> (usize, usize) {
+    if cells.is_empty() {
+        return (0, 0);
+    }
+    let col = col.min(cells.len() - 1);
+    let clicked_class = cell_class(cells, col);
+
+    let mut start = col;
+    while start > 0 && cell_class(cells, start - 1) == clicked_class {
+        start -= 1;
+    }
+    let mut end = col;
+    while end + 1 < cells.len() && cell_class(cells, end + 1) == clicked_class {
+        end += 1;
+    }
+    (start, end)
+}
+
+/// `CharClass` of the glyph occupying column `idx`. A `wide_next` continuation
+/// cell inherits the class of its parent wide cell (the nearest `wide: true`
+/// cell to the left — wide glyphs occupy exactly two columns), so the run
+/// doesn't fracture across a wide glyph's two cells.
+fn cell_class(cells: &[RenderCell], idx: usize) -> CharClass {
+    if cells[idx].wide_next {
+        if idx > 0 && cells[idx - 1].wide {
+            return char_class(cells[idx - 1].character);
+        }
+        // Malformed grid (wide_next with no preceding wide cell) — treat as
+        // punctuation so it at least doesn't merge with adjacent word runs.
+        return CharClass::Punct;
+    }
+    char_class(cells[idx].character)
 }
 
 /// Render a terminal row to an HTML string. Uses `dangerous_inner_html`
@@ -1501,6 +1577,71 @@ pub fn TerminalView(
         }
     };
 
+    // Double-click selects the word under the cursor (WindTerm behaviour) and
+    // copies it immediately. When an application has enabled mouse reporting
+    // (vim `set mouse=a`, tmux, htop) and Shift isn't held, xterm forwards the
+    // double-click as a second press report and the application performs its
+    // own word selection — we must NOT also run a local selection, otherwise
+    // both the app and the terminal try to own the click. Shift forces local
+    // word selection even under app reporting (same override as single-click
+    // drag selection).
+    let dbl_reporting = down_reporting;
+    let dbl_sgr = render_output.mode_mouse_sgr;
+    let dbl_rows = render_output.rows.clone();
+    let dbl_on_input = on_input;
+    let on_double_click = move |e: MouseEvent| {
+        if current_disconnected {
+            return;
+        }
+        let mods = e.modifiers();
+        let shift = mods.shift();
+
+        if dbl_reporting && !shift {
+            // App owns the mouse: forward as a press report (xterm sends the
+            // second click of a double-click as another press). The app does
+            // its own word selection.
+            let Some((row, col)) = event_cell(&e) else {
+                return;
+            };
+            dbl_on_input.call(encode_mouse_report(
+                MouseReportKind::Press,
+                0,
+                col,
+                row,
+                shift,
+                mods.alt(),
+                mods.ctrl(),
+                dbl_sgr,
+            ));
+            return;
+        }
+
+        // Local word selection: expand to the maximal same-char-class run.
+        let Some((row, col)) = event_cell(&e) else {
+            return;
+        };
+        let Some(row_cells) = dbl_rows.get(row) else {
+            return;
+        };
+        let (start_col, end_col) = word_range_in_row(&row_cells.cells, col);
+        // An empty/whitespace run or a single cell is still a valid selection:
+        // WindTerm selects the whitespace run too. But a degenerate range on an
+        // empty row isn't worth copying.
+        let anchor = (row, start_col);
+        let head = (row, end_col);
+        selection.set(Some(TextSelection { anchor, head }));
+        selecting.set(false); // no drag follows unless a fresh mousedown starts
+        let text = extract_selection(&dbl_rows, anchor, head);
+        if !text.is_empty() {
+            selection_text.set(text.clone());
+            spawn(async move {
+                copy_text_to_clipboard(text).await;
+            });
+        } else {
+            selection_text.set(String::new());
+        }
+    };
+
     // Extract in screen reading order (top-left → bottom-right regardless
     // of drag direction), then produce the clipboard text —
     // `extract_selection` already normalizes endpoints, so callers pass
@@ -1699,6 +1840,7 @@ pub fn TerminalView(
             onmousedown: on_mouse_down,
             onmousemove: on_mouse_move,
             onmouseup: on_mouse_up,
+            ondoubleclick: on_double_click,
             onwheel: move |e: WheelEvent| {
                 e.prevent_default();
                 let v = e.delta().strip_units();
@@ -1931,8 +2073,10 @@ pub fn TerminalView(
 mod tests {
     use super::{
         OneKeyKeyAction, event_cell_from_coords, onekey_popup_key_action, scroll_thumb_geometry,
+        word_range_in_row,
     };
     use dioxus::prelude::Key;
+    use rusterm_core::terminal::{RenderCell, RenderRow};
 
     #[test]
     fn event_cell_maps_client_coords_to_grid() {
@@ -1980,6 +2124,150 @@ mod tests {
             ),
             (23, 79)
         );
+    }
+
+    // Helper: build a `Vec<RenderCell>` from a string, one cell per char.
+    fn cells_from(s: &str) -> Vec<RenderCell> {
+        s.chars()
+            .map(|character| RenderCell {
+                character,
+                ..Default::default()
+            })
+            .collect()
+    }
+
+    // Helper: build a cell with `wide`/`wide_next` flags set, for CJK glyphs.
+    fn wide_cell(c: char) -> RenderCell {
+        RenderCell {
+            character: c,
+            wide: true,
+            ..Default::default()
+        }
+    }
+    fn wide_next_cell() -> RenderCell {
+        RenderCell {
+            character: '\u{0}', // placeholder — never emitted
+            wide_next: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn word_range_selects_full_word_run() {
+        // "hello world" — clicking any cell of "hello" selects cols 0..=4,
+        // clicking any cell of "world" selects cols 6..=10.
+        let cells = cells_from("hello world");
+        assert_eq!(word_range_in_row(&cells, 0), (0, 4)); // 'h'
+        assert_eq!(word_range_in_row(&cells, 2), (0, 4)); // 'l'
+        assert_eq!(word_range_in_row(&cells, 4), (0, 4)); // 'o'
+        assert_eq!(word_range_in_row(&cells, 5), (5, 5)); // ' ' (space)
+        assert_eq!(word_range_in_row(&cells, 6), (6, 10)); // 'w'
+        assert_eq!(word_range_in_row(&cells, 10), (6, 10)); // 'd'
+    }
+
+    #[test]
+    fn word_range_selects_punctuation_run() {
+        // "foo===bar" — clicking '=' selects the three-char '===' run.
+        let cells = cells_from("foo===bar");
+        assert_eq!(word_range_in_row(&cells, 3), (3, 5)); // first '='
+        assert_eq!(word_range_in_row(&cells, 4), (3, 5)); // middle '='
+        assert_eq!(word_range_in_row(&cells, 5), (3, 5)); // last '='
+        // 'f' and 'b' still select their word runs.
+        assert_eq!(word_range_in_row(&cells, 0), (0, 2));
+        assert_eq!(word_range_in_row(&cells, 6), (6, 8));
+    }
+
+    #[test]
+    fn word_range_selects_whitespace_run() {
+        // "a   b" — clicking the middle space selects the 3-space run.
+        let cells = cells_from("a   b");
+        assert_eq!(word_range_in_row(&cells, 1), (1, 3));
+        assert_eq!(word_range_in_row(&cells, 2), (1, 3));
+        assert_eq!(word_range_in_row(&cells, 3), (1, 3));
+    }
+
+    #[test]
+    fn word_range_at_row_boundaries() {
+        // Single word fills the whole row.
+        let cells = cells_from("rust");
+        assert_eq!(word_range_in_row(&cells, 0), (0, 3));
+        assert_eq!(word_range_in_row(&cells, 3), (0, 3));
+        // Single cell.
+        let one = cells_from("x");
+        assert_eq!(word_range_in_row(&one, 0), (0, 0));
+    }
+
+    #[test]
+    fn word_range_clamps_out_of_range_col() {
+        let cells = cells_from("ab cd");
+        // col way past the end clamps to the last cell.
+        assert_eq!(word_range_in_row(&cells, 99), (3, 4));
+    }
+
+    #[test]
+    fn word_range_empty_row() {
+        let cells: Vec<RenderCell> = vec![];
+        assert_eq!(word_range_in_row(&cells, 0), (0, 0));
+        assert_eq!(word_range_in_row(&cells, 5), (0, 0));
+    }
+
+    #[test]
+    fn word_range_underscore_is_word_char() {
+        // "my_var = 42" — clicking inside "my_var" selects the whole identifier
+        // including the underscore (matches xterm/IDE convention).
+        let cells = cells_from("my_var = 42");
+        assert_eq!(word_range_in_row(&cells, 0), (0, 5)); // 'm'
+        assert_eq!(word_range_in_row(&cells, 2), (0, 5)); // '_'
+        assert_eq!(word_range_in_row(&cells, 5), (0, 5)); // 'r'
+    }
+
+    #[test]
+    fn word_range_wide_char_does_not_fracture_selection() {
+        // "ab中cd" where 中 occupies two cells (wide + wide_next):
+        //   idx: 0='a' 1='b' 2=中(wide) 3=wide_next 4='c' 5='d'
+        // Clicking the wide char (either half) selects just the wide glyph
+        // (cols 2..=3), NOT the neighbouring ASCII letters.
+        let cells = vec![
+            RenderCell {
+                character: 'a',
+                ..Default::default()
+            },
+            RenderCell {
+                character: 'b',
+                ..Default::default()
+            },
+            wide_cell('中'),
+            wide_next_cell(),
+            RenderCell {
+                character: 'c',
+                ..Default::default()
+            },
+            RenderCell {
+                character: 'd',
+                ..Default::default()
+            },
+        ];
+        assert_eq!(word_range_in_row(&cells, 2), (2, 3)); // clicking the wide first cell
+        assert_eq!(word_range_in_row(&cells, 3), (2, 3)); // clicking the wide_next cell
+        // Adjacent ASCII word runs are unaffected.
+        assert_eq!(word_range_in_row(&cells, 0), (0, 1)); // "ab"
+        assert_eq!(word_range_in_row(&cells, 4), (4, 5)); // "cd"
+    }
+
+    #[test]
+    fn word_range_adjacent_wide_chars_same_class_extend() {
+        // "世界" — two adjacent CJK glyphs (each wide + wide_next), both
+        // Punct class, so the run extends across both glyphs (cols 0..=3).
+        let cells = vec![
+            wide_cell('世'),
+            wide_next_cell(),
+            wide_cell('界'),
+            wide_next_cell(),
+        ];
+        assert_eq!(word_range_in_row(&cells, 0), (0, 3));
+        assert_eq!(word_range_in_row(&cells, 1), (0, 3));
+        assert_eq!(word_range_in_row(&cells, 2), (0, 3));
+        assert_eq!(word_range_in_row(&cells, 3), (0, 3));
     }
 
     #[test]
@@ -2040,7 +2328,6 @@ mod tests {
     #[test]
     fn selection_highlight_wraps_cells_between_endpoints_only() {
         use super::{SELECTION_BG, row_to_html};
-        use rusterm_core::terminal::{RenderCell, RenderRow};
         let mk = |s: &str| RenderRow {
             cells: s
                 .chars()
