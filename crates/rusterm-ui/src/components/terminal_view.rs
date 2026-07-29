@@ -467,6 +467,7 @@ pub fn TerminalView(
 
     let closure_suggestions = current_suggestions.clone();
     let sid_for_keydown_log = session_id.clone();
+    let sid_for_copy = session_id.clone();
     let handle_keydown = move |e: KeyboardEvent| {
         let key = e.key();
         let code = e.code();
@@ -577,13 +578,49 @@ pub fn TerminalView(
             return;
         }
 
-        // Ctrl+Shift+C: copy selection
+        // Ctrl+Shift+C: copy selection. We use a JS helper that tries
+        // `window.getSelection().toString()` first (works for native drag-
+        // selections on the terminal content), and falls back to reading
+        // the active INPUT/TEXTAREA's selection (covers the rare case where
+        // focus is on the hidden terminal-input element). The clipboard write
+        // is fire-and-forget; we log the char count for debugging.
         if ctrl && shift && matches!(key, Key::Character(ref s) if s == "c" || s == "C") {
+            let sid_for_copy_log = sid_for_copy.clone();
             spawn(async move {
-                let _ = dioxus::document::eval(
-                    "navigator.clipboard.writeText(window.getSelection().toString())",
-                )
-                .await;
+                let js = "(function() {\
+                    var sel = window.getSelection();\
+                    var text = sel ? sel.toString() : '';\
+                    if (!text) {\
+                        var a = document.activeElement;\
+                        if (a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA') && typeof a.selectionStart === 'number' && typeof a.selectionEnd === 'number') {\
+                            text = a.value.substring(a.selectionStart, a.selectionEnd);\
+                        }\
+                    }\
+                    if (text) {\
+                        if (navigator.clipboard && navigator.clipboard.writeText) {\
+                            navigator.clipboard.writeText(text);\
+                        }\
+                        return String(text.length);\
+                    }\
+                    return '0';\
+                })()";
+                let result = dioxus::document::eval(js).await;
+                let n: usize = result
+                    .ok()
+                    .and_then(|r| r.as_str().and_then(|s| s.parse::<usize>().ok()))
+                    .unwrap_or(0);
+                if n > 0 {
+                    tracing::info!(
+                        "[COPY] Ctrl+Shift+C copied {} chars for session {:?}",
+                        n,
+                        &sid_for_copy_log[..sid_for_copy_log.len().min(8)]
+                    );
+                } else {
+                    tracing::debug!(
+                        "[COPY] Ctrl+Shift+C fired but no selection for session {:?}",
+                        &sid_for_copy_log[..sid_for_copy_log.len().min(8)]
+                    );
+                }
             });
             return;
         }
@@ -1072,6 +1109,44 @@ pub fn TerminalView(
         }
     };
 
+    // Select-to-copy: when the user finishes a mouse drag selection inside
+    // the terminal, automatically copy the selected text to the clipboard.
+    // This matches the behavior of most modern terminals (Windows Terminal,
+    // iTerm2 with select-to-clipboard, gnome-terminal with copy-on-select).
+    // A plain click (no drag) produces an empty selection, so nothing is
+    // copied — the click still falls through to `onclick_focus` to focus
+    // the terminal. We intentionally do NOT clear the selection after
+    // copying, so the user can see what was captured.
+    let copy_sid = session_id.clone();
+    let onmouseup_copy = move |_: MouseEvent| {
+        let sid = copy_sid.clone();
+        spawn(async move {
+            let js = "(function() {\
+                var sel = window.getSelection();\
+                var text = sel ? sel.toString() : '';\
+                if (text) {\
+                    if (navigator.clipboard && navigator.clipboard.writeText) {\
+                        navigator.clipboard.writeText(text);\
+                    }\
+                    return String(text.length);\
+                }\
+                return '0';\
+            })()";
+            let result = dioxus::document::eval(js).await;
+            let n: usize = result
+                .ok()
+                .and_then(|r| r.as_str().and_then(|s| s.parse::<usize>().ok()))
+                .unwrap_or(0);
+            if n > 0 {
+                tracing::info!(
+                    "[COPY] select-to-copy {} chars for session {:?}",
+                    n,
+                    &sid[..sid.len().min(8)]
+                );
+            }
+        });
+    };
+
     // Gutter width is based on the STABLE maximum line number (scrollback
     // capacity + visible rows), not the current line count — otherwise the
     // gutter widens at 10/100/1000/10000-line thresholds as scrollback fills,
@@ -1179,6 +1254,7 @@ pub fn TerminalView(
             },
             tabindex: "0",
             onclick: onclick_focus,
+            onmouseup: onmouseup_copy,
             oncontextmenu: oncontextmenu_reconnect,
             onfocus: move |_| focused.set(true),
             onblur: move |_| focused.set(false),
@@ -1305,8 +1381,13 @@ pub fn TerminalView(
                 }
 
                 // Terminal content
+                // Terminal content. `user-select: text` is explicitly declared
+                // here (the container default is `auto`, but some parent styles
+                // and drag-time body-level `userSelect: none` toggles can leak).
+                // Ensures mouse drag selection always works so users can select
+                // terminal output and copy it via Ctrl+Shift+C or select-to-copy.
                 div {
-                    style: "flex:1;min-width:0;overflow:hidden;",
+                    style: "flex:1;min-width:0;overflow:hidden;user-select:text;-webkit-user-select:text;",
 
                     for (row_idx, row_html) in row_htmls.iter().enumerate() {
                         div {

@@ -105,6 +105,22 @@ pub struct RenderOutput {
     pub scrollback_total: usize,
     pub mode_cursor_keys: bool,
     pub mode_bracketed_paste: bool,
+    /// True when the application requested any mouse tracking mode
+    /// (1000/1002/1003). While set, the UI should forward mouse press/motion/
+    /// release/wheel events to the PTY instead of doing local text selection
+    /// (Shift overrides back to local selection, as in xterm/WezTerm/WindTerm).
+    pub mode_mouse_reporting: bool,
+    /// True when the application requested SGR extended mouse coordinates
+    /// (\x1b[?1006h). Determines the encoding used for mouse reports.
+    pub mode_mouse_sgr: bool,
+    /// True when the application requested button-event tracking (1002) —
+    /// report motion only while a button is held — but NOT any-event tracking
+    /// (1003, report motion always). Kept separate so the UI can decide when
+    /// to send motion reports.
+    pub mode_mouse_button_motion: bool,
+    /// True when the application requested any-event tracking (1003) — report
+    /// all motion, buttons or not.
+    pub mode_mouse_any_motion: bool,
     pub line_number_start: usize,
     /// Max scrollback lines the terminal retains. Stable across output (unlike
     /// `scrollback_total`), so the UI can size the line-number gutter once
@@ -161,6 +177,10 @@ struct ScreenSwitchState {
     mode_show_cursor: bool,
     mode_cursor_keys: bool,
     mode_bracketed_paste: bool,
+    mode_mouse_reporting: bool,
+    mode_mouse_sgr: bool,
+    mode_mouse_button_motion: bool,
+    mode_mouse_any_motion: bool,
     mode_line_wrap: bool,
     mode_origin: bool,
     scroll_top: usize,
@@ -199,6 +219,14 @@ pub struct Terminal {
     mode_show_cursor: bool,
     mode_bracketed_paste: bool,
     mode_cursor_keys: bool,
+    /// Mouse tracking: report press/release (ESC[?1000h), plus button-held
+    /// motion (1002), plus all motion (1003), plus SGR coordinate encoding
+    /// (1006). `mode_mouse_reporting` is the UI-facing summary flag; the
+    /// motion granularity matters for how many events the UI should send.
+    mode_mouse_reporting: bool,
+    mode_mouse_sgr: bool,
+    mode_mouse_button_motion: bool,
+    mode_mouse_any_motion: bool,
     mode_origin: bool,
     mode_insert: bool,
 
@@ -260,6 +288,10 @@ impl Terminal {
             mode_show_cursor: true,
             mode_bracketed_paste: false,
             mode_cursor_keys: false,
+            mode_mouse_reporting: false,
+            mode_mouse_sgr: false,
+            mode_mouse_button_motion: false,
+            mode_mouse_any_motion: false,
             mode_origin: false,
             mode_insert: false,
             charsets: [StandardCharset::Ascii; 4],
@@ -606,6 +638,10 @@ impl Terminal {
             scrollback_total: scrollback_len,
             mode_cursor_keys: self.mode_cursor_keys,
             mode_bracketed_paste: self.mode_bracketed_paste,
+            mode_mouse_reporting: self.mode_mouse_reporting,
+            mode_mouse_sgr: self.mode_mouse_sgr,
+            mode_mouse_button_motion: self.mode_mouse_button_motion,
+            mode_mouse_any_motion: self.mode_mouse_any_motion,
             line_number_start,
             scrollback_capacity: self.scrollback_capacity,
         }
@@ -1260,6 +1296,10 @@ impl Handler for Terminal {
         self.mode_show_cursor = true;
         self.mode_bracketed_paste = false;
         self.mode_cursor_keys = false;
+        self.mode_mouse_reporting = false;
+        self.mode_mouse_sgr = false;
+        self.mode_mouse_button_motion = false;
+        self.mode_mouse_any_motion = false;
         self.mode_origin = false;
         self.mode_insert = false;
         self.charsets = [StandardCharset::Ascii; 4];
@@ -1356,6 +1396,19 @@ impl Handler for Terminal {
             PrivateMode::Named(ansi::NamedPrivateMode::BracketedPaste) => {
                 self.mode_bracketed_paste = true
             }
+            PrivateMode::Named(ansi::NamedPrivateMode::ReportMouseClicks) => {
+                self.mode_mouse_reporting = true
+            }
+            PrivateMode::Named(ansi::NamedPrivateMode::ReportCellMouseMotion) => {
+                self.mode_mouse_reporting = true;
+                self.mode_mouse_button_motion = true;
+                self.mode_mouse_any_motion = false;
+            }
+            PrivateMode::Named(ansi::NamedPrivateMode::ReportAllMouseMotion) => {
+                self.mode_mouse_reporting = true;
+                self.mode_mouse_any_motion = true
+            }
+            PrivateMode::Named(ansi::NamedPrivateMode::SgrMouse) => self.mode_mouse_sgr = true,
             PrivateMode::Named(ansi::NamedPrivateMode::SwapScreenAndSetRestoreCursor) => {
                 if !self.using_alt_screen {
                     tracing::debug!(
@@ -1376,6 +1429,10 @@ impl Handler for Terminal {
                         mode_show_cursor: self.mode_show_cursor,
                         mode_cursor_keys: self.mode_cursor_keys,
                         mode_bracketed_paste: self.mode_bracketed_paste,
+                        mode_mouse_reporting: self.mode_mouse_reporting,
+                        mode_mouse_sgr: self.mode_mouse_sgr,
+                        mode_mouse_button_motion: self.mode_mouse_button_motion,
+                        mode_mouse_any_motion: self.mode_mouse_any_motion,
                         mode_line_wrap: self.mode_line_wrap,
                         mode_origin: self.mode_origin,
                         scroll_top: self.scroll_top,
@@ -1409,6 +1466,24 @@ impl Handler for Terminal {
             PrivateMode::Named(ansi::NamedPrivateMode::BracketedPaste) => {
                 self.mode_bracketed_paste = false
             }
+            PrivateMode::Named(ansi::NamedPrivateMode::ReportMouseClicks) => {
+                self.mode_mouse_reporting = false
+            }
+            PrivateMode::Named(ansi::NamedPrivateMode::ReportCellMouseMotion) => {
+                self.mode_mouse_button_motion = false;
+                // Apps that turn 1002 off are shutting mouse tracking down;
+                // they don't separately reset 1000, so treat it as gone too.
+                if !self.mode_mouse_any_motion {
+                    self.mode_mouse_reporting = false;
+                }
+            }
+            PrivateMode::Named(ansi::NamedPrivateMode::ReportAllMouseMotion) => {
+                self.mode_mouse_any_motion = false;
+                if !self.mode_mouse_button_motion {
+                    self.mode_mouse_reporting = false;
+                }
+            }
+            PrivateMode::Named(ansi::NamedPrivateMode::SgrMouse) => self.mode_mouse_sgr = false,
             PrivateMode::Named(ansi::NamedPrivateMode::SwapScreenAndSetRestoreCursor) => {
                 if self.using_alt_screen {
                     tracing::debug!("[TERM] ESC[?1049l — switching back to primary screen");
@@ -1433,6 +1508,10 @@ impl Handler for Terminal {
                         self.mode_show_cursor = saved.mode_show_cursor;
                         self.mode_cursor_keys = saved.mode_cursor_keys;
                         self.mode_bracketed_paste = saved.mode_bracketed_paste;
+                        self.mode_mouse_reporting = saved.mode_mouse_reporting;
+                        self.mode_mouse_sgr = saved.mode_mouse_sgr;
+                        self.mode_mouse_button_motion = saved.mode_mouse_button_motion;
+                        self.mode_mouse_any_motion = saved.mode_mouse_any_motion;
                         self.mode_line_wrap = saved.mode_line_wrap;
                         self.mode_origin = saved.mode_origin;
                         self.scroll_top = saved.scroll_top;
