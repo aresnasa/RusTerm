@@ -36,6 +36,7 @@ async fn live_sftp_round_trip() {
             username,
             auth: SshAuth::Password { password },
             terminal_type: "xterm-256color".to_owned(),
+            proxy: None,
             proxy_jump: None,
             keepalive_interval: None,
             host_key_policy: "disabled".to_owned(),

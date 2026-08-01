@@ -10,8 +10,9 @@ use rand::RngCore;
 use crate::config::{
     ConnectionConfig, ConnectionKind, DEFAULT_ONEKEY_PASSWORD_EXPECT, EncryptedValue,
     FocusedTabAppearance, Keybindings, OneKey, OneKeyStep, PersistedConfig, PersistedConnection,
-    PersistedConnectionKind, PersistedOneKey, PersistedOneKeyStep, PersistedSshAuth,
-    PersistedSshConfig, SidebarPreferences, SkinSettings, SshAuth, SshConfig, WorkspacePreferences,
+    PersistedConnectionKind, PersistedOneKey, PersistedOneKeyStep, PersistedProxyConfig,
+    PersistedSshAuth, PersistedSshConfig, ProxyConfig, SidebarPreferences, SkinSettings, SshAuth,
+    SshConfig, WorkspacePreferences,
 };
 use rusterm_crypto::{KeyringStore, decrypt_data, encrypt_data};
 
@@ -747,6 +748,11 @@ impl ConfigManager {
                 username: ssh.username.clone(),
                 auth: self.encrypt_auth(&ssh.auth)?,
                 terminal_type: ssh.terminal_type.clone(),
+                proxy: ssh
+                    .proxy
+                    .as_ref()
+                    .map(|proxy| self.encrypt_proxy(proxy))
+                    .transpose()?,
                 proxy_jump: ssh.proxy_jump.clone(),
                 keepalive_interval: ssh.keepalive_interval,
                 host_key_policy: ssh.host_key_policy.clone(),
@@ -755,6 +761,20 @@ impl ConfigManager {
             ConnectionKind::Telnet(t) => PersistedConnectionKind::Telnet(t.clone()),
             ConnectionKind::Shell(s) => PersistedConnectionKind::Shell(s.clone()),
             ConnectionKind::Tcp(t) => PersistedConnectionKind::Tcp(t.clone()),
+        })
+    }
+
+    fn encrypt_proxy(&self, proxy: &ProxyConfig) -> Result<PersistedProxyConfig> {
+        Ok(PersistedProxyConfig {
+            kind: proxy.kind,
+            host: proxy.host.clone(),
+            port: proxy.port,
+            username: proxy.username.clone(),
+            password: proxy
+                .password
+                .as_ref()
+                .map(|password| self.encrypt_string(password))
+                .transpose()?,
         })
     }
 
@@ -803,6 +823,10 @@ impl ConfigManager {
                 username: ssh.username,
                 auth: self.decrypt_auth(ssh.auth)?,
                 terminal_type: ssh.terminal_type,
+                proxy: ssh
+                    .proxy
+                    .map(|proxy| self.decrypt_proxy(proxy))
+                    .transpose()?,
                 proxy_jump: ssh.proxy_jump,
                 keepalive_interval: ssh.keepalive_interval,
                 host_key_policy: ssh.host_key_policy,
@@ -811,6 +835,19 @@ impl ConfigManager {
             PersistedConnectionKind::Telnet(t) => ConnectionKind::Telnet(t),
             PersistedConnectionKind::Shell(s) => ConnectionKind::Shell(s),
             PersistedConnectionKind::Tcp(t) => ConnectionKind::Tcp(t),
+        })
+    }
+
+    fn decrypt_proxy(&self, proxy: PersistedProxyConfig) -> Result<ProxyConfig> {
+        Ok(ProxyConfig {
+            kind: proxy.kind,
+            host: proxy.host,
+            port: proxy.port,
+            username: proxy.username,
+            password: proxy
+                .password
+                .map(|password| self.decrypt_value(&password))
+                .transpose()?,
         })
     }
 
@@ -844,8 +881,8 @@ mod tests {
     use super::*;
     use crate::config::{
         ConnectionGroup, ConnectionKind, DockZone, KeyChord, Keybindings, OneKey, OneKeyStep,
-        PanelId, SerialConfig, SidebarPreferences, SkinKind, SkinPalette, SkinSettings, SshAuth,
-        SshConfig, TcpConfig, TelnetConfig, default_host_key_policy,
+        PanelId, ProxyConfig, ProxyKind, SerialConfig, SidebarPreferences, SkinKind, SkinPalette,
+        SkinSettings, SshAuth, SshConfig, TcpConfig, TelnetConfig, default_host_key_policy,
     };
 
     fn test_config_manager() -> (ConfigManager, tempfile::TempDir) {
@@ -1249,6 +1286,7 @@ mod tests {
                     password: "my-secret-password".to_string(),
                 },
                 terminal_type: "xterm-256color".to_string(),
+                proxy: None,
                 proxy_jump: None,
                 keepalive_interval: Some(30),
                 host_key_policy: default_host_key_policy(),
@@ -1283,6 +1321,43 @@ mod tests {
     }
 
     #[test]
+    fn proxy_credentials_roundtrip_encrypted() {
+        let (cm, _dir) = test_config_manager();
+        let proxy_password = "proxy-password-that-must-not-leak";
+        let conn = ConnectionConfig {
+            id: "proxy-test".to_string(),
+            name: "Proxied Server".to_string(),
+            kind: ConnectionKind::Ssh(SshConfig {
+                host: "ssh.example".to_string(),
+                port: 22,
+                username: "alice".to_string(),
+                auth: SshAuth::Agent,
+                terminal_type: "xterm-256color".to_string(),
+                proxy: Some(ProxyConfig {
+                    kind: ProxyKind::Socks5,
+                    host: "proxy.example".to_string(),
+                    port: 1080,
+                    username: Some("proxy-user".to_string()),
+                    password: Some(proxy_password.to_string()),
+                }),
+                proxy_jump: None,
+                keepalive_interval: None,
+                host_key_policy: default_host_key_policy(),
+            }),
+            group: None,
+            tags: vec![],
+            onekey: false,
+        };
+
+        cm.save_connections(&[conn.clone()]).unwrap();
+        assert_eq!(cm.load_connections().unwrap(), vec![conn]);
+
+        let persisted = fs::read_to_string(cm.config_path()).unwrap();
+        assert!(!persisted.contains(proxy_password));
+        assert!(persisted.contains("_encrypted"));
+    }
+
+    #[test]
     fn test_save_and_load_ssh_key_with_passphrase() {
         let (cm, _dir) = test_config_manager();
         let conn = ConnectionConfig {
@@ -1297,6 +1372,7 @@ mod tests {
                     passphrase: Some("key-passphrase".to_string()),
                 },
                 terminal_type: "xterm-256color".to_string(),
+                proxy: None,
                 proxy_jump: None,
                 keepalive_interval: None,
                 host_key_policy: default_host_key_policy(),
@@ -1398,6 +1474,7 @@ mod tests {
                     password: "secret".to_string(),
                 },
                 terminal_type: "xterm-256color".to_string(),
+                proxy: None,
                 proxy_jump: None,
                 keepalive_interval: None,
                 host_key_policy: default_host_key_policy(),
@@ -1445,6 +1522,7 @@ mod tests {
                     password: "secret123".to_string(),
                 },
                 terminal_type: "xterm-256color".to_string(),
+                proxy: None,
                 proxy_jump: None,
                 keepalive_interval: None,
                 host_key_policy: default_host_key_policy(),

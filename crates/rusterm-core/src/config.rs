@@ -19,6 +19,35 @@ pub enum ConnectionKind {
     Tcp(TcpConfig),
 }
 
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProxyKind {
+    Http,
+    Https,
+    Socks5,
+}
+
+#[derive(Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ProxyConfig {
+    pub kind: ProxyKind,
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+    pub password: Option<String>,
+}
+
+impl std::fmt::Debug for ProxyConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProxyConfig")
+            .field("kind", &self.kind)
+            .field("host", &self.host)
+            .field("port", &self.port)
+            .field("username", &self.username)
+            .field("password", &self.password.as_ref().map(|_| "<redacted>"))
+            .finish()
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SshConfig {
     pub host: String,
@@ -26,6 +55,8 @@ pub struct SshConfig {
     pub username: String,
     pub auth: SshAuth,
     pub terminal_type: String,
+    #[serde(default)]
+    pub proxy: Option<ProxyConfig>,
     pub proxy_jump: Option<String>,
     pub keepalive_interval: Option<u64>,
     /// Host key verification policy.
@@ -1251,10 +1282,21 @@ pub struct PersistedSshConfig {
     pub username: String,
     pub auth: PersistedSshAuth,
     pub terminal_type: String,
+    #[serde(default)]
+    pub proxy: Option<PersistedProxyConfig>,
     pub proxy_jump: Option<String>,
     pub keepalive_interval: Option<u64>,
     #[serde(default = "default_host_key_policy")]
     pub host_key_policy: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedProxyConfig {
+    pub kind: ProxyKind,
+    pub host: String,
+    pub port: u16,
+    pub username: Option<String>,
+    pub password: Option<EncryptedValue>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1286,6 +1328,7 @@ mod tests {
                     password: "secret".to_string(),
                 },
                 terminal_type: "xterm-256color".to_string(),
+                proxy: None,
                 proxy_jump: None,
                 keepalive_interval: Some(30),
                 host_key_policy: default_host_key_policy(),
@@ -1298,6 +1341,38 @@ mod tests {
         let json = serde_json::to_string(&config).unwrap();
         let deserialized: ConnectionConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(config, deserialized);
+    }
+
+    #[test]
+    fn legacy_ssh_config_without_proxy_defaults_to_direct_connection() {
+        let json = r#"{
+            "host":"example.com",
+            "port":22,
+            "username":"alice",
+            "auth":"Agent",
+            "terminal_type":"xterm-256color",
+            "proxy_jump":null,
+            "keepalive_interval":null
+        }"#;
+
+        let config: SshConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(config.proxy, None);
+        assert_eq!(config.host_key_policy, default_host_key_policy());
+    }
+
+    #[test]
+    fn proxy_debug_redacts_password() {
+        let proxy = ProxyConfig {
+            kind: ProxyKind::Https,
+            host: "proxy.example".to_string(),
+            port: 443,
+            username: Some("alice".to_string()),
+            password: Some("proxy-secret".to_string()),
+        };
+
+        let debug = format!("{proxy:?}");
+        assert!(!debug.contains("proxy-secret"));
+        assert!(debug.contains("<redacted>"));
     }
 
     #[test]
@@ -1332,6 +1407,7 @@ mod tests {
                 username: "user".to_string(),
                 auth: SshAuth::Agent,
                 terminal_type: "xterm-256color".to_string(),
+                proxy: None,
                 proxy_jump: None,
                 keepalive_interval: None,
                 host_key_policy: default_host_key_policy(),
