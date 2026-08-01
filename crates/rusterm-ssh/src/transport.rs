@@ -56,9 +56,10 @@ async fn connect_transport_with_tls_config(
     validate_host(target_host, "target validation")?;
 
     let Some(proxy) = proxy else {
-        return Ok(Box::new(
-            connect_tcp(target_host, target_port, "direct TCP connect").await?,
-        ) as BoxedTransport);
+        return Ok(
+            Box::new(connect_tcp(target_host, target_port, "direct TCP connect").await?)
+                as BoxedTransport,
+        );
     };
 
     validate_host(&proxy.host, "proxy validation")?;
@@ -71,7 +72,7 @@ async fn connect_transport_with_tls_config(
             )
             .await
             .map_err(|_| TransportError::new("HTTP CONNECT handshake", "timed out"))??;
-            Ok(Box::new(stream))
+            Ok(Box::new(stream) as BoxedTransport)
         }
         ProxyKind::Https => {
             let stream = connect_tcp(&proxy.host, proxy.port, "HTTPS proxy TCP connect").await?;
@@ -92,7 +93,7 @@ async fn connect_transport_with_tls_config(
             )
             .await
             .map_err(|_| TransportError::new("HTTPS CONNECT handshake", "timed out"))??;
-            Ok(Box::new(stream))
+            Ok(Box::new(stream) as BoxedTransport)
         }
         ProxyKind::Socks5 => {
             let mut stream =
@@ -103,7 +104,7 @@ async fn connect_transport_with_tls_config(
             )
             .await
             .map_err(|_| TransportError::new("SOCKS5 handshake", "timed out"))??;
-            Ok(Box::new(stream))
+            Ok(Box::new(stream) as BoxedTransport)
         }
     }
 }
