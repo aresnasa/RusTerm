@@ -1,8 +1,6 @@
 use dioxus::prelude::*;
 
-use rusterm_core::config::{
-    ConnectionConfig, ConnectionGroup, ConnectionKind, ProxyKind, SshAuth,
-};
+use rusterm_core::config::{ConnectionConfig, ConnectionGroup, ConnectionKind, ProxyKind, SshAuth};
 use rusterm_ssh::{
     SshHostSuggestion, default_ssh_config_path, list_identity_files, list_ssh_config_hosts,
     lookup_host,
