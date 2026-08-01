@@ -99,6 +99,8 @@ pub struct RenderOutput {
     pub cursor_row: usize,
     pub cursor_col: usize,
     pub cursor_visible: bool,
+    /// Current cursor color, including OSC 12 overrides.
+    pub cursor_color: CellColor,
     pub title: Option<String>,
     pub tmux_session: Option<String>,
     pub scrollback_offset: usize,
@@ -798,6 +800,10 @@ impl Terminal {
             cursor_row,
             cursor_col: self.cursor_col,
             cursor_visible,
+            cursor_color: self.resolve_render_color(
+                CellColor::Named(ansi::NamedColor::Cursor),
+                ansi::NamedColor::Cursor,
+            ),
             title: self.title.clone(),
             tmux_session: self.tmux_session.clone(),
             scrollback_offset: scroll_offset,
@@ -2038,7 +2044,7 @@ mod tests {
         let mut parser = vte::ansi::Processor::new();
         term.process(b"\x1b[31mA\x1b[0mB", &mut parser);
         term.process(
-            b"\x1b]4;1;#123456\x07\x1b]10;#345678;#56789a\x07",
+            b"\x1b]4;1;#123456\x07\x1b]10;#345678;#56789a\x07\x1b]12;#abcdef\x07",
             &mut parser,
         );
 
@@ -2067,12 +2073,27 @@ mod tests {
                 b: 0x9a,
             })
         );
+        assert_eq!(
+            term.render().cursor_color,
+            CellColor::Spec(ansi::Rgb {
+                r: 0xab,
+                g: 0xcd,
+                b: 0xef,
+            })
+        );
 
-        term.process(b"\x1b]104;1\x07\x1b]110\x07\x1b]111\x07", &mut parser);
+        term.process(
+            b"\x1b]104;1\x07\x1b]110\x07\x1b]111\x07\x1b]112\x07",
+            &mut parser,
+        );
         let cells = &term.render().rows[0].cells;
         assert_eq!(cells[0].fg, CellColor::Named(ansi::NamedColor::Red));
         assert_eq!(cells[1].fg, CellColor::Default);
         assert_eq!(cells[1].bg, CellColor::Default);
+        assert_eq!(
+            term.render().cursor_color,
+            CellColor::Named(ansi::NamedColor::Cursor)
+        );
     }
 
     #[test]

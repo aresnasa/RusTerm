@@ -607,6 +607,7 @@ fn cell_class(cells: &[RenderCell], idx: usize) -> CharClass {
 fn row_to_html(
     row: &RenderRow,
     cursor_col: Option<usize>,
+    cursor_color: &CellColor,
     suggestion: Option<&str>,
     sel: Option<(usize, usize)>,
 ) -> String {
@@ -678,12 +679,18 @@ fn row_to_html(
                 &html_escape(&cell.character.to_string())
             };
             let base_style = cell_style(&cell.fg, &cell.bg, cell.flags);
+            let cursor_border = color_to_css(cursor_color);
+            let cursor_border = if cursor_border.is_empty() {
+                "#c0caf5"
+            } else {
+                &cursor_border
+            };
             let cursor_style = if base_style.is_empty() {
-                "border-left:2px solid #c0caf5;margin-left:-1px".to_string()
+                format!("border-left:2px solid {cursor_border};margin-left:-1px")
             } else {
                 format!(
-                    "{};border-left:2px solid #c0caf5;margin-left:-1px",
-                    base_style
+                    "{};border-left:2px solid {};margin-left:-1px",
+                    base_style, cursor_border
                 )
             };
             html.push_str("<span style=\"");
@@ -1887,7 +1894,13 @@ pub fn TerminalView(
                 ""
             };
 
-            let content_html = row_to_html(row, cur_col, sug, sel_for_row(row_idx));
+            let content_html = row_to_html(
+                row,
+                cur_col,
+                &render_output.cursor_color,
+                sug,
+                sel_for_row(row_idx),
+            );
 
             let mut html = String::with_capacity(content_html.len() + 80);
             html.push_str("<div style=\"white-space:pre;line-height:1.5;");
@@ -2200,7 +2213,7 @@ mod tests {
         terminal_selection_text, word_range_in_row,
     };
     use dioxus::prelude::Key;
-    use rusterm_core::terminal::{RenderCell, RenderRow};
+    use rusterm_core::terminal::{CellColor, RenderCell, RenderRow};
 
     #[test]
     fn event_cell_maps_client_coords_to_grid() {
@@ -2602,7 +2615,7 @@ mod tests {
         };
         let row = mk("hello world");
         // Columns 6..=10 = "world".
-        let html = row_to_html(&row, None, None, Some((6, 10)));
+        let html = row_to_html(&row, None, &CellColor::Default, None, Some((6, 10)));
         assert!(
             html.contains(SELECTION_BG),
             "selection highlight style must be present: {html}"
@@ -2620,7 +2633,7 @@ mod tests {
             "highlight must not cover cells before the start column: {html}"
         );
         // No selection → no highlight style anywhere.
-        let plain = row_to_html(&row, None, None, None);
+        let plain = row_to_html(&row, None, &CellColor::Default, None, None);
         assert!(!plain.contains(SELECTION_BG));
     }
 
