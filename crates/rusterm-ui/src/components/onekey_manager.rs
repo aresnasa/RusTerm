@@ -318,7 +318,8 @@ pub fn OneKeyManager(
                      Send values are encrypted at rest." }
                 p { style: "margin: 0 0 14px; font-size: 11px; color: #414868; line-height: 1.5;",
                     "Use Custom regex only for unusual prompts. Matching is case-insensitive and runs \
-                     only for connections with One-Key Connect enabled." }
+                     only for connections with One-Key Connect enabled — set it in the connection's \
+                     Edit dialog (checkbox right under Name)." }
 
                 div {
                     style: "display: flex; gap: 12px; flex: 1; min-height: 360px;",

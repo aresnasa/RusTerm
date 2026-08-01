@@ -4281,51 +4281,47 @@ fn onekey_prompt_text(state: &AppState, session_id: &str, data: &[u8]) -> String
         .unwrap_or_default()
 }
 
+/// Static skip reasons returned by [`onekey_popup_for_output`]. Callers log
+/// each distinct reason at most once per session at info level (see
+/// `state.onekey_skip_logged`) — an always-skipped OneKey gate must be visible
+/// in the default log, not buried behind `RUST_LOG=debug`.
+type OneKeySkip = &'static str;
+
+const ONEKEY_SKIP_DISABLED: OneKeySkip =
+    "disabled_for_session (toggle 'One-Key Connect' on the connection)";
+const ONEKEY_SKIP_ONEKEYS_EMPTY: OneKeySkip =
+    "onekeys_empty (unlock the master password to load saved OneKeys)";
+const ONEKEY_SKIP_POPUP_VISIBLE: OneKeySkip = "popup_already_visible";
+const ONEKEY_SKIP_ALT_SCREEN: OneKeySkip =
+    "alt_screen_active (a full-screen app like vim/less owns the terminal)";
+const ONEKEY_SKIP_NO_MATCH: OneKeySkip = "no_match";
+
 fn onekey_popup_for_output(
     state: &AppState,
     session_id: &str,
     data: &[u8],
-) -> Option<OneKeyPopupState> {
+) -> Result<OneKeyPopupState, OneKeySkip> {
     let sid_short = &session_id[..session_id.len().min(8)];
     if !onekey_enabled_for_session(state, session_id) {
-        tracing::debug!(
-            "[ONEKEY-SKIP] session={} reason=disabled_for_session \
-             (toggle 'One-Key Connect' on the connection)",
-            sid_short
-        );
-        return None;
+        return Err(ONEKEY_SKIP_DISABLED);
     }
     let onekeys = state.onekeys.clone();
     if onekeys.is_empty() {
-        tracing::info!(
-            "[ONEKEY-SKIP] session={} reason=onekeys_empty \
-             (unlock the master password to load saved OneKeys)",
-            sid_short
-        );
-        return None;
+        return Err(ONEKEY_SKIP_ONEKEYS_EMPTY);
     }
     if state
         .onekey_popups
         .get(session_id)
         .is_some_and(|popup| popup.visible)
     {
-        tracing::debug!(
-            "[ONEKEY-SKIP] session={} reason=popup_already_visible",
-            sid_short
-        );
-        return None;
+        return Err(ONEKEY_SKIP_POPUP_VISIBLE);
     }
     if state
         .terminals
         .get(session_id)
         .is_some_and(|handle| handle.lock().terminal.is_alt_screen())
     {
-        tracing::debug!(
-            "[ONEKEY-SKIP] session={} reason=alt_screen_active \
-             (a full-screen app like vim/less owns the terminal)",
-            sid_short
-        );
-        return None;
+        return Err(ONEKEY_SKIP_ALT_SCREEN);
     }
 
     let text = onekey_prompt_text(state, session_id, data);
@@ -4361,15 +4357,10 @@ fn onekey_popup_for_output(
         });
     }
     if matches.is_empty() {
-        tracing::debug!(
-            "[ONEKEY-SKIP] session={} reason=no_match onekeys_count={}",
-            sid_short,
-            onekeys.len()
-        );
-        return None;
+        return Err(ONEKEY_SKIP_NO_MATCH);
     }
 
-    Some(OneKeyPopupState {
+    Ok(OneKeyPopupState {
         visible: true,
         matches,
         selected: 0,
@@ -4379,7 +4370,7 @@ fn onekey_popup_for_output(
 
 #[cfg(test)]
 fn check_onekey_match_in_state(state: &mut AppState, session_id: &str, data: &[u8]) {
-    if let Some(popup) = onekey_popup_for_output(state, session_id, data) {
+    if let Ok(popup) = onekey_popup_for_output(state, session_id, data) {
         state.onekey_popups.insert(session_id.to_string(), popup);
     }
 }
@@ -4395,7 +4386,9 @@ fn current_prompt_onekey_popups(state: &AppState) -> Vec<(String, OneKeyPopupSta
     enabled_session_ids
         .into_iter()
         .filter_map(|session_id| {
-            onekey_popup_for_output(state, &session_id, b"").map(|popup| (session_id, popup))
+            onekey_popup_for_output(state, &session_id, b"")
+                .ok()
+                .map(|popup| (session_id, popup))
         })
         .collect()
 }
@@ -4432,13 +4425,46 @@ fn refresh_onekey_popups_for_current_prompts(mut state: Signal<AppState>) {
     }
 }
 
+/// Record a OneKey skip for (session, reason); returns true the first time,
+/// so callers log each distinct skip exactly once at info level. Keeping the
+/// first occurrence visible in the default log is what makes a misconfigured
+/// gate (e.g. One-Key Connect never ticked on the connection) diagnosable
+/// without `RUST_LOG=debug`. Never carries prompt text, regexes, names, or
+/// send values — reason strings are static.
+fn note_onekey_skip(state: &mut AppState, session_id: &str, reason: OneKeySkip) -> bool {
+    state
+        .onekey_skip_logged
+        .insert((session_id.to_string(), reason))
+}
+
 fn check_onekey_match(mut state: Signal<AppState>, session_id: &str, data: &[u8]) {
-    let popup = onekey_popup_for_output(&state.read(), session_id, data);
-    if let Some(popup) = popup {
-        state
-            .write()
-            .onekey_popups
-            .insert(session_id.to_string(), popup);
+    // Decide from a read snapshot first so the read guard is released before
+    // we take the write guard below.
+    let (outcome, onekeys_count) = {
+        let snapshot = state.read();
+        (
+            onekey_popup_for_output(&snapshot, session_id, data),
+            snapshot.onekeys.len(),
+        )
+    };
+    match outcome {
+        Ok(popup) => {
+            state
+                .write()
+                .onekey_popups
+                .insert(session_id.to_string(), popup);
+        }
+        Err(reason) => {
+            let mut s = state.write();
+            if note_onekey_skip(&mut s, session_id, reason) {
+                tracing::info!(
+                    "[ONEKEY-SKIP] session={} reason={} onekeys_count={}",
+                    &session_id[..session_id.len().min(8)],
+                    reason,
+                    onekeys_count
+                );
+            }
+        }
     }
 }
 
@@ -4857,6 +4883,281 @@ mod session_startup_tests {
             state.onekey_popups.contains_key(session_id),
             "editing One-Key Connect must affect sessions already opened from that saved connection"
         );
+    }
+
+    #[test]
+    fn onekey_skip_is_recorded_once_per_session_and_reason() {
+        let mut state = AppState::default();
+
+        assert!(note_onekey_skip(
+            &mut state,
+            "session-a",
+            ONEKEY_SKIP_DISABLED
+        ));
+        assert!(!note_onekey_skip(
+            &mut state,
+            "session-a",
+            ONEKEY_SKIP_DISABLED
+        ));
+        assert!(note_onekey_skip(
+            &mut state,
+            "session-a",
+            ONEKEY_SKIP_NO_MATCH
+        ));
+        assert!(note_onekey_skip(
+            &mut state,
+            "session-b",
+            ONEKEY_SKIP_DISABLED
+        ));
+    }
+
+    #[test]
+    fn disabled_session_reports_disabled_skip_reason() {
+        let mut state =
+            state_with_enabled_onekey(rusterm_core::config::DEFAULT_ONEKEY_PASSWORD_EXPECT);
+        state
+            .session_configs
+            .get_mut("sudo-pane")
+            .expect("test session config")
+            .onekey = false;
+
+        let result = onekey_popup_for_output(&state, "sudo-pane", b"");
+        assert_eq!(result.err(), Some(ONEKEY_SKIP_DISABLED));
+    }
+
+    /// Regression test for the bug where toggling the `One-Key Connect`
+    /// checkbox had no effect: the dialog used `input.onchange = ...checked()`
+    /// which never fired in the WebView, so `form.onekey` stayed `false` and
+    /// `settings.json` was saved with `onekey: false` regardless of what the
+    /// user clicked. After the checkbox wrapper-onclick fix, this test
+    /// locks in the invariant: ANY `form.onekey = true` that reaches
+    /// `rebuild_connection` MUST surface on the rebuilt `ConnectionConfig`.
+    /// If this ever fails, the form → model bridge has been broken again.
+    #[test]
+    fn rebuild_connection_preserves_form_onekey_flag() {
+        use crate::components::connection_dialog::NewConnectionForm;
+
+        let original = ConnectionConfig {
+            id: "saved-id".to_string(),
+            name: "bidbot-prod".to_string(),
+            kind: ConnectionKind::Ssh(SshConfig {
+                host: "10.0.0.1".to_string(),
+                port: 22,
+                username: "ecs-user".to_string(),
+                auth: SshAuth::Agent,
+                terminal_type: "xterm-256color".to_string(),
+                proxy_jump: None,
+                keepalive_interval: None,
+                host_key_policy: rusterm_core::config::default_host_key_policy(),
+            }),
+            group: None,
+            tags: vec![],
+            onekey: false,
+        };
+
+        let mut form = NewConnectionForm {
+            name: original.name.clone(),
+            host: "10.0.0.1".to_string(),
+            port: "22".to_string(),
+            username: "ecs-user".to_string(),
+            auth_type: "agent".to_string(),
+            terminal_type: "xterm-256color".to_string(),
+            ..Default::default()
+        };
+        form.onekey = true;
+
+        let rebuilt = rebuild_connection(&original, &form);
+        assert_eq!(rebuilt.id, original.id, "id must be preserved on edit");
+        assert!(
+            rebuilt.onekey,
+            "toggling the checkbox must persist through rebuild"
+        );
+    }
+
+    /// Full user-journey regression for the bug reported on 2026-08-01:
+    /// 1. Connection saved with onekey=false.
+    /// 2. User opens the connection for edit, ticks One-Key Connect, saves.
+    /// 3. User disconnects + reconnects (new session_configs snapshot).
+    /// 4. User runs `sudo -i` — bidbot-prod prints
+    ///    "[sudo: authenticate] Password: ".
+    /// 5. OneKey popup MUST appear.
+    ///
+    /// Every previous round of debugging stopped at step 2 (the checkbox was
+    /// never persisted). This test chains the whole journey through the
+    /// istato to prove each bridge is wired: form→model→session_config→popup.
+    #[test]
+    fn bidbot_prod_full_flow_checkbox_persists_then_reconnect_then_popup() {
+        use crate::components::connection_dialog::NewConnectionForm;
+
+        // ── STEP 1: Save bidbot-prod with onekey=false (which is what's in
+        // settings.json right now, per the user's bug report).
+        let conn_id = "bidbot-connection-id";
+        let original = ConnectionConfig {
+            id: conn_id.to_string(),
+            name: "bidbot-prod".to_string(),
+            kind: ConnectionKind::Ssh(SshConfig {
+                host: "192.168.0.189".to_string(),
+                port: 22,
+                username: "ecs-user".to_string(),
+                auth: SshAuth::Agent,
+                terminal_type: "xterm-256color".to_string(),
+                proxy_jump: None,
+                keepalive_interval: None,
+                host_key_policy: rusterm_core::config::default_host_key_policy(),
+            }),
+            group: None,
+            tags: vec![],
+            onekey: false, // ← this is what the user's settings.json still says; the bug
+        };
+
+        let mut state = AppState::default();
+        state.connections.push(original.clone());
+        // OneKey library has a sudo-password credential registered.
+        state.onekeys.push(OneKey {
+            id: "sudo-credential".to_string(),
+            name: "sudo".to_string(),
+            steps: vec![OneKeyStep {
+                label: "Password".to_string(),
+                expect: rusterm_core::config::DEFAULT_ONEKEY_PASSWORD_EXPECT.to_string(),
+                send: "test-secret".to_string(),
+            }],
+        });
+
+        // ── STEP 2: User opens the connection dialog, ticks One-Key Connect,
+        // clicks Save. The form carries the new flag back to on_edit.
+        let mut form = NewConnectionForm {
+            name: original.name.clone(),
+            host: "192.168.0.189".to_string(),
+            port: "22".to_string(),
+            username: "ecs-user".to_string(),
+            auth_type: "agent".to_string(),
+            terminal_type: "xterm-256color".to_string(),
+            ..Default::default()
+        };
+        form.onekey = true; // ← what the onclick now sets (was broken before)
+
+        // on_edit: rebuild + apply
+        let updated = rebuild_connection(&original, &form);
+        assert!(updated.onekey, "rebuild must carry form.onekey=true");
+        apply_connection_edit(&mut state, updated);
+
+        let stored = state
+            .connections
+            .iter()
+            .find(|c| c.id == conn_id)
+            .expect("connection must persist");
+        assert!(stored.onekey, "apply_connection_edit must set onekey=true");
+
+        // ── STEP 3: User disconnects + reconnects. Fresh session picks up
+        // the updated connection config from state.connections.
+        let session_id = "bidbot-pane-uuid";
+        let fresh_session_config = state
+            .connections
+            .iter()
+            .find(|c| c.id == conn_id)
+            .cloned()
+            .expect("stored connection");
+        state
+            .session_configs
+            .insert(session_id.to_string(), fresh_session_config);
+
+        // ── STEP 4: User runs `sudo -i`. bidbot-prod prints the prompt to
+        // the terminal.
+        let prompt = b"[sudo: authenticate] Password: ";
+        let mut entry = TerminalEntry {
+            terminal: Terminal::new(TerminalSize::default()),
+            parser: vte::ansi::Processor::new(),
+            scroll_offset: 0,
+        };
+        entry.process_and_render(prompt);
+        state
+            .terminals
+            .insert(session_id.to_string(), Arc::new(Mutex::new(entry)));
+
+        // ── STEP 5: The popup MUST appear (this is the user-visible bug).
+        check_onekey_match_in_state(&mut state, session_id, prompt);
+
+        let popup = state
+            .onekey_popups
+            .get(session_id)
+            .expect("after edit → reconnect → sudo, the popup MUST appear");
+        assert!(popup.visible, "popup must be visible");
+        assert_eq!(popup.matches.len(), 1, "exactly one credential must match");
+        assert_eq!(popup.matches[0].send, "test-secret");
+    }
+
+    /// Mirror of the above but asserting the pre-bug world stays broken —
+    /// i.e. we don't accidentally fix disabled_for_session by always popping
+    /// the dialog. If the user has NOT enabled onekey, sudo should NOT show
+    /// a popup. (Negative control.)
+    #[test]
+    fn bidbot_prod_without_checkbox_does_no_popup_after_sudo() {
+        let session_id = "bidbot-pane";
+        let mut state = AppState::default();
+        state.session_configs.insert(
+            session_id.to_string(),
+            ConnectionConfig {
+                id: session_id.to_string(),
+                name: "bidbot-prod".to_string(),
+                kind: ConnectionKind::Shell(ShellConfig {
+                    command: None,
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    working_dir: None,
+                }),
+                group: None,
+                tags: vec![],
+                onekey: false, // ← user never enabled it
+            },
+        );
+        state.onekeys.push(OneKey {
+            id: "c".to_string(),
+            name: "sudo".to_string(),
+            steps: vec![OneKeyStep {
+                label: "Password".to_string(),
+                expect: rusterm_core::config::DEFAULT_ONEKEY_PASSWORD_EXPECT.to_string(),
+                send: "secret".to_string(),
+            }],
+        });
+
+        let prompt = b"[sudo: authenticate] Password: ";
+        let mut entry = TerminalEntry {
+            terminal: Terminal::new(TerminalSize::default()),
+            parser: vte::ansi::Processor::new(),
+            scroll_offset: 0,
+        };
+        entry.process_and_render(prompt);
+        state
+            .terminals
+            .insert(session_id.to_string(), Arc::new(Mutex::new(entry)));
+
+        check_onekey_match_in_state(&mut state, session_id, prompt);
+
+        assert!(
+            !state.onekey_popups.contains_key(session_id),
+            "without One-Key Connect, sudo must NOT open the popup"
+        );
+    }
+
+    #[test]
+    fn empty_onekey_library_reports_onekeys_empty_skip_reason() {
+        let mut state =
+            state_with_enabled_onekey(rusterm_core::config::DEFAULT_ONEKEY_PASSWORD_EXPECT);
+        state.onekeys.clear();
+
+        let result = onekey_popup_for_output(&state, "sudo-pane", b"");
+        assert_eq!(result.err(), Some(ONEKEY_SKIP_ONEKEYS_EMPTY));
+    }
+
+    #[test]
+    fn non_matching_prompt_reports_no_match_skip_reason() {
+        let state = state_with_enabled_onekey_for_prompt(
+            rusterm_core::config::DEFAULT_ONEKEY_PASSWORD_EXPECT,
+            b"ecs-user@host:~$ ",
+        );
+
+        let result = onekey_popup_for_output(&state, "sudo-pane", b"");
+        assert_eq!(result.err(), Some(ONEKEY_SKIP_NO_MATCH));
     }
 
     #[test]
@@ -8993,12 +9294,43 @@ pub fn App() -> Element {
                 // editing a saved connection is not the same as connecting to
                 // it. Established sessions keep their connection parameters,
                 // but the OneKey matching policy is synchronized immediately.
+                // Log arrival unconditionally: previous debugging showed the
+                // checkbox's onchange never fired in the WebView, which looked
+                // identical to on_edit never being called from the outside.
+                // Seeing this line is the single fastest way to distinguish
+                // "dialog submit didn't run" from "form state was wrong".
+                tracing::info!(
+                    "[ONEKEY] on_edit called id={} form.onekey={}",
+                    &id[..id.len().min(8)],
+                    form.onekey
+                );
                 let original = state.read().connections.iter().find(|c| c.id == id).cloned();
                 if let Some(original) = original {
+                    let was_onekey = original.onekey;
                     let updated = rebuild_connection(&original, &form);
+                    // Positive confirmation for the most error-prone toggle:
+                    // when One-Key Connect flips, say so at info level so the
+                    // default log shows the feature was actually armed (and
+                    // `sudo` now has a popup gate watching). Connection name
+                    // is the user's own label, consistent with other logs.
+                    if updated.onekey != was_onekey {
+                        tracing::info!(
+                            "[ONEKEY] connection '{}' onekey={}",
+                            updated.name,
+                            updated.onekey
+                        );
+                    }
                     apply_connection_edit(&mut state.write(), updated);
                     refresh_onekey_popups_for_current_prompts(state);
                     save_config(&state);
+                } else {
+                    // Must not be silent: the dialog already closed and the
+                    // user's edits are lost. Log loudly so this path is never
+                    // mistaken for a successful save again.
+                    tracing::error!(
+                        "[CONN-EDIT] no connection with id {} — edit discarded",
+                        &id[..id.len().min(8)]
+                    );
                 }
                 editing_conn.set(None);
                 modal.set(Modal::None);

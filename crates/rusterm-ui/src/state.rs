@@ -194,6 +194,12 @@ pub struct AppState {
     /// an OneKey's expect regex; persists across focus changes (no re-scan).
     #[serde(skip)]
     pub onekey_popups: HashMap<String, OneKeyPopupState>,
+    /// (session_id, skip-reason) pairs already reported at info level, so a
+    /// repeated OneKey gate skip (e.g. `disabled_for_session` on every output
+    /// chunk) logs exactly once per session instead of spamming — while never
+    /// being invisible like the old debug-only logs.
+    #[serde(skip)]
+    pub onekey_skip_logged: HashSet<(String, &'static str)>,
     /// Per-session connection config (kept in memory, not persisted) so a
     /// disconnected session can be reconnected by pressing Enter.
     #[serde(skip)]
@@ -440,6 +446,7 @@ impl Default for AppState {
             recent_failed_commands: HashSet::new(),
             onekeys: Vec::new(),
             onekey_popups: HashMap::new(),
+            onekey_skip_logged: HashSet::new(),
             session_configs: HashMap::new(),
             session_connection_states: HashMap::new(),
             analytics: crate::analytics::AnalyticsHandle::default(),

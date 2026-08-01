@@ -137,7 +137,7 @@ pub fn ConnectionDialog(
             Some(c) => form.set(form_from_connection(c)),
             None => form.set(default_form()),
         }
-        seeded_id.set(editing_id);
+        seeded_id.set(editing_id.clone());
     }
 
     let is_editing = editing.is_some();
@@ -147,6 +147,18 @@ pub fn ConnectionDialog(
         "New SSH Connection"
     };
     let submit_label = if is_editing { "Save" } else { "Connect" };
+    // Diagnostic: log every render where the dialog is visible. We need to
+    // know whether app.rs passed `editing` for the session the user thinks
+    // they're editing. If logs say `editing=none` while the user states they
+    // clicked Edit on an existing connection, the wiring from sidebar →
+    // modal → editing_conn → prop is broken upstream of this component.
+    tracing::info!(
+        "[CONN-DIALOG] render editing={} editing_id={} form.onekey={} form.name='{}'",
+        if is_editing { "some" } else { "none" },
+        editing_id,
+        form().onekey,
+        form().name
+    );
 
     let auth_type = form().auth_type.clone();
     let is_password = auth_type == "password";
@@ -196,6 +208,48 @@ pub fn ConnectionDialog(
                             placeholder: "My Server",
                             value: "{form().name}",
                             oninput: move |e| form.write().name = e.value(),
+                        }
+                    }
+
+                    // One-Key Connect — placed directly under Name so it stays
+                    // visible without scrolling in the (fixed-height) dialog.
+                    //
+                    // Event flow: we do NOT rely on the checkbox's `onchange`.
+                    // In close_confirmation_dialog.rs we observed that Dioxus's
+                    // checkbox `onchange` was unreliable in this WebView (the
+                    // same pattern there has an explicit comment about letting
+                    // the click bubble up to the parent instead), so here the
+                    // clickable wrapper toggles the form field directly. The
+                    // inner checkbox is purely visual (checked: reflects the
+                    // form state); `pointer-events: none` lets the single
+                    // onclick on the wrapper handle everything — meaning the
+                    // user can click the checkbox, the label, or the hint text
+                    // and the toggle always fires.
+                    //
+                    // Symptom being fixed: the previous `onchange: move |e| ...`
+                    // never actually fired in the WebView, so `form.onekey`
+                    // stayed `false` no matter how often the user toggled it,
+                    // settings.json was written with `onekey: false`, and the
+                    // resulting `disabled_for_session` skip made the OneKey
+                    // popup never appear even after `sudo` printed the
+                    // password prompt.
+                    div {
+                        style: "display: flex; align-items: center; gap: 8px; padding: 8px 10px; background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; cursor: pointer;",
+                        onclick: move |_| {
+                            let next = !form().onekey;
+                            form.write().onekey = next;
+                            tracing::info!("[ONEKEY] connection-dialog checkbox toggled onekey={}", next);
+                        },
+                        input {
+                            r#type: "checkbox",
+                            checked: form().onekey,
+                            style: "pointer-events: none; cursor: pointer;",
+                        }
+                        div {
+                            style: "display: flex; flex-direction: column; gap: 2px;",
+                            label { style: "font-size: 12px; color: #9ece6a; cursor: pointer; pointer-events: none;", "One-Key Connect" }
+                            span { style: "font-size: 11px; color: #565f89; line-height: 1.4; pointer-events: none;",
+                                "Auto-suggest a matching OneKey credential when this host asks for a password." }
                         }
                     }
 
@@ -442,16 +496,6 @@ pub fn ConnectionDialog(
                         }
                     }
 
-                    // One-key connect
-                    div {
-                        style: "display: flex; align-items: center; gap: 8px;",
-                        input {
-                            r#type: "checkbox",
-                            checked: form().onekey,
-                            onchange: move |e| form.write().onekey = e.checked(),
-                        }
-                        label { style: "font-size: 12px; color: #9ece6a; cursor: pointer;", "One-Key Connect" }
-                    }
                 }
 
                 div {
@@ -464,6 +508,18 @@ pub fn ConnectionDialog(
                     button {
                         style: "background: #7aa2f7; border: none; color: #1a1b26; border-radius: 4px; padding: 8px 16px; cursor: pointer; font-size: 13px; font-weight: 600;",
                         onclick: move |_| {
+                            // CRITICAL diagnostic: we MUST see this logline
+                            // every time the user clicks Save/Connect. If the
+                            // dialog visually closes but no log appears, the
+                            // WebView ate the click. If log shows editing=none
+                            // while the user was definitely in edit mode, the
+                            // `editing_conn` prop never got passed down.
+                            tracing::info!(
+                                "[CONN-DIALOG] submit clicked editing={} form.onekey={} form.name='{}'",
+                                if editing.is_some() { "some" } else { "none" },
+                                form().onekey,
+                                form().name
+                            );
                             if let Some(ref c) = editing {
                                 // Edit mode: preserve the id so the existing
                                 // entry is replaced. Non-form fields (group,
