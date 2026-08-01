@@ -3,6 +3,7 @@ use dioxus::prelude::*;
 // dioxus::prelude) — same import pattern as tab_bar.rs.
 use dioxus::html::input_data::MouseButton;
 
+use rusterm_core::config::{KeybindingAction, Keybindings};
 use rusterm_core::terminal::{
     CellColor, CellFlags, MouseReportKind, RenderCell, RenderOutput, RenderRow,
     encode_mouse_report, extract_selection,
@@ -745,6 +746,8 @@ pub fn TerminalView(
     suggestions: Vec<String>,
     suggestion_selected: usize,
     suggestion_visible: bool,
+    #[props(default)] keybindings: Keybindings,
+    #[props(default)] on_keybinding: EventHandler<KeybindingAction>,
     on_input: EventHandler<Vec<u8>>,
     on_command: EventHandler<String>,
     on_resize: EventHandler<(u16, u16, u32, u32)>,
@@ -858,6 +861,7 @@ pub fn TerminalView(
             if let Key::Character(ref s) = key {
                 if s.eq_ignore_ascii_case("v") {
                     e.prevent_default();
+                    e.stop_propagation();
                     let bracketed = render_output.mode_bracketed_paste;
                     paste_from_clipboard(&on_input, bracketed);
                     return;
@@ -886,10 +890,12 @@ pub fn TerminalView(
                 }
                 // With no terminal-owned selection, preserve the browser's
                 // native copy behavior for popup/input DOM selections.
+                e.stop_propagation();
                 return;
             }
             TerminalOverlayKeyAction::Copy(CopyShortcut::CtrlShift) => {
                 e.prevent_default();
+                e.stop_propagation();
                 let text = terminal_selection_text(&selection_text(), selection(), &copy_rows);
                 if !text.is_empty() {
                     if let ClipboardCopyOutcome::Copied(n) = copy_text_to_clipboard(text) {
@@ -938,26 +944,34 @@ pub fn TerminalView(
             TerminalOverlayKeyAction::OneKey(_) | TerminalOverlayKeyAction::None => {}
         }
 
+        // Ctrl+Shift+F remains terminal-local search. It intentionally wins
+        // over an application shortcut so focused terminal users never lose
+        // the established search behavior.
+        if ctrl && shift && matches!(key, Key::Character(ref s) if s == "f" || s == "F") {
+            e.prevent_default();
+            e.stop_propagation();
+            search_visible.toggle();
+            if !search_visible() {
+                search_query.set(String::new());
+                search_matches.set(Vec::new());
+                search_match_index.set(0);
+            }
+            return;
+        }
+
+        if let Some(action) =
+            crate::keybindings::action_for_event(&keybindings, &key, ctrl, alt, meta, shift)
+        {
+            e.prevent_default();
+            e.stop_propagation();
+            on_keybinding.call(action);
+            return;
+        }
+
         if meta {
             return;
         }
         e.prevent_default();
-
-        // Ctrl+Shift+W — cross-platform "close focused pane" shortcut.
-        // Let it bubble to the App's `onkeydown` (which calls
-        // `close_session`) WITHOUT sending anything to the PTY. Without
-        // this early return, the keymap's `Ctrl+Shift+<alpha>` arm would
-        // emit a CSI modifier-6 sequence (Ctrl+Shift+W = `CSI 1;6 W`),
-        // and the pane would close at the same time — double action.
-        // macOS Cmd+Shift+W already bubbles via the `meta` early return
-        // above, so this only needs to handle the Ctrl variant.
-        if ctrl && shift && !alt {
-            if let Key::Character(ref s) = key {
-                if s.eq_ignore_ascii_case("w") {
-                    return;
-                }
-            }
-        }
 
         // Disconnected session: Enter reconnects, everything else is ignored
         // (there's no live PTY to send to).
@@ -996,17 +1010,6 @@ pub fn TerminalView(
                     on_onekey_dismiss.call(());
                 }
             }
-        }
-
-        // Ctrl+Shift+F: toggle search bar
-        if ctrl && shift && matches!(key, Key::Character(ref s) if s == "f" || s == "F") {
-            search_visible.toggle();
-            if !search_visible() {
-                search_query.set(String::new());
-                search_matches.set(Vec::new());
-                search_match_index.set(0);
-            }
-            return;
         }
 
         if search_visible() {

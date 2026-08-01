@@ -5,7 +5,9 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use rusterm_core::config::{ConnectionConfig, FocusedTabAppearance, OneKey, SidebarPreferences};
+use rusterm_core::config::{
+    ConnectionConfig, FocusedTabAppearance, Keybindings, OneKey, SidebarPreferences,
+};
 use rusterm_core::config_manager::ConfigManager;
 use rusterm_core::session::SessionType;
 use rusterm_core::session_log::SessionLog;
@@ -133,6 +135,8 @@ pub struct AppState {
     pub theme: Theme,
     #[serde(default)]
     pub focused_tab_appearance: FocusedTabAppearance,
+    #[serde(default)]
+    pub keybindings: Keybindings,
     #[serde(skip)]
     pub close_senders: Vec<(String, mpsc::UnboundedSender<()>)>,
     #[serde(skip)]
@@ -495,6 +499,7 @@ impl Default for AppState {
             connections: Vec::new(),
             theme: Theme::Dark,
             focused_tab_appearance: FocusedTabAppearance::default(),
+            keybindings: Keybindings::default(),
             close_senders: Vec::new(),
             resize_senders: HashMap::new(),
             config_manager: None,

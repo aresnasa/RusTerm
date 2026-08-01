@@ -7,8 +7,8 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use rusterm_core::config::{
-    ConnectionConfig, ConnectionGroup, ConnectionKind, OneKey, OneKeyStep, ShellConfig,
-    SidebarPreferences, SshAuth, SshConfig,
+    ConnectionConfig, ConnectionGroup, ConnectionKind, KeybindingAction, Keybindings, OneKey,
+    OneKeyStep, ShellConfig, SidebarPreferences, SshAuth, SshConfig,
 };
 use rusterm_core::config_manager::ConfigManager;
 use rusterm_core::event::SessionEvent;
@@ -28,6 +28,7 @@ use crate::components::Sidebar;
 use crate::components::TabBar;
 use crate::components::TerminalView;
 use crate::components::connection_dialog::NewConnectionForm;
+use crate::keybindings::action_for_event;
 use crate::layout::{PaneLayout, SplitAxis, SplitDirection};
 use crate::state::{
     AppState, Modal, OneKeyMatch, OneKeyPopupState, OneKeySubmissionFeedback,
@@ -66,6 +67,62 @@ fn save_sidebar_preferences(state: &Signal<AppState>) {
     };
     if let Err(error) = config_manager.save_sidebar_preferences(&preferences) {
         tracing::error!("Failed to save sidebar preferences: {}", error);
+    }
+}
+
+/// Execute a user-configured application shortcut. This only covers safe,
+/// explicit app actions; unmatched keys always continue through terminal input.
+fn run_keybinding_action(
+    action: KeybindingAction,
+    mut state: Signal<AppState>,
+    mut input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+) {
+    match action {
+        KeybindingAction::CloseFocusedPane => {
+            let snapshot = state.read();
+            let (close_tab, close_idx, fallback_sid) = match snapshot.focused_pane.as_ref() {
+                Some(fp) => (
+                    Some(fp.layout_owner_tab_id.clone()),
+                    Some(fp.pane_idx),
+                    None,
+                ),
+                None => (None, None, snapshot.active_session.clone()),
+            };
+            drop(snapshot);
+
+            if let (Some(tab), Some(idx)) = (close_tab, close_idx) {
+                let outcome = close_pane(&mut state.write(), &mut input_senders.write(), &tab, idx);
+                tracing::info!(
+                    "[KEYBINDING] closed focused pane {} in tab {} → {:?}",
+                    idx,
+                    tab,
+                    outcome
+                );
+                restore_focus_to_active_session(state, 50);
+            } else if let Some(session_id) = fallback_sid {
+                close_session(&mut state.write(), &mut input_senders.write(), &session_id);
+                restore_focus_to_active_session(state, 50);
+            }
+        }
+        KeybindingAction::AppendPane => {
+            if !state.read().split_mode_enabled {
+                let _ = toggle_split_mode(&mut state.write());
+            }
+            let new_idx = append_pane_to_active(&mut state.write());
+            tracing::info!("[KEYBINDING] appended pane idx={new_idx:?}");
+            restore_focus_to_active_session(state, 100);
+        }
+        KeybindingAction::ToggleComparison => {
+            let on = toggle_comparison_mode(&mut state.write());
+            tracing::info!("[KEYBINDING] toggled comparison: {on:?}");
+        }
+        KeybindingAction::TogglePaneZoom => {
+            let session_id = state.read().active_session.clone();
+            if let Some(session_id) = session_id {
+                let toggled = toggle_pane_zoom(&mut state.write(), &session_id);
+                tracing::info!("[KEYBINDING] zoom for {}: applied={}", session_id, toggled);
+            }
+        }
     }
 }
 
@@ -272,6 +329,7 @@ fn render_terminal_pane(
                 state.read().session_connection_states.get(&tab.id),
                 Some(SessionConnectionState::Disconnected | SessionConnectionState::Reconnecting)
             );
+            let keybindings = state.read().keybindings.clone();
             rsx! {
                 TerminalView {
                     session_id: tab.id.clone(),
@@ -281,6 +339,10 @@ fn render_terminal_pane(
                     suggestions: tab.suggestions.clone(),
                     suggestion_selected: tab.suggestion_selected,
                     suggestion_visible: tab.suggestion_visible,
+                    keybindings,
+                    on_keybinding: move |action: KeybindingAction| {
+                        run_keybinding_action(action, state, input_senders);
+                    },
                     on_resize: move |(cols, rows, pw, ph): (u16, u16, u32, u32)| {
                         let terminals = state.read().terminals.clone();
                         if let Some(handle) = terminals.get(&sid_for_resize) {
@@ -9113,6 +9175,7 @@ pub fn App() -> Element {
                                 let (sug_enabled, sug_count) = cm.load_suggestion_settings();
                                 s.suggestion_enabled = sug_enabled;
                                 s.suggestion_count = sug_count;
+                                s.keybindings = cm.load_keybindings();
                                 s.config_manager = Some(cm);
                                 s.sidebar_preferences = sidebar_preferences;
                                 s.connections = connections;
@@ -9196,47 +9259,23 @@ pub fn App() -> Element {
             tabindex: "0",
             onkeydown: move |e: KeyboardEvent| {
                 let mods = e.modifiers();
-                // Close-focused-pane-session hotkeys.
-                //
-                // Three bindings, all deliberately AVOID clobbering the
-                // STANDARD terminal Ctrl+W (which deletes the previous word
-                // in shells, is the vim window-switch prefix, and is
-                // emacs' kill-region). The TerminalView intercepts Ctrl+W
-                // at its own `onkeydown` and sends `0x17` to the PTY —
-                // this handler only fires when focus is NOT on a terminal
-                // (e.g., sidebar, search box, or the main div itself after
-                // a click on empty chrome).
-                //
-                //   - macOS Cmd+W — WKWebView's default "close window"
-                //     shortcut. We intercept it to instead close the focused
-                //     pane session (preserving the rest of the window/tab).
-                //     When no pane session exists we let the event fall through
-                //     so the OS closes the window (last-tab-closes-app).
-                //
-                //   - All platforms Cmd/Ctrl+Shift+W — a dedicated
-                //     "close pane" shortcut that doesn't collide with plain
-                //     Ctrl+W. Shift+W is the conventional "close tab" companion
-                //     in browsers/editors, so Cmd/Ctrl+Shift+W is discoverable.
-                //
-                //   - Linux/Windows Ctrl+W (no Shift) — ONLY when this handler
-                //     fires (i.e., focus is NOT on a terminal). When a terminal
-                //     has focus, the TerminalView sends 0x17 to the PTY and
-                //     this handler never sees the event. So Ctrl+W works as
-                //     the standard Linux terminal shortcut inside a session,
-                //     AND as a close-pane shortcut when the user has clicked
-                //     away from a terminal (e.g., onto the sidebar or empty
-                //     chrome). This resolves the "control+w 不能关闭窗口" report
-                //     without breaking the "标准的 linux 终端快捷键在会话中需要能
-                //     正常执行的" requirement.
-                //
-                // The TerminalView's `onkeydown` returns early when `meta`
-                // is pressed (so Cmd+W and Cmd+Shift+W bubble here), and
-                // calls `prevent_default` for Ctrl-key combos (so Ctrl+W
-                // never reaches this handler WHEN a terminal has focus). The
-                // Shift variant works on Linux/Windows too because
-                // TerminalView's Ctrl+Shift handlers (copy/paste/search)
-                // only match C/V/F, not W — so Ctrl+Shift+W bubbles up to
-                // here even from a focused terminal.
+                let keybindings = state.read().keybindings.clone();
+                if let Some(action) = action_for_event(
+                    &keybindings,
+                    &e.key(),
+                    mods.ctrl(),
+                    mods.alt(),
+                    mods.meta(),
+                    mods.shift(),
+                ) {
+                    e.prevent_default();
+                    e.stop_propagation();
+                    run_keybinding_action(action, state, input_senders);
+                    return;
+                }
+                // Keep platform-standard plain Cmd/Ctrl+W behavior for the
+                // application chrome. Configurable pane shortcuts are resolved
+                // above and never intercept terminal control input.
                 if let Key::Character(ref s) = e.key() {
                     if s.eq_ignore_ascii_case("w") {
                         // macOS Cmd+W (no Shift) — the original binding.
@@ -9288,50 +9327,6 @@ pub fn App() -> Element {
                             // else: no session to close — let the event
                             // propagate so the OS handles Cmd+W (closes the
                             // window on macOS).
-                        }
-                        // Cmd/Ctrl+Shift+W — cross-platform close-pane.
-                        // `stop_propagation` so the TerminalView doesn't
-                        // also process it (it wouldn't, but be explicit).
-                        if (mods.meta() || mods.ctrl())
-                            && mods.shift()
-                            && !mods.alt()
-                            && !(mods.meta() && mods.ctrl())
-                        {
-                            let snapshot = state.read();
-                            let (close_tab, close_idx, fallback_sid) =
-                                match snapshot.focused_pane.as_ref() {
-                                    Some(fp) => (
-                                        Some(fp.layout_owner_tab_id.clone()),
-                                        Some(fp.pane_idx),
-                                        None,
-                                    ),
-                                    None => (None, None, snapshot.active_session.clone()),
-                                };
-                            drop(snapshot);
-                            if let (Some(tab), Some(idx)) = (close_tab, close_idx) {
-                                e.prevent_default();
-                                e.stop_propagation();
-                                let outcome = close_pane(
-                                    &mut state.write(),
-                                    &mut input_senders.write(),
-                                    &tab,
-                                    idx,
-                                );
-                                tracing::info!(
-                                    "[CMD+SHIFT+W] closed focused pane {} in tab {} → {:?}",
-                                    idx, tab, outcome
-                                );
-                                restore_focus_to_active_session(state, 50);
-                            } else if let Some(session_id) = fallback_sid {
-                                e.prevent_default();
-                                e.stop_propagation();
-                                close_session(
-                                    &mut state.write(),
-                                    &mut input_senders.write(),
-                                    &session_id,
-                                );
-                                restore_focus_to_active_session(state, 50);
-                            }
                         }
                         // Linux/Windows: plain Ctrl+W (no Shift) — close
                         // the focused pane. This handler ONLY fires
@@ -9409,54 +9404,6 @@ pub fn App() -> Element {
                                         });
                                     }
                                 }
-                            }
-                        }
-                    }
-                }
-                // Cmd/Ctrl+Shift+L → append one pane (on-demand split).
-                // Grows the active tab's layout by exactly one pane per press
-                // (1 → 2 → 3 → 4 → …), matching the toolbar's "⊕ Split" button.
-                // This replaces the old preset-cycling behaviour (1 → 2H → 2V → 4
-                // → 8 → 1) per the user's request to not use 2/4/8 jumps.
-                //
-                // If split mode is currently OFF (tab-tiled), this hotkey
-                // first turns it ON (revealing the layout), then appends.
-                if (mods.meta() || mods.ctrl()) && mods.shift() && !mods.alt() {
-                    if let Key::Character(ref s) = e.key() {
-                        if s.eq_ignore_ascii_case("l") {
-                            e.prevent_default();
-                            // Ensure split mode is ON before appending.
-                            if !state.read().split_mode_enabled {
-                                let _ = toggle_split_mode(&mut state.write());
-                            }
-                            let new_idx = append_pane_to_active(&mut state.write());
-                            tracing::info!(
-                                "[LAYOUT] hotkey appended pane idx={:?}",
-                                new_idx
-                            );
-                            // Restore focus to the active session's input div.
-                            // Appending a pane re-mounts panes, and the
-                            // auto-focus `use_effect` in each pane's
-                            // `TerminalView` may race — the last-mounted pane
-                            // wins focus, which may not be the active session.
-                            // This explicit restore ensures the user lands on
-                            // the pane they expect (the active one).
-                            restore_focus_to_active_session(state, 100);
-                        }
-                        // Cmd/Ctrl+Shift+C → toggle comparison mode.
-                        if s.eq_ignore_ascii_case("c") {
-                            e.prevent_default();
-                            let on = toggle_comparison_mode(&mut state.write());
-                            tracing::info!("[LAYOUT] hotkey toggled comparison: {:?}", on);
-                        }
-                        // Cmd/Ctrl+Shift+F → toggle fullscreen (zoom)
-                        // on the active pane.
-                        if s.eq_ignore_ascii_case("f") {
-                            e.prevent_default();
-                            let active = state.read().active_session.clone();
-                            if let Some(sid) = active {
-                                let toggled = toggle_pane_zoom(&mut state.write(), &sid);
-                                tracing::info!("[LAYOUT] hotkey zoom for {}: applied={}", sid, toggled);
                             }
                         }
                     }
@@ -10098,6 +10045,7 @@ pub fn App() -> Element {
                 appearance: state.read().focused_tab_appearance.clone(),
                 suggestion_enabled: state.read().suggestion_enabled,
                 suggestion_count: state.read().suggestion_count,
+                keybindings: state.read().keybindings.clone(),
                 on_close: move |_| modal.set(Modal::None),
                 on_save: move |appearance: rusterm_core::FocusedTabAppearance| {
                     let appearance = appearance.normalized();
@@ -10108,6 +10056,15 @@ pub fn App() -> Element {
                     }
                     state.write().focused_tab_appearance = appearance;
                     modal.set(Modal::None);
+                },
+                on_save_keybindings: move |keybindings: Keybindings| {
+                    let keybindings = keybindings.normalized();
+                    if let Some(cm) = state.read().config_manager.clone() {
+                        if let Err(e) = cm.save_keybindings(&keybindings) {
+                            tracing::error!("Failed to save keybindings: {}", e);
+                        }
+                    }
+                    state.write().keybindings = keybindings;
                 },
                 on_save_suggestions: move |(enabled, count): (bool, u8)| {
                     if let Some(cm) = state.read().config_manager.clone() {

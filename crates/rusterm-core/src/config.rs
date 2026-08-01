@@ -285,6 +285,153 @@ fn default_sidebar_width_px() -> u16 {
     DEFAULT_SIDEBAR_WIDTH_PX
 }
 
+/// A user-configured application shortcut. `primary` means Command on macOS
+/// and Control on other platforms, so settings remain portable across devices.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
+pub struct KeyChord {
+    pub key: String,
+    #[serde(default)]
+    pub primary: bool,
+    #[serde(default)]
+    pub alt: bool,
+    #[serde(default)]
+    pub shift: bool,
+}
+
+impl KeyChord {
+    pub fn normalized(mut self) -> Option<Self> {
+        self.key = self.key.trim().to_ascii_lowercase();
+        (!self.key.is_empty()).then_some(self)
+    }
+
+    /// Global application shortcuts must include the primary modifier and
+    /// Shift. This deliberately leaves common terminal controls such as
+    /// Ctrl+C and Ctrl+W available to the PTY.
+    pub fn is_safe_application_shortcut(&self) -> bool {
+        self.primary && self.shift
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum KeybindingAction {
+    CloseFocusedPane,
+    AppendPane,
+    ToggleComparison,
+    TogglePaneZoom,
+}
+
+impl KeybindingAction {
+    pub const ALL: [Self; 4] = [
+        Self::CloseFocusedPane,
+        Self::AppendPane,
+        Self::ToggleComparison,
+        Self::TogglePaneZoom,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::CloseFocusedPane => "Close focused pane",
+            Self::AppendPane => "Add split pane",
+            Self::ToggleComparison => "Toggle synchronized input",
+            Self::TogglePaneZoom => "Toggle pane zoom",
+        }
+    }
+}
+
+/// Application-level keybindings. `None` disables an action's shortcut.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Keybindings {
+    #[serde(default = "default_close_focused_pane_keybinding")]
+    pub close_focused_pane: Option<KeyChord>,
+    #[serde(default = "default_append_pane_keybinding")]
+    pub append_pane: Option<KeyChord>,
+    #[serde(default = "default_toggle_comparison_keybinding")]
+    pub toggle_comparison: Option<KeyChord>,
+    #[serde(default = "default_toggle_pane_zoom_keybinding")]
+    pub toggle_pane_zoom: Option<KeyChord>,
+}
+
+fn default_key_chord(key: &str) -> Option<KeyChord> {
+    Some(KeyChord {
+        key: key.to_string(),
+        primary: true,
+        alt: false,
+        shift: true,
+    })
+}
+
+fn default_close_focused_pane_keybinding() -> Option<KeyChord> {
+    default_key_chord("w")
+}
+
+fn default_append_pane_keybinding() -> Option<KeyChord> {
+    default_key_chord("l")
+}
+
+fn default_toggle_comparison_keybinding() -> Option<KeyChord> {
+    default_key_chord("c")
+}
+
+fn default_toggle_pane_zoom_keybinding() -> Option<KeyChord> {
+    default_key_chord("f")
+}
+
+impl Default for Keybindings {
+    fn default() -> Self {
+        Self {
+            close_focused_pane: default_close_focused_pane_keybinding(),
+            append_pane: default_append_pane_keybinding(),
+            toggle_comparison: default_toggle_comparison_keybinding(),
+            toggle_pane_zoom: default_toggle_pane_zoom_keybinding(),
+        }
+    }
+}
+
+impl Keybindings {
+    pub fn normalized(mut self) -> Self {
+        for action in KeybindingAction::ALL {
+            let chord = self.chord(action).cloned().and_then(KeyChord::normalized);
+            self.set_chord(action, chord.filter(KeyChord::is_safe_application_shortcut));
+        }
+        self
+    }
+
+    pub fn chord(&self, action: KeybindingAction) -> Option<&KeyChord> {
+        match action {
+            KeybindingAction::CloseFocusedPane => self.close_focused_pane.as_ref(),
+            KeybindingAction::AppendPane => self.append_pane.as_ref(),
+            KeybindingAction::ToggleComparison => self.toggle_comparison.as_ref(),
+            KeybindingAction::TogglePaneZoom => self.toggle_pane_zoom.as_ref(),
+        }
+    }
+
+    pub fn set_chord(&mut self, action: KeybindingAction, chord: Option<KeyChord>) {
+        match action {
+            KeybindingAction::CloseFocusedPane => self.close_focused_pane = chord,
+            KeybindingAction::AppendPane => self.append_pane = chord,
+            KeybindingAction::ToggleComparison => self.toggle_comparison = chord,
+            KeybindingAction::TogglePaneZoom => self.toggle_pane_zoom = chord,
+        }
+    }
+
+    pub fn action_for(&self, chord: &KeyChord) -> Option<KeybindingAction> {
+        KeybindingAction::ALL
+            .into_iter()
+            .find(|action| self.chord(*action).is_some_and(|binding| binding == chord))
+    }
+
+    pub fn conflicting_action(
+        &self,
+        action: KeybindingAction,
+        chord: &KeyChord,
+    ) -> Option<KeybindingAction> {
+        KeybindingAction::ALL.into_iter().find(|other| {
+            *other != action && self.chord(*other).is_some_and(|binding| binding == chord)
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedConfig {
     pub version: u32,
@@ -322,6 +469,10 @@ pub struct PersistedConfig {
     /// Width, hidden connections, and custom groups for the connection sidebar.
     #[serde(default)]
     pub sidebar: SidebarPreferences,
+    /// User-configured application shortcuts. Missing in legacy settings files
+    /// means the established defaults are used.
+    #[serde(default)]
+    pub keybindings: Keybindings,
 }
 
 /// Default for `PersistedConfig::confirm_close_on_exit`. Kept as a function
@@ -620,6 +771,47 @@ mod tests {
     }
 
     #[test]
+    fn keybindings_default_for_legacy_settings() {
+        let config: PersistedConfig =
+            serde_json::from_str(r#"{"version":1,"connections":[]}"#).unwrap();
+
+        assert_eq!(config.keybindings, Keybindings::default());
+    }
+
+    #[test]
+    fn keybindings_normalize_unsafe_manual_values() {
+        let keybindings = Keybindings {
+            close_focused_pane: Some(KeyChord {
+                key: " W ".to_string(),
+                primary: true,
+                alt: false,
+                shift: true,
+            }),
+            append_pane: Some(KeyChord {
+                key: "c".to_string(),
+                primary: true,
+                alt: false,
+                shift: false,
+            }),
+            ..Keybindings::default()
+        }
+        .normalized();
+
+        assert_eq!(keybindings.close_focused_pane.unwrap().key, "w");
+        assert!(keybindings.append_pane.is_none());
+    }
+
+    #[test]
+    fn keybindings_detect_conflicting_actions() {
+        let keybindings = Keybindings::default();
+        let chord = keybindings.append_pane.as_ref().unwrap();
+        assert_eq!(
+            keybindings.conflicting_action(KeybindingAction::TogglePaneZoom, chord),
+            Some(KeybindingAction::AppendPane)
+        );
+    }
+
+    #[test]
     fn suggestion_settings_roundtrip() {
         let config = PersistedConfig {
             version: 1,
@@ -632,6 +824,7 @@ mod tests {
             suggestion_enabled: false,
             suggestion_count: 10,
             sidebar: SidebarPreferences::default(),
+            keybindings: Keybindings::default(),
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: PersistedConfig = serde_json::from_str(&json).unwrap();

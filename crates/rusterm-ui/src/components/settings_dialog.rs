@@ -1,6 +1,9 @@
 use dioxus::prelude::*;
 
 use rusterm_core::FocusedTabAppearance;
+use rusterm_core::config::{KeybindingAction, Keybindings};
+
+use crate::keybindings::{event_chord, format_key_chord};
 
 /// Settings dialog: appearance + suggestion preferences.
 ///
@@ -21,6 +24,8 @@ pub fn SettingsDialog(
     /// Fires with `(enabled, count)` when the user clicks Save.
     #[props(default)]
     on_save_suggestions: EventHandler<(bool, u8)>,
+    #[props(default)] keybindings: Keybindings,
+    #[props(default)] on_save_keybindings: EventHandler<Keybindings>,
 ) -> Element {
     let mut draft = use_signal(|| appearance.normalized());
     let preview = draft().normalized();
@@ -33,6 +38,9 @@ pub fn SettingsDialog(
     // Suggestion draft state — edited locally, committed on Save.
     let mut sug_enabled = use_signal(|| suggestion_enabled);
     let mut sug_count = use_signal(|| suggestion_count);
+    let mut keybinding_draft = use_signal(|| keybindings.normalized());
+    let mut capturing_keybinding: Signal<Option<KeybindingAction>> = use_signal(|| None);
+    let mut keybinding_error: Signal<Option<String>> = use_signal(|| None);
 
     rsx! {
         div {
@@ -198,6 +206,100 @@ pub fn SettingsDialog(
                     }
                 }
 
+                h3 {
+                    style: "margin: 24px 0 6px; font-size: 16px;",
+                    "Keyboard shortcuts"
+                }
+                p {
+                    style: "margin: 0 0 12px; color: #7f849c; font-size: 12px; line-height: 1.5;",
+                    "Click a shortcut, then press a new combination. Application shortcuts require Cmd/Ctrl + Shift so standard terminal controls remain available."
+                }
+                div {
+                    style: "display: flex; flex-direction: column; gap: 8px;",
+                    for action in KeybindingAction::ALL {
+                        {
+                            let action_label = action.label();
+                            let is_capturing = capturing_keybinding() == Some(action);
+                            let chord_label = if is_capturing {
+                                "Press shortcut…".to_string()
+                            } else {
+                                format_key_chord(keybinding_draft().chord(action))
+                            };
+                            let button_border = if is_capturing { "#7aa2f7" } else { "#414868" };
+                            let button_bg = if is_capturing { "#2f3b5f" } else { "#1a1b26" };
+                            rsx! {
+                                div {
+                                    key: "keybinding-{action_label}",
+                                    style: "display: flex; align-items: center; justify-content: space-between; gap: 12px;",
+                                    span { style: "font-size: 12px; color: #a9b1d6;", "{action_label}" }
+                                    div { style: "display: flex; align-items: center; gap: 6px;",
+                                        button {
+                                            style: "min-width: 146px; background: {button_bg}; border: 1px solid {button_border}; color: #c0caf5; border-radius: 4px; padding: 6px 8px; cursor: pointer; font-family: 'JetBrains Mono', monospace; font-size: 12px;",
+                                            onclick: move |_| {
+                                                capturing_keybinding.set(Some(action));
+                                                keybinding_error.set(None);
+                                            },
+                                            onkeydown: move |e: KeyboardEvent| {
+                                                e.prevent_default();
+                                                e.stop_propagation();
+                                                if matches!(e.key(), Key::Escape) {
+                                                    capturing_keybinding.set(None);
+                                                    keybinding_error.set(None);
+                                                    return;
+                                                }
+                                                let modifiers = e.modifiers();
+                                                let Some(chord) = event_chord(
+                                                    &e.key(),
+                                                    modifiers.ctrl(),
+                                                    modifiers.alt(),
+                                                    modifiers.meta(),
+                                                    modifiers.shift(),
+                                                ) else {
+                                                    return;
+                                                };
+                                                if !chord.is_safe_application_shortcut() {
+                                                    keybinding_error.set(Some(
+                                                        "Use Cmd/Ctrl + Shift plus a key to keep terminal controls safe."
+                                                            .to_string(),
+                                                    ));
+                                                    return;
+                                                }
+                                                if let Some(conflict) = keybinding_draft()
+                                                    .conflicting_action(action, &chord)
+                                                {
+                                                    keybinding_error.set(Some(format!(
+                                                        "Already used by {}.",
+                                                        conflict.label()
+                                                    )));
+                                                    return;
+                                                }
+                                                keybinding_draft.write().set_chord(action, Some(chord));
+                                                capturing_keybinding.set(None);
+                                                keybinding_error.set(None);
+                                            },
+                                            "{chord_label}"
+                                        }
+                                        button {
+                                            style: "background: transparent; border: 1px solid #414868; color: #7f849c; border-radius: 4px; padding: 5px 7px; cursor: pointer; font-size: 11px;",
+                                            onclick: move |_| {
+                                                keybinding_draft.write().set_chord(action, None);
+                                                if capturing_keybinding() == Some(action) {
+                                                    capturing_keybinding.set(None);
+                                                }
+                                                keybinding_error.set(None);
+                                            },
+                                            "Disable"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    if let Some(error) = keybinding_error() {
+                        div { style: "font-size: 11px; color: #f7768e; margin-top: 2px;", "{error}" }
+                    }
+                }
+
                 div {
                     style: "display: flex; justify-content: space-between; gap: 8px; margin-top: 20px;",
                     button {
@@ -206,6 +308,9 @@ pub fn SettingsDialog(
                             draft.set(FocusedTabAppearance::default());
                             sug_enabled.set(true);
                             sug_count.set(3);
+                            keybinding_draft.set(Keybindings::default());
+                            capturing_keybinding.set(None);
+                            keybinding_error.set(None);
                         },
                         "Reset default"
                     }
@@ -221,6 +326,7 @@ pub fn SettingsDialog(
                             onclick: move |_| {
                                 on_save.call(draft().normalized());
                                 on_save_suggestions.call((sug_enabled(), sug_count()));
+                                on_save_keybindings.call(keybinding_draft().normalized());
                             },
                             "Save"
                         }
