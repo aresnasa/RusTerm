@@ -9,8 +9,8 @@ use tokio_util::sync::CancellationToken;
 
 use rusterm_core::config::{
     BottomPanelTab, ConnectionConfig, ConnectionGroup, ConnectionKind, DockZone, KeybindingAction,
-    Keybindings, OneKey, OneKeyStep, PanelId, RightPanelTab, ShellConfig, SidebarPreferences,
-    SkinSettings, SshAuth, SshConfig, WorkspacePreferences,
+    Keybindings, OneKey, OneKeyStep, PanelId, ProxyConfig, ProxyKind, RightPanelTab, ShellConfig,
+    SidebarPreferences, SkinSettings, SshAuth, SshConfig, WorkspacePreferences,
 };
 use rusterm_core::config_manager::ConfigManager;
 use rusterm_core::event::SessionEvent;
@@ -6404,6 +6404,11 @@ mod session_startup_tests {
             ..Default::default()
         };
         form.onekey = true;
+        form.proxy_type = "socks5".to_string();
+        form.proxy_host = "proxy.example".to_string();
+        form.proxy_port = "1080".to_string();
+        form.proxy_username = "proxy-user".to_string();
+        form.proxy_password = "proxy-password".to_string();
 
         let rebuilt = rebuild_connection(&original, &form);
         assert_eq!(rebuilt.id, original.id, "id must be preserved on edit");
@@ -6415,6 +6420,19 @@ mod session_startup_tests {
             rebuilt.group.as_deref(),
             Some("production-group"),
             "editing must persist the form's group selection"
+        );
+        let ConnectionKind::Ssh(ssh) = &rebuilt.kind else {
+            panic!("expected SSH connection");
+        };
+        assert_eq!(
+            ssh.proxy,
+            Some(ProxyConfig {
+                kind: ProxyKind::Socks5,
+                host: "proxy.example".to_string(),
+                port: 1080,
+                username: Some("proxy-user".to_string()),
+                password: Some("proxy-password".to_string()),
+            })
         );
     }
 
@@ -8161,6 +8179,23 @@ fn build_ssh_auth(form: &NewConnectionForm) -> SshAuth {
 /// is preserved as-is — the dialog only edits SSH-specific fields, so a Shell /
 /// Serial / Telnet / TCP connection keeps its config and just gets its name /
 /// onekey updated.
+fn build_proxy_config(form: &NewConnectionForm) -> Option<ProxyConfig> {
+    let (kind, default_port) = match form.proxy_type.as_str() {
+        "http" => (ProxyKind::Http, 8080),
+        "https" => (ProxyKind::Https, 443),
+        "socks5" => (ProxyKind::Socks5, 1080),
+        _ => return None,
+    };
+
+    Some(ProxyConfig {
+        kind,
+        host: form.proxy_host.trim().to_string(),
+        port: form.proxy_port.parse().unwrap_or(default_port),
+        username: (!form.proxy_username.is_empty()).then(|| form.proxy_username.clone()),
+        password: (!form.proxy_password.is_empty()).then(|| form.proxy_password.clone()),
+    })
+}
+
 fn rebuild_connection(original: &ConnectionConfig, form: &NewConnectionForm) -> ConnectionConfig {
     let kind = match &original.kind {
         ConnectionKind::Ssh(ssh) => {
@@ -8177,6 +8212,7 @@ fn rebuild_connection(original: &ConnectionConfig, form: &NewConnectionForm) -> 
                 username: form.username.clone(),
                 auth,
                 terminal_type,
+                proxy: build_proxy_config(form),
                 proxy_jump: ssh.proxy_jump.clone(),
                 keepalive_interval: ssh.keepalive_interval,
                 host_key_policy: ssh.host_key_policy.clone(),
@@ -11019,6 +11055,7 @@ pub fn App() -> Element {
                     username: form.username.clone(),
                     auth,
                     terminal_type,
+                    proxy: build_proxy_config(&form),
                     proxy_jump: None,
                     keepalive_interval: None,
                     host_key_policy: rusterm_core::config::default_host_key_policy(),

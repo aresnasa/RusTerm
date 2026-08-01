@@ -1,6 +1,8 @@
 use dioxus::prelude::*;
 
-use rusterm_core::config::{ConnectionConfig, ConnectionGroup, ConnectionKind, SshAuth};
+use rusterm_core::config::{
+    ConnectionConfig, ConnectionGroup, ConnectionKind, ProxyKind, SshAuth,
+};
 use rusterm_ssh::{
     SshHostSuggestion, default_ssh_config_path, list_identity_files, list_ssh_config_hosts,
     lookup_host,
@@ -17,6 +19,11 @@ pub struct NewConnectionForm {
     pub key_path: String,
     pub passphrase: String,
     pub terminal_type: String,
+    pub proxy_type: String,
+    pub proxy_host: String,
+    pub proxy_port: String,
+    pub proxy_username: String,
+    pub proxy_password: String,
     pub group_id: Option<String>,
     pub onekey: bool,
 }
@@ -37,6 +44,7 @@ fn default_form() -> NewConnectionForm {
     NewConnectionForm {
         auth_type: "password".to_string(),
         terminal_type: "xterm-256color".to_string(),
+        proxy_type: "none".to_string(),
         port: "22".to_string(),
         ..Default::default()
     }
@@ -65,6 +73,32 @@ fn form_from_connection(c: &ConnectionConfig) -> NewConnectionForm {
                 ),
                 SshAuth::Agent => ("agent", String::new(), String::new(), String::new()),
             };
+            let (proxy_type, proxy_host, proxy_port, proxy_username, proxy_password) = ssh
+                .proxy
+                .as_ref()
+                .map(|proxy| {
+                    let proxy_type = match proxy.kind {
+                        ProxyKind::Http => "http",
+                        ProxyKind::Https => "https",
+                        ProxyKind::Socks5 => "socks5",
+                    };
+                    (
+                        proxy_type.to_string(),
+                        proxy.host.clone(),
+                        proxy.port.to_string(),
+                        proxy.username.clone().unwrap_or_default(),
+                        proxy.password.clone().unwrap_or_default(),
+                    )
+                })
+                .unwrap_or_else(|| {
+                    (
+                        "none".to_string(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                        String::new(),
+                    )
+                });
             NewConnectionForm {
                 name: c.name.clone(),
                 host: ssh.host.clone(),
@@ -75,6 +109,11 @@ fn form_from_connection(c: &ConnectionConfig) -> NewConnectionForm {
                 key_path,
                 passphrase,
                 terminal_type: ssh.terminal_type.clone(),
+                proxy_type,
+                proxy_host,
+                proxy_port,
+                proxy_username,
+                proxy_password,
                 group_id: c.group.clone(),
                 onekey: c.onekey,
             }
@@ -168,6 +207,17 @@ pub fn ConnectionDialog(
     let is_password = auth_type == "password";
     let is_key = auth_type == "key";
     let is_agent = auth_type == "agent";
+    let proxy_type = form().proxy_type.clone();
+    let proxy_enabled = proxy_type != "none";
+    let proxy_port_placeholder = match proxy_type.as_str() {
+        "https" => "443",
+        "socks5" => "1080",
+        _ => "8080",
+    };
+    let show_proxy_settings = editing
+        .as_ref()
+        .map(|connection| matches!(connection.kind, ConnectionKind::Ssh(_)))
+        .unwrap_or(true);
 
     // In edit mode, the password field is shown empty (we never echo the
     // stored password back into the DOM for security). A small hint tells the
@@ -503,6 +553,101 @@ pub fn ConnectionDialog(
                         }
                     })}
 
+                    // Optional per-connection proxy. HTTPS means TLS to the
+                    // proxy server followed by HTTP CONNECT to the SSH target.
+                    {show_proxy_settings.then(|| rsx! {
+                        div {
+                            style: "display: flex; flex-direction: column; gap: 8px; padding: 10px; background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px;",
+                            div {
+                                style: "display: flex; flex-direction: column; gap: 4px;",
+                                label { style: "font-size: 12px; color: #565f89;", "Proxy" }
+                                select {
+                                    style: "background: #16161e; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
+                                    value: "{form().proxy_type}",
+                                    onchange: move |e| {
+                                        let next = e.value();
+                                        let mut current = form.write();
+                                        let previous_default = match current.proxy_type.as_str() {
+                                            "https" => "443",
+                                            "socks5" => "1080",
+                                            "http" => "8080",
+                                            _ => "",
+                                        };
+                                        if current.proxy_port.is_empty() || current.proxy_port == previous_default {
+                                            current.proxy_port = match next.as_str() {
+                                                "https" => "443",
+                                                "socks5" => "1080",
+                                                "http" => "8080",
+                                                _ => "",
+                                            }
+                                            .to_string();
+                                        }
+                                        current.proxy_type = next;
+                                    },
+                                    option { value: "none", "None (direct)" }
+                                    option { value: "http", "HTTP CONNECT" }
+                                    option { value: "https", "HTTPS CONNECT" }
+                                    option { value: "socks5", "SOCKS5" }
+                                }
+                            }
+
+                            {proxy_enabled.then(|| rsx! {
+                                div {
+                                    style: "display: flex; gap: 8px;",
+                                    div {
+                                        style: "flex: 3; display: flex; flex-direction: column; gap: 4px;",
+                                        label { style: "font-size: 12px; color: #565f89;", "Proxy Host" }
+                                        input {
+                                            style: "background: #16161e; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
+                                            r#type: "text",
+                                            placeholder: "proxy.example.com",
+                                            value: "{form().proxy_host}",
+                                            oninput: move |e| form.write().proxy_host = e.value(),
+                                        }
+                                    }
+                                    div {
+                                        style: "flex: 1; display: flex; flex-direction: column; gap: 4px;",
+                                        label { style: "font-size: 12px; color: #565f89;", "Port" }
+                                        input {
+                                            style: "background: #16161e; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
+                                            r#type: "text",
+                                            placeholder: "{proxy_port_placeholder}",
+                                            value: "{form().proxy_port}",
+                                            oninput: move |e| form.write().proxy_port = e.value(),
+                                        }
+                                    }
+                                }
+                                div {
+                                    style: "display: flex; gap: 8px;",
+                                    div {
+                                        style: "flex: 1; display: flex; flex-direction: column; gap: 4px;",
+                                        label { style: "font-size: 12px; color: #565f89;", "Proxy Username (optional)" }
+                                        input {
+                                            style: "background: #16161e; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
+                                            r#type: "text",
+                                            value: "{form().proxy_username}",
+                                            oninput: move |e| form.write().proxy_username = e.value(),
+                                        }
+                                    }
+                                    div {
+                                        style: "flex: 1; display: flex; flex-direction: column; gap: 4px;",
+                                        label { style: "font-size: 12px; color: #565f89;", "Proxy Password (optional)" }
+                                        input {
+                                            style: "background: #16161e; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
+                                            r#type: "password",
+                                            value: "{form().proxy_password}",
+                                            oninput: move |e| form.write().proxy_password = e.value(),
+                                        }
+                                    }
+                                }
+                                div {
+                                    style: "font-size: 11px; color: #565f89; line-height: 1.4;",
+                                    "Authentication requires both username and password. HTTPS secures the connection to the proxy before CONNECT."
+                                }
+                            })}
+                        }
+                    })}
+
                     // Terminal Type selector
                     div {
                         style: "display: flex; flex-direction: column; gap: 4px;",
@@ -562,5 +707,46 @@ pub fn ConnectionDialog(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusterm_core::config::{ProxyConfig, SshConfig};
+
+    #[test]
+    fn edit_form_restores_proxy_configuration() {
+        let connection = ConnectionConfig {
+            id: "proxied".to_string(),
+            name: "Proxied SSH".to_string(),
+            kind: ConnectionKind::Ssh(SshConfig {
+                host: "ssh.example".to_string(),
+                port: 22,
+                username: "alice".to_string(),
+                auth: SshAuth::Agent,
+                terminal_type: "xterm-256color".to_string(),
+                proxy: Some(ProxyConfig {
+                    kind: ProxyKind::Https,
+                    host: "proxy.example".to_string(),
+                    port: 443,
+                    username: Some("proxy-user".to_string()),
+                    password: Some("proxy-password".to_string()),
+                }),
+                proxy_jump: None,
+                keepalive_interval: None,
+                host_key_policy: rusterm_core::config::default_host_key_policy(),
+            }),
+            group: None,
+            tags: vec![],
+            onekey: false,
+        };
+
+        let form = form_from_connection(&connection);
+        assert_eq!(form.proxy_type, "https");
+        assert_eq!(form.proxy_host, "proxy.example");
+        assert_eq!(form.proxy_port, "443");
+        assert_eq!(form.proxy_username, "proxy-user");
+        assert_eq!(form.proxy_password, "proxy-password");
     }
 }
