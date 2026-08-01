@@ -200,6 +200,11 @@ pub struct AppState {
     /// suggest nothing than suggest failed commands.
     #[serde(skip)]
     pub pending_exit_check: HashMap<String, VecDeque<(String, String)>>,
+    /// Input tracked synchronously from terminal key events. This avoids using
+    /// the asynchronously echoed terminal grid as the source of truth when
+    /// Enter arrives immediately after a fast paste or Compare broadcast.
+    #[serde(skip)]
+    pub terminal_command_lines: HashMap<String, TrackedCommandLine>,
     /// Commands that have just failed (rc != 0) and are awaiting the async
     /// `mark_command_failed` DB write to complete.
     ///
@@ -412,6 +417,12 @@ pub struct AppState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TrackedCommandLine {
+    Reliable(String),
+    Unreliable,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PendingCommandPayload {
     /// The command text is already present in the shell's input buffer; only
     /// the captured Enter bytes should be sent.
@@ -572,6 +583,7 @@ impl Default for AppState {
             master_password_error: None,
             suggestion_epoch: 0,
             pending_exit_check: HashMap::new(),
+            terminal_command_lines: HashMap::new(),
             recent_failed_commands: HashSet::new(),
             onekeys: Vec::new(),
             onekey_popups: HashMap::new(),
@@ -966,6 +978,58 @@ pub fn build_session_tree(state: &AppState) -> Vec<WorkspaceNode> {
             }
         })
         .collect()
+}
+
+pub fn track_terminal_input(state: &mut AppState, session_ids: &[String], data: &[u8]) {
+    for session_id in session_ids {
+        let line = state
+            .terminal_command_lines
+            .entry(session_id.clone())
+            .or_insert_with(|| TrackedCommandLine::Reliable(String::new()));
+        match data {
+            [0x03] | [0x15] => *line = TrackedCommandLine::Reliable(String::new()),
+            [0x17] => {
+                if let TrackedCommandLine::Reliable(value) = line {
+                    while value.ends_with(char::is_whitespace) {
+                        value.pop();
+                    }
+                    while value.chars().last().is_some_and(|ch| !ch.is_whitespace()) {
+                        value.pop();
+                    }
+                }
+            }
+            [0x7f] => {
+                if let TrackedCommandLine::Reliable(value) = line {
+                    value.pop();
+                }
+            }
+            _ if data.iter().all(|byte| *byte >= 0x20 && *byte != 0x7f) => {
+                if let Ok(text) = std::str::from_utf8(data) {
+                    if let TrackedCommandLine::Reliable(value) = line {
+                        value.push_str(text);
+                    }
+                } else {
+                    *line = TrackedCommandLine::Unreliable;
+                }
+            }
+            _ => *line = TrackedCommandLine::Unreliable,
+        }
+    }
+}
+
+pub fn tracked_terminal_command(state: &AppState, session_id: &str) -> Option<String> {
+    match state.terminal_command_lines.get(session_id) {
+        Some(TrackedCommandLine::Reliable(command)) if !command.trim().is_empty() => {
+            Some(command.trim().to_string())
+        }
+        _ => None,
+    }
+}
+
+pub fn clear_terminal_command_lines(state: &mut AppState, session_ids: &[String]) {
+    for session_id in session_ids {
+        state.terminal_command_lines.remove(session_id);
+    }
 }
 
 pub fn enqueue_pending_exit(
@@ -2109,6 +2173,7 @@ pub fn close_session(
     state.session_connection_states.remove(id);
     state.session_configs.remove(id);
     state.pending_exit_check.remove(id);
+    state.terminal_command_lines.remove(id);
     state.ssh_sessions.remove(id);
     state.sftp_clients.remove(id);
     state.transfers.cancel_for_session(id);
@@ -2274,6 +2339,7 @@ pub fn close_workspace(
         state.session_connection_states.remove(sid);
         state.session_configs.remove(sid);
         state.pending_exit_check.remove(sid);
+        state.terminal_command_lines.remove(sid);
         state.ssh_sessions.remove(sid);
         state.sftp_clients.remove(sid);
         state.transfers.cancel_for_session(sid);

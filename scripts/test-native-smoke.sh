@@ -30,7 +30,7 @@ SUCCESS_COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM history WHERE command I
 DANGEROUS_COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM history WHERE command = 'mkfs.ext4 /dev/sda';")
 echo "RUSTERM_E2E_HISTORY_SUCCESS_COUNT=$SUCCESS_COUNT"
 echo "RUSTERM_E2E_HISTORY_DANGEROUS_COUNT=$DANGEROUS_COUNT"
-sqlite3 "$DB_PATH" "SELECT command || '|' || session_id || '|' || COALESCE(exit_code, -999) FROM history WHERE command LIKE 'printf RUSTERM_%_E2E_OK' ORDER BY created_at, id;"
+sqlite3 "$DB_PATH" "SELECT command || '|' || session_id || '|' || COALESCE(exit_code, -999) FROM history ORDER BY created_at, id;"
 [ "$SUCCESS_COUNT" = "5" ]
 [ "$DANGEROUS_COUNT" = "0" ]
 
