@@ -5808,12 +5808,37 @@ fn longest_suffix_matching_prefix(data: &[u8], expected: &[u8]) -> usize {
         .unwrap_or(0)
 }
 
+const LOCAL_SHELL_INTEGRATION_ENV: &str = "RUSTERM_SI";
+
+fn shell_integration_script() -> &'static str {
+    r#"__rusterm_precmd() { printf '\e]133;D;%s\e\\' "$?"; printf '\e]133;A\e\\'; printf '\e]7;file://%s%s\e\\' "${HOSTNAME:-localhost}" "$PWD"; }; if [ -n "$ZSH_VERSION" ]; then precmd_functions+=(__rusterm_precmd); elif [ -n "$BASH_VERSION" ]; then PROMPT_COMMAND="__rusterm_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"; fi"#
+}
+
+/// The local shell receives only this short bootstrap through its interactive
+/// input. Keeping it below a normal prompt width prevents Zsh's line editor
+/// from rewriting the command with wrap/redraw control sequences.
 fn shell_integration_setup() -> Vec<u8> {
-    let mut setup = r#"__rusterm_precmd() { printf '\e]133;D;%s\e\\' "$?"; printf '\e]133;A\e\\'; printf '\e]7;file://%s%s\e\\' "${HOSTNAME:-localhost}" "$PWD"; }; if [ -n "$ZSH_VERSION" ]; then precmd_functions+=(__rusterm_precmd); elif [ -n "$BASH_VERSION" ]; then PROMPT_COMMAND="__rusterm_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"; fi"#
-        .as_bytes()
-        .to_vec();
+    format!(" eval \"${LOCAL_SHELL_INTEGRATION_ENV}\"\n").into_bytes()
+}
+
+fn ssh_shell_integration_setup() -> Vec<u8> {
+    let mut setup = shell_integration_script().as_bytes().to_vec();
     setup.push(b'\n');
     setup
+}
+
+fn prepare_local_shell_integration(shell_config: &mut ShellConfig) -> Vec<u8> {
+    shell_config
+        .env
+        .retain(|(key, _)| key != LOCAL_SHELL_INTEGRATION_ENV);
+    shell_config.env.push((
+        LOCAL_SHELL_INTEGRATION_ENV.to_string(),
+        format!(
+            "{}; unset {LOCAL_SHELL_INTEGRATION_ENV}",
+            shell_integration_script()
+        ),
+    ));
+    shell_integration_setup()
 }
 
 async fn inject_shell_integration_when_quiet(
@@ -5842,7 +5867,7 @@ async fn inject_shell_integration_when_quiet(
         }
     }
 
-    let setup = shell_integration_setup();
+    let setup = ssh_shell_integration_setup();
     echo_filter.lock().arm(&setup);
     if integration_tx.send(setup).is_ok() {
         tracing::info!(
@@ -5921,6 +5946,77 @@ mod session_startup_tests {
     }
 
     #[test]
+    fn local_shell_integration_does_not_send_full_script_through_pty() {
+        let setup = shell_integration_setup();
+
+        assert!(setup.len() < 32);
+        assert!(
+            !setup
+                .windows(b"__rusterm_precmd".len())
+                .any(|window| { window == b"__rusterm_precmd" })
+        );
+    }
+
+    #[test]
+    fn local_shell_integration_script_is_passed_through_environment() {
+        let mut config = ShellConfig {
+            command: None,
+            args: Vec::new(),
+            env: vec![
+                ("KEEP_ME".to_string(), "value".to_string()),
+                (LOCAL_SHELL_INTEGRATION_ENV.to_string(), "stale".to_string()),
+            ],
+            working_dir: None,
+        };
+
+        let setup = prepare_local_shell_integration(&mut config);
+        let integration_values: Vec<&str> = config
+            .env
+            .iter()
+            .filter(|(key, _)| key == LOCAL_SHELL_INTEGRATION_ENV)
+            .map(|(_, value)| value.as_str())
+            .collect();
+
+        assert_eq!(setup, shell_integration_setup());
+        assert_eq!(integration_values.len(), 1);
+        assert!(integration_values[0].contains("__rusterm_precmd"));
+        assert!(integration_values[0].contains("unset RUSTERM_SI"));
+        assert!(
+            config
+                .env
+                .iter()
+                .any(|(key, value)| { key == "KEEP_ME" && value == "value" })
+        );
+    }
+
+    #[test]
+    fn zsh_line_editor_echo_of_local_bootstrap_is_hidden() {
+        let setup = shell_integration_setup();
+        let command = &setup[..setup.len() - 1];
+        let mut filter = ShellIntegrationEchoFilter::default();
+        filter.arm(&setup);
+
+        // Captured from a real `zsh -f -i` PTY. ZLE paints the first input
+        // character, backs over it, then redraws the complete short command.
+        let mut output = b" \x08".to_vec();
+        output.extend_from_slice(command);
+        output.extend_from_slice(b"\x1b[?2004l\r\r\n\x1b]133;D;0\x1b\\\x1b]133;A\x1b\\prompt% ");
+
+        let visible = filter.filter(&output);
+        assert!(
+            !visible
+                .windows(command.len())
+                .any(|window| window == command)
+        );
+        assert!(
+            visible
+                .windows(b"\x1b]133;D;0\x1b\\".len())
+                .any(|window| { window == b"\x1b]133;D;0\x1b\\" })
+        );
+        assert!(visible.ends_with(b"prompt% "));
+    }
+
+    #[test]
     fn shell_integration_echo_is_hidden_without_hiding_prompt_or_osc() {
         let setup = shell_integration_setup();
         let command = &setup[..setup.len() - 1];
@@ -5944,9 +6040,10 @@ mod session_startup_tests {
         let mut filter = ShellIntegrationEchoFilter::default();
         filter.arm(&setup);
 
-        assert!(filter.filter(&command[..37]).is_empty());
+        let split = command.len() / 2;
+        assert!(filter.filter(&command[..split]).is_empty());
         assert_eq!(
-            filter.filter(&command[37..]),
+            filter.filter(&command[split..]),
             SHELL_INTEGRATION_ERASE_ECHO_LINE
         );
         assert!(filter.filter(b"\r").is_empty());
@@ -7712,8 +7809,9 @@ fn start_shell_connection(
     mut state: Signal<AppState>,
     mut input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
     tab_id: String,
-    shell_config: ShellConfig,
+    mut shell_config: ShellConfig,
 ) {
+    let shell_integration_setup = prepare_local_shell_integration(&mut shell_config);
     let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
 
     let size = {
@@ -7760,9 +7858,9 @@ fn start_shell_connection(
                 let integration_tx = session.input_tx.clone();
                 let echo_filter = shell_integration_echo_filter.clone();
                 let int_sid = tab_id.clone();
+                let setup = shell_integration_setup;
                 spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-                    let setup = shell_integration_setup();
                     echo_filter.lock().arm(&setup);
                     if integration_tx.send(setup).is_ok() {
                         tracing::info!("[local] injected shell integration for {}", int_sid);
