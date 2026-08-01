@@ -742,6 +742,11 @@ pub fn TerminalView(
     /// triggers `on_reconnect` and all other keys are ignored (no live PTY).
     disconnected: bool,
     on_reconnect: EventHandler<()>,
+    /// Per-row diff status for comparison-mode highlighting. `None` when
+    /// comparison mode is off (no highlight). When `Some`, rows marked
+    /// [`RowDiff::Different`] get a muted red background so the user can
+    /// spot where outputs diverge across panes.
+    row_diffs: Option<Vec<crate::comparison::RowDiff>>,
 ) -> Element {
     let mut focused = use_signal(|| false);
     let mut search_visible = use_signal(|| false);
@@ -769,7 +774,18 @@ pub fn TerminalView(
     let current_suggestion_selected = suggestion_selected;
 
     let current_onekey_visible = onekey_visible;
-    let current_onekey_entries = onekey_entries.clone();
+    // Cap the entries used for both keyboard navigation and rendering to
+    // MAX_VISIBLE_ROWS so arrow-key wrapping and the popup's visible items
+    // stay in sync.
+    let current_onekey_entries: Vec<OneKeyMatch> = onekey_entries
+        .iter()
+        .take(crate::components::suggestion_popup::MAX_VISIBLE_ROWS)
+        .cloned()
+        .collect();
+    // Snapshot the count for the keydown closure (which is a `move` closure).
+    // This avoids moving `current_onekey_entries` into the closure, leaving it
+    // available for the rsx! rendering block below.
+    let current_onekey_len = current_onekey_entries.len();
     let current_onekey_selected = onekey_selected;
     let current_onekey_submission_feedback = onekey_submission_feedback.clone();
     let current_disconnected = disconnected;
@@ -819,7 +835,7 @@ pub fn TerminalView(
             shift,
             current_onekey_visible,
             current_onekey_selected,
-            current_onekey_entries.len(),
+            current_onekey_len,
         );
         match overlay_key_action {
             TerminalOverlayKeyAction::Copy(CopyShortcut::Command) => {
@@ -926,7 +942,7 @@ pub fn TerminalView(
                 }
                 OneKeyKeyAction::Select => {
                     let selected =
-                        current_onekey_selected.min(current_onekey_entries.len().saturating_sub(1));
+                        current_onekey_selected.min(current_onekey_len.saturating_sub(1));
                     on_onekey_select.call(selected);
                     return;
                 }
@@ -1368,10 +1384,11 @@ pub fn TerminalView(
     let thumb_top_str = format!("{:.2}", thumb_top_pct);
     let thumb_height_str = format!("{:.2}", thumb_height_pct);
 
-    // The `--suggestion-bottom` CSS variable (used by SuggestionPopup to sit
-    // above the cursor row) is kept current by the resize future above, which
-    // re-measures every 100ms. (A use_effect here would only run once on mount
-    // — version is a plain prop, not a tracked Signal — leaving the value stale.)
+    // The `--suggestion-top` / `--suggestion-bottom` CSS variables (used by
+    // SuggestionPopup / OneKeyPopup to sit below/above the cursor row) are
+    // kept current by the resize future above, which re-measures every
+    // 100ms. (A use_effect here would only run once on mount — version is a
+    // plain prop, not a tracked Signal — leaving the value stale.)
 
     // Recompute search matches
     {
@@ -1823,7 +1840,15 @@ pub fn TerminalView(
             let is_current_match = sm.get(sidx).map(|(r, _)| *r == row_idx).unwrap_or(false);
             let is_search_match = sm.iter().any(|(r, _)| *r == row_idx);
 
-            let row_bg = if is_current_match {
+            // Comparison-mode diff highlight takes priority over search-match
+            // backgrounds (a diff row is more important to notice than a
+            // search hit). Search highlights still apply to non-diff rows.
+            let is_diff_row = row_diffs.as_ref().and_then(|d| d.get(row_idx))
+                == Some(&crate::comparison::RowDiff::Different);
+
+            let row_bg = if is_diff_row {
+                crate::comparison::DIFF_ROW_BG
+            } else if is_current_match {
                 "background:rgba(122,162,247,0.2);"
             } else if is_search_match {
                 "background:rgba(122,162,247,0.08);"
@@ -2082,7 +2107,7 @@ pub fn TerminalView(
                 }
             }
 
-            // Suggestion panel (Atuin-style, positioned above the cursor line)
+            // Suggestion panel (Atuin-style, positioned below the cursor line)
             if current_suggestion_visible && !current_suggestions.is_empty() {
                 SuggestionPopup {
                     suggestions: current_suggestions.clone(),
@@ -2104,18 +2129,18 @@ pub fn TerminalView(
                 Some(OneKeySubmissionFeedback::Submitted { .. })
             ) {
                 div {
-                    style: "position:absolute;right:10px;bottom:var(--suggestion-bottom, 2em);z-index:19;padding:5px 9px;background:#1a1b26;border:1px solid #9ece6a;border-radius:4px;color:#9ece6a;font-size:11px;pointer-events:none;",
+                    style: "position:absolute;right:10px;top:var(--suggestion-top, 2em);z-index:19;padding:5px 9px;background:#1a1b26;border:1px solid #9ece6a;border-radius:4px;color:#9ece6a;font-size:11px;pointer-events:none;",
                     "Credential sent · input hidden by remote"
                 }
             }
 
             // OneKey autofill popup for this TerminalView's session. It is
-            // positioned relative to this pane and grows above the cursor.
-            if onekey_visible && !onekey_entries.is_empty() {
+            // positioned relative to this pane and grows below the cursor.
+            if onekey_visible && !current_onekey_entries.is_empty() {
                 OneKeyPopup {
-                    entries: onekey_entries.clone(),
-                    selected: onekey_selected.min(onekey_entries.len().saturating_sub(1)),
-                    submission_feedback: onekey_submission_feedback.clone(),
+                    entries: current_onekey_entries.clone(),
+                    selected: current_onekey_selected.min(current_onekey_entries.len().saturating_sub(1)),
+                    submission_feedback: current_onekey_submission_feedback.clone(),
                     on_highlight: move |index: usize| {
                         on_onekey_navigate.call(Some(index));
                     },

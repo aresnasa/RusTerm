@@ -317,6 +317,31 @@ pub struct AppState {
     /// exactly one on the app state for the whole session lifetime.
     #[serde(skip)]
     pub safety_checker: rusterm_core::CommandSafetyChecker,
+
+    // ── Comparison-mode diff highlighting ──────────────────────────────────
+    //
+    // When comparison mode is ON with ≥2 occupied panes, the visible output
+    // of every pane is diffed line-by-line. Lines that differ are
+    // highlighted. If too many lines differ (the outputs are fundamentally
+    // different), a warning dialog asks the user to confirm before the
+    // highlights are applied.
+    //
+    // `comparison_diff_confirmed` resets to `false` every time comparison
+    // mode is toggled, so the user is re-warned on each new comparison
+    // session.
+    /// Per-session row-diff results for the active tab's panes. `None` when
+    /// comparison is off or no diff has been computed yet.
+    #[serde(skip)]
+    pub comparison_diffs: Option<Vec<(String, Vec<crate::comparison::RowDiff>)>>,
+    /// When the diff exceeds the noise threshold, this holds the summary so
+    /// the UI can render a warning dialog. Cleared once the user confirms or
+    /// cancels.
+    #[serde(skip)]
+    pub comparison_diff_warning: Option<crate::comparison::DiffSummary>,
+    /// Whether the user has confirmed viewing large diffs for the current
+    /// comparison session. Reset to `false` when comparison mode is toggled.
+    #[serde(skip)]
+    pub comparison_diff_confirmed: bool,
 }
 
 /// State held while the dangerous-command confirmation modal is open.
@@ -490,6 +515,9 @@ impl Default for AppState {
             close_dialog_dont_ask_again: true,
             pending_dangerous_command: None,
             safety_checker: rusterm_core::CommandSafetyChecker::new(),
+            comparison_diffs: None,
+            comparison_diff_warning: None,
+            comparison_diff_confirmed: false,
         }
     }
 }
@@ -581,6 +609,154 @@ impl AppState {
         match self.theme {
             Theme::Dark => "Dark",
             Theme::Light => "Light",
+        }
+    }
+
+    // ── Pane-layout persistence ───────────────────────────────────────────
+    //
+    // The user can freely customise the multi-pane arrangement (split tree,
+    // column/row fractions, floating window geometry, comparison mode). These
+    // helpers snapshot that arrangement into a [`LayoutState`] (each tab = one
+    // independent JSON segment) and restore it after sessions are reopened.
+    //
+    // Because session ids are regenerated on every launch, panes reference
+    // sessions by *display name* in the persisted form — see the module docs
+    // of [`crate::layout_state`] for the full rationale.
+
+    /// Build a [`LayoutState`] snapshot from the current workspace tabs.
+    ///
+    /// Only tabs whose layout differs from a plain single-pane arrangement
+    /// are included — a tab with one pane at default geometry has nothing
+    /// custom to remember, and omitting it keeps the file small.
+    ///
+    /// Each pane's `session_id` is rewritten to the session's display name
+    /// so the snapshot is stable across launches (live ids are fresh UUIDs).
+    pub fn build_layout_state(&self) -> crate::layout_state::LayoutState {
+        use crate::layout_state::{LayoutState, PersistedTabLayout};
+
+        let session_name = |sid: &str| -> String {
+            self.sessions
+                .iter()
+                .find(|t| t.id == sid)
+                .map(|t| t.name.clone())
+                .unwrap_or_default()
+        };
+
+        let mut tabs = Vec::new();
+        for tab in &self.tabs {
+            let Some(layout) = self.layouts.get(&tab.id) else {
+                continue;
+            };
+            // Skip trivial single-pane layouts — nothing custom to persist.
+            // A single non-empty pane with no floating geometry and default
+            // fractions is the implicit default; restoring it is a no-op.
+            let non_empty = layout
+                .panes
+                .iter()
+                .filter(|p| !p.session_id.is_empty())
+                .count();
+            if non_empty <= 1 && layout.panes.iter().all(|p| p.floating.is_none()) {
+                continue;
+            }
+
+            // Clone and rewrite session_id → display name for every pane.
+            let mut snapshot = layout.clone();
+            for pane in &mut snapshot.panes {
+                if !pane.session_id.is_empty() {
+                    pane.session_id = session_name(&pane.session_id);
+                }
+            }
+
+            let anchor_name = tab
+                .anchor_session_id
+                .as_deref()
+                .map(session_name)
+                .unwrap_or_default();
+            // If the anchor session has no resolvable name we can't
+            // reattach the layout on restore — skip it rather than emit a
+            // dangling entry.
+            if anchor_name.is_empty() {
+                continue;
+            }
+
+            tabs.push(PersistedTabLayout {
+                anchor_name,
+                layout: snapshot,
+            });
+        }
+
+        LayoutState {
+            schema_version: 1,
+            saved_at: Some(chrono::Utc::now()),
+            tabs,
+        }
+    }
+
+    /// Reapply a previously-saved [`LayoutState`] after sessions have been
+    /// restored.
+    ///
+    /// For each persisted tab layout we locate the restored workspace tab
+    /// whose anchor session name matches, then rewrite every pane's
+    /// placeholder name back to the live session id and insert the layout
+    /// under the tab's (fresh) group id.
+    ///
+    /// Panes whose name no longer matches any live session are cleared
+    /// (empty `session_id`) — the renderer shows them as blank drop targets
+    /// instead of dropping them, preserving the user's split structure.
+    pub fn apply_layout_state(&mut self, saved: &crate::layout_state::LayoutState) {
+        use crate::layout_state::PersistedTabLayout;
+
+        for PersistedTabLayout {
+            anchor_name,
+            layout,
+        } in &saved.tabs
+        {
+            // Find the workspace tab whose anchor session has this name.
+            let group_id =
+                self.tabs
+                    .iter()
+                    .find(|t| {
+                        t.anchor_session_id.as_deref().and_then(|sid| {
+                            self.sessions.iter().find(|s| s.id == sid).map(|s| &s.name)
+                        }) == Some(anchor_name)
+                    })
+                    .map(|t| t.id.clone());
+            let Some(group_id) = group_id else {
+                tracing::debug!(
+                    "layout restore: no restored tab matches anchor {:?} — skipping",
+                    anchor_name
+                );
+                continue;
+            };
+
+            // Map display name → live session id for every restored session.
+            let name_to_id: HashMap<&str, &str> = self
+                .sessions
+                .iter()
+                .map(|s| (s.name.as_str(), s.id.as_str()))
+                .collect();
+
+            let mut restored = layout.clone();
+            for pane in &mut restored.panes {
+                if pane.session_id.is_empty() {
+                    continue;
+                }
+                // session_id currently holds a display name (written at save
+                // time). Resolve it back to a live id; if not found, clear
+                // the pane so it renders as an empty drop target.
+                match name_to_id.get(pane.session_id.as_str()) {
+                    Some(live_id) => pane.session_id = live_id.to_string(),
+                    None => {
+                        tracing::info!(
+                            "layout restore: pane session {:?} not found among restored sessions — leaving pane empty",
+                            pane.session_id
+                        );
+                        pane.session_id.clear();
+                    }
+                }
+            }
+
+            self.layouts.insert(group_id, restored);
         }
     }
 
@@ -760,10 +936,19 @@ pub fn toggle_pane_zoom(state: &mut AppState, session_id: &str) -> bool {
 ///
 /// Returns the new comparison state (`true` = now on), or `None` if
 /// there's no active tab with a layout.
+///
+/// Whenever comparison is toggled (on or off), the diff-highlight state is
+/// reset so stale results from the previous session don't leak through and
+/// the user is re-warned if the new diff is large.
 pub fn toggle_comparison_mode(state: &mut AppState) -> Option<bool> {
     let active_id = state.active_tab.clone()?;
     let layout = state.layouts.get_mut(&active_id)?;
-    Some(layout.toggle_comparison())
+    let now_on = layout.toggle_comparison();
+    // Reset diff state on every toggle.
+    state.comparison_diffs = None;
+    state.comparison_diff_warning = None;
+    state.comparison_diff_confirmed = false;
+    Some(now_on)
 }
 
 /// Toggle the split-pane mode for the active tab.
@@ -4015,6 +4200,133 @@ mod tests {
         let layout = state.layouts.get("alpha").unwrap();
         assert!(layout.comparison);
         assert!(layout.zoomed.is_none());
+    }
+
+    // ------------------------------------------------------------------
+    // Pane-layout persistence (build_layout_state / apply_layout_state)
+    // ------------------------------------------------------------------
+    //
+    // These cover the session-id ↔ display-name bridge: panes store
+    // session *names* in the persisted form (live ids are fresh UUIDs on
+    // every launch), and are mapped back to live ids on restore.
+
+    /// A multi-pane layout is captured with pane session_ids rewritten to
+    /// the sessions' display names.
+    #[test]
+    fn build_layout_state_rewrites_session_ids_to_names() {
+        let state = state_with_pane_sessions("alpha", &["beta"]);
+        let snapshot = state.build_layout_state();
+        assert_eq!(snapshot.tabs.len(), 1);
+        let tab = &snapshot.tabs[0];
+        assert_eq!(tab.anchor_name, "alpha");
+        // panes hold names, not live ids.
+        assert_eq!(tab.layout.panes[0].session_id, "alpha");
+        assert_eq!(tab.layout.panes[1].session_id, "beta");
+    }
+
+    /// A trivial single-pane tab (no customisation) is omitted from the
+    /// snapshot so the file stays small.
+    #[test]
+    fn build_layout_state_skips_trivial_single_pane_tabs() {
+        let state = state_with_active_session(&["solo"]);
+        // No layout entry at all → nothing to save.
+        let snapshot = state.build_layout_state();
+        assert!(snapshot.tabs.is_empty());
+    }
+
+    /// The comparison flag and split structure survive the round-trip.
+    #[test]
+    fn build_layout_state_captures_comparison_and_preset() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma", "delta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Grid4);
+        toggle_comparison_mode(&mut state);
+        let snapshot = state.build_layout_state();
+        assert_eq!(snapshot.tabs.len(), 1);
+        let tab = &snapshot.tabs[0];
+        assert!(tab.layout.comparison);
+        assert_eq!(tab.layout.panes.len(), 4);
+    }
+
+    /// After restore, pane names map back to live session ids and the layout
+    /// is re-keyed under the tab's fresh group id.
+    #[test]
+    fn apply_layout_state_maps_names_back_to_live_ids() {
+        // Simulate the post-restore state: sessions exist with fresh ids, but
+        // no layout has been re-attached yet.
+        let mut state = state_with_pane_sessions("alpha", &["beta"]);
+        state.layouts.clear();
+
+        // Build a snapshot as if saved from a previous launch (pane ids are
+        // display names).
+        let saved = crate::layout_state::LayoutState {
+            schema_version: 1,
+            saved_at: None,
+            tabs: vec![crate::layout_state::PersistedTabLayout {
+                anchor_name: "alpha".to_string(),
+                layout: PaneLayout::from_preset(
+                    LayoutPreset::Split2H,
+                    &["alpha".to_string(), "beta".to_string()],
+                ),
+            }],
+        };
+
+        state.apply_layout_state(&saved);
+        // The layout is re-keyed under alpha's tab group id.
+        let layout = state.layouts.get("alpha").expect("layout re-attached");
+        // Pane session_ids are live ids again (in this test harness name==id).
+        assert_eq!(layout.panes[0].session_id, "alpha");
+        assert_eq!(layout.panes[1].session_id, "beta");
+    }
+
+    /// A pane whose session wasn't restored is cleared (rendered as an empty
+    /// drop target), preserving the user's split structure.
+    #[test]
+    fn apply_layout_state_clears_unresolvable_panes() {
+        let mut state = state_with_pane_sessions("alpha", &["beta"]);
+        state.layouts.clear();
+
+        // "gamma" was never restored.
+        let saved = crate::layout_state::LayoutState {
+            schema_version: 1,
+            saved_at: None,
+            tabs: vec![crate::layout_state::PersistedTabLayout {
+                anchor_name: "alpha".to_string(),
+                layout: PaneLayout::from_preset(
+                    LayoutPreset::Split2H,
+                    &["alpha".to_string(), "gamma".to_string()],
+                ),
+            }],
+        };
+
+        state.apply_layout_state(&saved);
+        let layout = state.layouts.get("alpha").unwrap();
+        assert_eq!(layout.panes[0].session_id, "alpha");
+        // gamma not found → pane left empty.
+        assert!(layout.panes[1].session_id.is_empty());
+    }
+
+    /// A layout whose anchor session wasn't restored is skipped entirely
+    /// (no dangling layout entry under a non-existent tab).
+    #[test]
+    fn apply_layout_state_skips_tab_with_unrestored_anchor() {
+        let mut state = state_with_pane_sessions("alpha", &["beta"]);
+        state.layouts.clear();
+
+        let saved = crate::layout_state::LayoutState {
+            schema_version: 1,
+            saved_at: None,
+            tabs: vec![crate::layout_state::PersistedTabLayout {
+                anchor_name: "ghost".to_string(), // no such tab
+                layout: PaneLayout::from_preset(
+                    LayoutPreset::Split2H,
+                    &["ghost".to_string(), "beta".to_string()],
+                ),
+            }],
+        };
+
+        state.apply_layout_state(&saved);
+        // No layout inserted for the ghost tab.
+        assert!(state.layouts.is_empty());
     }
 
     /// Task 15 contract: closing a pane's session and re-applying the

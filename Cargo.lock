@@ -6760,6 +6760,7 @@ dependencies = [
  "rusterm-ssh",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",

@@ -164,6 +164,15 @@ fn render_terminal_pane(
             let sid_clone = tab.id.clone();
             let sid_for_cmd = tab.id.clone();
             let sid_for_resize = tab.id.clone();
+            // Look up this session's comparison-mode row diffs (if any).
+            // `comparison_diffs` is `None` when comparison mode is off, so this
+            // is a cheap `None` check in the common case.
+            let row_diffs = state.read().comparison_diffs.as_ref().and_then(|diffs| {
+                diffs
+                    .iter()
+                    .find(|(sid, _)| sid == &tab.id)
+                    .map(|(_, d)| d.clone())
+            });
             let sid_for_scroll_up = tab.id.clone();
             let sid_for_scroll_down = tab.id.clone();
             let sid_for_scroll_bottom = tab.id.clone();
@@ -1002,6 +1011,7 @@ fn render_terminal_pane(
                     on_reconnect: move |_: ()| {
                         reconnect_session(state_for_cmd, senders, sid_for_reconnect.clone());
                     },
+                    row_diffs: row_diffs.clone(),
                 }
             }
         }
@@ -3130,6 +3140,68 @@ fn multi_pane_container(
     // prompt that would only obscure the terminal view for no benefit.
     let occupied_panes = visible.iter().filter(|(_, sid, _)| !sid.is_empty()).count();
     let show_comparison_banner = comparison_on && occupied_panes > 1;
+
+    // ── Comparison-mode diff computation ─────────────────────────────────
+    //
+    // When comparison is ON with ≥2 occupied panes, extract the visible text
+    // from each pane and diff them line-by-line. If the diff is large (>50%
+    // of rows differ) and the user hasn't confirmed yet, set a warning state
+    // instead of applying highlights — the UI renders a confirmation dialog.
+    //
+    // This runs every render frame, but: (a) the diff is computed from the
+    // cached `render_output` snapshots (no terminal locks), (b) it's only
+    // ~20-50 rows × panes, and (c) Signal writes with equal values are
+    // no-ops (Dioxus uses PartialEq to short-circuit notifications), so
+    // there's no re-render loop.
+    if comparison_on && occupied_panes > 1 {
+        let snapshot = state.read();
+        // Collect (session_id, visible_text_lines) for each occupied pane.
+        let pane_texts: Vec<(String, Vec<String>)> = visible
+            .iter()
+            .filter(|(_, sid, _)| !sid.is_empty())
+            .filter_map(|(_, sid, _)| {
+                snapshot.sessions.iter().find(|t| t.id == *sid).map(|tab| {
+                    (
+                        sid.clone(),
+                        crate::comparison::extract_pane_lines(&tab.render_output.rows),
+                    )
+                })
+            })
+            .collect();
+        let confirmed = snapshot.comparison_diff_confirmed;
+        drop(snapshot);
+
+        if pane_texts.len() > 1 {
+            let diffs = crate::comparison::compute_comparison_diffs(&pane_texts);
+            let summary = crate::comparison::diff_summary(&diffs);
+
+            if summary.exceeds_threshold() && !confirmed {
+                // Too many differences — warn the user before highlighting.
+                // Don't apply highlights yet (set diffs to None so
+                // TerminalView doesn't render diff backgrounds).
+                let mut s = state.write();
+                s.comparison_diffs = None;
+                s.comparison_diff_warning = Some(summary);
+            } else {
+                // Either the diff is small enough, or the user confirmed —
+                // apply highlights and clear any pending warning.
+                let mut s = state.write();
+                s.comparison_diffs = Some(diffs);
+                if s.comparison_diff_warning.is_some() {
+                    s.comparison_diff_warning = None;
+                }
+            }
+        }
+    } else {
+        // Comparison off or single pane — clear stale diff state.
+        let mut s = state.write();
+        if s.comparison_diffs.is_some() {
+            s.comparison_diffs = None;
+        }
+        if s.comparison_diff_warning.is_some() {
+            s.comparison_diff_warning = None;
+        }
+    }
     let layout_floating = layout.is_floating();
     let layout_owner_tab_id = state.read().active_tab.clone().unwrap_or_default();
     let focused_pane = state.read().focused_pane.clone();
@@ -3511,26 +3583,40 @@ fn multi_pane_container(
             // true when comparison is on AND there are 2+ occupied panes —
             // a single-pane broadcast is a no-op, so the indicator would be
             // misleading and is suppressed.
-            {show_comparison_banner.then(|| rsx! {
-                div {
-                    style: "
-                        position: absolute;
-                        top: 4px;
-                        right: 4px;
-                        padding: 2px 8px;
-                        background: rgba(122,162,247,0.92);
-                        color: #1a1b26;
-                        font-size: 10px;
-                        font-weight: 600;
-                        letter-spacing: 0.2px;
-                        border-radius: 3px;
-                        z-index: 100;
-                        pointer-events: none;
-                        box-shadow: 0 1px 4px rgba(0,0,0,0.35);
-                        white-space: nowrap;
-                        border: 1px solid rgba(255,255,255,0.18);
-                    ",
-                    "⚠ Comparison mode ON"
+            {show_comparison_banner.then(|| {
+                // If diffs are active, show the diff count in the badge for
+                // instant feedback. When the warning dialog is showing (diffs
+                // too large), the badge stays as a plain indicator.
+                let diff_info = state.read().comparison_diffs.as_ref()
+                    .map(|diffs| crate::comparison::diff_summary(diffs));
+                let badge_text = match &diff_info {
+                    Some(s) if s.diff_rows > 0 => {
+                        format!("⚠ Comparison · {} diff", s.diff_rows)
+                    }
+                    Some(_) => "⚠ Comparison · identical".to_string(),
+                    None => "⚠ Comparison mode ON".to_string(),
+                };
+                rsx! {
+                    div {
+                        style: "
+                            position: absolute;
+                            top: 4px;
+                            right: 4px;
+                            padding: 2px 8px;
+                            background: rgba(122,162,247,0.92);
+                            color: #1a1b26;
+                            font-size: 10px;
+                            font-weight: 600;
+                            letter-spacing: 0.2px;
+                            border-radius: 3px;
+                            z-index: 100;
+                            pointer-events: none;
+                            box-shadow: 0 1px 4px rgba(0,0,0,0.35);
+                            white-space: nowrap;
+                            border: 1px solid rgba(255,255,255,0.18);
+                        ",
+                        "{badge_text}"
+                    }
                 }
             })}
 
@@ -7443,6 +7529,44 @@ fn restore_sessions(
             set_active_tab(&mut state.write(), &tab_id);
         }
     }
+
+    // Reapply saved pane layouts now that all sessions have been reopened.
+    // The layouts are keyed by session *display name* in the persisted
+    // snapshot (live ids are fresh UUIDs), so this must run AFTER every
+    // session has been registered in `state.sessions`. Each tab's layout is
+    // an independent JSON segment, so a layout is restored as long as its
+    // anchor session was successfully reconnected — unrelated tabs that
+    // failed to restore don't block it.
+    //
+    // Layout restore is best-effort: if no layout_state.json exists (first
+    // launch, or the user never customised panes) this is a no-op and every
+    // restored session simply lands in its own single-pane tab (the default
+    // `restore_sessions` behaviour above).
+    if let Some(saved_layout) = crate::layout_state::LayoutState::load() {
+        if !saved_layout.tabs.is_empty() {
+            tracing::info!(
+                "Applying saved pane layouts: {} tab(s)",
+                saved_layout.tabs.len()
+            );
+            state.write().apply_layout_state(&saved_layout);
+        }
+    }
+}
+
+/// Synchronously snapshot the current pane layouts to `layout_state.json`.
+///
+/// Called from the exit paths (both the fast-close path and the
+/// confirm-close dialog) so the user's very last arrangement is captured
+/// even if it changed within the last 30s periodic-save window. Best-effort:
+/// failures are logged but never block the exit.
+fn save_layout_snapshot(state: &Signal<AppState>) {
+    let snapshot = state.read().build_layout_state();
+    if snapshot.tabs.is_empty() {
+        return;
+    }
+    if let Err(e) = snapshot.save() {
+        tracing::warn!("Failed to save layout state on exit: {}", e);
+    }
 }
 
 /// Schedule a `cd '<cwd>'\n` send to the session's input sender after a
@@ -8495,6 +8619,11 @@ pub fn App() -> Element {
         // (which runs right after this handler in the same event-loop tick)
         // actually destroys the window and exits the app.
         if !s.confirm_close_on_exit {
+            // Best-effort layout save before exit so the user's last pane
+            // arrangement isn't lost between the last 30s periodic save and
+            // the actual exit. `save()` is synchronous + atomic, so it
+            // completes before `handle_close_requested` destroys the window.
+            save_layout_snapshot(&state_for_close);
             desktop_for_close.set_close_behavior(WindowCloseBehaviour::WindowCloses);
             return;
         }
@@ -8657,6 +8786,52 @@ pub fn App() -> Element {
             drop(s);
             if let Err(e) = snapshot.save(&master_key) {
                 tracing::warn!("Failed to save session state: {}", e);
+            }
+        }
+    });
+
+    // Periodically persist the user's custom pane-layout arrangement (split
+    // tree, column/row fractions, floating window geometry, comparison flag)
+    // so it survives an app restart without the user having to manually
+    // re-arrange their panes or edit a config file.
+    //
+    // The snapshot is written to a *plaintext* JSON file
+    // (`layout_state.json`) — it contains no secrets, only geometry + session
+    // display names — so it doesn't need the master key and can be saved
+    // even before the app is unlocked. This mirrors `window_state.json`.
+    //
+    // Each workspace tab with a non-default layout is an independent JSON
+    // segment inside the file, so one tab's layout can be restored even if
+    // another tab's sessions failed to reconnect.
+    //
+    // The save is atomic (temp + rename) and runs at the same 30s cadence as
+    // the session-state save so the two snapshots stay roughly in sync.
+    // There is also an exit-time save (see the close handler) so the very
+    // last arrangement is always captured.
+    let state_for_layout_save = state.clone();
+    let _layout_state_save_future = use_future(move || async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_secs(
+                crate::layout_state::SAVE_INTERVAL_SECS,
+            ))
+            .await;
+
+            // Skip if there are no layouts to save (single-session tabs have
+            // no layout entry). The snapshot builder itself also filters out
+            // trivial single-pane tabs, but checking `is_empty` here avoids
+            // even building the snapshot when there's clearly nothing to do.
+            let snapshot = {
+                let s = state_for_layout_save.read();
+                if s.layouts.is_empty() {
+                    continue;
+                }
+                s.build_layout_state()
+            };
+            if snapshot.tabs.is_empty() {
+                continue;
+            }
+            if let Err(e) = snapshot.save() {
+                tracing::warn!("Failed to save layout state: {}", e);
             }
         }
     });
@@ -9941,6 +10116,58 @@ pub fn App() -> Element {
             }
         }
 
+        // ── Comparison-mode large-diff warning modal ─────────────────────────
+        // When comparison mode detects that >50% of visible rows differ
+        // across panes, this dialog asks the user to confirm before applying
+        // highlights. “继续” sets `comparison_diff_confirmed = true` so the
+        // highlights show immediately on the next frame (and the warning
+        // won't reappear until comparison is toggled). “取消” leaves diffs
+        // off — the user can keep broadcasting input but without visual
+        // noise from highlighting fundamentally different outputs.
+        if let Some(summary) = state.read().comparison_diff_warning.clone() {
+            div {
+                style: "position:fixed;inset:0;background:rgba(0,0,0,0.7);display:flex;align-items:center;justify-content:center;z-index:2100;",
+                div {
+                    style: "background:#24283b;border:1px solid #e0af68;border-radius:8px;padding:28px;width:480px;font-family:'Segoe UI',system-ui,sans-serif;color:#c0caf5;",
+                    div {
+                        style: "font-size:15px;font-weight:600;margin-bottom:12px;",
+                        "⚠ 检测到大量输出差异"
+                    }
+                    div {
+                        style: "font-size:13px;color:#a9b1d6;line-height:1.6;margin-bottom:20px;",
+                        "比对模式发现 {summary.diff_rows} / {summary.total_rows} 行（{(summary.diff_fraction() * 100.0) as u32}%）存在差异。\n输出的内容差异过大，高亮所有差异行可能会影响阅读。\n是否仍然显示差异高亮？"
+                    }
+                    div {
+                        style: "display:flex;gap:12px;justify-content:flex-end;",
+                        button {
+                            style: "padding:8px 20px;background:transparent;border:1px solid #414868;border-radius:4px;color:#a9b1d6;font-size:13px;cursor:pointer;",
+                            onclick: move |_| {
+                                // Cancel — the user decided the outputs are too
+                                // different to compare visually. Turn off
+                                // comparison mode entirely (stops broadcast +
+                                // badge + diff computation), and clear the
+                                // warning. This avoids a re-prompt loop.
+                                let mut s = state.write();
+                                s.comparison_diff_warning = None;
+                                toggle_comparison_mode(&mut s);
+                            },
+                            "取消"
+                        }
+                        button {
+                            style: "padding:8px 20px;background:#7aa2f7;border:1px solid #7aa2f7;border-radius:4px;color:#1a1b26;font-size:13px;font-weight:600;cursor:pointer;",
+                            onclick: move |_| {
+                                // Confirm — show highlights despite large diff.
+                                let mut s = state.write();
+                                s.comparison_diff_confirmed = true;
+                                s.comparison_diff_warning = None;
+                            },
+                            "继续显示"
+                        }
+                    }
+                }
+            }
+        }
+
         // ── Last-window close confirmation modal ────────────────────────────
         // Shown when the user closes the last window and `confirm_close_on_exit`
         // is true (the safe default). The wry event handler above sets
@@ -10007,6 +10234,9 @@ pub fn App() -> Element {
                         state.write().confirm_close_on_exit = false;
                     }
                     state.write().close_dialog_visible = false;
+                    // Best-effort layout save before exit (see the fast-close
+                    // path above for rationale).
+                    save_layout_snapshot(&state);
                     // Flip the close behaviour to WindowCloses and call
                     // window.close() so handle_close_requested actually destroys
                     // the window + exits the app (since this is the last window).

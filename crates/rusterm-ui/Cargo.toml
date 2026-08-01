@@ -40,3 +40,6 @@ default = []
 ## When disabled, analytics queries return empty results and no DuckDB
 ## connection is opened.
 analytics = ["dep:rusterm-analytics"]
+
+[dev-dependencies]
+tempfile = "3"

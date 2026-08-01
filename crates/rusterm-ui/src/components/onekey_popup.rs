@@ -1,11 +1,15 @@
 use dioxus::prelude::*;
 
+use crate::components::suggestion_popup::MAX_VISIBLE_ROWS;
 use crate::state::{OneKeyMatch, OneKeySubmissionFeedback};
 
-/// OneKey autofill popup. Renders above the current cursor row using the same
-/// pane-relative coordinate as command suggestions. Secrets are never rendered:
-/// the popup only emits the selected index, which the owning session resolves
-/// back to the current match before sending it to the PTY.
+/// OneKey autofill popup. Renders below the current cursor row using the
+/// same pane-relative coordinate as command suggestions. Secrets are never
+/// rendered: the popup only emits the selected index, which the owning
+/// session resolves back to the current match before sending it to the PTY.
+///
+/// At most [`MAX_VISIBLE_ROWS`] entries are shown so the popup stays compact
+/// and never blocks the terminal view.
 #[component]
 pub fn OneKeyPopup(
     entries: Vec<OneKeyMatch>,
@@ -21,19 +25,24 @@ pub fn OneKeyPopup(
         Some(OneKeySubmissionFeedback::Rejected { .. })
     );
 
+    // Cap to the first MAX_VISIBLE_ROWS entries so the popup stays compact.
+    // The parent (TerminalView) also caps the entry list it uses for arrow-key
+    // navigation, so indices stay consistent between display and navigation.
+    let visible: Vec<&OneKeyMatch> = entries.iter().take(MAX_VISIBLE_ROWS).collect();
+    let selected = selected.min(visible.len().saturating_sub(1));
+
     rsx! {
         div {
             style: "
                 position: absolute;
                 left: 0; right: 0;
-                top: auto;
-                bottom: var(--suggestion-bottom, 2em);
-                max-height: 45%;
+                top: var(--suggestion-top, 2em);
+                max-height: calc(100% - var(--suggestion-top, 2em));
                 overflow-y: auto;
                 background: #16161e;
                 border: 1px solid #2a2b3d;
-                border-bottom: none;
-                box-shadow: 0 -4px 16px rgba(0,0,0,0.4);
+                border-top: none;
+                box-shadow: 0 4px 16px rgba(0,0,0,0.4);
                 font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
                 font-size: 13px;
                 line-height: 1.5;
@@ -52,7 +61,7 @@ pub fn OneKeyPopup(
                 }
             }
 
-            for (i, m) in entries.iter().enumerate() {
+            for (i, m) in visible.iter().enumerate() {
                 {
                     let is_sel = i == selected;
                     let bg = if is_sel { "#283457" } else { "transparent" };

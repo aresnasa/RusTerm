@@ -1,12 +1,15 @@
 use dioxus::prelude::*;
 
-/// Atuin-style suggestion panel rendered ABOVE the current cursor line.
+/// Atuin-style suggestion panel rendered BELOW the current cursor line.
 /// Shows matching history commands sorted by frequency, with the selected
 /// item highlighted. Appears automatically as the user types.
 ///
-/// The vertical position is set via a CSS variable `--suggestion-bottom`
+/// The vertical position is set via a CSS variable `--suggestion-top`
 /// on the parent terminal container, measured by JavaScript to sit exactly
-/// above the cursor row. Falls back to `2em` if unset.
+/// below the cursor row. Falls back to `2em` if unset.
+///
+/// At most [`MAX_VISIBLE_ROWS`] items are shown (the most relevant matches)
+/// so the panel stays compact and never blocks the terminal view.
 ///
 /// Interactions:
 ///   - Click on an item        : accept it (same as Tab)
@@ -26,6 +29,11 @@ use dioxus::prelude::*;
 /// `Shift+Delete` shortcut is kept for power users but is awkward on macOS
 /// MacBook keyboards (which have no dedicated forward-delete key, so it
 /// requires Shift+Fn+Backspace), so the × button is the primary path.
+
+/// Maximum number of suggestion rows the popup ever renders. Keeping this
+/// small (3) prevents the panel from covering terminal output — the user
+/// sees their top matches without losing sight of the session.
+pub const MAX_VISIBLE_ROWS: usize = 3;
 #[component]
 pub fn SuggestionPopup(
     suggestions: Vec<String>,
@@ -38,20 +46,23 @@ pub fn SuggestionPopup(
         return rsx! {};
     }
 
-    let current_selected = selected_index;
+    // Cap to the most relevant MAX_VISIBLE_ROWS matches so the popup stays
+    // compact and never covers a large swath of terminal output.
+    let visible: Vec<&String> = suggestions.iter().take(MAX_VISIBLE_ROWS).collect();
+    let current_selected = selected_index.min(visible.len().saturating_sub(1));
 
     rsx! {
         div {
             style: "
                 position: absolute;
                 left: 0; right: 0;
-                bottom: var(--suggestion-bottom, 2em);
-                max-height: 50%;
+                top: var(--suggestion-top, 2em);
+                max-height: calc(100% - var(--suggestion-top, 2em));
                 overflow-y: auto;
                 background: #16161e;
                 border: 1px solid #2a2b3d;
-                border-bottom: none;
-                box-shadow: 0 -4px 16px rgba(0,0,0,0.4);
+                border-top: none;
+                box-shadow: 0 4px 16px rgba(0,0,0,0.4);
                 font-family: 'JetBrains Mono', 'Fira Code', 'Cascadia Code', monospace;
                 font-size: 13px;
                 line-height: 1.5;
@@ -67,7 +78,7 @@ pub fn SuggestionPopup(
             onmousedown: move |e| e.stop_propagation(),
             onmouseup: move |e| e.stop_propagation(),
             onclick: move |e| e.stop_propagation(),
-            for (i, cmd) in suggestions.iter().enumerate() {
+            for (i, cmd) in visible.iter().enumerate() {
                 {
                     let is_selected = i == current_selected;
                     let bg = if is_selected { "#283457" } else { "transparent" };
@@ -77,8 +88,8 @@ pub fn SuggestionPopup(
                     } else {
                         "border-left:2px solid transparent;"
                     };
-                    let cmd_for_select = cmd.clone();
-                    let cmd_for_delete = cmd.clone();
+                    let cmd_for_select = (*cmd).clone();
+                    let cmd_for_delete = (*cmd).clone();
                     // × button color:
                     //   - selected item : bright green (always visible)
                     //   - non-selected   : muted gray, brightens on row hover
