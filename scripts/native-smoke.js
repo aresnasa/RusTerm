@@ -334,6 +334,121 @@ return (async () => {
       "left dock width did not grow",
     );
 
+    stage = "resize-bottom-release-outside-overlay";
+    const bottomZone = document.querySelector(
+      '[data-rusterm-dock-zone="bottom"]',
+    );
+    const bottomBefore = bottomZone.getBoundingClientRect().height;
+    const bottomHandle = bottomZone.querySelector(".dock-resize-handle");
+    const bottomHandleRect = bottomHandle.getBoundingClientRect();
+    const bottomUserSelectBefore = document.body.style.userSelect;
+    bottomHandle.dispatchEvent(
+      new MouseEvent("mousedown", {
+        button: 0,
+        buttons: 1,
+        clientX: bottomHandleRect.left + 40,
+        clientY: bottomHandleRect.top + 1,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    const activeBottomHandle = await waitFor(
+      () =>
+        document.querySelector(
+          '[data-rusterm-dock-zone="bottom"] .dock-resize-handle.active',
+        ),
+      "bottom resize did not start",
+    );
+    const bottomResizeOverlay = activeBottomHandle.previousElementSibling;
+    bottomResizeOverlay.dispatchEvent(
+      new MouseEvent("mousemove", {
+        button: 0,
+        buttons: 1,
+        clientX: bottomHandleRect.left + 40,
+        clientY: bottomHandleRect.top - 39,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    await waitFor(
+      () => bottomZone.getBoundingClientRect().height > bottomBefore + 20,
+      "bottom dock height did not grow",
+    );
+    document.dispatchEvent(
+      new MouseEvent("mouseup", {
+        button: 0,
+        buttons: 0,
+        clientX: bottomHandleRect.left + 40,
+        clientY: bottomHandleRect.top - 39,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    await waitFor(
+      () =>
+        !document.querySelector(
+          '[data-rusterm-dock-zone="bottom"] .dock-resize-handle.active',
+        ),
+      "bottom resize remained active after document mouseup",
+      1000,
+    );
+    const bottomAfterRelease = bottomZone.getBoundingClientRect().height;
+    document.dispatchEvent(
+      new MouseEvent("mousemove", {
+        button: 0,
+        buttons: 1,
+        clientX: bottomHandleRect.left + 40,
+        clientY: bottomHandleRect.top - 79,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    await sleep(100);
+    if (bottomZone.getBoundingClientRect().height !== bottomAfterRelease) {
+      throw new Error("bottom dock kept resizing after document mouseup");
+    }
+    if (window._rusterm_dock_resize_remove != null) {
+      throw new Error("bottom resize global listeners were not removed");
+    }
+    if (document.body.style.userSelect !== bottomUserSelectBefore) {
+      throw new Error("bottom resize did not restore body user-select");
+    }
+    bottomHandle.dispatchEvent(
+      new MouseEvent("mousedown", {
+        button: 0,
+        buttons: 1,
+        clientX: bottomHandleRect.left + 40,
+        clientY: bottomHandleRect.top + 1,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    await waitFor(
+      () =>
+        document.querySelector(
+          '[data-rusterm-dock-zone="bottom"] .dock-resize-handle.active',
+        ),
+      "bottom resize did not restart",
+    );
+    document.dispatchEvent(
+      new MouseEvent("mouseup", {
+        button: 0,
+        buttons: 0,
+        clientX: bottomHandleRect.left + 40,
+        clientY: bottomHandleRect.top + 1,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    await waitFor(
+      () =>
+        !document.querySelector(
+          '[data-rusterm-dock-zone="bottom"] .dock-resize-handle.active',
+        ),
+      "second bottom resize remained active after document mouseup",
+      1000,
+    );
+
     stage = "drag-remote-files";
     const sourceTab = document.querySelector(
       '[title="Drag to reorder or move Remote files"]',
