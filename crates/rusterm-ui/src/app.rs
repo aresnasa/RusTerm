@@ -2235,7 +2235,7 @@ pub(crate) struct SplitDragState {
 }
 
 /// Active freeform pane-window move. Coordinates are viewport-relative; the
-/// container dimensions are captured at drag start for normalized movement.
+/// container dimensions are captured when click-to-move starts for normalized movement.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub(crate) struct PaneMoveState {
     pub(crate) pane_idx: usize,
@@ -2258,17 +2258,20 @@ pub(crate) fn build_install_pane_move_script(initial_x: f64, initial_y: f64) -> 
                 window.__rusterm_pane_move_pos = e.clientX + ',' + e.clientY;\n\
                 e.preventDefault();\n\
             }};\n\
-            var upHandler = function(e) {{\n\
+            var clickHandler = function(e) {{\n\
+                if (e.button !== 0) {{ return; }}\n\
                 window.__rusterm_pane_move_pos = e.clientX + ',' + e.clientY;\n\
                 window.__rusterm_pane_move_done = true;\n\
                 e.preventDefault();\n\
+                e.stopPropagation();\n\
+                if (e.stopImmediatePropagation) {{ e.stopImmediatePropagation(); }}\n\
                 if (window._rusterm_pane_move_remove) {{ window._rusterm_pane_move_remove(); window._rusterm_pane_move_remove = null; }}\n\
             }};\n\
             document.addEventListener('mousemove', moveHandler, true);\n\
-            document.addEventListener('mouseup', upHandler, true);\n\
+            document.addEventListener('click', clickHandler, true);\n\
             window._rusterm_pane_move_remove = function() {{\n\
                 document.removeEventListener('mousemove', moveHandler, true);\n\
-                document.removeEventListener('mouseup', upHandler, true);\n\
+                document.removeEventListener('click', clickHandler, true);\n\
                 document.body.style.webkitUserSelect = '';\n\
                 document.body.style.userSelect = '';\n\
             }};\n\
@@ -4450,9 +4453,9 @@ fn multi_pane_container(
             // the `.pane-title-bar:hover` rule doesn't override (CSS
             // specificity: inline style > class rule).
             //
-            // The drag handle (`⠿`) brightens on hover so the user can
-            // discover that the title bar is draggable. The slight
-            // `transform: scale` gives a tactile "lift" affordance.
+            // The move handle (`⠿`) brightens on hover so the user can
+            // discover the click-to-move control. The slight `transform: scale`
+            // gives a tactile "lift" affordance.
             style { "
                 .pane-title-bar:hover {{ filter: brightness(1.10); }}
                 .pane-drag-handle:hover {{ color: #bb9af7 !important; transform: scale(1.15); }}
@@ -4776,7 +4779,7 @@ fn multi_pane_container(
                             z-index: 10;
                             transition: background 0.12s ease;
                         "),
-                        title: "拖动会话标题可移动到其他窗格；⠿ 可拖动浮动窗",
+                        title: "拖动会话标题可移动到其他窗格；⠿ 单击开始/停止移动浮动窗",
                         onmousedown: move |e: MouseEvent| {
                             // Only start a drag on primary button (left
                             // click). Middle/right clicks have other
@@ -4849,8 +4852,16 @@ fn multi_pane_container(
                         span {
                             class: "pane-drag-handle",
                             style: "display: inline-flex; align-items: center; justify-content: center; width: 18px; margin-right: 5px; cursor: move; color: #7aa2f7; font-size: 13px; transition: color 0.12s ease, transform 0.12s ease;",
-                            title: "拖动小窗口（浮动模式）",
+                            title: "单击开始移动小窗口，再次单击停止",
                             onmousedown: move |e: MouseEvent| {
+                                if e.trigger_button() == Some(MouseButton::Primary) {
+                                    // Keep the title bar's session drag gesture from starting.
+                                    // Do not prevent the default here: WKWebView would suppress
+                                    // the click that starts pane movement.
+                                    e.stop_propagation();
+                                }
+                            },
+                            onclick: move |e: MouseEvent| {
                                 if e.trigger_button() == Some(MouseButton::Primary) {
                                     e.prevent_default();
                                     e.stop_propagation();
@@ -12139,23 +12150,36 @@ mod pane_move_tests {
     use super::{build_install_pane_move_script, parse_pane_move_poll_response};
 
     #[test]
-    fn pane_move_script_uses_dedicated_capture_phase_globals() {
+    fn pane_move_script_uses_dedicated_capture_phase_click_listener() {
         let script = build_install_pane_move_script(12.5, 34.0);
         assert!(script.contains("window.__rusterm_pane_move_pos = '12.5,34'"));
         assert!(script.contains("window.__rusterm_pane_move_done = false"));
         assert!(script.contains("window._rusterm_pane_move_remove"));
         assert!(script.contains("document.addEventListener('mousemove', moveHandler, true)"));
+        assert!(script.contains("document.addEventListener('click', clickHandler, true)"));
+        assert!(!script.contains("addEventListener('mouseup'"));
         assert!(!script.contains("__rusterm_tab_drag_pos"));
         assert!(!script.contains("__rusterm_drag_pos"));
     }
 
     #[test]
-    fn pane_move_script_records_release_and_restores_selection() {
+    fn pane_move_script_stops_on_next_primary_click_without_activating_target() {
         let script = build_install_pane_move_script(1.0, 2.0);
+        assert!(script.contains("if (e.button !== 0) { return; }"));
         assert!(script.contains("window.__rusterm_pane_move_pos = e.clientX + ',' + e.clientY"));
         assert!(script.contains("window.__rusterm_pane_move_done = true"));
+        assert!(script.contains("e.preventDefault()"));
+        assert!(script.contains("e.stopPropagation()"));
+        assert!(script.contains("e.stopImmediatePropagation()"));
+    }
+
+    #[test]
+    fn pane_move_script_cleanup_removes_click_listener_and_restores_selection() {
+        let script = build_install_pane_move_script(1.0, 2.0);
+        assert!(script.contains("document.removeEventListener('click', clickHandler, true)"));
         assert!(script.contains("document.body.style.webkitUserSelect = 'none'"));
         assert!(script.contains("document.body.style.webkitUserSelect = ''"));
+        assert!(script.contains("document.body.style.userSelect = ''"));
     }
 
     #[test]

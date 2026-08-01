@@ -346,6 +346,98 @@ return (async () => {
         ),
       "comparison command was not broadcast to every workspace terminal",
     );
+
+    stage = "toggle-floating-pane-move";
+    const paneHandle = await waitFor(
+      () => document.querySelector(".pane-drag-handle"),
+      "floating pane move handle did not render",
+    );
+    const paneHandleRect = paneHandle.getBoundingClientRect();
+    const startX = paneHandleRect.left + paneHandleRect.width / 2;
+    const startY = paneHandleRect.top + paneHandleRect.height / 2;
+    for (const type of ["mousedown", "mouseup", "click"]) {
+      paneHandle.dispatchEvent(
+        new MouseEvent(type, {
+          button: 0,
+          buttons: type === "mousedown" ? 1 : 0,
+          clientX: startX,
+          clientY: startY,
+          bubbles: true,
+          cancelable: true,
+          composed: true,
+        }),
+      );
+    }
+    await waitFor(
+      () =>
+        typeof window._rusterm_pane_move_remove === "function" &&
+        document.body.style.userSelect === "none",
+      "first pane-handle click did not start move mode",
+    );
+    const firstPaneWindow = () =>
+      document
+        .querySelector(".pane-drag-handle")
+        ?.closest(".pane-title-bar")
+        ?.parentElement;
+    const beforeMoveRect = firstPaneWindow().getBoundingClientRect();
+    const movedX = startX + 70;
+    const movedY = startY + 45;
+    document.dispatchEvent(
+      new MouseEvent("mousemove", {
+        button: 0,
+        buttons: 0,
+        clientX: movedX,
+        clientY: movedY,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    await waitFor(() => {
+      const rect = firstPaneWindow()?.getBoundingClientRect();
+      return (
+        rect &&
+        (Math.abs(rect.left - beforeMoveRect.left) > 20 ||
+          Math.abs(rect.top - beforeMoveRect.top) > 20)
+      );
+    }, "pane did not follow a button-free mousemove after the first click");
+    document.body.dispatchEvent(
+      new MouseEvent("click", {
+        button: 0,
+        buttons: 0,
+        clientX: movedX,
+        clientY: movedY,
+        bubbles: true,
+        cancelable: true,
+        composed: true,
+      }),
+    );
+    await waitFor(
+      () =>
+        window._rusterm_pane_move_remove == null &&
+        document.body.style.userSelect !== "none",
+      "second primary click did not stop move mode or clean up listeners",
+    );
+    await sleep(80);
+    const stoppedRect = firstPaneWindow().getBoundingClientRect();
+    document.dispatchEvent(
+      new MouseEvent("mousemove", {
+        button: 0,
+        buttons: 0,
+        clientX: movedX + 90,
+        clientY: movedY + 60,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    await sleep(120);
+    const afterStopRect = firstPaneWindow().getBoundingClientRect();
+    if (
+      Math.abs(afterStopRect.left - stoppedRect.left) > 1 ||
+      Math.abs(afterStopRect.top - stoppedRect.top) > 1
+    ) {
+      throw new Error("pane kept following the pointer after the second click");
+    }
+
     const currentMainTerminal = document.getElementById(mainTerminal.id);
     if (!currentMainTerminal)
       throw new Error("main terminal disappeared after distribute");
