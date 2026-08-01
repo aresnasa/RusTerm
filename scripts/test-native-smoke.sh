@@ -22,6 +22,13 @@ env \
     RUST_LOG=rusterm_ui=info \
     "$ROOT_DIR/target/debug/rusterm"
 
+DB_PATH="$HOME_DIR/Library/Application Support/rusterm/rusterm.db"
+test -f "$DB_PATH"
+SUCCESS_COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM history WHERE command IN ('printf RUSTERM_MAIN_E2E_OK', 'printf RUSTERM_AFTER_CANCEL_OK', 'printf RUSTERM_BOTTOM_E2E_OK') AND exit_code = 0;")
+DANGEROUS_COUNT=$(sqlite3 "$DB_PATH" "SELECT COUNT(*) FROM history WHERE command = 'mkfs.ext4 /dev/rusterm-e2e-nonexistent';")
+[ "$SUCCESS_COUNT" = "3" ]
+[ "$DANGEROUS_COUNT" = "0" ]
+
 env \
     HOME="$HOME_DIR" \
     RUSTERM_CONFIG_DIR="$CONFIG_DIR" \
