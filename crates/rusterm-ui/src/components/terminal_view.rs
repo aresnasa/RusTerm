@@ -2535,23 +2535,29 @@ mod tests {
     }
 
     #[test]
-    fn onekey_popup_navigates_with_arrows_and_wraps() {
-        assert_eq!(
-            onekey_popup_key_action(&Key::ArrowDown, 0, 3),
-            OneKeyKeyAction::Navigate(1)
-        );
-        assert_eq!(
-            onekey_popup_key_action(&Key::ArrowDown, 2, 3),
-            OneKeyKeyAction::Navigate(0)
-        );
-        assert_eq!(
-            onekey_popup_key_action(&Key::ArrowUp, 0, 3),
-            OneKeyKeyAction::Navigate(2)
-        );
-        assert_eq!(
-            onekey_popup_key_action(&Key::ArrowUp, 2, 3),
-            OneKeyKeyAction::Navigate(1)
-        );
+    fn onekey_popup_does_not_consume_terminal_arrow_keys() {
+        for key in [
+            Key::ArrowDown,
+            Key::ArrowUp,
+            Key::ArrowLeft,
+            Key::ArrowRight,
+        ] {
+            assert_eq!(
+                onekey_popup_key_action(&key, 0, 3),
+                OneKeyKeyAction::DismissAndForward,
+                "{key:?} must reach the PTY instead of navigating the popup"
+            );
+        }
+    }
+
+    #[test]
+    fn unmodified_cursor_keys_use_standard_csi_sequences() {
+        assert_eq!(cursor_key_seq(1, b'A', false, None), b"\x1b[A");
+        assert_eq!(cursor_key_seq(1, b'B', false, None), b"\x1b[B");
+        assert_eq!(cursor_key_seq(1, b'C', false, None), b"\x1b[C");
+        assert_eq!(cursor_key_seq(1, b'D', false, None), b"\x1b[D");
+        assert_eq!(cursor_key_seq(1, b'D', true, None), b"\x1bOD");
+        assert_eq!(cursor_key_seq(1, b'D', false, Some(2)), b"\x1b[1;2D");
     }
 
     #[test]

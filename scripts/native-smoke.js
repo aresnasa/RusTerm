@@ -131,9 +131,9 @@ return (async () => {
         `${label} dock tab did not activate`,
       );
     };
-    const typeCommand = async (terminal, command) => {
+    const typeKeys = async (terminal, text) => {
       terminal.focus();
-      for (const key of command) {
+      for (const key of text) {
         terminal.dispatchEvent(
           new KeyboardEvent("keydown", {
             key,
@@ -144,6 +144,9 @@ return (async () => {
         );
         await sleep(2);
       }
+    };
+    const typeCommand = async (terminal, command) => {
+      await typeKeys(terminal, command);
       terminal.dispatchEvent(
         new KeyboardEvent("keydown", {
           key: "Enter",
@@ -560,6 +563,75 @@ return (async () => {
       mainTerminal,
       "printf RUSTERM_MAIN_E2E_OK",
       "RUSTERM_MAIN_E2E_OK",
+    );
+
+    stage = "suggestion-delete-click";
+    const suggestionCommand = "printf RUSTERM_SUGGEST_DELETE_E2E";
+    const suggestionPrefix = "printf RUSTERM_SUGGEST_DEL";
+    await sendCommand(
+      mainTerminal,
+      suggestionCommand,
+      "RUSTERM_SUGGEST_DELETE_E2E",
+    );
+    await typeKeys(mainTerminal, suggestionPrefix);
+    const deleteSuggestionButton = await waitFor(
+      () =>
+        [
+          ...document.querySelectorAll(
+            'button[aria-label="Remove command from history"]',
+          ),
+        ].find((button) =>
+          button.closest(".sug-row")?.textContent.includes(suggestionCommand),
+        ),
+      "suggestion delete button did not render",
+    );
+    for (const type of ["pointerdown", "mousedown", "mouseup", "click"]) {
+      const EventCtor = type === "pointerdown" ? PointerEvent : MouseEvent;
+      deleteSuggestionButton.dispatchEvent(
+        new EventCtor(type, {
+          button: 0,
+          buttons: type === "pointerdown" || type === "mousedown" ? 1 : 0,
+          bubbles: true,
+          cancelable: true,
+          composed: true,
+        }),
+      );
+    }
+    await waitFor(
+      () =>
+        ![...document.querySelectorAll(".sug-row")].some((row) =>
+          row.textContent.includes(suggestionCommand),
+        ),
+      "clicked suggestion remained visible",
+      3000,
+    );
+    mainTerminal.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "c",
+        code: "KeyC",
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    await sleep(150);
+    await typeKeys(mainTerminal, suggestionPrefix);
+    await sleep(600);
+    if (
+      [...document.querySelectorAll(".sug-row")].some((row) =>
+        row.textContent.includes(suggestionCommand),
+      )
+    ) {
+      throw new Error("deleted suggestion resurfaced after query refresh");
+    }
+    mainTerminal.dispatchEvent(
+      new KeyboardEvent("keydown", {
+        key: "c",
+        code: "KeyC",
+        ctrlKey: true,
+        bubbles: true,
+        cancelable: true,
+      }),
     );
 
     await sleep(750);
