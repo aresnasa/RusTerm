@@ -225,7 +225,9 @@ return (async () => {
         `settings panel is not opaque: ${panelStyle.backgroundColor}`,
       );
     if (Number.parseInt(overlayStyle.zIndex, 10) < 1000)
-      throw new Error(`settings overlay z-index is too low: ${overlayStyle.zIndex}`);
+      throw new Error(
+        `settings overlay z-index is too low: ${overlayStyle.zIndex}`,
+      );
     if (overlayStyle.pointerEvents === "none")
       throw new Error("settings overlay does not block workspace interaction");
     const heading = settingsPanel.querySelector("h3");
@@ -251,7 +253,9 @@ return (async () => {
       overlayRect.top + 4,
     );
     if (!cornerTarget?.closest('[data-rusterm-settings-overlay="true"]'))
-      throw new Error("settings overlay does not cover the workspace hit target");
+      throw new Error(
+        "settings overlay does not cover the workspace hit target",
+      );
     await clickButton("Reset default");
     await clickButton("Save");
     await waitFor(
@@ -488,9 +492,7 @@ return (async () => {
       "first pane-handle click did not start move mode",
     );
     const firstPaneWindow = () =>
-      document
-        .querySelector(".pane-drag-handle")
-        ?.closest(".pane-title-bar")
+      document.querySelector(".pane-drag-handle")?.closest(".pane-title-bar")
         ?.parentElement;
     const beforeMoveRect = firstPaneWindow().getBoundingClientRect();
     const movedX = startX + 70;
@@ -514,9 +516,9 @@ return (async () => {
       );
     }, "pane did not follow a button-free mousemove after the first click");
     document.body.dispatchEvent(
-      new MouseEvent("click", {
+      new MouseEvent("mousedown", {
         button: 0,
-        buttons: 0,
+        buttons: 1,
         clientX: movedX,
         clientY: movedY,
         bubbles: true,
@@ -524,11 +526,29 @@ return (async () => {
         composed: true,
       }),
     );
+    if (window.__rusterm_pane_move_done !== true) {
+      throw new Error(
+        "second primary press did not stop move mode immediately",
+      );
+    }
+    for (const type of ["mouseup", "click"]) {
+      document.body.dispatchEvent(
+        new MouseEvent(type, {
+          button: 0,
+          buttons: 0,
+          clientX: movedX,
+          clientY: movedY,
+          bubbles: true,
+          cancelable: true,
+          composed: true,
+        }),
+      );
+    }
     await waitFor(
       () =>
         window._rusterm_pane_move_remove == null &&
         document.body.style.userSelect !== "none",
-      "second primary click did not stop move mode or clean up listeners",
+      "second primary press did not stop move mode or clean up listeners",
     );
     await sleep(80);
     const stoppedRect = firstPaneWindow().getBoundingClientRect();
@@ -548,7 +568,9 @@ return (async () => {
       Math.abs(afterStopRect.left - stoppedRect.left) > 1 ||
       Math.abs(afterStopRect.top - stoppedRect.top) > 1
     ) {
-      throw new Error("pane kept following the pointer after the second click");
+      throw new Error(
+        "pane kept following the pointer after the second primary press",
+      );
     }
 
     const currentMainTerminal = document.getElementById(mainTerminal.id);

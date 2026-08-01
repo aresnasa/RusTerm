@@ -4908,7 +4908,7 @@ fn multi_pane_container(
                         span {
                             class: "pane-drag-handle",
                             style: "display: inline-flex; align-items: center; justify-content: center; width: 18px; margin-right: 5px; cursor: move; color: #7aa2f7; font-size: 13px; transition: color 0.12s ease, transform 0.12s ease;",
-                            title: "单击开始移动小窗口，再次单击停止",
+                            title: "单击开始移动小窗口，再次按下左键或按 Esc 停止",
                             onmousedown: move |e: MouseEvent| {
                                 if e.trigger_button() == Some(MouseButton::Primary) {
                                     // Keep the title bar's session drag gesture from starting.
