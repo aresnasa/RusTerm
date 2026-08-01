@@ -111,11 +111,12 @@ async fn connect_transport_with_tls_config(
 
 fn default_tls_config() -> Arc<ClientConfig> {
     let roots = RootCertStore::from_iter(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    Arc::new(
-        ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    )
+    let builder = ClientConfig::builder_with_provider(Arc::new(
+        rustls::crypto::aws_lc_rs::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("AWS-LC supports Rustls default protocol versions");
+    Arc::new(builder.with_root_certificates(roots).with_no_client_auth())
 }
 
 async fn connect_tcp(
@@ -538,10 +539,14 @@ mod tests {
         let certificate = certified.cert.der().clone();
         let private_key = PrivateKeyDer::Pkcs8(certified.signing_key.serialize_der().into());
 
-        let server_config = ServerConfig::builder()
-            .with_no_client_auth()
-            .with_single_cert(vec![certificate.clone()], private_key)
-            .unwrap();
+        let server_config = ServerConfig::builder_with_provider(Arc::new(
+            rustls::crypto::aws_lc_rs::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(vec![certificate.clone()], private_key)
+        .unwrap();
         let acceptor = TlsAcceptor::from(Arc::new(server_config));
         let listener = TcpListener::bind(("127.0.0.1", 0)).await.unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -560,9 +565,13 @@ mod tests {
         let mut roots = RootCertStore::empty();
         roots.add(certificate).unwrap();
         let client_config = Arc::new(
-            ClientConfig::builder()
-                .with_root_certificates(roots)
-                .with_no_client_auth(),
+            ClientConfig::builder_with_provider(Arc::new(
+                rustls::crypto::aws_lc_rs::default_provider(),
+            ))
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
         );
         let proxy = ProxyConfig {
             kind: ProxyKind::Https,
