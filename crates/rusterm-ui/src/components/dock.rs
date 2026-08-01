@@ -189,6 +189,134 @@ pub async fn poll_dock_drag_state() -> Option<(f64, f64, bool, Option<DockDropTa
     parse_dock_drag_poll_response(result.as_str()?)
 }
 
+fn build_install_dock_resize_script(
+    initial_position: f64,
+    coordinate: &str,
+    cursor: &str,
+    token: &str,
+) -> String {
+    format!(
+        "(function() {{\n\
+            if (window._rusterm_dock_resize_remove) {{ window._rusterm_dock_resize_remove(); window._rusterm_dock_resize_remove = null; }}\n\
+            window.__rusterm_dock_resize_pos = '{initial_position}';\n\
+            window.__rusterm_dock_resize_done = false;\n\
+            window.__rusterm_dock_resize_token = '{token}';\n\
+            var previousCursor = document.body.style.cursor;\n\
+            var previousWebkitUserSelect = document.body.style.webkitUserSelect;\n\
+            var previousUserSelect = document.body.style.userSelect;\n\
+            document.body.style.cursor = '{cursor}';\n\
+            document.body.style.webkitUserSelect = 'none';\n\
+            document.body.style.userSelect = 'none';\n\
+            if (window.getSelection) {{ window.getSelection().removeAllRanges(); }}\n\
+            var removeListeners = function() {{\n\
+                document.removeEventListener('mousemove', moveHandler, true);\n\
+                document.removeEventListener('mouseup', finishHandler, true);\n\
+                document.removeEventListener('pointerup', finishHandler, true);\n\
+                document.removeEventListener('pointercancel', finishHandler, true);\n\
+                window.removeEventListener('blur', finishHandler, true);\n\
+                document.removeEventListener('visibilitychange', visibilityHandler, true);\n\
+                document.removeEventListener('keydown', keyHandler, true);\n\
+                document.body.style.cursor = previousCursor;\n\
+                document.body.style.webkitUserSelect = previousWebkitUserSelect;\n\
+                document.body.style.userSelect = previousUserSelect;\n\
+            }};\n\
+            var finishHandler = function(e) {{\n\
+                if (e && Number.isFinite(e.{coordinate})) {{ window.__rusterm_dock_resize_pos = String(e.{coordinate}); }}\n\
+                window.__rusterm_dock_resize_done = true;\n\
+                if (e && e.cancelable) {{ e.preventDefault(); }}\n\
+                var remove = window._rusterm_dock_resize_remove;\n\
+                window._rusterm_dock_resize_remove = null;\n\
+                if (remove) {{ remove(); }}\n\
+            }};\n\
+            var moveHandler = function(e) {{\n\
+                if (typeof e.buttons === 'number' && e.buttons === 0) {{ finishHandler(e); return; }}\n\
+                window.__rusterm_dock_resize_pos = String(e.{coordinate});\n\
+                if (e.cancelable) {{ e.preventDefault(); }}\n\
+            }};\n\
+            var visibilityHandler = function() {{ if (document.hidden) {{ finishHandler(null); }} }};\n\
+            var keyHandler = function(e) {{ if (e.key === 'Escape') {{ finishHandler(e); }} }};\n\
+            window._rusterm_dock_resize_remove = removeListeners;\n\
+            document.addEventListener('mousemove', moveHandler, true);\n\
+            document.addEventListener('mouseup', finishHandler, true);\n\
+            document.addEventListener('pointerup', finishHandler, true);\n\
+            document.addEventListener('pointercancel', finishHandler, true);\n\
+            window.addEventListener('blur', finishHandler, true);\n\
+            document.addEventListener('visibilitychange', visibilityHandler, true);\n\
+            document.addEventListener('keydown', keyHandler, true);\n\
+        }})()"
+    )
+}
+
+fn install_dock_resize_listeners(initial_position: f64, zone: DockZone, generation: u64) {
+    let coordinate = if zone == DockZone::Bottom {
+        "clientY"
+    } else {
+        "clientX"
+    };
+    let cursor = if zone == DockZone::Bottom {
+        "row-resize"
+    } else {
+        "col-resize"
+    };
+    let token = format!("{}:{generation}", zone_name(zone));
+    let script = build_install_dock_resize_script(initial_position, coordinate, cursor, &token);
+    spawn(async move {
+        let _ = dioxus::document::eval(&script).await;
+    });
+}
+
+async fn poll_dock_resize_state() -> Option<(f64, bool, String)> {
+    let result = dioxus::document::eval(
+        "return (function() {\n\
+            var position = Number(window.__rusterm_dock_resize_pos);\n\
+            var token = window.__rusterm_dock_resize_token || '';\n\
+            if (!Number.isFinite(position) || !token) return '';\n\
+            return [String(position), window.__rusterm_dock_resize_done ? '1' : '0', token].join('\\u001f');\n\
+        })()",
+    )
+    .await
+    .ok()?;
+    parse_dock_resize_poll_response(result.as_str()?)
+}
+
+fn parse_dock_resize_poll_response(response: &str) -> Option<(f64, bool, String)> {
+    let mut fields = response.split('\u{1f}');
+    let position = fields.next()?.parse::<f64>().ok()?;
+    if !position.is_finite() {
+        return None;
+    }
+    let done = match fields.next()? {
+        "0" => false,
+        "1" => true,
+        _ => return None,
+    };
+    let token = fields.next()?;
+    if token.is_empty() || fields.next().is_some() {
+        return None;
+    }
+    Some((position, done, token.to_owned()))
+}
+
+fn resized_dock_extent(
+    zone: DockZone,
+    start_position: f64,
+    start_extent: u16,
+    position: f64,
+) -> u16 {
+    let delta = match zone {
+        DockZone::Left => position - start_position,
+        DockZone::Right | DockZone::Bottom => start_position - position,
+    };
+    let (minimum, maximum) = match zone {
+        DockZone::Left => (MIN_SIDEBAR_WIDTH_PX, MAX_SIDEBAR_WIDTH_PX),
+        DockZone::Right => (MIN_RIGHT_PANEL_WIDTH_PX, MAX_RIGHT_PANEL_WIDTH_PX),
+        DockZone::Bottom => (MIN_BOTTOM_PANEL_HEIGHT_PX, MAX_BOTTOM_PANEL_HEIGHT_PX),
+    };
+    (f64::from(start_extent) + delta)
+        .round()
+        .clamp(f64::from(minimum), f64::from(maximum)) as u16
+}
+
 fn parse_dock_drag_poll_response(
     response: &str,
 ) -> Option<(f64, f64, bool, Option<DockDropTarget>)> {
@@ -233,10 +361,34 @@ pub fn DockZoneView(
 
     let incoming_extent = stack.extent_px;
     let mut live_extent = use_signal(|| incoming_extent);
-    let mut resize_drag = use_signal(|| Option::<(f64, u16)>::None);
+    let mut resize_drag = use_signal(|| Option::<(f64, u16, u64)>::None);
+    let mut resize_generation = use_signal(|| 0_u64);
     use_effect(move || {
         if resize_drag.peek().is_none() && *live_extent.peek() != incoming_extent {
             live_extent.set(incoming_extent);
+        }
+    });
+    let _resize_drag_poll = use_future(move || async move {
+        loop {
+            let Some((start_position, start_extent, generation)) = resize_drag() else {
+                tokio::time::sleep(std::time::Duration::from_millis(32)).await;
+                continue;
+            };
+            if let Some((position, done, token)) = poll_dock_resize_state().await {
+                let expected_token = format!("{}:{generation}", zone_name(zone));
+                if token == expected_token {
+                    let extent = resized_dock_extent(zone, start_position, start_extent, position);
+                    if live_extent() != extent {
+                        live_extent.set(extent);
+                    }
+                    if done {
+                        resize_drag.set(None);
+                        on_extent_change.call((zone, extent));
+                        continue;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(16)).await;
         }
     });
 
@@ -335,31 +487,23 @@ pub fn DockZoneView(
             }
             if resize_drag().is_some() {
                 div {
+                    "data-rusterm-dock-resize-overlay": "true",
                     style: "position:fixed;inset:0;z-index:79;cursor:{resize_cursor};background:transparent;",
                     onmousemove: move |event: MouseEvent| {
-                        let Some((start_position, start_extent)) = resize_drag() else { return; };
+                        let Some((start_position, start_extent, _)) = resize_drag() else { return; };
                         event.prevent_default();
                         let coordinates = event.client_coordinates();
-                        let delta = match zone {
-                            DockZone::Left => coordinates.x - start_position,
-                            DockZone::Right => start_position - coordinates.x,
-                            DockZone::Bottom => start_position - coordinates.y,
+                        let position = if zone == DockZone::Bottom {
+                            coordinates.y
+                        } else {
+                            coordinates.x
                         };
-                        let (minimum, maximum) = match zone {
-                            DockZone::Left => (MIN_SIDEBAR_WIDTH_PX, MAX_SIDEBAR_WIDTH_PX),
-                            DockZone::Right => (MIN_RIGHT_PANEL_WIDTH_PX, MAX_RIGHT_PANEL_WIDTH_PX),
-                            DockZone::Bottom => (MIN_BOTTOM_PANEL_HEIGHT_PX, MAX_BOTTOM_PANEL_HEIGHT_PX),
-                        };
-                        live_extent.set(
-                            (f64::from(start_extent) + delta)
-                                .round()
-                                .clamp(f64::from(minimum), f64::from(maximum)) as u16,
-                        );
-                    },
-                    onmouseup: move |event: MouseEvent| {
-                        event.prevent_default();
-                        resize_drag.set(None);
-                        on_extent_change.call((zone, live_extent()));
+                        live_extent.set(resized_dock_extent(
+                            zone,
+                            start_position,
+                            start_extent,
+                            position,
+                        ));
                     },
                 }
             }
@@ -372,7 +516,10 @@ pub fn DockZoneView(
                         event.stop_propagation();
                         let coordinates = event.client_coordinates();
                         let position = if zone == DockZone::Bottom { coordinates.y } else { coordinates.x };
-                        resize_drag.set(Some((position, live_extent())));
+                        let generation = resize_generation().wrapping_add(1);
+                        resize_generation.set(generation);
+                        resize_drag.set(Some((position, live_extent(), generation)));
+                        install_dock_resize_listeners(position, zone, generation);
                     }
                 },
             }
@@ -455,6 +602,57 @@ mod tests {
             parse_dock_drag_poll_response("12\u{1f}30\u{1f}1\u{1f}\u{1f}"),
             Some((12.0, 30.0, true, None))
         );
+    }
+
+    #[test]
+    fn dock_resize_poll_response_requires_a_finite_position_and_token() {
+        assert_eq!(
+            parse_dock_resize_poll_response("125.5\u{1f}1\u{1f}bottom:2"),
+            Some((125.5, true, "bottom:2".to_owned()))
+        );
+        assert_eq!(
+            parse_dock_resize_poll_response("NaN\u{1f}0\u{1f}bottom:2"),
+            None
+        );
+        assert_eq!(parse_dock_resize_poll_response("125\u{1f}0\u{1f}"), None);
+    }
+
+    #[test]
+    fn dock_resize_script_captures_and_cleans_up_every_end_signal() {
+        let script = build_install_dock_resize_script(200.0, "clientY", "row-resize", "bottom:3");
+        for listener in [
+            "document.addEventListener('mouseup', finishHandler, true)",
+            "document.addEventListener('pointerup', finishHandler, true)",
+            "document.addEventListener('pointercancel', finishHandler, true)",
+            "window.addEventListener('blur', finishHandler, true)",
+            "document.addEventListener('visibilitychange', visibilityHandler, true)",
+            "document.addEventListener('keydown', keyHandler, true)",
+        ] {
+            assert!(script.contains(listener), "missing listener: {listener}");
+        }
+        for listener in [
+            "document.removeEventListener('mouseup', finishHandler, true)",
+            "document.removeEventListener('pointerup', finishHandler, true)",
+            "document.removeEventListener('pointercancel', finishHandler, true)",
+            "window.removeEventListener('blur', finishHandler, true)",
+            "document.removeEventListener('visibilitychange', visibilityHandler, true)",
+            "document.removeEventListener('keydown', keyHandler, true)",
+        ] {
+            assert!(script.contains(listener), "missing cleanup: {listener}");
+        }
+        assert!(script.contains("e.buttons === 0"));
+        assert!(script.contains("document.hidden"));
+        assert!(script.contains("e.key === 'Escape'"));
+        assert!(script.contains("window._rusterm_dock_resize_remove = null"));
+        assert!(script.contains("document.body.style.cursor = previousCursor"));
+        assert!(script.contains("document.body.style.userSelect = previousUserSelect"));
+    }
+
+    #[test]
+    fn dock_resize_extent_follows_each_zone_direction() {
+        assert_eq!(resized_dock_extent(DockZone::Left, 100.0, 250, 140.0), 290);
+        assert_eq!(resized_dock_extent(DockZone::Right, 100.0, 250, 60.0), 290);
+        assert_eq!(resized_dock_extent(DockZone::Bottom, 100.0, 250, 60.0), 290);
     }
 
     #[test]

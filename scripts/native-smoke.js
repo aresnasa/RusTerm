@@ -360,6 +360,11 @@ return (async () => {
       "bottom resize did not start",
     );
     const bottomResizeOverlay = activeBottomHandle.previousElementSibling;
+    await waitFor(
+      () => typeof window._rusterm_dock_resize_remove === "function",
+      "bottom resize global listeners were not installed",
+      1000,
+    );
     bottomResizeOverlay.dispatchEvent(
       new MouseEvent("mousemove", {
         button: 0,
@@ -392,6 +397,9 @@ return (async () => {
       "bottom resize remained active after document mouseup",
       1000,
     );
+    if (document.querySelector('[data-rusterm-dock-resize-overlay="true"]')) {
+      throw new Error("bottom resize overlay remained after document mouseup");
+    }
     const bottomAfterRelease = bottomZone.getBoundingClientRect().height;
     document.dispatchEvent(
       new MouseEvent("mousemove", {
@@ -430,12 +438,50 @@ return (async () => {
         ),
       "bottom resize did not restart",
     );
+    await waitFor(
+      () => typeof window._rusterm_dock_resize_remove === "function",
+      "second bottom resize global listeners were not installed",
+      1000,
+    );
+    window.dispatchEvent(new Event("blur"));
+    await waitFor(
+      () =>
+        !document.querySelector(
+          '[data-rusterm-dock-zone="bottom"] .dock-resize-handle.active',
+        ),
+      "second bottom resize remained active after window blur",
+      1000,
+    );
+
+    const latestBottomHandleRect = bottomHandle.getBoundingClientRect();
+    bottomHandle.dispatchEvent(
+      new MouseEvent("mousedown", {
+        button: 0,
+        buttons: 1,
+        clientX: latestBottomHandleRect.left + 40,
+        clientY: latestBottomHandleRect.top + 1,
+        bubbles: true,
+        cancelable: true,
+      }),
+    );
+    await waitFor(
+      () =>
+        document.querySelector(
+          '[data-rusterm-dock-zone="bottom"] .dock-resize-handle.active',
+        ),
+      "bottom resize did not restart after blur",
+    );
+    await waitFor(
+      () => typeof window._rusterm_dock_resize_remove === "function",
+      "third bottom resize global listeners were not installed",
+      1000,
+    );
     document.dispatchEvent(
-      new MouseEvent("mouseup", {
+      new MouseEvent("mousemove", {
         button: 0,
         buttons: 0,
-        clientX: bottomHandleRect.left + 40,
-        clientY: bottomHandleRect.top + 1,
+        clientX: latestBottomHandleRect.left + 40,
+        clientY: latestBottomHandleRect.top + 1,
         bubbles: true,
         cancelable: true,
       }),
@@ -445,7 +491,7 @@ return (async () => {
         !document.querySelector(
           '[data-rusterm-dock-zone="bottom"] .dock-resize-handle.active',
         ),
-      "second bottom resize remained active after document mouseup",
+      "third bottom resize ignored mousemove with no pressed buttons",
       1000,
     );
 
