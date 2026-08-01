@@ -2249,32 +2249,86 @@ pub(crate) struct PaneMoveState {
 pub(crate) fn build_install_pane_move_script(initial_x: f64, initial_y: f64) -> String {
     format!(
         "(function() {{\n\
+            if (window._rusterm_pane_move_remove) {{ window._rusterm_pane_move_remove(true); }}\n\
             window.__rusterm_pane_move_pos = '{x},{y}';\n\
             window.__rusterm_pane_move_done = false;\n\
-            if (window._rusterm_pane_move_remove) {{ window._rusterm_pane_move_remove(); }}\n\
             document.body.style.webkitUserSelect = 'none';\n\
             document.body.style.userSelect = 'none';\n\
             if (window.getSelection) {{ window.getSelection().removeAllRanges(); }}\n\
-            var moveHandler = function(e) {{\n\
-                window.__rusterm_pane_move_pos = e.clientX + ',' + e.clientY;\n\
-                e.preventDefault();\n\
-            }};\n\
-            var clickHandler = function(e) {{\n\
-                if (e.button !== 0) {{ return; }}\n\
-                window.__rusterm_pane_move_pos = e.clientX + ',' + e.clientY;\n\
-                window.__rusterm_pane_move_done = true;\n\
+            var stopPressActive = false;\n\
+            var consumeEvent = function(e) {{\n\
                 e.preventDefault();\n\
                 e.stopPropagation();\n\
                 if (e.stopImmediatePropagation) {{ e.stopImmediatePropagation(); }}\n\
-                if (window._rusterm_pane_move_remove) {{ window._rusterm_pane_move_remove(); window._rusterm_pane_move_remove = null; }}\n\
             }};\n\
-            document.addEventListener('mousemove', moveHandler, true);\n\
-            document.addEventListener('click', clickHandler, true);\n\
-            window._rusterm_pane_move_remove = function() {{\n\
+            var moveHandler = function(e) {{\n\
+                if (window.__rusterm_pane_move_done) {{ return; }}\n\
+                window.__rusterm_pane_move_pos = e.clientX + ',' + e.clientY;\n\
+                e.preventDefault();\n\
+            }};\n\
+            var finishMove = function() {{\n\
+                window.__rusterm_pane_move_done = true;\n\
+            }};\n\
+            var removeListeners = function(force) {{\n\
                 document.removeEventListener('mousemove', moveHandler, true);\n\
-                document.removeEventListener('click', clickHandler, true);\n\
+                document.removeEventListener('mousedown', pressHandler, true);\n\
+                window.removeEventListener('blur', cancelHandler, true);\n\
+                document.removeEventListener('visibilitychange', visibilityHandler, true);\n\
+                document.removeEventListener('keydown', keyHandler, true);\n\
+                if (force || !stopPressActive) {{\n\
+                    document.removeEventListener('mouseup', releaseHandler, true);\n\
+                    document.removeEventListener('click', clickHandler, true);\n\
+                    stopPressActive = false;\n\
+                }}\n\
                 document.body.style.webkitUserSelect = '';\n\
                 document.body.style.userSelect = '';\n\
+            }};\n\
+            var pressHandler = function(e) {{\n\
+                if (e.button !== 0) {{ return; }}\n\
+                window.__rusterm_pane_move_pos = e.clientX + ',' + e.clientY;\n\
+                stopPressActive = true;\n\
+                finishMove();\n\
+                consumeEvent(e);\n\
+            }};\n\
+            var releaseHandler = function(e) {{\n\
+                if (!stopPressActive) {{ return; }}\n\
+                consumeEvent(e);\n\
+                setTimeout(function() {{\n\
+                    stopPressActive = false;\n\
+                    removeListeners(true);\n\
+                }}, 0);\n\
+            }};\n\
+            var clickHandler = function(e) {{\n\
+                if (!stopPressActive) {{ return; }}\n\
+                consumeEvent(e);\n\
+                stopPressActive = false;\n\
+                removeListeners(true);\n\
+            }};\n\
+            var cancelHandler = function() {{\n\
+                finishMove();\n\
+                stopPressActive = false;\n\
+                removeListeners(true);\n\
+            }};\n\
+            var visibilityHandler = function() {{\n\
+                if (document.hidden) {{ cancelHandler(); }}\n\
+            }};\n\
+            var keyHandler = function(e) {{\n\
+                if (e.key === 'Escape') {{\n\
+                    finishMove();\n\
+                    stopPressActive = false;\n\
+                    consumeEvent(e);\n\
+                    removeListeners(true);\n\
+                }}\n\
+            }};\n\
+            document.addEventListener('mousemove', moveHandler, true);\n\
+            document.addEventListener('mousedown', pressHandler, true);\n\
+            document.addEventListener('mouseup', releaseHandler, true);\n\
+            document.addEventListener('click', clickHandler, true);\n\
+            window.addEventListener('blur', cancelHandler, true);\n\
+            document.addEventListener('visibilitychange', visibilityHandler, true);\n\
+            document.addEventListener('keydown', keyHandler, true);\n\
+            window._rusterm_pane_move_remove = function(force) {{\n\
+                removeListeners(Boolean(force));\n\
             }};\n\
         }})()",
         x = initial_x,
@@ -12328,33 +12382,59 @@ mod pane_move_tests {
     use super::{build_install_pane_move_script, parse_pane_move_poll_response};
 
     #[test]
-    fn pane_move_script_uses_dedicated_capture_phase_click_listener() {
+    fn pane_move_script_uses_primary_press_as_the_reliable_stop_signal() {
         let script = build_install_pane_move_script(12.5, 34.0);
         assert!(script.contains("window.__rusterm_pane_move_pos = '12.5,34'"));
         assert!(script.contains("window.__rusterm_pane_move_done = false"));
         assert!(script.contains("window._rusterm_pane_move_remove"));
         assert!(script.contains("document.addEventListener('mousemove', moveHandler, true)"));
+        assert!(script.contains("document.addEventListener('mousedown', pressHandler, true)"));
+        assert!(script.contains("document.addEventListener('mouseup', releaseHandler, true)"));
         assert!(script.contains("document.addEventListener('click', clickHandler, true)"));
-        assert!(!script.contains("addEventListener('mouseup'"));
         assert!(!script.contains("__rusterm_tab_drag_pos"));
         assert!(!script.contains("__rusterm_drag_pos"));
     }
 
     #[test]
-    fn pane_move_script_stops_on_next_primary_click_without_activating_target() {
+    fn pane_move_script_stops_on_next_primary_press_without_activating_target() {
         let script = build_install_pane_move_script(1.0, 2.0);
+        assert!(script.contains("var pressHandler = function(e)"));
         assert!(script.contains("if (e.button !== 0) { return; }"));
         assert!(script.contains("window.__rusterm_pane_move_pos = e.clientX + ',' + e.clientY"));
         assert!(script.contains("window.__rusterm_pane_move_done = true"));
+        assert!(script.contains("if (!stopPressActive) { return; }"));
         assert!(script.contains("e.preventDefault()"));
         assert!(script.contains("e.stopPropagation()"));
         assert!(script.contains("e.stopImmediatePropagation()"));
     }
 
     #[test]
-    fn pane_move_script_cleanup_removes_click_listener_and_restores_selection() {
+    fn pane_move_script_finishes_when_interaction_context_is_lost() {
         let script = build_install_pane_move_script(1.0, 2.0);
+        assert!(script.contains("window.addEventListener('blur', cancelHandler, true)"));
+        assert!(
+            script
+                .contains("document.addEventListener('visibilitychange', visibilityHandler, true)")
+        );
+        assert!(script.contains("document.addEventListener('keydown', keyHandler, true)"));
+        assert!(script.contains("if (e.key === 'Escape')"));
+        assert!(script.contains("if (document.hidden)"));
+    }
+
+    #[test]
+    fn pane_move_script_cleanup_removes_all_listeners_and_restores_selection() {
+        let script = build_install_pane_move_script(1.0, 2.0);
+        assert!(script.contains("document.removeEventListener('mousemove', moveHandler, true)"));
+        assert!(script.contains("document.removeEventListener('mousedown', pressHandler, true)"));
+        assert!(script.contains("document.removeEventListener('mouseup', releaseHandler, true)"));
         assert!(script.contains("document.removeEventListener('click', clickHandler, true)"));
+        assert!(script.contains("window.removeEventListener('blur', cancelHandler, true)"));
+        assert!(
+            script.contains(
+                "document.removeEventListener('visibilitychange', visibilityHandler, true)"
+            )
+        );
+        assert!(script.contains("document.removeEventListener('keydown', keyHandler, true)"));
         assert!(script.contains("document.body.style.webkitUserSelect = 'none'"));
         assert!(script.contains("document.body.style.webkitUserSelect = ''"));
         assert!(script.contains("document.body.style.userSelect = ''"));
