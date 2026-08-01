@@ -133,9 +133,9 @@ fn update_dock_extent(preferences: &mut WorkspacePreferences, zone: DockZone, ex
 
 fn render_workspace_dock_panel(
     panel: PanelId,
-    state: Signal<AppState>,
+    mut state: Signal<AppState>,
     mut modal: Signal<Modal>,
-    input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    mut input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
     mut editing_conn: Signal<Option<ConnectionConfig>>,
     mut delete_target: Signal<Option<ConnectionConfig>>,
     drag_over_group: Option<String>,
