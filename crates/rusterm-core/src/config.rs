@@ -517,6 +517,436 @@ fn default_sidebar_width_px() -> u16 {
     DEFAULT_SIDEBAR_WIDTH_PX
 }
 
+pub const DEFAULT_RIGHT_PANEL_WIDTH_PX: u16 = 300;
+pub const MIN_RIGHT_PANEL_WIDTH_PX: u16 = 220;
+pub const MAX_RIGHT_PANEL_WIDTH_PX: u16 = 600;
+pub const DEFAULT_BOTTOM_PANEL_HEIGHT_PX: u16 = 220;
+pub const MIN_BOTTOM_PANEL_HEIGHT_PX: u16 = 120;
+pub const MAX_BOTTOM_PANEL_HEIGHT_PX: u16 = 520;
+
+fn default_workspace_panel_visible() -> bool {
+    true
+}
+
+fn default_right_panel_width_px() -> u16 {
+    DEFAULT_RIGHT_PANEL_WIDTH_PX
+}
+
+fn default_bottom_panel_height_px() -> u16 {
+    DEFAULT_BOTTOM_PANEL_HEIGHT_PX
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum LeftPanelTab {
+    #[default]
+    Connections,
+    Files,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum RightPanelTab {
+    #[default]
+    Sessions,
+    History,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BottomPanelTab {
+    #[default]
+    Send,
+    Shell,
+    Transfers,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum PanelId {
+    Connections,
+    RemoteFiles,
+    Sessions,
+    History,
+    Send,
+    EmbeddedShell,
+    Transfers,
+}
+
+impl PanelId {
+    pub const ALL: [Self; 7] = [
+        Self::Connections,
+        Self::RemoteFiles,
+        Self::Sessions,
+        Self::History,
+        Self::Send,
+        Self::EmbeddedShell,
+        Self::Transfers,
+    ];
+
+    const fn default_zone(self) -> DockZone {
+        match self {
+            Self::Connections | Self::RemoteFiles => DockZone::Left,
+            Self::Sessions | Self::History => DockZone::Right,
+            Self::Send | Self::EmbeddedShell | Self::Transfers => DockZone::Bottom,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum DockZone {
+    Left,
+    Right,
+    Bottom,
+}
+
+impl DockZone {
+    const ALL: [Self; 3] = [Self::Left, Self::Right, Self::Bottom];
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DockStackState {
+    #[serde(default)]
+    pub panels: Vec<PanelId>,
+    #[serde(default)]
+    pub active: Option<PanelId>,
+    #[serde(default = "default_workspace_panel_visible")]
+    pub visible: bool,
+    #[serde(default)]
+    pub extent_px: u16,
+}
+
+impl DockStackState {
+    fn normalized_for(mut self, zone: DockZone) -> Self {
+        let mut unique = Vec::with_capacity(self.panels.len());
+        for panel in self.panels {
+            if !unique.contains(&panel) {
+                unique.push(panel);
+            }
+        }
+        self.panels = unique;
+        self.active = self.active.filter(|panel| self.panels.contains(panel));
+        if self.active.is_none() {
+            self.active = self.panels.first().copied();
+        }
+        self.extent_px = match zone {
+            DockZone::Left => self
+                .extent_px
+                .clamp(MIN_SIDEBAR_WIDTH_PX, MAX_SIDEBAR_WIDTH_PX),
+            DockZone::Right => self
+                .extent_px
+                .clamp(MIN_RIGHT_PANEL_WIDTH_PX, MAX_RIGHT_PANEL_WIDTH_PX),
+            DockZone::Bottom => self
+                .extent_px
+                .clamp(MIN_BOTTOM_PANEL_HEIGHT_PX, MAX_BOTTOM_PANEL_HEIGHT_PX),
+        };
+        self
+    }
+}
+
+fn default_left_dock_stack() -> DockStackState {
+    DockStackState {
+        panels: vec![PanelId::Connections, PanelId::RemoteFiles],
+        active: Some(PanelId::Connections),
+        visible: true,
+        extent_px: DEFAULT_SIDEBAR_WIDTH_PX,
+    }
+}
+
+fn default_right_dock_stack() -> DockStackState {
+    DockStackState {
+        panels: vec![PanelId::Sessions, PanelId::History],
+        active: Some(PanelId::Sessions),
+        visible: true,
+        extent_px: DEFAULT_RIGHT_PANEL_WIDTH_PX,
+    }
+}
+
+fn default_bottom_dock_stack() -> DockStackState {
+    DockStackState {
+        panels: vec![PanelId::Send, PanelId::EmbeddedShell, PanelId::Transfers],
+        active: Some(PanelId::Send),
+        visible: true,
+        extent_px: DEFAULT_BOTTOM_PANEL_HEIGHT_PX,
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DockLayout {
+    #[serde(default = "default_left_dock_stack")]
+    pub left: DockStackState,
+    #[serde(default = "default_right_dock_stack")]
+    pub right: DockStackState,
+    #[serde(default = "default_bottom_dock_stack")]
+    pub bottom: DockStackState,
+}
+
+impl Default for DockLayout {
+    fn default() -> Self {
+        Self {
+            left: default_left_dock_stack(),
+            right: default_right_dock_stack(),
+            bottom: default_bottom_dock_stack(),
+        }
+    }
+}
+
+impl DockLayout {
+    pub fn stack(&self, zone: DockZone) -> &DockStackState {
+        match zone {
+            DockZone::Left => &self.left,
+            DockZone::Right => &self.right,
+            DockZone::Bottom => &self.bottom,
+        }
+    }
+
+    pub fn stack_mut(&mut self, zone: DockZone) -> &mut DockStackState {
+        match zone {
+            DockZone::Left => &mut self.left,
+            DockZone::Right => &mut self.right,
+            DockZone::Bottom => &mut self.bottom,
+        }
+    }
+
+    pub fn zone_for(&self, panel: PanelId) -> Option<DockZone> {
+        DockZone::ALL
+            .into_iter()
+            .find(|zone| self.stack(*zone).panels.contains(&panel))
+    }
+
+    pub fn normalize(&mut self) {
+        let mut seen = Vec::with_capacity(PanelId::ALL.len());
+        for zone in DockZone::ALL {
+            self.stack_mut(zone).panels.retain(|panel| {
+                if seen.contains(panel) {
+                    false
+                } else {
+                    seen.push(*panel);
+                    true
+                }
+            });
+        }
+
+        for panel in PanelId::ALL {
+            if !seen.contains(&panel) {
+                self.stack_mut(panel.default_zone()).panels.push(panel);
+                seen.push(panel);
+            }
+        }
+
+        for zone in DockZone::ALL {
+            let stack = std::mem::replace(self.stack_mut(zone), default_left_dock_stack());
+            *self.stack_mut(zone) = stack.normalized_for(zone);
+        }
+    }
+
+    pub fn normalized(mut self) -> Self {
+        self.normalize();
+        self
+    }
+
+    pub fn move_panel(&mut self, panel: PanelId, target_zone: DockZone, target_index: usize) {
+        self.normalize();
+        let source_zone = self.zone_for(panel);
+        let panel_was_active = source_zone
+            .map(|zone| self.stack(zone).active == Some(panel))
+            .unwrap_or(false);
+        let target_was_hidden = !self.stack(target_zone).visible;
+
+        for zone in DockZone::ALL {
+            let stack = self.stack_mut(zone);
+            stack.panels.retain(|candidate| *candidate != panel);
+            if stack.active == Some(panel) {
+                stack.active = None;
+            }
+        }
+
+        let target = self.stack_mut(target_zone);
+        target
+            .panels
+            .insert(target_index.min(target.panels.len()), panel);
+        target.visible = true;
+        if panel_was_active || source_zone != Some(target_zone) || target_was_hidden {
+            target.active = Some(panel);
+        }
+        self.normalize();
+    }
+
+    pub fn set_zone_visible(&mut self, zone: DockZone, visible: bool) {
+        self.stack_mut(zone).visible = visible;
+    }
+
+    pub fn hide_zone(&mut self, zone: DockZone) {
+        self.set_zone_visible(zone, false);
+    }
+
+    pub fn show_zone(&mut self, zone: DockZone) {
+        self.set_zone_visible(zone, true);
+    }
+}
+
+/// Persistent state for the tool windows docked around the terminal canvas.
+/// Terminal pane geometry remains owned by `PaneLayout`; these preferences only
+/// describe the outer workspace chrome. The legacy fields remain the UI-facing
+/// compatibility projection while the complete layout is stored in `dock_layout`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct WorkspacePreferences {
+    #[serde(default = "default_workspace_panel_visible")]
+    pub left_visible: bool,
+    #[serde(default = "default_workspace_panel_visible")]
+    pub right_visible: bool,
+    #[serde(default = "default_workspace_panel_visible")]
+    pub bottom_visible: bool,
+    #[serde(default = "default_right_panel_width_px")]
+    pub right_width_px: u16,
+    #[serde(default = "default_bottom_panel_height_px")]
+    pub bottom_height_px: u16,
+    #[serde(default)]
+    pub left_tab: LeftPanelTab,
+    #[serde(default)]
+    pub right_tab: RightPanelTab,
+    #[serde(default)]
+    pub bottom_tab: BottomPanelTab,
+    #[serde(default)]
+    pub dock_layout: DockLayout,
+}
+
+impl Default for WorkspacePreferences {
+    fn default() -> Self {
+        Self {
+            left_visible: true,
+            right_visible: true,
+            bottom_visible: true,
+            right_width_px: DEFAULT_RIGHT_PANEL_WIDTH_PX,
+            bottom_height_px: DEFAULT_BOTTOM_PANEL_HEIGHT_PX,
+            left_tab: LeftPanelTab::default(),
+            right_tab: RightPanelTab::default(),
+            bottom_tab: BottomPanelTab::default(),
+            dock_layout: DockLayout::default(),
+        }
+    }
+}
+
+impl WorkspacePreferences {
+    pub fn normalized(mut self) -> Self {
+        self.right_width_px = self
+            .right_width_px
+            .clamp(MIN_RIGHT_PANEL_WIDTH_PX, MAX_RIGHT_PANEL_WIDTH_PX);
+        self.bottom_height_px = self
+            .bottom_height_px
+            .clamp(MIN_BOTTOM_PANEL_HEIGHT_PX, MAX_BOTTOM_PANEL_HEIGHT_PX);
+        self.dock_layout.normalize();
+
+        self.dock_layout.left.visible = self.left_visible;
+        self.dock_layout.right.visible = self.right_visible;
+        self.dock_layout.bottom.visible = self.bottom_visible;
+        self.dock_layout.right.extent_px = self.right_width_px;
+        self.dock_layout.bottom.extent_px = self.bottom_height_px;
+
+        self.migrate_legacy_active_tabs();
+        self.dock_layout.normalize();
+        self.sync_legacy_projection();
+        self
+    }
+
+    pub fn move_panel(&mut self, panel: PanelId, target_zone: DockZone, target_index: usize) {
+        self.dock_layout
+            .move_panel(panel, target_zone, target_index);
+        self.sync_legacy_projection();
+    }
+
+    pub fn set_zone_visible(&mut self, zone: DockZone, visible: bool) {
+        self.dock_layout.set_zone_visible(zone, visible);
+        self.sync_legacy_projection();
+    }
+
+    pub fn hide_zone(&mut self, zone: DockZone) {
+        self.set_zone_visible(zone, false);
+    }
+
+    pub fn show_zone(&mut self, zone: DockZone) {
+        self.set_zone_visible(zone, true);
+    }
+
+    fn migrate_legacy_active_tabs(&mut self) {
+        let legacy_panels = [
+            (
+                DockZone::Left,
+                match self.left_tab {
+                    LeftPanelTab::Connections => PanelId::Connections,
+                    LeftPanelTab::Files => PanelId::RemoteFiles,
+                },
+                matches!(
+                    self.dock_layout.left.active,
+                    None | Some(PanelId::Connections | PanelId::RemoteFiles)
+                ),
+            ),
+            (
+                DockZone::Right,
+                match self.right_tab {
+                    RightPanelTab::Sessions => PanelId::Sessions,
+                    RightPanelTab::History => PanelId::History,
+                },
+                matches!(
+                    self.dock_layout.right.active,
+                    None | Some(PanelId::Sessions | PanelId::History)
+                ),
+            ),
+            (
+                DockZone::Bottom,
+                match self.bottom_tab {
+                    BottomPanelTab::Send => PanelId::Send,
+                    BottomPanelTab::Shell => PanelId::EmbeddedShell,
+                    BottomPanelTab::Transfers => PanelId::Transfers,
+                },
+                matches!(
+                    self.dock_layout.bottom.active,
+                    None | Some(PanelId::Send | PanelId::EmbeddedShell | PanelId::Transfers)
+                ),
+            ),
+        ];
+
+        for (zone, panel, active_is_legacy_panel) in legacy_panels {
+            let stack = self.dock_layout.stack_mut(zone);
+            if active_is_legacy_panel && stack.panels.contains(&panel) {
+                stack.active = Some(panel);
+            }
+        }
+    }
+
+    fn sync_legacy_projection(&mut self) {
+        self.left_visible = self.dock_layout.left.visible;
+        self.right_visible = self.dock_layout.right.visible;
+        self.bottom_visible = self.dock_layout.bottom.visible;
+        self.right_width_px = self.dock_layout.right.extent_px;
+        self.bottom_height_px = self.dock_layout.bottom.extent_px;
+
+        if let Some(active) = self.dock_layout.left.active {
+            self.left_tab = match active {
+                PanelId::Connections => LeftPanelTab::Connections,
+                PanelId::RemoteFiles => LeftPanelTab::Files,
+                _ => self.left_tab,
+            };
+        }
+        if let Some(active) = self.dock_layout.right.active {
+            self.right_tab = match active {
+                PanelId::Sessions => RightPanelTab::Sessions,
+                PanelId::History => RightPanelTab::History,
+                _ => self.right_tab,
+            };
+        }
+        if let Some(active) = self.dock_layout.bottom.active {
+            self.bottom_tab = match active {
+                PanelId::Send => BottomPanelTab::Send,
+                PanelId::EmbeddedShell => BottomPanelTab::Shell,
+                PanelId::Transfers => BottomPanelTab::Transfers,
+                _ => self.bottom_tab,
+            };
+        }
+    }
+}
+
 /// A user-configured application shortcut. `primary` means Command on macOS
 /// and Control on other platforms, so settings remain portable across devices.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -701,6 +1131,9 @@ pub struct PersistedConfig {
     /// Width, hidden connections, and custom groups for the connection sidebar.
     #[serde(default)]
     pub sidebar: SidebarPreferences,
+    /// Visibility, size, and active tabs for the outer docked tool panels.
+    #[serde(default)]
+    pub workspace: WorkspacePreferences,
     /// User-configured application shortcuts. Missing in legacy settings files
     /// means the established defaults are used.
     #[serde(default)]
@@ -986,6 +1419,165 @@ mod tests {
     }
 
     #[test]
+    fn workspace_preferences_default_for_legacy_settings() {
+        let config: PersistedConfig =
+            serde_json::from_str(r#"{"version":1,"connections":[]}"#).unwrap();
+
+        assert_eq!(config.workspace, WorkspacePreferences::default());
+    }
+
+    #[test]
+    fn workspace_preferences_normalize_sizes_and_roundtrip_tabs() {
+        let preferences = WorkspacePreferences {
+            left_visible: false,
+            right_visible: true,
+            bottom_visible: false,
+            right_width_px: 10,
+            bottom_height_px: u16::MAX,
+            left_tab: LeftPanelTab::Files,
+            right_tab: RightPanelTab::History,
+            bottom_tab: BottomPanelTab::Transfers,
+            ..WorkspacePreferences::default()
+        }
+        .normalized();
+
+        assert_eq!(preferences.right_width_px, MIN_RIGHT_PANEL_WIDTH_PX);
+        assert_eq!(preferences.bottom_height_px, MAX_BOTTOM_PANEL_HEIGHT_PX);
+        assert_eq!(
+            preferences.dock_layout.left.active,
+            Some(PanelId::RemoteFiles)
+        );
+        assert_eq!(preferences.dock_layout.right.active, Some(PanelId::History));
+        assert_eq!(
+            preferences.dock_layout.bottom.active,
+            Some(PanelId::Transfers)
+        );
+
+        let json = serde_json::to_string(&preferences).unwrap();
+        let parsed: WorkspacePreferences = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, preferences);
+    }
+
+    #[test]
+    fn workspace_preferences_migrate_legacy_json_into_dock_layout() {
+        let preferences: WorkspacePreferences = serde_json::from_str(
+            r#"{
+                "left_visible": false,
+                "right_visible": true,
+                "bottom_visible": false,
+                "right_width_px": 410,
+                "bottom_height_px": 315,
+                "left_tab": "files",
+                "right_tab": "history",
+                "bottom_tab": "shell"
+            }"#,
+        )
+        .unwrap();
+        let preferences = preferences.normalized();
+
+        assert_eq!(
+            preferences.dock_layout.left.panels,
+            vec![PanelId::Connections, PanelId::RemoteFiles]
+        );
+        assert_eq!(
+            preferences.dock_layout.left.active,
+            Some(PanelId::RemoteFiles)
+        );
+        assert!(!preferences.dock_layout.left.visible);
+        assert_eq!(preferences.dock_layout.right.active, Some(PanelId::History));
+        assert_eq!(preferences.dock_layout.right.extent_px, 410);
+        assert_eq!(
+            preferences.dock_layout.bottom.active,
+            Some(PanelId::EmbeddedShell)
+        );
+        assert!(!preferences.dock_layout.bottom.visible);
+        assert_eq!(preferences.dock_layout.bottom.extent_px, 315);
+    }
+
+    #[test]
+    fn dock_layout_reorders_within_a_zone() {
+        let mut layout = DockLayout::default();
+        layout.move_panel(PanelId::RemoteFiles, DockZone::Left, 0);
+
+        assert_eq!(
+            layout.left.panels,
+            vec![PanelId::RemoteFiles, PanelId::Connections]
+        );
+        assert_eq!(layout.left.active, Some(PanelId::Connections));
+    }
+
+    #[test]
+    fn dock_layout_moves_panels_across_zones() {
+        let mut layout = DockLayout::default();
+        layout.move_panel(PanelId::Connections, DockZone::Right, 1);
+
+        assert_eq!(layout.left.panels, vec![PanelId::RemoteFiles]);
+        assert_eq!(layout.left.active, Some(PanelId::RemoteFiles));
+        assert_eq!(
+            layout.right.panels,
+            vec![PanelId::Sessions, PanelId::Connections, PanelId::History]
+        );
+        assert_eq!(layout.right.active, Some(PanelId::Connections));
+        assert_eq!(layout.zone_for(PanelId::Connections), Some(DockZone::Right));
+    }
+
+    #[test]
+    fn moving_to_a_hidden_edge_reopens_it() {
+        let mut layout = DockLayout::default();
+        layout.hide_zone(DockZone::Right);
+        layout.move_panel(PanelId::Connections, DockZone::Right, 0);
+
+        assert!(layout.right.visible);
+        assert_eq!(layout.right.active, Some(PanelId::Connections));
+        assert_eq!(layout.right.panels.first(), Some(&PanelId::Connections));
+    }
+
+    #[test]
+    fn dock_layout_normalize_repairs_duplicates_missing_panels_active_and_extents() {
+        let mut layout = DockLayout {
+            left: DockStackState {
+                panels: vec![PanelId::Sessions, PanelId::Sessions],
+                active: Some(PanelId::History),
+                visible: true,
+                extent_px: 0,
+            },
+            right: DockStackState {
+                panels: vec![PanelId::Sessions, PanelId::Connections],
+                active: Some(PanelId::Sessions),
+                visible: false,
+                extent_px: u16::MAX,
+            },
+            bottom: DockStackState {
+                panels: Vec::new(),
+                active: Some(PanelId::Connections),
+                visible: true,
+                extent_px: u16::MAX,
+            },
+        };
+
+        layout.normalize();
+
+        for panel in PanelId::ALL {
+            let occurrences = DockZone::ALL
+                .into_iter()
+                .filter(|zone| layout.stack(*zone).panels.contains(&panel))
+                .count();
+            assert_eq!(occurrences, 1, "{panel:?} must occur exactly once");
+        }
+        assert_eq!(layout.left.active, Some(PanelId::Sessions));
+        assert_eq!(layout.right.active, Some(PanelId::Connections));
+        assert_eq!(layout.bottom.active, Some(PanelId::Send));
+        assert_eq!(layout.left.extent_px, MIN_SIDEBAR_WIDTH_PX);
+        assert_eq!(layout.right.extent_px, MAX_RIGHT_PANEL_WIDTH_PX);
+        assert_eq!(layout.bottom.extent_px, MAX_BOTTOM_PANEL_HEIGHT_PX);
+        assert!(!layout.right.visible);
+
+        let normalized = layout.clone();
+        layout.normalize();
+        assert_eq!(layout, normalized);
+    }
+
+    #[test]
     fn focused_tab_appearance_defaults_for_legacy_settings() {
         let config: PersistedConfig =
             serde_json::from_str(r#"{"version":1,"connections":[]}"#).unwrap();
@@ -1077,6 +1669,7 @@ mod tests {
             suggestion_enabled: false,
             suggestion_count: 10,
             sidebar: SidebarPreferences::default(),
+            workspace: WorkspacePreferences::default(),
             keybindings: Keybindings::default(),
             skin: SkinSettings::default(),
         };

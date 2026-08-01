@@ -4,9 +4,11 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use rusterm_core::config::{
     ConnectionConfig, FocusedTabAppearance, Keybindings, OneKey, SidebarPreferences, SkinSettings,
+    WorkspacePreferences,
 };
 use rusterm_core::config_manager::ConfigManager;
 use rusterm_core::session::SessionType;
@@ -108,6 +110,33 @@ pub struct WorkspaceTab {
     pub anchor_session_id: Option<String>,
 }
 
+/// UI-facing snapshot of one workspace tab and its pane hierarchy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceNode {
+    pub tab_id: String,
+    pub anchor_session_id: Option<String>,
+    pub is_active: bool,
+    pub panes: Vec<PaneNode>,
+}
+
+/// UI-facing snapshot of one pane. Empty panes remain present with no session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PaneNode {
+    pub index: usize,
+    pub is_focused: bool,
+    pub session: Option<SessionNode>,
+}
+
+/// UI-facing snapshot of a live session assigned to a pane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SessionNode {
+    pub id: String,
+    pub name: String,
+    pub kind: SessionType,
+    pub is_active: bool,
+    pub connection_state: SessionConnectionState,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppState {
     /// Terminal registry. Every live session (whether it's a tab anchor or
@@ -131,6 +160,8 @@ pub struct AppState {
     pub tabs: Vec<WorkspaceTab>,
     pub sidebar_open: bool,
     pub sidebar_preferences: SidebarPreferences,
+    #[serde(default)]
+    pub workspace_preferences: WorkspacePreferences,
     pub connections: Vec<ConnectionConfig>,
     pub theme: Theme,
     #[serde(default)]
@@ -230,6 +261,22 @@ pub struct AppState {
     /// while preserving the same session id and pane assignment.
     #[serde(skip)]
     pub session_connection_states: HashMap<String, SessionConnectionState>,
+    /// Authenticated SSH control sessions keyed by terminal session id. These
+    /// handles are reused to open independent SFTP subsystem channels.
+    #[serde(skip)]
+    pub ssh_sessions: HashMap<String, rusterm_ssh::SshSession>,
+    /// Lazily opened SFTP clients. Kept separate from terminal channels so file
+    /// operations can continue while the terminal remains interactive.
+    #[serde(skip)]
+    pub sftp_clients: HashMap<String, rusterm_ssh::SftpClient>,
+    /// Runtime-only transfer queue and cancellation handles.
+    #[serde(skip)]
+    pub transfers: crate::transfers::TransferState,
+    #[serde(skip)]
+    pub transfer_cancellations: HashMap<String, CancellationToken>,
+    /// Local PTY session rendered only inside the bottom dock Shell panel.
+    #[serde(skip)]
+    pub bottom_shell_session_id: Option<String>,
     /// DuckDB-backed analytics handle. Lazily opened on first use (so the
     /// ~50MB bundled libduckdb doesn't initialize on app startup unless
     /// the user actually queries analytics). When the `analytics` feature
@@ -331,6 +378,12 @@ pub struct AppState {
     /// exactly one on the app state for the whole session lifetime.
     #[serde(skip)]
     pub safety_checker: rusterm_core::CommandSafetyChecker,
+    /// Two-stage approval gateway for model suggestions and terminal results.
+    /// This object never executes commands itself: it only yields a one-shot
+    /// capability after explicit user approval and withholds captured output
+    /// from LLM context until a second explicit approval.
+    #[serde(skip)]
+    pub shadow_sandbox: rusterm_ai::ShadowSandbox,
 
     // ── Comparison-mode diff highlighting ──────────────────────────────────
     //
@@ -358,18 +411,24 @@ pub struct AppState {
     pub comparison_diff_confirmed: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PendingCommandPayload {
+    /// The command text is already present in the shell's input buffer; only
+    /// the captured Enter bytes should be sent.
+    EnterOnly(Vec<u8>),
+    /// Send the complete command followed by a carriage return.
+    FullLine,
+}
+
 /// State held while the dangerous-command confirmation modal is open.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingDangerousCommand {
-    /// The full command line that triggered the warning (used to re-send
-    /// Enter if the user confirms). Stored verbatim so we don't lose any
-    /// quoting / escaping the user typed.
     pub command: String,
-    /// Human-readable reason from `SafetyVerdict::Warn`. Shown in the modal.
     pub reason: String,
-    /// Session id the command was typed into. Used to route the eventual
-    /// Enter to the right PTY sender.
-    pub session_id: String,
+    /// Every session that will execute the command (Compare mode may provide
+    /// more than one). Each target receives its own pending-history id.
+    pub targets: Vec<String>,
+    pub payload: PendingCommandPayload,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -498,6 +557,7 @@ impl Default for AppState {
             tabs: Vec::new(),
             sidebar_open: true,
             sidebar_preferences: SidebarPreferences::default(),
+            workspace_preferences: WorkspacePreferences::default(),
             connections: Vec::new(),
             theme: Theme::Dark,
             focused_tab_appearance: FocusedTabAppearance::default(),
@@ -520,6 +580,11 @@ impl Default for AppState {
             onekey_skip_logged: HashSet::new(),
             session_configs: HashMap::new(),
             session_connection_states: HashMap::new(),
+            ssh_sessions: HashMap::new(),
+            sftp_clients: HashMap::new(),
+            transfers: crate::transfers::TransferState::default(),
+            transfer_cancellations: HashMap::new(),
+            bottom_shell_session_id: None,
             analytics: crate::analytics::AnalyticsHandle::default(),
             layouts: HashMap::new(),
             focused_pane: None,
@@ -534,6 +599,7 @@ impl Default for AppState {
             close_dialog_dont_ask_again: true,
             pending_dangerous_command: None,
             safety_checker: rusterm_core::CommandSafetyChecker::new(),
+            shadow_sandbox: rusterm_ai::ShadowSandbox::default(),
             comparison_diffs: None,
             comparison_diff_warning: None,
             comparison_diff_confirmed: false,
@@ -564,6 +630,7 @@ impl AppState {
         let sessions: Vec<_> = self
             .sessions
             .iter()
+            .filter(|tab| self.bottom_shell_session_id.as_deref() != Some(tab.id.as_str()))
             .map(|tab| {
                 // Tail of command history — last 100 entries, display-only.
                 let history_tail: Vec<String> = if tab.command_history.len() > 100 {
@@ -808,6 +875,79 @@ impl AppState {
     }
 }
 
+/// Build the workspace → pane → session hierarchy consumed by navigation UI.
+///
+/// `sessions` is the source of truth for live sessions. Stale layout or anchor
+/// references therefore produce an empty pane instead of a synthetic session,
+/// and a live session referenced more than once appears only at its first
+/// position in tab/pane order.
+pub fn build_session_tree(state: &AppState) -> Vec<WorkspaceNode> {
+    let sessions_by_id: HashMap<&str, &SessionTab> = state
+        .sessions
+        .iter()
+        .map(|session| (session.id.as_str(), session))
+        .collect();
+    let mut seen_sessions = HashSet::new();
+
+    state
+        .tabs
+        .iter()
+        .map(|tab| {
+            let pane_session_ids: Vec<&str> = state.layouts.get(&tab.id).map_or_else(
+                || vec![tab.anchor_session_id.as_deref().unwrap_or_default()],
+                |layout| {
+                    layout
+                        .panes
+                        .iter()
+                        .map(|pane| pane.session_id.as_str())
+                        .collect()
+                },
+            );
+
+            let panes = pane_session_ids
+                .into_iter()
+                .enumerate()
+                .map(|(index, session_id)| {
+                    let session = sessions_by_id
+                        .get(session_id)
+                        .filter(|_| !session_id.is_empty())
+                        .and_then(|session| {
+                            seen_sessions
+                                .insert(session.id.as_str())
+                                .then(|| SessionNode {
+                                    id: session.id.clone(),
+                                    name: session.name.clone(),
+                                    kind: session.kind,
+                                    is_active: state.active_session.as_deref()
+                                        == Some(session.id.as_str()),
+                                    connection_state: state
+                                        .session_connection_states
+                                        .get(&session.id)
+                                        .copied()
+                                        .unwrap_or_default(),
+                                })
+                        });
+
+                    PaneNode {
+                        index,
+                        is_focused: state.focused_pane.as_ref().is_some_and(|focused| {
+                            focused.layout_owner_tab_id == tab.id && focused.pane_idx == index
+                        }),
+                        session,
+                    }
+                })
+                .collect();
+
+            WorkspaceNode {
+                tab_id: tab.id.clone(),
+                anchor_session_id: tab.anchor_session_id.clone(),
+                is_active: state.active_tab.as_deref() == Some(tab.id.as_str()),
+                panes,
+            }
+        })
+        .collect()
+}
+
 /// Helper: set the active tab and derive `active_session` from the tab's
 /// anchor. Use this whenever the active top TabBar entry changes so the two
 /// fields stay in sync (Step 1 compatibility).
@@ -821,6 +961,42 @@ pub fn set_active_tab(state: &mut AppState, tab_id: &str) {
         .iter()
         .find(|t| t.id == tab_id)
         .and_then(|t| t.anchor_session_id.clone());
+}
+
+/// Activate the workspace tab and pane that contain `session_id`.
+/// Returns false when the session is not part of any current workspace.
+pub fn activate_session(state: &mut AppState, session_id: &str) -> bool {
+    if !state
+        .sessions
+        .iter()
+        .any(|session| session.id == session_id)
+    {
+        return false;
+    }
+
+    let Some(tab_id) = state.tabs.iter().find_map(|tab| {
+        let is_anchor = tab.anchor_session_id.as_deref() == Some(session_id);
+        let is_in_layout = state.layouts.get(&tab.id).is_some_and(|layout| {
+            layout
+                .panes
+                .iter()
+                .any(|pane| pane.session_id == session_id)
+        });
+        (is_anchor || is_in_layout).then(|| tab.id.clone())
+    }) else {
+        return false;
+    };
+
+    set_active_tab(state, &tab_id);
+    if let Some(pane_idx) = state.layouts.get(&tab_id).and_then(|layout| {
+        layout
+            .panes
+            .iter()
+            .position(|pane| pane.session_id == session_id)
+    }) {
+        let _ = focus_pane_for_layout(state, &tab_id, pane_idx);
+    }
+    true
 }
 
 /// Helper: push a new workspace tab + anchor and make it the active tab.
@@ -910,7 +1086,10 @@ pub fn apply_layout_preset(state: &mut AppState, preset: LayoutPreset) -> bool {
     // first tab.
     let mut ids = vec![anchor_session.clone()];
     for tab in &state.sessions {
-        if tab.id != anchor_session && !ids.contains(&tab.id) {
+        if state.bottom_shell_session_id.as_deref() != Some(tab.id.as_str())
+            && tab.id != anchor_session
+            && !ids.contains(&tab.id)
+        {
             ids.push(tab.id.clone());
         }
     }
@@ -1155,6 +1334,22 @@ pub fn broadcast_targets(state: &AppState) -> Vec<String> {
     targets
 }
 
+/// Resolve the target sessions for commands initiated outside a TerminalView
+/// (for example the docked Send panel or command-history list).
+/// Comparison mode broadcasts to all panes; otherwise the focused pane wins,
+/// falling back to the active tab's anchor.
+pub fn command_send_targets(state: &AppState) -> Vec<String> {
+    let broadcast = broadcast_targets(state);
+    if broadcast.len() > 1 {
+        return broadcast;
+    }
+
+    focused_pane_session(state)
+        .or_else(|| state.active_tab_anchor_session())
+        .map(|session_id| vec![session_id])
+        .unwrap_or_default()
+}
+
 /// Get the list of sessions whose terminals should move in response to a
 /// wheel event from `source_session_id`.
 ///
@@ -1313,6 +1508,9 @@ pub fn set_pane_session_for_layout(
     pane_idx: usize,
     session_id: String,
 ) -> bool {
+    if state.bottom_shell_session_id.as_deref() == Some(session_id.as_str()) {
+        return false;
+    }
     let Some(layout) = state.layouts.get_mut(layout_owner_tab_id) else {
         return false;
     };
@@ -1370,7 +1568,10 @@ pub fn append_pane_to_active(state: &mut AppState) -> Option<usize> {
         let anchor = state.active_tab_anchor_session()?;
         let mut ids = vec![anchor.clone()];
         for tab in &state.sessions {
-            if tab.id != anchor && !ids.contains(&tab.id) {
+            if state.bottom_shell_session_id.as_deref() != Some(tab.id.as_str())
+                && tab.id != anchor
+                && !ids.contains(&tab.id)
+            {
                 ids.push(tab.id.clone());
             }
         }
@@ -1702,7 +1903,9 @@ pub fn distribute_sessions_across_panes(state: &mut AppState) -> usize {
         session_ids.push(anchor);
     }
     for tab in &state.sessions {
-        if !session_ids.contains(&tab.id) {
+        if state.bottom_shell_session_id.as_deref() != Some(tab.id.as_str())
+            && !session_ids.contains(&tab.id)
+        {
             session_ids.push(tab.id.clone());
         }
     }
@@ -1799,11 +2002,35 @@ pub fn close_session(
     state.close_senders.retain(|(sid, _)| sid != id);
     state.resize_senders.remove(id);
     state.terminals.remove(id);
+    state.session_logs.remove(id);
     state.onekey_popups.remove(id);
     state.onekey_submission_feedback.remove(id);
+    state.onekey_submission_cooldown.remove(id);
+    state
+        .onekey_skip_logged
+        .retain(|(session_id, _)| session_id != id);
     state.session_connection_states.remove(id);
     state.session_configs.remove(id);
     state.pending_exit_check.remove(id);
+    state.ssh_sessions.remove(id);
+    state.sftp_clients.remove(id);
+    state.transfers.cancel_for_session(id);
+    for job_id in state
+        .transfers
+        .jobs
+        .iter()
+        .filter(|job| job.session == id)
+        .map(|job| job.id.clone())
+        .collect::<Vec<_>>()
+    {
+        if let Some(token) = state.transfer_cancellations.remove(&job_id) {
+            token.cancel();
+        }
+    }
+    if state.bottom_shell_session_id.as_deref() == Some(id) {
+        state.bottom_shell_session_id = None;
+    }
+    state.shadow_sandbox.cancel_session(id);
     state.sessions.retain(|s| s.id != id);
 
     // Capture whether the focused pane was displaying this session BEFORE
@@ -1940,11 +2167,35 @@ pub fn close_workspace(
         state.close_senders.retain(|(id, _)| id != sid);
         state.resize_senders.remove(sid);
         state.terminals.remove(sid);
+        state.session_logs.remove(sid);
         state.onekey_popups.remove(sid);
         state.onekey_submission_feedback.remove(sid);
+        state.onekey_submission_cooldown.remove(sid);
+        state
+            .onekey_skip_logged
+            .retain(|(session_id, _)| session_id != sid);
         state.session_connection_states.remove(sid);
         state.session_configs.remove(sid);
         state.pending_exit_check.remove(sid);
+        state.ssh_sessions.remove(sid);
+        state.sftp_clients.remove(sid);
+        state.transfers.cancel_for_session(sid);
+        for job_id in state
+            .transfers
+            .jobs
+            .iter()
+            .filter(|job| &job.session == sid)
+            .map(|job| job.id.clone())
+            .collect::<Vec<_>>()
+        {
+            if let Some(token) = state.transfer_cancellations.remove(&job_id) {
+                token.cancel();
+            }
+        }
+        if state.bottom_shell_session_id.as_deref() == Some(sid.as_str()) {
+            state.bottom_shell_session_id = None;
+        }
+        state.shadow_sandbox.cancel_session(sid);
     }
     state.sessions.retain(|s| !session_ids.contains(&s.id));
 
@@ -2837,6 +3088,136 @@ mod tests {
             state.active_session = Some(first_id);
         }
         state
+    }
+
+    #[test]
+    fn session_tree_builds_fallback_pane_and_marks_active_state() {
+        let state = state_with_active_session(&["alpha"]);
+
+        let tree = build_session_tree(&state);
+
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].tab_id, "alpha");
+        assert_eq!(tree[0].anchor_session_id.as_deref(), Some("alpha"));
+        assert!(tree[0].is_active);
+        assert_eq!(tree[0].panes.len(), 1);
+        assert_eq!(tree[0].panes[0].index, 0);
+        assert!(!tree[0].panes[0].is_focused);
+
+        let session = tree[0].panes[0].session.as_ref().unwrap();
+        assert_eq!(session.id, "alpha");
+        assert_eq!(session.name, "alpha");
+        assert_eq!(session.kind, SessionType::Ssh);
+        assert!(session.is_active);
+        assert_eq!(session.connection_state, SessionConnectionState::Connected);
+    }
+
+    #[test]
+    fn session_tree_keeps_empty_panes_and_shows_pane_only_sessions() {
+        let mut state = state_with_pane_sessions("alpha", &["beta"]);
+        state.layouts.insert(
+            "alpha".to_string(),
+            PaneLayout::from_preset(
+                LayoutPreset::Grid4,
+                &["alpha".to_string(), "beta".to_string()],
+            ),
+        );
+        state.focused_pane = Some(FocusedPane {
+            layout_owner_tab_id: "alpha".to_string(),
+            pane_idx: 1,
+        });
+        state
+            .session_connection_states
+            .insert("beta".to_string(), SessionConnectionState::Reconnecting);
+
+        let tree = build_session_tree(&state);
+
+        assert_eq!(tree.len(), 1);
+        assert_eq!(tree[0].panes.len(), 4);
+        assert_eq!(
+            tree[0].panes[0]
+                .session
+                .as_ref()
+                .map(|session| session.id.as_str()),
+            Some("alpha")
+        );
+        let pane_only = tree[0].panes[1].session.as_ref().unwrap();
+        assert_eq!(pane_only.id, "beta");
+        assert!(!pane_only.is_active);
+        assert_eq!(
+            pane_only.connection_state,
+            SessionConnectionState::Reconnecting
+        );
+        assert!(tree[0].panes[1].is_focused);
+        assert!(tree[0].panes[2].session.is_none());
+        assert!(tree[0].panes[3].session.is_none());
+    }
+
+    #[test]
+    fn session_tree_deduplicates_sessions_across_panes_and_workspaces() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        state.layouts.insert(
+            "alpha".to_string(),
+            PaneLayout::from_preset(
+                LayoutPreset::Grid4,
+                &["alpha".to_string(), "beta".to_string(), "alpha".to_string()],
+            ),
+        );
+
+        let tree = build_session_tree(&state);
+        let session_ids: Vec<&str> = tree
+            .iter()
+            .flat_map(|workspace| &workspace.panes)
+            .filter_map(|pane| pane.session.as_ref().map(|session| session.id.as_str()))
+            .collect();
+
+        assert_eq!(session_ids, vec!["alpha", "beta"]);
+        assert!(tree[0].panes[2].session.is_none());
+        assert_eq!(tree[1].panes.len(), 1);
+        assert!(tree[1].panes[0].session.is_none());
+    }
+
+    #[test]
+    fn session_tree_treats_stale_references_as_empty_panes() {
+        let mut state = state_with_active_session(&["alpha"]);
+        state.tabs.insert(
+            0,
+            WorkspaceTab {
+                id: "stale-tab".to_string(),
+                anchor_session_id: Some("missing-anchor".to_string()),
+            },
+        );
+        state.layouts.insert(
+            "alpha".to_string(),
+            PaneLayout::from_preset(
+                LayoutPreset::Split2H,
+                &["missing-pane-session".to_string(), "alpha".to_string()],
+            ),
+        );
+        state.focused_pane = Some(FocusedPane {
+            layout_owner_tab_id: "alpha".to_string(),
+            pane_idx: 99,
+        });
+
+        let tree = build_session_tree(&state);
+
+        assert_eq!(tree.len(), 2);
+        assert_eq!(tree[0].panes.len(), 1);
+        assert!(tree[0].panes[0].session.is_none());
+        assert_eq!(tree[1].panes.len(), 2);
+        assert!(tree[1].panes[0].session.is_none());
+        assert_eq!(
+            tree[1].panes[1]
+                .session
+                .as_ref()
+                .map(|session| session.id.as_str()),
+            Some("alpha")
+        );
+        assert!(
+            tree.iter()
+                .flat_map(|workspace| &workspace.panes)
+                .all(|pane| !pane.is_focused)
+        );
     }
 
     #[test]
@@ -3736,6 +4117,31 @@ mod tests {
     }
 
     #[test]
+    fn activate_session_switches_to_its_workspace_tab() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+
+        assert!(activate_session(&mut state, "beta"));
+        assert_eq!(state.active_tab.as_deref(), Some("beta"));
+        assert_eq!(state.active_session.as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn activate_session_focuses_a_pane_session() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+
+        assert!(activate_session(&mut state, "beta"));
+        assert_eq!(state.active_tab.as_deref(), Some("alpha"));
+        assert_eq!(focused_pane_session(&state).as_deref(), Some("beta"));
+    }
+
+    #[test]
+    fn activate_session_rejects_unknown_session() {
+        let mut state = state_with_active_session(&["alpha"]);
+        assert!(!activate_session(&mut state, "missing"));
+    }
+
+    #[test]
     fn cmd_w_closing_focused_pane_preserves_tab() {
         // Plan B + Cmd+W contract: closing a NON-anchor pane session via
         // close_session (Cmd+W) clears the pane slot but leaves the tab +
@@ -3874,6 +4280,24 @@ mod tests {
         toggle_comparison_mode(&mut state);
         let targets = broadcast_targets(&state);
         assert_eq!(targets, vec!["alpha".to_string(), "beta".to_string()]);
+    }
+
+    #[test]
+    fn command_send_targets_prefers_focused_pane_without_comparison() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        assert!(focus_pane_for_layout(&mut state, "alpha", 1));
+
+        assert_eq!(command_send_targets(&state), vec!["beta"]);
+    }
+
+    #[test]
+    fn command_send_targets_broadcasts_when_comparison_is_enabled() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        assert!(toggle_comparison_mode(&mut state).unwrap());
+
+        assert_eq!(command_send_targets(&state), vec!["alpha", "beta"]);
     }
 
     #[test]

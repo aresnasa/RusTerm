@@ -6,7 +6,9 @@ edition.workspace = true
 [dependencies]
 russh.workspace = true
 russh-config.workspace = true
+russh-sftp.workspace = true
 tokio.workspace = true
+tokio-util = { workspace = true, features = ["rt"] }
 serde.workspace = true
 tracing.workspace = true
 anyhow.workspace = true

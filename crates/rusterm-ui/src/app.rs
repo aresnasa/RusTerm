@@ -5,10 +5,12 @@ use dioxus::html::input_data::MouseButton;
 use dioxus::prelude::*;
 use parking_lot::Mutex;
 use tokio::sync::mpsc;
+use tokio_util::sync::CancellationToken;
 
 use rusterm_core::config::{
-    ConnectionConfig, ConnectionGroup, ConnectionKind, KeybindingAction, Keybindings, OneKey,
-    OneKeyStep, ShellConfig, SidebarPreferences, SkinSettings, SshAuth, SshConfig,
+    BottomPanelTab, ConnectionConfig, ConnectionGroup, ConnectionKind, DockZone, KeybindingAction,
+    Keybindings, OneKey, OneKeyStep, PanelId, RightPanelTab, ShellConfig, SidebarPreferences,
+    SkinSettings, SshAuth, SshConfig, WorkspacePreferences,
 };
 use rusterm_core::config_manager::ConfigManager;
 use rusterm_core::event::SessionEvent;
@@ -20,28 +22,40 @@ use crate::components::AiPanel;
 use crate::components::CloseConfirmationDialog;
 use crate::components::ConnectionDialog;
 use crate::components::DangerousCommandDialog;
+use crate::components::DockDragGhost;
+use crate::components::DockHiddenDropTargets;
+use crate::components::DockZoneView;
 use crate::components::MasterPasswordDialog;
 use crate::components::OneKeyManager;
 use crate::components::RestoreSessionDialog;
 use crate::components::SettingsDialog;
+use crate::components::ShadowExecutionDialog;
+use crate::components::ShadowResultDialog;
 use crate::components::Sidebar;
 use crate::components::TabBar;
 use crate::components::TerminalView;
 use crate::components::connection_dialog::NewConnectionForm;
+use crate::components::dock::{
+    DockDragState, adjusted_drop_index, dock_drag_threshold_exceeded, poll_dock_drag_state,
+    start_dock_drag,
+};
+use crate::components::{BottomToolPanel, RemoteFilesPanel, RightToolPanel};
 use crate::keybindings::action_for_event;
 use crate::layout::{PaneLayout, SplitAxis, SplitDirection};
 use crate::skin::css_variables;
 use crate::state::{
     AppState, Modal, OneKeyMatch, OneKeyPopupState, OneKeySubmissionFeedback,
-    PendingDangerousCommand, SessionConnectionState, SessionTab, TabDropOutcome, TerminalEntry,
-    UnlockState, append_pane_to_active, begin_floating_pane_move, close_pane, close_session,
-    close_workspace, distribute_sessions_across_panes, execute_tab_drop_on_pane,
-    execute_tab_drop_on_pane_at, focus_pane_for_layout, focused_pane_session,
-    move_floating_pane_for_active, move_session_to_leftmost, prepare_split_for_sidebar_drop,
-    prepare_split_for_sidebar_drop_at, push_workspace_tab, resize_layout_split,
-    scroll_sync_targets, set_active_tab, set_pane_session_for_layout, source_pane_for_copy,
-    toggle_comparison_mode, toggle_pane_zoom, toggle_split_mode,
+    PendingCommandPayload, PendingDangerousCommand, SessionConnectionState, SessionTab,
+    TabDropOutcome, TerminalEntry, UnlockState, activate_session, append_pane_to_active,
+    begin_floating_pane_move, close_pane, close_session, close_workspace, command_send_targets,
+    distribute_sessions_across_panes, execute_tab_drop_on_pane, execute_tab_drop_on_pane_at,
+    focus_pane_for_layout, focused_pane_session, move_floating_pane_for_active,
+    move_session_to_leftmost, prepare_split_for_sidebar_drop, prepare_split_for_sidebar_drop_at,
+    push_workspace_tab, resize_layout_split, scroll_sync_targets, set_active_tab,
+    set_pane_session_for_layout, source_pane_for_copy, toggle_comparison_mode, toggle_pane_zoom,
+    toggle_split_mode,
 };
+use crate::transfers::{FileEndpoint, TransferJob, TransferRequest, TransferStatus};
 
 fn save_config(state: &Signal<AppState>) {
     let s = state.read();
@@ -69,6 +83,691 @@ fn save_sidebar_preferences(state: &Signal<AppState>) {
     if let Err(error) = config_manager.save_sidebar_preferences(&preferences) {
         tracing::error!("Failed to save sidebar preferences: {}", error);
     }
+}
+
+fn save_workspace_preferences(state: &Signal<AppState>) {
+    let (config_manager, preferences) = {
+        let app = state.read();
+        (
+            app.config_manager.clone(),
+            app.workspace_preferences.clone().normalized(),
+        )
+    };
+    let Some(config_manager) = config_manager else {
+        tracing::error!("ConfigManager not initialized, cannot save workspace preferences");
+        return;
+    };
+    if let Err(error) = config_manager.save_workspace_preferences(&preferences) {
+        tracing::error!("Failed to save workspace preferences: {}", error);
+    }
+}
+
+fn update_workspace_preferences(
+    mut state: Signal<AppState>,
+    update: impl FnOnce(&mut WorkspacePreferences),
+) {
+    {
+        let mut app = state.write();
+        update(&mut app.workspace_preferences);
+        app.workspace_preferences = app.workspace_preferences.clone().normalized();
+    }
+    save_workspace_preferences(&state);
+}
+
+fn activate_workspace_panel(preferences: &mut WorkspacePreferences, panel: PanelId) {
+    let Some(zone) = preferences.dock_layout.zone_for(panel) else {
+        return;
+    };
+    preferences.dock_layout.stack_mut(zone).active = Some(panel);
+    preferences.set_zone_visible(zone, true);
+}
+
+fn update_dock_extent(preferences: &mut WorkspacePreferences, zone: DockZone, extent_px: u16) {
+    preferences.dock_layout.stack_mut(zone).extent_px = extent_px;
+    match zone {
+        DockZone::Left => {}
+        DockZone::Right => preferences.right_width_px = extent_px,
+        DockZone::Bottom => preferences.bottom_height_px = extent_px,
+    }
+}
+
+fn render_workspace_dock_panel(
+    panel: PanelId,
+    state: Signal<AppState>,
+    mut modal: Signal<Modal>,
+    input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    mut editing_conn: Signal<Option<ConnectionConfig>>,
+    mut delete_target: Signal<Option<ConnectionConfig>>,
+    drag_over_group: Option<String>,
+    tab_drag: Signal<Option<TabDragState>>,
+) -> Element {
+    let extent_px = {
+        let app = state.read();
+        app.workspace_preferences
+            .dock_layout
+            .zone_for(panel)
+            .map(|zone| app.workspace_preferences.dock_layout.stack(zone).extent_px)
+            .unwrap_or_default()
+    };
+
+    match panel {
+        PanelId::Connections => rsx! {
+            Sidebar {
+                connections: state.read().connections.clone(),
+                preferences: state.read().sidebar_preferences.clone(),
+                embedded: true,
+                drag_over_group,
+                on_preferences_change: move |preferences: SidebarPreferences| {
+                    state.write().sidebar_preferences = preferences.normalized();
+                    save_sidebar_preferences(&state);
+                },
+                on_group_change: move |(connection_id, group_id): (String, Option<String>)| {
+                    let groups = state.read().sidebar_preferences.groups.clone();
+                    let changed = assign_connection_to_group(
+                        &mut state.write().connections,
+                        &groups,
+                        &connection_id,
+                        group_id.as_deref(),
+                    );
+                    if changed {
+                        save_config(&state);
+                    }
+                },
+                on_group_delete: move |group_id: String| {
+                    let connections_changed = {
+                        let mut app = state.write();
+                        app.sidebar_preferences.groups.retain(|group| group.id != group_id);
+                        let mut changed = false;
+                        for connection in &mut app.connections {
+                            if connection.group.as_deref() == Some(group_id.as_str()) {
+                                connection.group = None;
+                                changed = true;
+                            }
+                        }
+                        changed
+                    };
+                    save_sidebar_preferences(&state);
+                    if connections_changed {
+                        save_config(&state);
+                    }
+                },
+                on_connect: move |id: String| {
+                    let connection = state
+                        .read()
+                        .connections
+                        .iter()
+                        .find(|connection| connection.id == id)
+                        .cloned();
+                    if let Some(connection) = connection {
+                        open_connection(state, input_senders, connection, None);
+                    }
+                },
+                on_new: move |_| {
+                    editing_conn.set(None);
+                    modal.set(Modal::NewConnection);
+                },
+                on_onekey: move |_| modal.set(Modal::OneKeyManager),
+                on_show_files: move |_| {
+                    update_workspace_preferences(state, |preferences| {
+                        activate_workspace_panel(preferences, PanelId::RemoteFiles);
+                    });
+                },
+                on_copy: move |id: String| {
+                    let connection = state
+                        .read()
+                        .connections
+                        .iter()
+                        .find(|connection| connection.id == id)
+                        .cloned();
+                    if let Some(connection) = connection {
+                        state.write().connections.push(ConnectionConfig {
+                            id: uuid::Uuid::new_v4().to_string(),
+                            name: format!("{} (copy)", connection.name),
+                            kind: connection.kind,
+                            group: connection.group,
+                            tags: connection.tags,
+                            onekey: connection.onekey,
+                        });
+                        save_config(&state);
+                    }
+                },
+                on_edit: move |id: String| {
+                    let connection = state
+                        .read()
+                        .connections
+                        .iter()
+                        .find(|connection| connection.id == id)
+                        .cloned();
+                    if let Some(connection) = connection {
+                        editing_conn.set(Some(connection));
+                        modal.set(Modal::NewConnection);
+                    }
+                },
+                on_delete: move |id: String| {
+                    let connection = state
+                        .read()
+                        .connections
+                        .iter()
+                        .find(|connection| connection.id == id)
+                        .cloned();
+                    if let Some(connection) = connection {
+                        delete_target.set(Some(connection));
+                    }
+                },
+                on_drag_start: move |(connection, name, x, y): (ConnectionConfig, String, f64, f64)| {
+                    start_tab_drag(tab_drag, DragKind::Connection(connection), name, x, y);
+                },
+            }
+        },
+        PanelId::RemoteFiles => rsx! {
+            RemoteFilesPanel {
+                state,
+                width_px: extent_px,
+                embedded: true,
+                on_width_change: move |_| {},
+                on_show_connections: move |_| {
+                    update_workspace_preferences(state, |preferences| {
+                        activate_workspace_panel(preferences, PanelId::Connections);
+                    });
+                },
+                on_transfer: move |request: TransferRequest| {
+                    if let Some(job_id) = enqueue_transfer(state, request) {
+                        tracing::info!("[TRANSFER] queued job {}", job_id);
+                        update_workspace_preferences(state, |preferences| {
+                            activate_workspace_panel(preferences, PanelId::Transfers);
+                        });
+                    }
+                },
+            }
+        },
+        PanelId::Sessions | PanelId::History => {
+            let active_tab = if panel == PanelId::Sessions {
+                RightPanelTab::Sessions
+            } else {
+                RightPanelTab::History
+            };
+            rsx! {
+                RightToolPanel {
+                    state,
+                    width_px: extent_px,
+                    embedded: true,
+                    active_tab,
+                    on_width_change: move |_| {},
+                    on_tab_change: move |tab: RightPanelTab| {
+                        let selected = match tab {
+                            RightPanelTab::Sessions => PanelId::Sessions,
+                            RightPanelTab::History => PanelId::History,
+                        };
+                        update_workspace_preferences(state, |preferences| {
+                            activate_workspace_panel(preferences, selected);
+                        });
+                    },
+                    on_select_session: move |session_id: String| {
+                        if activate_session(&mut state.write(), &session_id) {
+                            restore_focus_to_active_session(state, 50);
+                        }
+                    },
+                    on_run_history: move |command: String| {
+                        let sent = send_workspace_command(&state, &input_senders, &command);
+                        tracing::info!("[HISTORY-PANEL] queued command for {} session(s)", sent);
+                        restore_focus_to_active_session(state, 50);
+                    },
+                    on_close: move |_| {},
+                }
+            }
+        }
+        PanelId::Send | PanelId::EmbeddedShell | PanelId::Transfers => {
+            let active_tab = match panel {
+                PanelId::Send => BottomPanelTab::Send,
+                PanelId::EmbeddedShell => BottomPanelTab::Shell,
+                PanelId::Transfers => BottomPanelTab::Transfers,
+                _ => unreachable!(),
+            };
+            let target_label = {
+                let app = state.read();
+                let targets = command_send_targets(&app);
+                match targets.as_slice() {
+                    [] => "No active session".to_string(),
+                    [session_id] => app
+                        .sessions
+                        .iter()
+                        .find(|session| &session.id == session_id)
+                        .map(|session| session.name.clone())
+                        .unwrap_or_else(|| "Focused session".to_string()),
+                    _ => format!("{} synchronized sessions", targets.len()),
+                }
+            };
+            let shell_content = (panel == PanelId::EmbeddedShell)
+                .then(|| state.read().bottom_shell_session_id.clone())
+                .flatten()
+                .map(|session_id| render_terminal_pane(state, input_senders, session_id, true));
+            rsx! {
+                BottomToolPanel {
+                    height_px: extent_px,
+                    embedded: true,
+                    active_tab,
+                    target_label,
+                    shell_content,
+                    transfer_jobs: state.read().transfers.jobs.clone(),
+                    on_height_change: move |_| {},
+                    on_tab_change: move |tab: BottomPanelTab| {
+                        let selected = match tab {
+                            BottomPanelTab::Send => PanelId::Send,
+                            BottomPanelTab::Shell => PanelId::EmbeddedShell,
+                            BottomPanelTab::Transfers => PanelId::Transfers,
+                        };
+                        update_workspace_preferences(state, |preferences| {
+                            activate_workspace_panel(preferences, selected);
+                        });
+                    },
+                    on_send: move |command: String| {
+                        let sent = send_workspace_command(&state, &input_senders, &command);
+                        tracing::info!("[SEND-PANEL] queued command for {} session(s)", sent);
+                        restore_focus_to_active_session(state, 50);
+                    },
+                    on_open_shell: move |_| open_bottom_shell(state, input_senders),
+                    on_terminate_shell: move |_| {
+                        let session_id = state.read().bottom_shell_session_id.clone();
+                        if let Some(session_id) = session_id {
+                            close_session(
+                                &mut state.write(),
+                                &mut input_senders.write(),
+                                &session_id,
+                            );
+                        }
+                    },
+                    on_cancel_transfer: move |job_id: String| {
+                        let _ = cancel_transfer(state, &job_id);
+                    },
+                    on_retry_transfer: move |job_id: String| {
+                        let _ = retry_transfer(state, &job_id);
+                    },
+                    on_clear_transfers: move |_| {
+                        state.write().transfers.clear_finished();
+                    },
+                    on_close: move |_| {},
+                }
+            }
+        }
+    }
+}
+
+fn render_workspace_dock_zone(
+    zone: DockZone,
+    state: Signal<AppState>,
+    modal: Signal<Modal>,
+    input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    editing_conn: Signal<Option<ConnectionConfig>>,
+    delete_target: Signal<Option<ConnectionConfig>>,
+    drag_over_group: Option<String>,
+    tab_drag: Signal<Option<TabDragState>>,
+    dock_drag: Signal<Option<DockDragState>>,
+) -> Element {
+    let stack = state
+        .read()
+        .workspace_preferences
+        .dock_layout
+        .stack(zone)
+        .clone();
+    if !stack.visible || stack.panels.is_empty() {
+        return rsx! {};
+    }
+    let content = stack
+        .active
+        .map(|panel| {
+            render_workspace_dock_panel(
+                panel,
+                state,
+                modal,
+                input_senders,
+                editing_conn,
+                delete_target,
+                drag_over_group,
+                tab_drag,
+            )
+        })
+        .unwrap_or_else(|| rsx! {});
+
+    rsx! {
+        DockZoneView {
+            zone,
+            stack,
+            drag: dock_drag(),
+            content,
+            on_activate: move |panel: PanelId| {
+                update_workspace_preferences(state, |preferences| {
+                    activate_workspace_panel(preferences, panel);
+                });
+            },
+            on_hide: move |zone: DockZone| {
+                update_workspace_preferences(state, |preferences| preferences.hide_zone(zone));
+            },
+            on_extent_change: move |(zone, extent_px): (DockZone, u16)| {
+                update_workspace_preferences(state, |preferences| {
+                    update_dock_extent(preferences, zone, extent_px);
+                });
+            },
+            on_drag_start: move |(panel, x, y): (PanelId, f64, f64)| {
+                start_dock_drag(dock_drag, panel, x, y);
+            },
+        }
+    }
+}
+
+fn send_workspace_command(
+    state: &Signal<AppState>,
+    input_senders: &Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    command: &str,
+) -> usize {
+    let targets = command_send_targets(&state.read());
+    request_command_submission(
+        *state,
+        *input_senders,
+        command.to_string(),
+        targets,
+        PendingCommandPayload::FullLine,
+    )
+}
+
+fn request_command_submission(
+    mut state: Signal<AppState>,
+    input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    command: String,
+    targets: Vec<String>,
+    payload: PendingCommandPayload,
+) -> usize {
+    let command = command.trim().to_string();
+    if command.is_empty() || targets.is_empty() {
+        return 0;
+    }
+
+    let verdict = state.read().safety_checker.check(&command);
+    match verdict {
+        rusterm_core::SafetyVerdict::Safe => {
+            dispatch_approved_command(state, input_senders, command, targets, payload)
+        }
+        rusterm_core::SafetyVerdict::Warn(reason) => {
+            state.write().pending_dangerous_command = Some(PendingDangerousCommand {
+                command,
+                reason,
+                targets,
+                payload,
+            });
+            0
+        }
+        rusterm_core::SafetyVerdict::Block(reason) => {
+            tracing::warn!("[SAFETY] blocked command outright: {reason}");
+            0
+        }
+    }
+}
+
+fn dispatch_approved_command(
+    mut state: Signal<AppState>,
+    input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    command: String,
+    targets: Vec<String>,
+    payload: PendingCommandPayload,
+) -> usize {
+    let bytes = match &payload {
+        PendingCommandPayload::EnterOnly(bytes) => bytes.clone(),
+        PendingCommandPayload::FullLine => format!("{command}\r").into_bytes(),
+    };
+    let mut sent = 0;
+    for session_id in targets {
+        let history_id = uuid::Uuid::new_v4().to_string();
+        {
+            let mut app = state.write();
+            let queue = app
+                .pending_exit_check
+                .entry(session_id.clone())
+                .or_default();
+            const MAX_PENDING: usize = 32;
+            while queue.len() >= MAX_PENDING {
+                queue.pop_front();
+            }
+            queue.push_back((command.clone(), history_id.clone()));
+            if let Some(log) = app.session_logs.get(&session_id) {
+                log.lock().log_input(&bytes);
+            }
+        }
+
+        let send_ok = input_senders
+            .read()
+            .get(&session_id)
+            .cloned()
+            .is_some_and(|sender| sender.send(bytes.clone()).is_ok());
+        if send_ok {
+            sent += 1;
+        } else {
+            let mut app = state.write();
+            if let Some(queue) = app.pending_exit_check.get_mut(&session_id) {
+                if queue.back().is_some_and(|(_, id)| id == &history_id) {
+                    queue.pop_back();
+                }
+            }
+            tracing::warn!("[COMMAND] target session unavailable: {session_id}");
+        }
+    }
+    sent
+}
+
+fn enqueue_transfer(mut state: Signal<AppState>, request: TransferRequest) -> Option<String> {
+    if request.source.direction_to(&request.destination).is_none() {
+        tracing::warn!("[TRANSFER] rejected request with incompatible endpoints");
+        return None;
+    }
+
+    let job_id = uuid::Uuid::new_v4().to_string();
+    if !state.write().transfers.enqueue(
+        job_id.clone(),
+        request.session,
+        request.source,
+        request.destination,
+        request.total,
+    ) {
+        return None;
+    }
+    pump_transfer_queue(state);
+    Some(job_id)
+}
+
+fn cancel_transfer(mut state: Signal<AppState>, job_id: &str) -> bool {
+    let cancelled = state.write().transfers.cancel(job_id);
+    if cancelled {
+        if let Some(token) = state.write().transfer_cancellations.remove(job_id) {
+            token.cancel();
+        }
+        pump_transfer_queue(state);
+    }
+    cancelled
+}
+
+fn retry_transfer(mut state: Signal<AppState>, job_id: &str) -> bool {
+    let retried = state.write().transfers.retry(job_id);
+    if retried {
+        pump_transfer_queue(state);
+    }
+    retried
+}
+
+fn pump_transfer_queue(mut state: Signal<AppState>) {
+    loop {
+        let Some(job) = ({ state.write().transfers.start_next().cloned() }) else {
+            break;
+        };
+        let cancellation = CancellationToken::new();
+        state
+            .write()
+            .transfer_cancellations
+            .insert(job.id.clone(), cancellation.clone());
+        spawn(async move {
+            let result = run_transfer_job(state, job.clone(), cancellation).await;
+            {
+                let mut app = state.write();
+                app.transfer_cancellations.remove(&job.id);
+                let already_cancelled = app
+                    .transfers
+                    .find(&job.id)
+                    .is_some_and(|queued| queued.status == TransferStatus::Cancelled);
+                if !already_cancelled {
+                    match result {
+                        Ok(bytes) => {
+                            let _ = app.transfers.report_progress(&job.id, bytes);
+                            let _ = app.transfers.succeed(&job.id);
+                        }
+                        Err(rusterm_ssh::SftpError::Cancelled) => {
+                            let _ = app.transfers.cancel(&job.id);
+                        }
+                        Err(error) => {
+                            let _ = app.transfers.fail(&job.id, error.to_string());
+                            if matches!(
+                                error,
+                                rusterm_ssh::SftpError::Connection(_)
+                                    | rusterm_ssh::SftpError::ConnectionLost(_)
+                                    | rusterm_ssh::SftpError::Timeout
+                            ) {
+                                app.sftp_clients.remove(&job.session);
+                            }
+                        }
+                    }
+                }
+            }
+            pump_transfer_queue(state);
+        });
+    }
+}
+
+async fn run_transfer_job(
+    mut state: Signal<AppState>,
+    job: TransferJob,
+    cancellation: CancellationToken,
+) -> Result<u64, rusterm_ssh::SftpError> {
+    let client = if let Some(client) = state.read().sftp_clients.get(&job.session).cloned() {
+        client
+    } else {
+        let ssh_session = state
+            .read()
+            .ssh_sessions
+            .get(&job.session)
+            .cloned()
+            .ok_or_else(|| {
+                rusterm_ssh::SftpError::Connection("SSH session is not connected".to_string())
+            })?;
+        let opened = ssh_session.open_sftp().await?;
+        let mut app = state.write();
+        if !app.ssh_sessions.contains_key(&job.session) {
+            return Err(rusterm_ssh::SftpError::ConnectionLost(
+                "SSH session disconnected while SFTP was opening".to_string(),
+            ));
+        }
+        app.sftp_clients
+            .entry(job.session.clone())
+            .or_insert_with(|| opened.clone())
+            .clone()
+    };
+
+    let progress_job_id = job.id.clone();
+    let mut progress_state = state;
+    let on_progress = move |bytes| {
+        let _ = progress_state
+            .write()
+            .transfers
+            .report_progress(&progress_job_id, bytes);
+    };
+
+    match (&job.source, &job.destination) {
+        (FileEndpoint::Local(local), FileEndpoint::Remote(remote)) => client
+            .upload_with_progress(local, remote.clone(), cancellation, on_progress)
+            .await
+            .map(|result| result.bytes_transferred),
+        (FileEndpoint::Remote(remote), FileEndpoint::Local(local)) => client
+            .download_with_progress(remote.clone(), local, cancellation, on_progress)
+            .await
+            .map(|result| result.bytes_transferred),
+        _ => Err(rusterm_ssh::SftpError::InvalidPath(
+            "transfer endpoints must be one local and one remote path".to_string(),
+        )),
+    }
+}
+
+/// Ask one configured provider for command suggestions. Terminal results enter
+/// the request only through `ShadowSandbox::llm_context`, which contains exclusively
+/// the results approved in the second confirmation dialog.
+fn request_ai_suggestions(
+    state: Signal<AppState>,
+    mut modal: Signal<Modal>,
+    mut ai_suggestions: Signal<Vec<rusterm_ai::suggestion::AiSuggestion>>,
+    mut ai_status: Signal<String>,
+) {
+    modal.set(Modal::AiSuggest);
+    ai_suggestions.set(Vec::new());
+
+    let (partial, approved_context) = {
+        let snapshot = state.read();
+        let session_id =
+            focused_pane_session(&snapshot).or_else(|| snapshot.active_session.clone());
+        let partial = session_id
+            .and_then(|session_id| snapshot.terminals.get(&session_id).cloned())
+            .map(|terminal| terminal.lock().terminal.extract_current_line())
+            .map(|line| strip_prompt(line.trim()))
+            .unwrap_or_default();
+        (partial, snapshot.shadow_sandbox.llm_context())
+    };
+
+    let openai_key = std::env::var("OPENAI_API_KEY")
+        .ok()
+        .filter(|key| !key.trim().is_empty());
+    let anthropic_key = std::env::var("ANTHROPIC_API_KEY")
+        .ok()
+        .filter(|key| !key.trim().is_empty());
+    if openai_key.is_none() && anthropic_key.is_none() {
+        ai_status.set(
+            "未配置模型：请在启动环境中设置 OPENAI_API_KEY 或 ANTHROPIC_API_KEY。".to_string(),
+        );
+        return;
+    }
+
+    ai_status.set("正在请求模型建议；仅发送已授权的执行结果…".to_string());
+    spawn(async move {
+        let mut engine = rusterm_ai::SuggestionEngine::new();
+        let provider = if let Some(api_key) = openai_key {
+            engine.with_openai(rusterm_ai::OpenAIClient::new(
+                rusterm_ai::openai::OpenAISettings {
+                    api_key,
+                    base_url: std::env::var("OPENAI_BASE_URL").ok(),
+                    model: std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o".to_string()),
+                },
+            ));
+            rusterm_ai::suggestion::AiProvider::OpenAI
+        } else if let Some(api_key) = anthropic_key {
+            engine.with_anthropic(rusterm_ai::AnthropicClient::new(
+                rusterm_ai::anthropic::AnthropicSettings {
+                    api_key,
+                    base_url: std::env::var("ANTHROPIC_BASE_URL").ok(),
+                    model: std::env::var("ANTHROPIC_MODEL")
+                        .unwrap_or_else(|_| "claude-sonnet-4-20250514".to_string()),
+                },
+            ));
+            rusterm_ai::suggestion::AiProvider::Anthropic
+        } else {
+            return;
+        };
+
+        match engine.suggest(&approved_context, &partial, provider).await {
+            Ok(suggestions) => {
+                let count = suggestions.len();
+                ai_suggestions.set(suggestions);
+                ai_status.set(format!(
+                    "模型返回 {count} 条建议。建议不会自动执行，请逐条审查。"
+                ));
+            }
+            Err(error) => {
+                tracing::warn!("[SHADOW-SANDBOX] model suggestion failed: {}", error);
+                ai_status.set(format!("模型请求失败：{error}"));
+            }
+        }
+    });
 }
 
 /// Execute a user-configured application shortcut. This only covers safe,
@@ -267,13 +966,16 @@ fn scroll_terminal_sessions(
     source_session_id: &str,
     rows: usize,
     scroll_up: bool,
+    isolated: bool,
 ) {
     let (targets, terminals) = {
         let app_state = state.read();
-        (
-            scroll_sync_targets(&app_state, source_session_id),
-            app_state.terminals.clone(),
-        )
+        let targets = if isolated {
+            vec![source_session_id.to_string()]
+        } else {
+            scroll_sync_targets(&app_state, source_session_id)
+        };
+        (targets, app_state.terminals.clone())
     };
 
     let renders = targets
@@ -318,9 +1020,17 @@ fn scroll_terminal_sessions(
 /// closed mid-render.
 fn render_terminal_pane(
     mut state: Signal<AppState>,
-    input_senders: Signal<std::collections::HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    mut input_senders: Signal<std::collections::HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
     session_id: String,
+    isolated: bool,
 ) -> Element {
+    let embedded_session = state.read().bottom_shell_session_id.clone();
+    if (!isolated && embedded_session.as_deref() == Some(session_id.as_str()))
+        || (isolated && embedded_session.as_deref() != Some(session_id.as_str()))
+    {
+        tracing::warn!("refusing to mount session {session_id} in the wrong terminal placement");
+        return rsx! { div {} };
+    }
     let tabs = &state.read().sessions;
     match tabs.iter().find(|t| t.id == session_id) {
         Some(tab) => {
@@ -384,7 +1094,17 @@ fn render_terminal_pane(
                     suggestion_visible: tab.suggestion_visible,
                     keybindings,
                     on_keybinding: move |action: KeybindingAction| {
-                        run_keybinding_action(action, state, input_senders);
+                        if isolated {
+                            if action == KeybindingAction::CloseFocusedPane {
+                                close_session(
+                                    &mut state.write(),
+                                    &mut input_senders.write(),
+                                    &session_id,
+                                );
+                            }
+                        } else {
+                            run_keybinding_action(action, state, input_senders);
+                        }
                     },
                     on_resize: move |(cols, rows, pw, ph): (u16, u16, u32, u32)| {
                         let terminals = state.read().terminals.clone();
@@ -418,51 +1138,38 @@ fn render_terminal_pane(
                             is_enter,
                             data.len()
                         );
-                        // --- Dangerous-command protection (feature #17) ---
-                        // Before sending Enter to the PTY, run the current
-                        // input line through the safety checker. If the verdict
-                        // is `Warn`, DON'T send Enter — instead stash the
-                        // pending command + reason and show a confirmation
-                        // modal. The modal's "继续" button sends the original
-                        // Enter; "取消" discards it.
-                        //
-                        // We only check on Enter (not every keystroke) to
-                        // avoid false positives on partial input and to keep
-                        // the check cheap.
-                        //
-                        // Multi-line inputs (shell `\` continuations) are a
-                        // known limitation — we only see the current line. See
-                        // `command_safety.rs` docs for the trade-off.
+                        // Enter is a command submission, not raw input. Route it
+                        // through the shared safety/history/Compare dispatcher so
+                        // panel, history, AI and terminal submissions have the same
+                        // semantics and failed sends cannot poison the exit-code FIFO.
                         if is_enter {
                             let line = {
                                 let terminals = state_for_cmd.read().terminals.clone();
                                 terminals
                                     .get(&sid_clone)
-                                    .map(|h| h.lock().terminal.extract_current_line())
+                                    .map(|handle| handle.lock().terminal.extract_current_line())
                                     .unwrap_or_default()
                             };
-                            let cmd = strip_prompt(line.trim()).to_string();
-                            if !cmd.is_empty() {
-                                let verdict = state_for_cmd.read().safety_checker.check(&cmd);
-                                if let rusterm_core::SafetyVerdict::Warn(reason) = verdict {
-                                    tracing::info!(
-                                        "[SAFETY] blocked dangerous command: session={} cmd={:?} reason={}",
-                                        &sid_clone[..sid_clone.len().min(8)],
-                                        cmd,
-                                        reason
-                                    );
-                                    state_for_cmd.write().pending_dangerous_command = Some(
-                                        PendingDangerousCommand {
-                                            command: cmd,
-                                            reason,
-                                            session_id: sid_clone.clone(),
-                                        }
-                                    );
-                                    // Return WITHOUT sending — the modal's
-                                    // "继续" button will re-send the Enter if
-                                    // the user confirms.
-                                    return;
-                                }
+                            let command = strip_prompt(line.trim()).to_string();
+                            if !command.is_empty() {
+                                let comparison_targets = if isolated {
+                                    vec![sid_clone.clone()]
+                                } else {
+                                    let targets = crate::state::broadcast_targets(&state_for_cmd.read());
+                                    if targets.len() > 1 {
+                                        targets
+                                    } else {
+                                        vec![sid_clone.clone()]
+                                    }
+                                };
+                                let _ = request_command_submission(
+                                    state_for_cmd,
+                                    senders,
+                                    command,
+                                    comparison_targets,
+                                    PendingCommandPayload::EnterOnly(data),
+                                );
+                                return;
                             }
                         }
                         // Log input
@@ -504,8 +1211,12 @@ fn render_terminal_pane(
                         // would surface a popup mid-navigation and hijack the
                         // next arrow keypress).
                         let is_arrow = is_arrow_key_seq(&data);
-                        let broadcast_targets = crate::state::broadcast_targets(&state_for_cmd.read());
-                        let is_broadcast = broadcast_targets.len() > 1;
+                        let broadcast_targets = if isolated {
+                            vec![sid_clone.clone()]
+                        } else {
+                            crate::state::broadcast_targets(&state_for_cmd.read())
+                        };
+                        let is_broadcast = !isolated && broadcast_targets.len() > 1;
                         if is_broadcast {
                             tracing::info!(
                                 "[INPUT] comparison mode ON — broadcasting to {} sessions",
@@ -753,76 +1464,26 @@ fn render_terminal_pane(
                         }
                     },
                     on_command: move |_: String| {
-                        tracing::info!(
-                            "[COMMAND] Enter pressed, session={}",
-                            &sid_for_cmd[..sid_for_cmd.len().min(8)]
-                        );
-                        // Clear suggestion on Enter
-                        state_for_cmd.write().sessions.iter_mut()
-                            .find(|t| t.id == sid_for_cmd)
+                        // Enter submission is handled atomically by `on_input`.
+                        // This callback only clears suggestion UI; keeping history
+                        // enqueueing here would race dangerous-command approval.
+                        state_for_cmd
+                            .write()
+                            .sessions
+                            .iter_mut()
+                            .find(|tab| tab.id == sid_for_cmd)
                             .map(|tab| {
                                 tab.suggestion = None;
                                 tab.suggestions = Vec::new();
                                 tab.suggestion_visible = false;
                                 tab.suggestion_selected = 0;
                             });
-
-                        let terminals = state_for_cmd.read().terminals.clone();
-                        if let Some(handle) = terminals.get(&sid_for_cmd) {
-                            let raw_line = handle.lock().terminal.extract_current_line();
-                            let cmd = strip_prompt(raw_line.trim());
-                            tracing::info!(
-                                "[COMMAND] session={} raw_line={:?} cmd={:?}",
-                                &sid_for_cmd[..sid_for_cmd.len().min(8)],
-                                raw_line,
-                                cmd
-                            );
-                            if !cmd.is_empty() {
-                                // DEFERRED RECORDING — do NOT push to
-                                // command_history or save to DB yet. The
-                                // command might fail (typos, broken
-                                // commands), and the user explicitly
-                                // doesn't want failed commands showing
-                                // up in suggestions. Instead, queue it
-                                // and wait for the shell's OSC 133;D
-                                // exit-code report (shell integration).
-                                // Only on rc==0 will we commit the
-                                // command to history + DB. On rc!=0 we
-                                // silently drop it. If the shell never
-                                // emits OSC 133;D, the entry stays
-                                // queued until the per-session cap
-                                // (MAX_PENDING below) evicts it — by
-                                // design, we'd rather suggest nothing
-                                // than suggest failed commands.
-                                let entry_id = uuid::Uuid::new_v4().to_string();
-                                let mut s = state_for_cmd.write();
-                                let queue = s
-                                    .pending_exit_check
-                                    .entry(sid_for_cmd.clone())
-                                    .or_default();
-                                // Defensive cap: if the shell never emits
-                                // OSC 133;D (no shell integration, or
-                                // integration not yet loaded), the queue
-                                // would grow unboundedly. Drop the oldest
-                                // entry to keep the queue bounded — those
-                                // dropped entries are commands we couldn't
-                                // confirm succeeded, so dropping them is
-                                // consistent with "never suggest failed
-                                // commands". 32 is plenty for any
-                                // realistic prompt-then-Enter burst.
-                                const MAX_PENDING: usize = 32;
-                                while queue.len() >= MAX_PENDING {
-                                    queue.pop_front();
-                                }
-                                queue.push_back((cmd, entry_id));
-                            }
-                        }
                     },
                     on_scroll_up: move |rows: usize| {
-                        scroll_terminal_sessions(state, &sid_for_scroll_up, rows, true);
+                        scroll_terminal_sessions(state, &sid_for_scroll_up, rows, true, isolated);
                     },
                     on_scroll_down: move |rows: usize| {
-                        scroll_terminal_sessions(state, &sid_for_scroll_down, rows, false);
+                        scroll_terminal_sessions(state, &sid_for_scroll_down, rows, false, isolated);
                     },
                     on_scroll_to_bottom: move |_: ()| {
                         let terminals = state_for_cmd.read().terminals.clone();
@@ -1503,7 +2164,7 @@ fn single_pane_with_drop(
                 tracing::debug!("[DROP-SINGLE] received drop with no recognized MIME type");
             },
             {drop_overlay}
-            {render_terminal_pane(state, input_senders, render_sid)}
+            {render_terminal_pane(state, input_senders, render_sid, false)}
         }
     }
 }
@@ -1987,7 +2648,8 @@ async fn poll_split_drag_state() -> Option<(f64, f64, bool)> {
 /// (rare: the active session's pane might have been swapped out during
 /// a drag-and-drop rearrangement), the `?.focus()` is a no-op.
 fn restore_focus_to_active_session(state: Signal<AppState>, delay_ms: u64) {
-    let active_sid = state.read().active_session.clone();
+    let active_sid =
+        focused_pane_session(&state.read()).or_else(|| state.read().active_session.clone());
     if let Some(sid) = active_sid {
         spawn(async move {
             tokio::time::sleep(std::time::Duration::from_millis(delay_ms)).await;
@@ -3164,6 +3826,9 @@ fn empty_pane_title_actions(
                         target_pane_idx,
                     );
                     state.write().sidebar_open = true;
+                    update_workspace_preferences(state, |preferences| {
+                        activate_workspace_panel(preferences, PanelId::Connections);
+                    });
                 },
                 "+"
             }
@@ -4359,7 +5024,7 @@ fn multi_pane_container(
                                 }
                             }
                         } else {
-                            {render_terminal_pane(state, input_senders, session_id.clone())}
+                            {render_terminal_pane(state, input_senders, session_id.clone(), false)}
                         }
                     }
                 }
@@ -6000,10 +6665,13 @@ fn start_ssh_connection(
 
         match client.connect(tab_id.clone(), initial_size).await {
             Ok((session, ssh_session)) => {
-                state
-                    .write()
-                    .session_connection_states
-                    .insert(tab_id.clone(), SessionConnectionState::Connected);
+                {
+                    let mut app = state.write();
+                    app.session_connection_states
+                        .insert(tab_id.clone(), SessionConnectionState::Connected);
+                    app.ssh_sessions.insert(tab_id.clone(), ssh_session.clone());
+                    app.sftp_clients.remove(&tab_id);
+                }
                 input_senders
                     .write()
                     .insert(tab_id.clone(), session.input_tx.clone());
@@ -6613,6 +7281,9 @@ fn start_ssh_connection(
                             if capturing {
                                 continue;
                             }
+                            // Shadow-sandbox capture starts only after explicit
+                            // execution approval and is scoped to this session.
+                            state.write().shadow_sandbox.record_output(&id, &data);
                             // Log output
                             {
                                 let logs = state.read().session_logs.clone();
@@ -6630,6 +7301,12 @@ fn start_ssh_connection(
                                         entry.terminal.cwd().map(|p| p.to_path_buf()),
                                     )
                                 };
+                                if let Some(exit_code) = exit_code {
+                                    let _ = state
+                                        .write()
+                                        .shadow_sandbox
+                                        .finish_execution(&id, exit_code);
+                                }
                                 // Shell integration (OSC 133;D): DEFERRED RECORDING.
                                 // Commands are queued in `pending_exit_check` when Enter is
                                 // pressed (see on_command). Only now, when the shell reports
@@ -6888,6 +7565,28 @@ fn start_ssh_connection(
                             check_onekey_match(state, &id, &data);
                         }
                         SessionEvent::Disconnected(id, reason) => {
+                            {
+                                let mut app = state.write();
+                                let _ = app
+                                    .shadow_sandbox
+                                    .fail_execution(&id, format!("会话断开：{reason}"));
+                                app.ssh_sessions.remove(&id);
+                                app.sftp_clients.remove(&id);
+                                app.transfers.cancel_for_session(&id);
+                                let job_ids = app
+                                    .transfers
+                                    .jobs
+                                    .iter()
+                                    .filter(|job| job.session == id)
+                                    .map(|job| job.id.clone())
+                                    .collect::<Vec<_>>();
+                                for job_id in job_ids {
+                                    if let Some(token) = app.transfer_cancellations.remove(&job_id)
+                                    {
+                                        token.cancel();
+                                    }
+                                }
+                            }
                             input_senders.write().remove(&id);
                             let msg = format!(
                                 "\r\n--- Disconnected: {} ---\r\nPress Enter to reconnect.\r\n",
@@ -7084,6 +7783,7 @@ fn start_shell_connection(
                             if data.is_empty() {
                                 continue;
                             }
+                            state.write().shadow_sandbox.record_output(&id, &data);
                             {
                                 let logs = state.read().session_logs.clone();
                                 if let Some(log) = logs.get(&id) {
@@ -7100,6 +7800,12 @@ fn start_shell_connection(
                                         entry.terminal.cwd().map(|p| p.to_path_buf()),
                                     )
                                 };
+                                if let Some(exit_code) = exit_code {
+                                    let _ = state
+                                        .write()
+                                        .shadow_sandbox
+                                        .finish_execution(&id, exit_code);
+                                }
                                 // Shell integration (OSC 133;D): DEFERRED RECORDING.
                                 // Commands are queued in `pending_exit_check` when Enter is
                                 // pressed (see on_command). Only now, when the shell reports
@@ -7328,6 +8034,10 @@ fn start_shell_connection(
                             check_onekey_match(state, &id, &data);
                         }
                         SessionEvent::Disconnected(id, reason) => {
+                            let _ = state
+                                .write()
+                                .shadow_sandbox
+                                .fail_execution(&id, format!("会话断开：{reason}"));
                             input_senders.write().remove(&id);
                             let msg = format!(
                                 "\r\n--- Disconnected: {} ---\r\nPress Enter to reconnect.\r\n",
@@ -7513,61 +8223,94 @@ fn create_terminal_with_size(id: String, size: TerminalSize, state: &mut Signal<
     }
 }
 
-/// Open the computer's local shell (the user's default $SHELL — zsh on macOS,
-/// bash/zsh on Linux) as a new session tab. Triggered by the "Local" button in
-/// the status bar. `command: None` makes the PTY spawn the default prog.
-fn open_local_terminal(
-    mut state: Signal<AppState>,
-    input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
-) {
-    let tab_id = uuid::Uuid::new_v4().to_string();
+fn create_local_shell_session(state: &mut Signal<AppState>, embedded: bool) -> String {
+    let session_id = uuid::Uuid::new_v4().to_string();
     let shell_config = ShellConfig {
-        command: None, // default prog = user's $SHELL (zsh/bash)
+        command: None,
         args: Vec::new(),
         env: Vec::new(),
         working_dir: None,
     };
-    create_terminal(tab_id.clone(), &mut state);
-    // Remember the config so this local shell can be reconnected by pressing
-    // Enter after it exits/disconnects.
-    state.write().session_configs.insert(
-        tab_id.clone(),
-        ConnectionConfig {
-            id: tab_id.clone(),
-            name: "Local".to_string(),
-            kind: ConnectionKind::Shell(shell_config.clone()),
-            group: None,
-            tags: Vec::new(),
-            onekey: false,
-        },
-    );
-
-    // No "Starting local shell..." banner — keep the local terminal clean
-    // (the shell prints its own prompt once it starts).
-    let render_output = Default::default();
-    state.write().sessions.push(SessionTab {
-        id: tab_id.clone(),
-        name: "Local".to_string(),
-        kind: SessionType::Shell,
-        render_output,
-        version: 1,
-        suggestion: None,
-        suggestions: Vec::new(),
-        suggestion_selected: 0,
-        suggestion_visible: false,
-        command_history: Vec::new(),
-        hostname: Some("local".to_string()),
-        cwd: None,
-    });
-    // No explicit pane target → this is a new top-level workspace tab.
-    // push_workspace_tab creates the WorkspaceTab + sets active_tab +
-    // active_session (anchor).
+    create_terminal(session_id.clone(), state);
+    let name = if embedded { "Bottom Shell" } else { "Local" };
     {
-        let mut s = state.write();
-        push_workspace_tab(&mut s, &tab_id);
+        let mut app = state.write();
+        app.session_configs.insert(
+            session_id.clone(),
+            ConnectionConfig {
+                id: session_id.clone(),
+                name: name.to_string(),
+                kind: ConnectionKind::Shell(shell_config),
+                group: None,
+                tags: Vec::new(),
+                onekey: false,
+            },
+        );
+        app.sessions.push(SessionTab {
+            id: session_id.clone(),
+            name: name.to_string(),
+            kind: SessionType::Shell,
+            render_output: Default::default(),
+            version: 1,
+            suggestion: None,
+            suggestions: Vec::new(),
+            suggestion_selected: 0,
+            suggestion_visible: false,
+            command_history: Vec::new(),
+            hostname: Some("local".to_string()),
+            cwd: None,
+        });
+        if embedded {
+            app.bottom_shell_session_id = Some(session_id.clone());
+        }
     }
+    session_id
+}
 
-    start_shell_connection(state, input_senders, tab_id, shell_config);
+fn open_bottom_shell(
+    mut state: Signal<AppState>,
+    input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+) {
+    if state
+        .read()
+        .bottom_shell_session_id
+        .as_ref()
+        .is_some_and(|session_id| {
+            state
+                .read()
+                .sessions
+                .iter()
+                .any(|tab| &tab.id == session_id)
+        })
+    {
+        return;
+    }
+    let session_id = create_local_shell_session(&mut state, true);
+    let shell_config = ShellConfig {
+        command: None,
+        args: Vec::new(),
+        env: Vec::new(),
+        working_dir: None,
+    };
+    start_shell_connection(state, input_senders, session_id, shell_config);
+}
+
+fn open_local_terminal(
+    mut state: Signal<AppState>,
+    input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+) {
+    let session_id = create_local_shell_session(&mut state, false);
+    {
+        let mut app = state.write();
+        push_workspace_tab(&mut app, &session_id);
+    }
+    let shell_config = ShellConfig {
+        command: None,
+        args: Vec::new(),
+        env: Vec::new(),
+        working_dir: None,
+    };
+    start_shell_connection(state, input_senders, session_id, shell_config);
 }
 
 /// Restore sessions from a saved `SessionState` snapshot.
@@ -8394,6 +9137,7 @@ pub fn App() -> Element {
     let mut state = use_signal(AppState::default);
     let mut modal = use_signal(|| Modal::None);
     let ai_suggestions = use_signal(Vec::<rusterm_ai::suggestion::AiSuggestion>::new);
+    let mut ai_status = use_signal(|| "模型建议不会自动执行。".to_string());
     let mut input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>> =
         use_signal(HashMap::new);
     // Connection currently being edited in the ConnectionDialog. `None` means
@@ -8501,6 +9245,11 @@ pub fn App() -> Element {
     // the polling loop cleans up the signal and the tab's `onclick`
     // fires normally.
     let mut tab_drag: Signal<Option<TabDragState>> = use_signal(|| None);
+
+    // Peripheral tool-panel drag. This uses a separate document-capture JS
+    // channel from terminal tab drag, so the two gestures cannot clobber each
+    // other's cursor or release state.
+    let mut dock_drag: Signal<Option<DockDragState>> = use_signal(|| None);
 
     // Active freeform pane-window move. This is deliberately separate from
     // `tab_drag`: the ⠿ handle moves the window, while the title text keeps
@@ -8730,6 +9479,53 @@ pub fn App() -> Element {
                 }
             }
             // 16ms = ~60Hz. Fast enough for smooth dragging.
+            tokio::time::sleep(std::time::Duration::from_millis(16)).await;
+        }
+    });
+
+    // Dock tabs use the same proven document-level capture + ~60Hz polling
+    // design as terminal tabs, but hit-test real dock/tab DOM rectangles.
+    let _dock_drag_poll = use_future(move || async move {
+        loop {
+            if dock_drag().is_none() {
+                tokio::time::sleep(std::time::Duration::from_millis(32)).await;
+                continue;
+            }
+            if let Some((x, y, done, target)) = poll_dock_drag_state().await {
+                let Some(current) = dock_drag() else {
+                    continue;
+                };
+                let dragging = current.dragging
+                    || dock_drag_threshold_exceeded(current.start_x, current.start_y, x, y);
+                let updated = DockDragState {
+                    cur_x: x,
+                    cur_y: y,
+                    dragging,
+                    target,
+                    ..current
+                };
+                dock_drag.set(Some(updated.clone()));
+
+                if done {
+                    if dragging {
+                        if let Some(target) = target {
+                            let target_index = {
+                                let app = state.read();
+                                adjusted_drop_index(
+                                    &app.workspace_preferences.dock_layout,
+                                    updated.panel,
+                                    target,
+                                )
+                            };
+                            update_workspace_preferences(state, |preferences| {
+                                preferences.move_panel(updated.panel, target.zone, target_index);
+                            });
+                        }
+                    }
+                    dock_drag.set(None);
+                    continue;
+                }
+            }
             tokio::time::sleep(std::time::Duration::from_millis(16)).await;
         }
     });
@@ -9177,6 +9973,7 @@ pub fn App() -> Element {
                                     cm.load_sidebar_preferences(),
                                     &connections,
                                 );
+                                let workspace_preferences = cm.load_workspace_preferences();
                                 // If even one step fails to decrypt, load_onekeys
                                 // returns Err and (without this) unwrap_or_default
                                 // would silently empty the whole library → no
@@ -9206,6 +10003,7 @@ pub fn App() -> Element {
                                 s.skin = cm.load_skin_settings();
                                 s.config_manager = Some(cm);
                                 s.sidebar_preferences = sidebar_preferences;
+                                s.workspace_preferences = workspace_preferences;
                                 s.connections = connections;
                                 s.onekeys = onekeys;
                                 s.unlock_state = UnlockState::Unlocked;
@@ -9442,107 +10240,17 @@ pub fn App() -> Element {
                 }
             },
 
-            // Sidebar
-            {rsx! {
-                Sidebar {
-                    connections: state.read().connections.clone(),
-                    preferences: state.read().sidebar_preferences.clone(),
-                    drag_over_group: drag_over_group(),
-                    on_preferences_change: move |preferences: SidebarPreferences| {
-                        state.write().sidebar_preferences = preferences.normalized();
-                        save_sidebar_preferences(&state);
-                    },
-                    on_group_change: move |(connection_id, group_id): (String, Option<String>)| {
-                        let groups = state.read().sidebar_preferences.groups.clone();
-                        let changed = assign_connection_to_group(
-                            &mut state.write().connections,
-                            &groups,
-                            &connection_id,
-                            group_id.as_deref(),
-                        );
-                        if changed {
-                            save_config(&state);
-                        }
-                    },
-                    on_group_delete: move |group_id: String| {
-                        let connections_changed = {
-                            let mut app = state.write();
-                            app.sidebar_preferences.groups.retain(|group| group.id != group_id);
-                            let mut changed = false;
-                            for connection in &mut app.connections {
-                                if connection.group.as_deref() == Some(group_id.as_str()) {
-                                    connection.group = None;
-                                    changed = true;
-                                }
-                            }
-                            changed
-                        };
-                        save_sidebar_preferences(&state);
-                        if connections_changed {
-                            save_config(&state);
-                        }
-                    },
-                    on_connect: move |id: String| {
-                        let conn = state.read().connections.iter().find(|c| c.id == id).cloned();
-                        if let Some(conn) = conn {
-                            // No explicit pane target means the connection
-                            // opens as a new active tab. Pane-drop flows pass a
-                            // stable layout owner + pane index instead.
-                            open_connection(state, input_senders, conn, None);
-                        }
-                    },
-                    on_new: move |_| {
-                        editing_conn.set(None);
-                        modal.set(Modal::NewConnection);
-                    },
-                    on_onekey: move |_| {
-                        modal.set(Modal::OneKeyManager);
-                    },
-                    on_copy: move |id: String| {
-                        let conn = state.read().connections.iter().find(|c| c.id == id).cloned();
-                        if let Some(conn) = conn {
-                            let new_id = uuid::Uuid::new_v4().to_string();
-                            let new_name = format!("{} (copy)", conn.name);
-                            let copied = ConnectionConfig {
-                                id: new_id.clone(),
-                                name: new_name,
-                                kind: conn.kind.clone(),
-                                group: conn.group.clone(),
-                                tags: conn.tags.clone(),
-                                onekey: conn.onekey,
-                            };
-                            state.write().connections.push(copied);
-                            save_config(&state);
-                        }
-                    },
-                    on_edit: move |id: String| {
-                        let conn = state.read().connections.iter().find(|c| c.id == id).cloned();
-                        if let Some(conn) = conn {
-                            editing_conn.set(Some(conn));
-                            modal.set(Modal::NewConnection);
-                        }
-                    },
-                    on_delete: move |id: String| {
-                        let conn = state.read().connections.iter().find(|c| c.id == id).cloned();
-                        if let Some(conn) = conn {
-                            delete_target.set(Some(conn));
-                        }
-                    },
-                    // Sidebar → pane drag (Task 22 extension): replaces the
-                    // prior HTML5 `ondragstart` + `ondrop` wiring that
-                    // was unreliable in dioxus 0.7's desktop webview.
-                    // `onmousedown` on a ConnItem hands the connection
-                    // config + cursor position to `start_tab_drag`, which
-                    // installs the document-level JS listeners. The polling
-                    // `use_future` takes over and `finish_tab_drag` opens
-                    // the connection in the hit-test pane. Plain
-                    // click-to-connect still works (the polling loop only
-                    // fires the drop if the cursor crossed the threshold).
-                    on_drag_start: move |(conn, name, x, y): (ConnectionConfig, String, f64, f64)| {
-                        start_tab_drag(tab_drag, DragKind::Connection(conn), name, x, y);
-                    },
-                }
-            }}
+            {render_workspace_dock_zone(
+                DockZone::Left,
+                state,
+                modal,
+                input_senders,
+                editing_conn,
+                delete_target,
+                drag_over_group(),
+                tab_drag,
+                dock_drag,
+            )}
 
             // Main area
             div {
@@ -9731,22 +10439,60 @@ pub fn App() -> Element {
                         }
                     })}
 
-                    // AI panel overlay
+                    // AI panel overlay. Selecting a suggestion only creates an
+                    // approval request; it never writes to a PTY directly.
                     AiPanel {
                         visible: matches!(modal(), Modal::AiSuggest),
                         suggestions: ai_suggestions(),
+                        status: ai_status(),
+                        shared_result_count: state.read().shadow_sandbox.shared_result_count(),
                         on_close: move |_| modal.set(Modal::None),
-                        on_apply: move |cmd: String| {
-                            let active = state.read().active_session.clone();
-                            if let Some(sid) = active {
-                                if let Some(sender) = input_senders.read().get(&sid) {
-                                    let _ = sender.send(format!("{}\n", cmd).into_bytes());
-                                }
+                        on_review: move |command: String| {
+                            let request = {
+                                let snapshot = state.read();
+                                let session_id = focused_pane_session(&snapshot)
+                                    .or_else(|| snapshot.active_session.clone());
+                                session_id.and_then(|session_id| {
+                                    let tab = snapshot.sessions.iter().find(|tab| tab.id == session_id)?;
+                                    let target_label = tab.hostname.clone().unwrap_or_else(|| tab.name.clone());
+                                    let risk_reason = match snapshot.safety_checker.check(&command) {
+                                        rusterm_core::SafetyVerdict::Safe => None,
+                                        rusterm_core::SafetyVerdict::Warn(reason)
+                                        | rusterm_core::SafetyVerdict::Block(reason) => Some(reason),
+                                    };
+                                    Some(rusterm_ai::ShadowExecutionRequest::new(
+                                        command,
+                                        session_id,
+                                        target_label,
+                                        tab.cwd.clone(),
+                                        risk_reason,
+                                    ))
+                                })
+                            };
+
+                            let Some(request) = request else {
+                                ai_status.set("没有可执行建议的活动会话。".to_string());
+                                return;
+                            };
+                            match state.write().shadow_sandbox.propose(request) {
+                                Ok(()) => modal.set(Modal::None),
+                                Err(error) => ai_status.set(format!("无法开始审批：{error}")),
                             }
-                            modal.set(Modal::None);
                         },
                     }
                 }
+
+                {render_workspace_dock_zone(
+                    DockZone::Bottom,
+                    state,
+                    modal,
+                    input_senders,
+                    editing_conn,
+                    delete_target,
+                    drag_over_group(),
+                    tab_drag,
+                    dock_drag,
+                )}
 
                 // Status bar
                 div {
@@ -9877,7 +10623,53 @@ pub fn App() -> Element {
                         }}
                     " }
                     div {
-                        style: "margin-left: auto; display: flex; gap: 12px; align-items: center;",
+                        style: "margin-left: auto; display: flex; gap: 8px; align-items: center; min-width:0;",
+
+                        span {
+                            style: if state.read().workspace_preferences.left_visible {
+                                "cursor:pointer;color:var(--skin-accent);border:1px solid var(--skin-accent);border-radius:3px;padding:1px 5px;"
+                            } else {
+                                "cursor:pointer;color:var(--skin-text-muted);border:1px solid var(--skin-border);border-radius:3px;padding:1px 5px;"
+                            },
+                            title: "Show or hide the left connection/file dock",
+                            onclick: move |_| {
+                                update_workspace_preferences(state, |preferences| {
+                                    let visible = preferences.dock_layout.left.visible;
+                                    preferences.set_zone_visible(DockZone::Left, !visible);
+                                });
+                            },
+                            "Left"
+                        }
+                        span {
+                            style: if state.read().workspace_preferences.bottom_visible {
+                                "cursor:pointer;color:var(--skin-accent);border:1px solid var(--skin-accent);border-radius:3px;padding:1px 5px;"
+                            } else {
+                                "cursor:pointer;color:var(--skin-text-muted);border:1px solid var(--skin-border);border-radius:3px;padding:1px 5px;"
+                            },
+                            title: "Show or hide Send, Shell, and Transfers",
+                            onclick: move |_| {
+                                update_workspace_preferences(state, |preferences| {
+                                    let visible = preferences.dock_layout.bottom.visible;
+                                    preferences.set_zone_visible(DockZone::Bottom, !visible);
+                                });
+                            },
+                            "Bottom"
+                        }
+                        span {
+                            style: if state.read().workspace_preferences.right_visible {
+                                "cursor:pointer;color:var(--skin-accent);border:1px solid var(--skin-accent);border-radius:3px;padding:1px 5px;"
+                            } else {
+                                "cursor:pointer;color:var(--skin-text-muted);border:1px solid var(--skin-border);border-radius:3px;padding:1px 5px;"
+                            },
+                            title: "Show or hide Sessions and History",
+                            onclick: move |_| {
+                                update_workspace_preferences(state, |preferences| {
+                                    let visible = preferences.dock_layout.right.visible;
+                                    preferences.set_zone_visible(DockZone::Right, !visible);
+                                });
+                            },
+                            "Right"
+                        }
 
                         // --- Multi-pane layout controls ---
                         // The layout toolbar lets the user append one pane at a
@@ -10043,12 +10835,14 @@ pub fn App() -> Element {
                             "Sessions: {state.read().sessions.len()}"
                         }
                         span {
-                            style: "color: #9ece6a; font-size: 10px; letter-spacing: 0.5px; border: 1px solid #9ece6a; border-radius: 3px; padding: 0 4px; cursor: default;",
-                            "LOCAL ONLY"
+                            style: "color:var(--skin-warning);font-size:10px;letter-spacing:0.5px;border:1px solid var(--skin-warning);border-radius:3px;padding:0 4px;cursor:default;",
+                            "LLM OPT-IN"
                         }
                         span {
-                            style: "cursor: pointer; color: #7aa2f7;",
-                            onclick: move |_| modal.set(Modal::AiSuggest),
+                            style: "cursor:pointer;color:var(--skin-accent);",
+                            onclick: move |_| {
+                                request_ai_suggestions(state, modal, ai_suggestions, ai_status);
+                            },
                             "AI"
                         }
                         span {
@@ -10070,7 +10864,25 @@ pub fn App() -> Element {
                     }
                 }
             }
+
+            {render_workspace_dock_zone(
+                DockZone::Right,
+                state,
+                modal,
+                input_senders,
+                editing_conn,
+                delete_target,
+                drag_over_group(),
+                tab_drag,
+                dock_drag,
+            )}
         }
+
+        DockHiddenDropTargets {
+            layout: state.read().workspace_preferences.dock_layout.clone(),
+            drag: dock_drag(),
+        }
+        DockDragGhost { drag: dock_drag() }
 
         if matches!(modal(), Modal::Settings) {
             SettingsDialog {
@@ -10393,6 +11205,62 @@ pub fn App() -> Element {
             }
         }
 
+        // ── Shadow-sandbox two-stage authorization ──────────────────────────
+        // Stage 1: a model suggestion is inert until this dialog yields a
+        // one-shot ApprovedExecution capability. The sandbox has no execution
+        // API of its own; only this user-confirmed branch can write to the PTY.
+        if let Some(request) = state.read().shadow_sandbox.pending_execution().cloned() {
+            ShadowExecutionDialog {
+                request,
+                on_execute: move |_| {
+                    let approved = state.write().shadow_sandbox.approve_execution();
+                    match approved {
+                        Ok(approved) => {
+                            let session_id = approved.session_id().to_string();
+                            let sent = dispatch_approved_command(
+                                state,
+                                input_senders,
+                                approved.command().to_string(),
+                                vec![session_id.clone()],
+                                PendingCommandPayload::FullLine,
+                            );
+                            if sent == 0 {
+                                let _ = state.write().shadow_sandbox.fail_execution(
+                                    &session_id,
+                                    "目标会话不可用，命令未发送",
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            ai_status.set(format!("执行审批已失效：{error}"));
+                        }
+                    }
+                },
+                on_cancel: move |_| {
+                    let _ = state.write().shadow_sandbox.reject_execution();
+                },
+            }
+        }
+
+        // Stage 2: captured output remains local until the user explicitly
+        // authorizes model sharing. Approval then triggers a fresh model request
+        // built solely from ShadowSandbox::llm_context().
+        if let Some(result) = state.read().shadow_sandbox.pending_result().cloned() {
+            ShadowResultDialog {
+                result,
+                on_share: move |_| {
+                    let approval = state.write().shadow_sandbox.approve_result_sharing();
+                    match approval {
+                        Ok(_) => request_ai_suggestions(state, modal, ai_suggestions, ai_status),
+                        Err(error) => ai_status.set(format!("结果授权已失效：{error}")),
+                    }
+                },
+                on_reject: move |_| {
+                    let _ = state.write().shadow_sandbox.reject_result_sharing();
+                },
+            }
+        }
+
         // ── Dangerous-command confirmation modal (feature #17 part 2) ────────
         // Shown when the user presses Enter on a command the safety checker
         // flagged. Two actions:
@@ -10403,12 +11271,15 @@ pub fn App() -> Element {
                 command: pending.command.clone(),
                 reason: pending.reason.clone(),
                 on_proceed: move |_| {
-                    // User confirmed — send the original Enter to the PTY.
-                    let p = state.write().pending_dangerous_command.take();
-                    if let Some(p) = p {
-                        if let Some(sender) = input_senders.read().get(&p.session_id) {
-                            let _ = sender.send(b"\n".to_vec());
-                        }
+                    let pending = state.write().pending_dangerous_command.take();
+                    if let Some(pending) = pending {
+                        let _ = dispatch_approved_command(
+                            state,
+                            input_senders,
+                            pending.command,
+                            pending.targets,
+                            pending.payload,
+                        );
                     }
                 },
                 on_cancel: move |_| {

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use rusqlite::params;
 use tokio_rusqlite::Connection;
 
-use crate::history::HistoryEntry;
+use crate::history::{HistoryCursor, HistoryEntry, HistoryPage};
 use crate::schema::INIT_SQL;
 
 #[derive(Clone)]
@@ -365,6 +365,82 @@ impl Database {
         Ok(rows)
     }
 
+    /// Return one page of history in reverse chronological order.
+    ///
+    /// The `(created_at, id)` cursor matches the complete sort key, so entries
+    /// with identical timestamps remain stable across page boundaries.
+    pub async fn list_history_page(
+        &self,
+        query: Option<&str>,
+        session_id: Option<&str>,
+        before: Option<&HistoryCursor>,
+        limit: usize,
+    ) -> anyhow::Result<HistoryPage> {
+        const MAX_PAGE_SIZE: usize = 500;
+
+        let query = query.map(str::to_owned);
+        let session_id = session_id.map(str::to_owned);
+        let before_created_at = before.map(|cursor| cursor.created_at.clone());
+        let before_id = before.map(|cursor| cursor.id.clone());
+        let limit = limit.clamp(1, MAX_PAGE_SIZE);
+        let fetch_limit = (limit + 1) as i64;
+
+        self.conn
+            .lock()
+            .await
+            .call::<_, HistoryPage, rusqlite::Error>(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, command, session_id, cwd, hostname, exit_code, \
+                     duration_ms, created_at
+                     FROM history
+                     WHERE (?1 IS NULL OR instr(LOWER(command), LOWER(?1)) > 0)
+                       AND (?2 IS NULL OR session_id = ?2)
+                       AND (?3 IS NULL
+                            OR created_at < ?3
+                            OR (created_at = ?3 AND id < ?4))
+                     ORDER BY created_at DESC, id DESC
+                     LIMIT ?5",
+                )?;
+
+                let mut entries = stmt
+                    .query_map(
+                        params![query, session_id, before_created_at, before_id, fetch_limit],
+                        |row| {
+                            Ok(HistoryEntry {
+                                id: row.get(0)?,
+                                command: row.get(1)?,
+                                session_id: row.get(2)?,
+                                cwd: row.get(3)?,
+                                hostname: row.get(4)?,
+                                exit_code: row.get(5)?,
+                                duration_ms: row.get(6)?,
+                                created_at: row.get(7)?,
+                            })
+                        },
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+
+                let has_more = entries.len() > limit;
+                if has_more {
+                    entries.truncate(limit);
+                }
+                let next_cursor = has_more.then(|| {
+                    let last = entries.last().expect("clamped page limit is non-zero");
+                    HistoryCursor {
+                        created_at: last.created_at.clone(),
+                        id: last.id.clone(),
+                    }
+                });
+
+                Ok(HistoryPage {
+                    entries,
+                    next_cursor,
+                })
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("History page query error: {:?}", e))
+    }
+
     /// Search command history with frecency ranking (frequency + recency + success).
     /// Groups by command, counts executions, and ranks by a combined
     /// score of frequency, recency, and success rate inspired by atuin.
@@ -390,11 +466,11 @@ impl Database {
         //   success_score = successful_count / total_count * 10.0
         //   final_score = frequency_score + recency_score + success_score
         let order_expr = "(LN(COUNT(*) + 1) * 20.0) + \
-         CASE WHEN (unixepoch(MAX(h.created_at)) - ?3) < 3600 THEN 90.0 \
-              WHEN (unixepoch(MAX(h.created_at)) - ?3) < 86400 THEN 70.0 \
-              WHEN (unixepoch(MAX(h.created_at)) - ?3) < 259200 THEN 50.0 \
-              WHEN (unixepoch(MAX(h.created_at)) - ?3) < 604800 THEN 30.0 \
-              WHEN (unixepoch(MAX(h.created_at)) - ?3) < 2592000 THEN 15.0 \
+         CASE WHEN (?3 - unixepoch(MAX(h.created_at))) < 3600 THEN 90.0 \
+              WHEN (?3 - unixepoch(MAX(h.created_at))) < 86400 THEN 70.0 \
+              WHEN (?3 - unixepoch(MAX(h.created_at))) < 259200 THEN 50.0 \
+              WHEN (?3 - unixepoch(MAX(h.created_at))) < 604800 THEN 30.0 \
+              WHEN (?3 - unixepoch(MAX(h.created_at))) < 2592000 THEN 15.0 \
               ELSE 5.0 END + \
          (CAST(SUM(CASE WHEN h.exit_code = 0 THEN 1 ELSE 0 END) AS REAL) / COUNT(*) * 10.0) DESC";
 

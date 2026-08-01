@@ -1,9 +1,13 @@
 pub mod channel;
 pub mod client;
 pub mod known_hosts;
+pub mod sftp;
 pub mod ssh_config;
 
 pub use client::{SshClient, SshSession, parse_remote_history};
+pub use sftp::{
+    RemoteDirEntry, RemoteFileMetadata, RemoteFileType, SftpClient, SftpError, TransferResult,
+};
 pub use ssh_config::{
     ResolvedHost, SshHostSuggestion, default_ssh_config_path, default_ssh_dir, expand_tilde,
     is_identity_file, is_wildcard_pattern, list_identity_files, list_identity_files_at,

@@ -4,16 +4,16 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use argon2::password_hash::{PasswordHasher, SaltString};
 use argon2::{Algorithm, Argon2, Params, Version};
-use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use rand::RngCore;
 
 use crate::config::{
-    ConnectionConfig, ConnectionKind, DEFAULT_ONEKEY_PASSWORD_EXPECT, EncryptedValue,
-    FocusedTabAppearance, Keybindings, OneKey, OneKeyStep, PersistedConfig, PersistedConnection,
-    PersistedConnectionKind, PersistedOneKey, PersistedOneKeyStep, PersistedSshAuth,
-    PersistedSshConfig, SidebarPreferences, SkinSettings, SshAuth, SshConfig,
+    ConnectionConfig, ConnectionKind, EncryptedValue, FocusedTabAppearance, Keybindings, OneKey,
+    OneKeyStep, PersistedConfig, PersistedConnection, PersistedConnectionKind, PersistedOneKey,
+    PersistedOneKeyStep, PersistedSshAuth, PersistedSshConfig, SidebarPreferences, SkinSettings,
+    SshAuth, SshConfig, WorkspacePreferences, DEFAULT_ONEKEY_PASSWORD_EXPECT,
 };
-use rusterm_crypto::{KeyringStore, decrypt_data, encrypt_data};
+use rusterm_crypto::{decrypt_data, encrypt_data, KeyringStore};
 
 const CONFIG_FILE_NAME: &str = "settings.json";
 const CONFIG_VERSION: u32 = 1;
@@ -252,6 +252,7 @@ impl ConfigManager {
             suggestion_enabled: existing.suggestion_enabled,
             suggestion_count: existing.suggestion_count,
             sidebar: existing.sidebar,
+            workspace: existing.workspace,
             keybindings: existing.keybindings,
             skin: existing.skin,
         };
@@ -283,6 +284,7 @@ impl ConfigManager {
             suggestion_enabled: existing.suggestion_enabled,
             suggestion_count: existing.suggestion_count,
             sidebar: existing.sidebar,
+            workspace: existing.workspace,
             keybindings: existing.keybindings,
             skin: existing.skin,
         };
@@ -321,6 +323,7 @@ impl ConfigManager {
             suggestion_enabled: existing.suggestion_enabled,
             suggestion_count: existing.suggestion_count,
             sidebar: existing.sidebar,
+            workspace: existing.workspace,
             keybindings: existing.keybindings,
             skin: existing.skin,
         };
@@ -355,6 +358,7 @@ impl ConfigManager {
             suggestion_enabled: existing.suggestion_enabled,
             suggestion_count: existing.suggestion_count,
             sidebar: existing.sidebar,
+            workspace: existing.workspace,
             keybindings: keybindings.clone().normalized(),
             skin: existing.skin,
         };
@@ -387,6 +391,7 @@ impl ConfigManager {
             suggestion_enabled: existing.suggestion_enabled,
             suggestion_count: existing.suggestion_count,
             sidebar: existing.sidebar,
+            workspace: existing.workspace,
             keybindings: existing.keybindings,
             skin: skin.clone().normalized(),
         };
@@ -427,6 +432,7 @@ impl ConfigManager {
             suggestion_enabled: enabled,
             suggestion_count: count,
             sidebar: existing.sidebar,
+            workspace: existing.workspace,
             keybindings: existing.keybindings,
             skin: existing.skin,
         };
@@ -461,6 +467,40 @@ impl ConfigManager {
             suggestion_enabled: existing.suggestion_enabled,
             suggestion_count: existing.suggestion_count,
             sidebar: sidebar.clone().normalized(),
+            workspace: existing.workspace,
+            keybindings: existing.keybindings,
+            skin: existing.skin,
+        };
+
+        let json =
+            serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
+        let temp_path = self.config_path.with_extension("json.tmp");
+        fs::write(&temp_path, &json).context("Failed to write config file")?;
+        fs::rename(&temp_path, &self.config_path).context("Failed to rename temp config file")?;
+        Ok(())
+    }
+
+    /// Load normalized visibility, sizes, and selected tabs for outer tool panels.
+    pub fn load_workspace_preferences(&self) -> WorkspacePreferences {
+        self.read_persisted().workspace.normalized()
+    }
+
+    /// Persist outer workspace-panel preferences without changing encrypted
+    /// connections, OneKeys, or unrelated application settings.
+    pub fn save_workspace_preferences(&self, workspace: &WorkspacePreferences) -> Result<()> {
+        let existing = self.read_persisted();
+        let persisted = PersistedConfig {
+            version: CONFIG_VERSION,
+            connections: existing.connections,
+            onekeys: existing.onekeys,
+            master_password_hash: self.master_password_hash.clone(),
+            restore_disabled: existing.restore_disabled,
+            confirm_close_on_exit: existing.confirm_close_on_exit,
+            focused_tab_appearance: existing.focused_tab_appearance,
+            suggestion_enabled: existing.suggestion_enabled,
+            suggestion_count: existing.suggestion_count,
+            sidebar: existing.sidebar,
+            workspace: workspace.clone().normalized(),
             keybindings: existing.keybindings,
             skin: existing.skin,
         };
@@ -535,6 +575,7 @@ impl ConfigManager {
             suggestion_enabled: existing.suggestion_enabled,
             suggestion_count: existing.suggestion_count,
             sidebar: existing.sidebar,
+            workspace: existing.workspace,
             keybindings: existing.keybindings,
             skin: existing.skin,
         };
@@ -551,39 +592,32 @@ impl ConfigManager {
 
     /// Read the on-disk PersistedConfig (or an empty default if missing/unparseable).
     fn read_persisted(&self) -> PersistedConfig {
-        if !self.config_path.exists() {
-            return PersistedConfig {
-                version: CONFIG_VERSION,
-                connections: vec![],
-                onekeys: vec![],
-                master_password_hash: None,
-                restore_disabled: false,
-                confirm_close_on_exit: true,
-                focused_tab_appearance: FocusedTabAppearance::default(),
-                suggestion_enabled: true,
-                suggestion_count: 3,
-                sidebar: SidebarPreferences::default(),
-                keybindings: Keybindings::default(),
-                skin: SkinSettings::default(),
-            };
-        }
-        fs::read_to_string(&self.config_path)
-            .ok()
-            .and_then(|c| serde_json::from_str(&c).ok())
-            .unwrap_or(PersistedConfig {
-                version: CONFIG_VERSION,
-                connections: vec![],
-                onekeys: vec![],
-                master_password_hash: None,
-                restore_disabled: false,
-                confirm_close_on_exit: true,
-                focused_tab_appearance: FocusedTabAppearance::default(),
-                suggestion_enabled: true,
-                suggestion_count: 3,
-                sidebar: SidebarPreferences::default(),
-                keybindings: Keybindings::default(),
-                skin: SkinSettings::default(),
-            })
+        let default_config = || PersistedConfig {
+            version: CONFIG_VERSION,
+            connections: vec![],
+            onekeys: vec![],
+            master_password_hash: None,
+            restore_disabled: false,
+            confirm_close_on_exit: true,
+            focused_tab_appearance: FocusedTabAppearance::default(),
+            suggestion_enabled: true,
+            suggestion_count: 3,
+            sidebar: SidebarPreferences::default(),
+            workspace: WorkspacePreferences::default(),
+            keybindings: Keybindings::default(),
+            skin: SkinSettings::default(),
+        };
+
+        let mut persisted = if self.config_path.exists() {
+            fs::read_to_string(&self.config_path)
+                .ok()
+                .and_then(|contents| serde_json::from_str(&contents).ok())
+                .unwrap_or_else(default_config)
+        } else {
+            default_config()
+        };
+        persisted.workspace = persisted.workspace.normalized();
+        persisted
     }
 
     /// Save the OneKey library. Preserves existing connections (read-modify-write).
@@ -603,6 +637,7 @@ impl ConfigManager {
             suggestion_enabled: existing.suggestion_enabled,
             suggestion_count: existing.suggestion_count,
             sidebar: existing.sidebar,
+            workspace: existing.workspace,
             keybindings: existing.keybindings,
             skin: existing.skin,
         };
@@ -808,9 +843,9 @@ impl ConfigManager {
 mod tests {
     use super::*;
     use crate::config::{
-        ConnectionGroup, ConnectionKind, KeyChord, Keybindings, OneKey, OneKeyStep, SerialConfig,
-        SidebarPreferences, SkinKind, SkinPalette, SkinSettings, SshAuth, SshConfig, TcpConfig,
-        TelnetConfig, default_host_key_policy,
+        default_host_key_policy, ConnectionGroup, ConnectionKind, KeyChord, Keybindings, OneKey,
+        OneKeyStep, SerialConfig, SidebarPreferences, SkinKind, SkinPalette, SkinSettings, SshAuth,
+        SshConfig, TcpConfig, TelnetConfig,
     };
 
     fn test_config_manager() -> (ConfigManager, tempfile::TempDir) {
@@ -914,6 +949,34 @@ mod tests {
         cm.save_suggestion_settings(false, 10).unwrap();
 
         assert_eq!(cm.load_sidebar_preferences(), preferences);
+    }
+
+    #[test]
+    fn workspace_preferences_roundtrip_and_survive_other_saves() {
+        let (cm, _dir) = test_config_manager();
+        let preferences = WorkspacePreferences {
+            left_visible: false,
+            right_visible: true,
+            bottom_visible: true,
+            right_width_px: 420,
+            bottom_height_px: 260,
+            left_tab: crate::config::LeftPanelTab::Files,
+            right_tab: crate::config::RightPanelTab::History,
+            bottom_tab: crate::config::BottomPanelTab::Shell,
+            ..WorkspacePreferences::default()
+        }
+        .normalized();
+
+        cm.save_workspace_preferences(&preferences).unwrap();
+        assert_eq!(cm.load_workspace_preferences(), preferences);
+
+        cm.save_connections(&[]).unwrap();
+        cm.save_onekeys(&[]).unwrap();
+        cm.save_sidebar_preferences(&SidebarPreferences::default())
+            .unwrap();
+        cm.save_skin_settings(&SkinSettings::default()).unwrap();
+
+        assert_eq!(cm.load_workspace_preferences(), preferences);
     }
 
     #[test]

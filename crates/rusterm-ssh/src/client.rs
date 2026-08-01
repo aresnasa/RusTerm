@@ -10,6 +10,7 @@ use rusterm_core::session::{Session, SessionId, SessionType};
 use rusterm_core::terminal::TerminalSize;
 
 use crate::known_hosts::{HostKeyPolicy, verify_server_key};
+use crate::sftp::{SftpClient, map_sftp_error, map_ssh_error};
 
 /// russh `Handler` carrying the per-connection state needed to verify
 /// the server's host key against `known_hosts`.
@@ -468,7 +469,37 @@ pub struct SshSession {
     disconnected: Arc<std::sync::atomic::AtomicBool>,
 }
 
+impl std::fmt::Debug for SshSession {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("SshSession")
+            .field("session_id", &self.session_id)
+            .field(
+                "disconnected",
+                &self.disconnected.load(std::sync::atomic::Ordering::Relaxed),
+            )
+            .finish_non_exhaustive()
+    }
+}
+
 impl SshSession {
+    /// Open an SFTP subsystem over a new channel on this authenticated session.
+    pub async fn open_sftp(&self) -> Result<SftpClient, crate::sftp::SftpError> {
+        let channel = self
+            .handle
+            .channel_open_session()
+            .await
+            .map_err(map_ssh_error)?;
+        channel
+            .request_subsystem(true, "sftp")
+            .await
+            .map_err(map_ssh_error)?;
+        let session = russh_sftp::client::SftpSession::new(channel.into_stream())
+            .await
+            .map_err(map_sftp_error)?;
+        Ok(SftpClient::new(session))
+    }
+
     pub async fn disconnect(&self) -> anyhow::Result<()> {
         if self
             .disconnected

@@ -83,6 +83,7 @@ pub(crate) fn create_group(
 pub fn Sidebar(
     connections: Vec<ConnectionConfig>,
     preferences: SidebarPreferences,
+    embedded: bool,
     drag_over_group: Option<String>,
     on_preferences_change: EventHandler<SidebarPreferences>,
     on_group_change: EventHandler<(String, Option<String>)>,
@@ -91,6 +92,7 @@ pub fn Sidebar(
     on_new: EventHandler<()>,
     on_copy: EventHandler<String>,
     on_onekey: EventHandler<()>,
+    on_show_files: EventHandler<()>,
     on_edit: EventHandler<String>,
     on_delete: EventHandler<String>,
     on_drag_start: EventHandler<(ConnectionConfig, String, f64, f64)>,
@@ -140,13 +142,17 @@ pub fn Sidebar(
         .cloned()
         .collect();
 
-    let sidebar_style = format!(
-        "position:relative;width:min({}px,45vw);min-width:min({}px,45vw);max-width:min({}px,45vw);flex:0 0 min({}px,45vw);background:var(--skin-bg);border-right:1px solid var(--skin-border);display:flex;flex-direction:column;height:100%;color:var(--skin-text);user-select:none;box-sizing:border-box;",
-        live_width(),
-        MIN_SIDEBAR_WIDTH_PX,
-        MAX_SIDEBAR_WIDTH_PX,
-        live_width()
-    );
+    let sidebar_style = if embedded {
+        "position:relative;width:100%;min-width:0;height:100%;background:var(--skin-bg);display:flex;flex-direction:column;color:var(--skin-text);user-select:none;box-sizing:border-box;overflow:hidden;".to_string()
+    } else {
+        format!(
+            "position:relative;width:min({}px,45vw);min-width:min({}px,45vw);max-width:min({}px,45vw);flex:0 0 min({}px,45vw);background:var(--skin-bg);border-right:1px solid var(--skin-border);display:flex;flex-direction:column;height:100%;color:var(--skin-text);user-select:none;box-sizing:border-box;",
+            live_width(),
+            MIN_SIDEBAR_WIDTH_PX,
+            MAX_SIDEBAR_WIDTH_PX,
+            live_width()
+        )
+    };
     let hidden_button_title = if show_hidden() {
         "Hide hidden connections again"
     } else {
@@ -187,10 +193,19 @@ pub fn Sidebar(
             style: "{sidebar_style}",
 
             div {
-                style: "padding:10px 10px 8px;display:flex;justify-content:space-between;align-items:center;gap:8px;",
-                span { style: "font-weight:600;font-size:14px;letter-spacing:.3px;", "Connections" }
+                style: "padding:10px 10px 8px;display:flex;align-items:center;gap:8px;min-width:0;flex-wrap:nowrap;",
+                span {
+                    style: "flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600;font-size:14px;letter-spacing:.3px;",
+                    "Connections"
+                }
                 div {
-                    style: "display:flex;gap:5px;",
+                    style: "display:flex;flex:0 0 auto;flex-wrap:nowrap;gap:5px;white-space:nowrap;",
+                    button {
+                        class: "sidebar-icon-button",
+                        title: "Open local file manager",
+                        onclick: move |_| on_show_files.call(()),
+                        Icon { name: IconName::FolderOpen, size: 15 }
+                    }
                     button {
                         class: "sidebar-icon-button",
                         style: "color:{hidden_button_color};",
@@ -334,7 +349,7 @@ pub fn Sidebar(
                 }
             }
 
-            if resize_drag().is_some() {
+            if !embedded && resize_drag().is_some() {
                 // Fallback for WebViews that do not keep sending mouse events
                 // to the narrow handle after the pointer leaves it. On
                 // platforms with implicit capture the handle remains primary;
@@ -360,6 +375,7 @@ pub fn Sidebar(
                 }
             }
 
+            if !embedded {
             div {
                 class: if resize_drag().is_some() { "sidebar-resize-handle active" } else { "sidebar-resize-handle" },
                 style: "position:absolute;right:-3px;top:0;width:6px;height:100%;z-index:80;cursor:col-resize;background:transparent;transition:background .1s;",
@@ -389,6 +405,7 @@ pub fn Sidebar(
                     updated.width_px = live_width();
                     on_preferences_change.call(updated);
                 },
+            }
             }
         }
 
