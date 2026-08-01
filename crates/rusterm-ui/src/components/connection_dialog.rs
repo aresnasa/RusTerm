@@ -1,6 +1,6 @@
 use dioxus::prelude::*;
 
-use rusterm_core::config::{ConnectionConfig, ConnectionKind, SshAuth};
+use rusterm_core::config::{ConnectionConfig, ConnectionGroup, ConnectionKind, SshAuth};
 use rusterm_ssh::{
     SshHostSuggestion, default_ssh_config_path, list_identity_files, list_ssh_config_hosts,
     lookup_host,
@@ -17,6 +17,7 @@ pub struct NewConnectionForm {
     pub key_path: String,
     pub passphrase: String,
     pub terminal_type: String,
+    pub group_id: Option<String>,
     pub onekey: bool,
 }
 
@@ -74,6 +75,7 @@ fn form_from_connection(c: &ConnectionConfig) -> NewConnectionForm {
                 key_path,
                 passphrase,
                 terminal_type: ssh.terminal_type.clone(),
+                group_id: c.group.clone(),
                 onekey: c.onekey,
             }
         }
@@ -81,6 +83,7 @@ fn form_from_connection(c: &ConnectionConfig) -> NewConnectionForm {
         // fields are irrelevant and ignored on save (kind is preserved).
         _ => NewConnectionForm {
             name: c.name.clone(),
+            group_id: c.group.clone(),
             onekey: c.onekey,
             ..default_form()
         },
@@ -90,6 +93,7 @@ fn form_from_connection(c: &ConnectionConfig) -> NewConnectionForm {
 #[component]
 pub fn ConnectionDialog(
     visible: bool,
+    groups: Vec<ConnectionGroup>,
     on_close: EventHandler<()>,
     on_create: EventHandler<NewConnectionForm>,
     /// When `Some`, the dialog operates in edit mode: fields are pre-filled
@@ -208,6 +212,27 @@ pub fn ConnectionDialog(
                             placeholder: "My Server",
                             value: "{form().name}",
                             oninput: move |e| form.write().name = e.value(),
+                        }
+                    }
+
+                    // Group
+                    div {
+                        style: "display: flex; flex-direction: column; gap: 4px;",
+                        label { style: "font-size: 12px; color: #565f89;", "Group" }
+                        select {
+                            style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
+                            value: "{form().group_id.as_deref().unwrap_or_default()}",
+                            onchange: move |e| {
+                                let value = e.value();
+                                form.write().group_id = (!value.is_empty()).then_some(value);
+                            },
+                            option { value: "", "Ungrouped" }
+                            for group in groups.iter() {
+                                option {
+                                    value: "{group.id}",
+                                    "{group.name}"
+                                }
+                            }
                         }
                     }
 
@@ -522,8 +547,8 @@ pub fn ConnectionDialog(
                             );
                             if let Some(ref c) = editing {
                                 // Edit mode: preserve the id so the existing
-                                // entry is replaced. Non-form fields (group,
-                                // tags, proxy_jump, keepalive_interval, and the
+                                // entry is replaced. Non-form fields (tags,
+                                // proxy_jump, keepalive_interval, and the
                                 // whole kind for non-SSH) are preserved by
                                 // `rebuild_connection` in app.rs.
                                 on_edit.call((c.id.clone(), form()));

@@ -7,7 +7,8 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 
 use rusterm_core::config::{
-    ConnectionConfig, ConnectionKind, OneKey, OneKeyStep, ShellConfig, SshAuth, SshConfig,
+    ConnectionConfig, ConnectionGroup, ConnectionKind, OneKey, OneKeyStep, ShellConfig,
+    SidebarPreferences, SshAuth, SshConfig,
 };
 use rusterm_core::config_manager::ConfigManager;
 use rusterm_core::event::SessionEvent;
@@ -52,6 +53,68 @@ fn save_config(state: &Signal<AppState>) {
     if let Err(e) = cm.save_connections(&s.connections) {
         tracing::error!("Failed to save connections: {}", e);
     }
+}
+
+fn save_sidebar_preferences(state: &Signal<AppState>) {
+    let (config_manager, preferences) = {
+        let app = state.read();
+        (app.config_manager.clone(), app.sidebar_preferences.clone())
+    };
+    let Some(config_manager) = config_manager else {
+        tracing::error!("ConfigManager not initialized, cannot save sidebar preferences");
+        return;
+    };
+    if let Err(error) = config_manager.save_sidebar_preferences(&preferences) {
+        tracing::error!("Failed to save sidebar preferences: {}", error);
+    }
+}
+
+/// Preserve groups already present in older connection records. Before custom
+/// sidebar groups were persisted separately, `ConnectionConfig::group` could
+/// still contain a user-authored group name; expose it as an implicit group.
+fn reconcile_sidebar_groups(
+    preferences: SidebarPreferences,
+    connections: &[ConnectionConfig],
+) -> SidebarPreferences {
+    let mut preferences = preferences.normalized();
+    for group_id in connections
+        .iter()
+        .filter_map(|connection| connection.group.as_deref())
+        .filter(|group_id| !group_id.trim().is_empty())
+    {
+        if !preferences.groups.iter().any(|group| group.id == group_id) {
+            preferences.groups.push(ConnectionGroup {
+                id: group_id.to_string(),
+                name: group_id.to_string(),
+                collapsed: false,
+            });
+        }
+    }
+    preferences
+}
+
+fn assign_connection_to_group(
+    connections: &mut [ConnectionConfig],
+    groups: &[ConnectionGroup],
+    connection_id: &str,
+    group_id: Option<&str>,
+) -> bool {
+    if group_id.is_some_and(|group_id| !groups.iter().any(|group| group.id == group_id)) {
+        return false;
+    }
+
+    let Some(connection) = connections
+        .iter_mut()
+        .find(|connection| connection.id == connection_id)
+    else {
+        return false;
+    };
+    let group_id = group_id.map(str::to_string);
+    if connection.group == group_id {
+        return false;
+    }
+    connection.group = group_id;
+    true
 }
 
 fn apply_connection_edit(state: &mut AppState, updated: ConnectionConfig) -> bool {
@@ -2032,29 +2095,28 @@ pub(crate) fn install_tab_drag_js_listeners(initial_x: f64, initial_y: f64) {
     });
 }
 
-/// Parse the response from `poll_tab_drag_state`'s `eval` call. The JS
-/// returns a string like `"123.4,567.8,0,80.0,60.0"`
-/// (x, y, done-flag, container_left, container_top) or `""` if the
-/// globals aren't set.
-///
-/// Returns `None` if the string is empty or malformed (defensive
-/// against a stale `tab_drag` signal after the listeners were already
-/// removed). Extracted as a pure function so the parsing can be
-/// unit-tested without a dioxus runtime.
-pub(crate) fn parse_tab_drag_poll_response(s: &str) -> Option<(f64, f64, bool, f64, f64)> {
+/// Parse the response from `poll_tab_drag_state`'s `eval` call. Fields are
+/// separated by the ASCII unit separator so a legacy group id may safely
+/// contain commas. The six fields are x, y, done, container left/top, and the
+/// hovered connection-group id (empty when no group header is under the cursor).
+pub(crate) fn parse_tab_drag_poll_response(
+    s: &str,
+) -> Option<(f64, f64, bool, f64, f64, Option<String>)> {
     if s.is_empty() {
         return None;
     }
-    let parts: Vec<&str> = s.split(',').collect();
-    if parts.len() != 5 {
+    let mut parts = s.split('\u{1f}');
+    let x = parts.next()?.parse::<f64>().ok()?;
+    let y = parts.next()?.parse::<f64>().ok()?;
+    let done = parts.next()? == "1";
+    let container_left = parts.next()?.parse::<f64>().ok()?;
+    let container_top = parts.next()?.parse::<f64>().ok()?;
+    let group_id = parts.next()?;
+    if parts.next().is_some() {
         return None;
     }
-    let x = parts[0].parse::<f64>().ok()?;
-    let y = parts[1].parse::<f64>().ok()?;
-    let done = parts[2] == "1";
-    let container_left = parts[3].parse::<f64>().ok()?;
-    let container_top = parts[4].parse::<f64>().ok()?;
-    Some((x, y, done, container_left, container_top))
+    let group_id = (!group_id.is_empty()).then(|| group_id.to_string());
+    Some((x, y, done, container_left, container_top, group_id))
 }
 
 /// Read the current mouse position, "done" flag, and container offset
@@ -2069,11 +2131,13 @@ pub(crate) fn parse_tab_drag_poll_response(s: &str) -> Option<(f64, f64, bool, f
 /// reflows. The install-time capture in `build_install_tab_drag_script`
 /// is kept as a fallback for the very first poll (before this re-measure
 /// lands) but is overwritten here on every subsequent tick.
-async fn poll_tab_drag_state() -> Option<(f64, f64, bool, f64, f64)> {
+async fn poll_tab_drag_state() -> Option<(f64, f64, bool, f64, f64, Option<String>)> {
     let result = dioxus::document::eval(
         "return (function() {\n\
             var pos = window.__rusterm_tab_drag_pos || '';\n\
             if (!pos) return '';\n\
+            var coords = pos.split(',');\n\
+            if (coords.length !== 2) return '';\n\
             var done = window.__rusterm_tab_drag_done ? '1' : '0';\n\
             // Re-measure the container offset on every poll so the hit-test\n\
             // stays correct if the container shifts mid-drag (sidebar\n\
@@ -2082,7 +2146,10 @@ async fn poll_tab_drag_state() -> Option<(f64, f64, bool, f64, f64)> {
             // re-measure lands.\n\
             var el = document.getElementById('terminal-content');\n\
             var r = el ? el.getBoundingClientRect() : { left: window.__rusterm_tab_drag_container_left || 0, top: window.__rusterm_tab_drag_container_top || 0 };\n\
-            return pos + ',' + done + ',' + r.left + ',' + r.top;\n\
+            var hit = document.elementFromPoint(Number(coords[0]), Number(coords[1]));\n\
+            var groupEl = hit && hit.closest ? hit.closest('[data-rusterm-group-id]') : null;\n\
+            var groupId = groupEl ? (groupEl.getAttribute('data-rusterm-group-id') || '') : '';\n\
+            return [coords[0], coords[1], done, r.left, r.top, groupId].join('\\u001f');\n\
         })()",
     )
     .await
@@ -2549,6 +2616,30 @@ fn open_cloned_sessions_for_self_drop(
         .count()
 }
 
+fn clear_tab_drag_state(
+    mut tab_drag: Signal<Option<TabDragState>>,
+    mut drag_over_pane: Signal<Option<(usize, PaneDropRegion)>>,
+    mut drag_over_group: Signal<Option<String>>,
+) {
+    tab_drag.set(None);
+    drag_over_pane.set(None);
+    drag_over_group.set(None);
+    spawn(async move {
+        let _ = dioxus::document::eval(
+            "(function() {\n\
+                if (window._rusterm_tab_drag_remove) { window._rusterm_tab_drag_remove(); window._rusterm_tab_drag_remove = null; }\n\
+                window.__rusterm_tab_drag_pos = '';\n\
+                window.__rusterm_tab_drag_done = false;\n\
+                window.__rusterm_tab_drag_container_left = 0;\n\
+                window.__rusterm_tab_drag_container_top = 0;\n\
+                document.body.style.webkitUserSelect = '';\n\
+                document.body.style.userSelect = '';\n\
+            })()",
+        )
+        .await;
+    });
+}
+
 /// Finish a tab drag: do the final hit-test at the release position,
 /// call `execute_tab_drop_on_pane` (the single source of truth for drop
 /// dispatch), log the outcome, and restore focus if a new pane was
@@ -2568,13 +2659,15 @@ fn open_cloned_sessions_for_self_drop(
 pub(crate) fn finish_tab_drag(
     mut state: Signal<AppState>,
     mut input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
-    mut tab_drag: Signal<Option<TabDragState>>,
+    tab_drag: Signal<Option<TabDragState>>,
     mut drag_over_pane: Signal<Option<(usize, PaneDropRegion)>>,
+    mut drag_over_group: Signal<Option<String>>,
     container_size: Signal<Option<(f64, f64)>>,
     final_x: f64,
     final_y: f64,
     container_left: f64,
     container_top: f64,
+    drop_group_id: Option<String>,
 ) {
     // Read the drag state. Clone the session_id out so we can release
     // the borrow before mutating `state` below (avoids holding a
@@ -2583,9 +2676,39 @@ pub(crate) fn finish_tab_drag(
     let Some(drag) = drag_opt else {
         // Already cleared — nothing to do.
         drag_over_pane.set(None);
+        drag_over_group.set(None);
         return;
     };
     let drag_kind = drag.kind.clone();
+
+    // A connection dropped on a group header is a configuration move, not a
+    // request to open a terminal. Handle it before pane hit-testing so the two
+    // drop destinations remain mutually exclusive.
+    if let (DragKind::Connection(connection), Some(group_id)) =
+        (&drag_kind, drop_group_id.as_deref())
+    {
+        let groups = state.read().sidebar_preferences.groups.clone();
+        if groups.iter().any(|group| group.id == group_id) {
+            let changed = assign_connection_to_group(
+                &mut state.write().connections,
+                &groups,
+                &connection.id,
+                Some(group_id),
+            );
+            if changed {
+                save_config(&state);
+            }
+            tracing::info!(
+                "[TAB-DRAG] moved connection {} to group {} (changed={})",
+                &connection.id[..connection.id.len().min(8)],
+                group_id,
+                changed
+            );
+            clear_tab_drag_state(tab_drag, drag_over_pane, drag_over_group);
+            restore_focus_to_active_session(state, 20);
+            return;
+        }
+    }
 
     // Compute the hit-test target.
     //
@@ -2853,23 +2976,8 @@ pub(crate) fn finish_tab_drag(
         tracing::info!("[TAB-DRAG] release outside any pane — no-op");
     }
 
-    // Clear the drag state and the drop-target highlight.
-    tab_drag.set(None);
-    drag_over_pane.set(None);
-    // Clean up the JS-side globals + listeners (idempotent).
-    spawn(async move {
-        let _ = dioxus::document::eval(
-            "(function() {\n\
-                if (window._rusterm_tab_drag_remove) { window._rusterm_tab_drag_remove(); window._rusterm_tab_drag_remove = null; }\n\
-                window.__rusterm_tab_drag_pos = '';\n\
-                window.__rusterm_tab_drag_done = false;\n\
-                window.__rusterm_tab_drag_container_left = 0;\n\
-                window.__rusterm_tab_drag_container_top = 0;\n\
-                document.body.style.webkitUserSelect = '';\n\
-                document.body.style.userSelect = '';\n\
-            })()",
-        ).await;
-    });
+    // Clear the drag state and both drop-target highlights.
+    clear_tab_drag_state(tab_drag, drag_over_pane, drag_over_group);
     // Restore focus to the active session (the drag's `onmousedown`
     // `prevent_default` prevented focus from landing on the tab, but
     // nothing restored it to the pane that had it before — same root
@@ -5488,7 +5596,7 @@ mod session_startup_tests {
     /// `rebuild_connection` MUST surface on the rebuilt `ConnectionConfig`.
     /// If this ever fails, the form → model bridge has been broken again.
     #[test]
-    fn rebuild_connection_preserves_form_onekey_flag() {
+    fn rebuild_connection_preserves_form_onekey_and_group_selection() {
         use crate::components::connection_dialog::NewConnectionForm;
 
         let original = ConnectionConfig {
@@ -5516,6 +5624,7 @@ mod session_startup_tests {
             username: "ecs-user".to_string(),
             auth_type: "agent".to_string(),
             terminal_type: "xterm-256color".to_string(),
+            group_id: Some("production-group".to_string()),
             ..Default::default()
         };
         form.onekey = true;
@@ -5525,6 +5634,11 @@ mod session_startup_tests {
         assert!(
             rebuilt.onekey,
             "toggling the checkbox must persist through rebuild"
+        );
+        assert_eq!(
+            rebuilt.group.as_deref(),
+            Some("production-group"),
+            "editing must persist the form's group selection"
         );
     }
 
@@ -7219,8 +7333,8 @@ fn build_ssh_auth(form: &NewConnectionForm) -> SshAuth {
 }
 
 /// Rebuild a `ConnectionConfig` from an edit-dialog form, preserving the
-/// original id and any fields the dialog doesn't expose (group, tags, and for
-/// SSH: proxy_jump / keepalive_interval). For non-SSH kinds the whole `kind`
+/// original id and any fields the dialog doesn't expose (tags and, for SSH,
+/// proxy_jump / keepalive_interval). For non-SSH kinds the whole `kind`
 /// is preserved as-is — the dialog only edits SSH-specific fields, so a Shell /
 /// Serial / Telnet / TCP connection keeps its config and just gets its name /
 /// onekey updated.
@@ -7255,7 +7369,7 @@ fn rebuild_connection(original: &ConnectionConfig, form: &NewConnectionForm) -> 
             form.name.clone()
         },
         kind,
-        group: original.group.clone(),
+        group: form.group_id.clone(),
         tags: original.tags.clone(),
         onekey: form.onekey,
     }
@@ -7409,7 +7523,19 @@ fn restore_sessions(
                     env: Vec::new(),
                     working_dir: None,
                 };
-                create_terminal(tab_id.clone(), &mut state);
+                // Use the persisted terminal size so the restored session
+                // opens at the same resolution the user left it.
+                let term_size = ps
+                    .terminal_size
+                    .as_ref()
+                    .map(|s| TerminalSize {
+                        cols: s.cols,
+                        rows: s.rows,
+                        pixel_width: s.pixel_width,
+                        pixel_height: s.pixel_height,
+                    })
+                    .unwrap_or_default();
+                create_terminal_with_size(tab_id.clone(), term_size, &mut state);
                 state.write().session_configs.insert(
                     tab_id.clone(),
                     ConnectionConfig {
@@ -7475,6 +7601,20 @@ fn restore_sessions(
                         .map(|t| t.id.clone())
                         .unwrap_or_default();
                     if !tab_id.is_empty() {
+                        // Apply the persisted terminal size so the SSH session
+                        // opens with the correct PTY winsize from the start.
+                        if let Some(ts) = ps.terminal_size.as_ref() {
+                            let terminals = state.read().terminals.clone();
+                            if let Some(handle) = terminals.get(&tab_id) {
+                                let mut entry = handle.lock();
+                                entry.terminal.resize(
+                                    ts.cols,
+                                    ts.rows,
+                                    ts.pixel_width,
+                                    ts.pixel_height,
+                                );
+                            }
+                        }
                         // Pre-seed command history tail so suggestions work.
                         let mut s = state.write();
                         if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == tab_id) {
@@ -7837,6 +7977,79 @@ mod connection_target_tests {
         // No pane is empty — both sessions are live.
         assert!(layout.panes.iter().all(|pane| !pane.session_id.is_empty()));
     }
+
+    fn saved_connection(id: &str) -> ConnectionConfig {
+        ConnectionConfig {
+            id: id.to_string(),
+            name: id.to_string(),
+            kind: ConnectionKind::Shell(ShellConfig {
+                command: None,
+                args: Vec::new(),
+                env: Vec::new(),
+                working_dir: None,
+            }),
+            group: None,
+            tags: Vec::new(),
+            onekey: false,
+        }
+    }
+
+    #[test]
+    fn assigning_connection_to_group_uses_stable_profile_id() {
+        let groups = vec![ConnectionGroup {
+            id: "production-id".to_string(),
+            name: "Production".to_string(),
+            collapsed: false,
+        }];
+        let mut connections = vec![saved_connection("profile-id")];
+
+        assert!(assign_connection_to_group(
+            &mut connections,
+            &groups,
+            "profile-id",
+            Some("production-id"),
+        ));
+        assert_eq!(connections[0].group.as_deref(), Some("production-id"));
+        assert!(!assign_connection_to_group(
+            &mut connections,
+            &groups,
+            "profile-id",
+            Some("production-id"),
+        ));
+    }
+
+    #[test]
+    fn assigning_connection_rejects_unknown_targets_and_supports_ungrouped() {
+        let groups = vec![ConnectionGroup {
+            id: "known".to_string(),
+            name: "Known".to_string(),
+            collapsed: false,
+        }];
+        let mut connections = vec![saved_connection("profile")];
+
+        assert!(!assign_connection_to_group(
+            &mut connections,
+            &groups,
+            "profile",
+            Some("unknown"),
+        ));
+        assert_eq!(connections[0].group, None);
+
+        connections[0].group = Some("known".to_string());
+        assert!(assign_connection_to_group(
+            &mut connections,
+            &groups,
+            "profile",
+            None,
+        ));
+        assert_eq!(connections[0].group, None);
+        assert!(!assign_connection_to_group(
+            &mut connections,
+            &groups,
+            "missing-profile",
+            Some("known"),
+        ));
+    }
 }
 
 /// Tests for the pane title bar's session-type accent color helper.
@@ -8125,6 +8338,9 @@ pub fn App() -> Element {
     // actually changes. This matches the user's "取舍分频性能" preference:
     // fewer re-renders over per-tick feedback.
     let mut drag_over_pane: Signal<Option<(usize, PaneDropRegion)>> = use_signal(|| None);
+    // Stable connection-group id currently under a dragged sidebar connection.
+    // Session drags never populate this signal.
+    let mut drag_over_group: Signal<Option<String>> = use_signal(|| None);
 
     // Measured pixel dimensions of the `#terminal-content` container (the
     // flex:1 div that holds either the single active TerminalView or the
@@ -8295,7 +8511,7 @@ pub fn App() -> Element {
     //
     // The loop:
     //  1. If `tab_drag` is `None`: sleep 32ms, continue.
-    //  2. Poll `poll_tab_drag_state()` → `(x, y, done, left, top)`.
+    //  2. Poll `poll_tab_drag_state()` → `(x, y, done, left, top, group)`.
     //  3. Update `tab_drag`'s `cur_x`/`cur_y`. If `!dragging` and the
     //     cursor has crossed the threshold, set `dragging = true`.
     //  4. If `done` (user released the mouse button):
@@ -8303,8 +8519,8 @@ pub fn App() -> Element {
     //       `execute_tab_drop_on_pane` + focus restore + cleanup).
     //     - Else (it was a click, not a drag): just clean up the signal.
     //       The tab's `onclick` fires normally.
-    //  5. Else if `dragging`: live hit-test → `drag_over_pane.set(idx)`
-    //     for drop-zone highlight.
+    //  5. Else if `dragging`: live hit-test → `drag_over_group` or
+    //     `drag_over_pane` for the applicable drop-target highlight.
     //  6. Sleep 16ms.
     //
     // NEVER breaks — `use_future` only runs its closure once on mount,
@@ -8317,7 +8533,7 @@ pub fn App() -> Element {
             }
             // Read the JS-side mouse position + done flag + container offset.
             match poll_tab_drag_state().await {
-                Some((x, y, done, left, top)) => {
+                Some((x, y, done, left, top, hovered_group_id)) => {
                     let drag_opt = tab_drag();
                     let Some(drag) = drag_opt else {
                         // Drag was cleared between the check above and now —
@@ -8329,6 +8545,7 @@ pub fn App() -> Element {
                     // a click (no drag) from a real drag.
                     let now_dragging = drag.dragging
                         || tab_drag_threshold_exceeded(drag.start_x, drag.start_y, x, y);
+                    let is_connection_drag = matches!(&drag.kind, DragKind::Connection(_));
                     // Update the drag state with the new cursor position
                     // (and possibly the promoted `dragging` flag). Drop
                     // the borrow before any `state.write()` below to
@@ -8353,31 +8570,20 @@ pub fn App() -> Element {
                                 input_senders,
                                 tab_drag,
                                 drag_over_pane,
+                                drag_over_group,
                                 container_size,
                                 x,
                                 y,
                                 left,
                                 top,
+                                hovered_group_id,
                             );
                         } else {
                             // It was a click, not a drag. Clean up the
                             // signal WITHOUT executing a drop. The tab's
                             // `onclick` fires normally.
                             tracing::debug!("[TAB-DRAG] mousedown-without-drag cleanup (click)");
-                            tab_drag.set(None);
-                            drag_over_pane.set(None);
-                            // Clean up the JS-side globals.
-                            spawn(async move {
-                                let _ = dioxus::document::eval(
-                                    "(function() {\n\
-                                        if (window._rusterm_tab_drag_remove) { window._rusterm_tab_drag_remove(); window._rusterm_tab_drag_remove = null; }\n\
-                                        window.__rusterm_tab_drag_pos = '';\n\
-                                        window.__rusterm_tab_drag_done = false;\n\
-                                        document.body.style.webkitUserSelect = '';\n\
-                                        document.body.style.userSelect = '';\n\
-                                    })()",
-                                ).await;
-                            });
+                            clear_tab_drag_state(tab_drag, drag_over_pane, drag_over_group);
                         }
                         // Loop back to idle — do NOT break, or subsequent
                         // drags wouldn't be polled.
@@ -8386,6 +8592,13 @@ pub fn App() -> Element {
                     // Live hit-test for drop-zone highlight (only when
                     // actually dragging — a click doesn't highlight).
                     if now_dragging {
+                        let group_hit = is_connection_drag.then_some(hovered_group_id).flatten();
+                        drag_over_group.set(group_hit.clone());
+                        if group_hit.is_some() {
+                            drag_over_pane.set(None);
+                            tokio::time::sleep(std::time::Duration::from_millis(16)).await;
+                            continue;
+                        }
                         let (cw, ch) = container_size().unwrap_or((1200.0, 800.0));
                         let active_layout = state
                             .read()
@@ -8871,6 +9084,10 @@ pub fn App() -> Element {
                         match ConfigManager::with_master_password(&password) {
                             Ok(cm) => {
                                 let connections = cm.load_connections().unwrap_or_default();
+                                let sidebar_preferences = reconcile_sidebar_groups(
+                                    cm.load_sidebar_preferences(),
+                                    &connections,
+                                );
                                 // If even one step fails to decrypt, load_onekeys
                                 // returns Err and (without this) unwrap_or_default
                                 // would silently empty the whole library → no
@@ -8897,6 +9114,7 @@ pub fn App() -> Element {
                                 s.suggestion_enabled = sug_enabled;
                                 s.suggestion_count = sug_count;
                                 s.config_manager = Some(cm);
+                                s.sidebar_preferences = sidebar_preferences;
                                 s.connections = connections;
                                 s.onekeys = onekeys;
                                 s.unlock_state = UnlockState::Unlocked;
@@ -9249,6 +9467,42 @@ pub fn App() -> Element {
             {rsx! {
                 Sidebar {
                     connections: state.read().connections.clone(),
+                    preferences: state.read().sidebar_preferences.clone(),
+                    drag_over_group: drag_over_group(),
+                    on_preferences_change: move |preferences: SidebarPreferences| {
+                        state.write().sidebar_preferences = preferences.normalized();
+                        save_sidebar_preferences(&state);
+                    },
+                    on_group_change: move |(connection_id, group_id): (String, Option<String>)| {
+                        let groups = state.read().sidebar_preferences.groups.clone();
+                        let changed = assign_connection_to_group(
+                            &mut state.write().connections,
+                            &groups,
+                            &connection_id,
+                            group_id.as_deref(),
+                        );
+                        if changed {
+                            save_config(&state);
+                        }
+                    },
+                    on_group_delete: move |group_id: String| {
+                        let connections_changed = {
+                            let mut app = state.write();
+                            app.sidebar_preferences.groups.retain(|group| group.id != group_id);
+                            let mut changed = false;
+                            for connection in &mut app.connections {
+                                if connection.group.as_deref() == Some(group_id.as_str()) {
+                                    connection.group = None;
+                                    changed = true;
+                                }
+                            }
+                            changed
+                        };
+                        save_sidebar_preferences(&state);
+                        if connections_changed {
+                            save_config(&state);
+                        }
+                    },
                     on_connect: move |id: String| {
                         let conn = state.read().connections.iter().find(|c| c.id == id).cloned();
                         if let Some(conn) = conn {
@@ -9880,6 +10134,7 @@ pub fn App() -> Element {
         // Connection dialog modal
         ConnectionDialog {
             visible: matches!(modal(), Modal::NewConnection),
+            groups: state.read().sidebar_preferences.groups.clone(),
             editing: editing_conn.read().clone(),
             on_close: move |_| {
                 editing_conn.set(None);
@@ -9913,7 +10168,7 @@ pub fn App() -> Element {
                         form.name.clone()
                     },
                     kind: ConnectionKind::Ssh(ssh_config.clone()),
-                    group: None,
+                    group: form.group_id.clone(),
                     tags: vec![],
                     onekey: form.onekey,
                 };
@@ -10051,11 +10306,19 @@ pub fn App() -> Element {
                             style: "background: #f7768e; border: none; color: #1a1b26; border-radius: 4px; padding: 8px 16px; cursor: pointer; font-size: 13px; font-weight: 600;",
                             onclick: move |_| {
                                 let target_id = target.id.clone();
-                                {
+                                let sidebar_changed = {
                                     let mut s = state.write();
                                     s.connections.retain(|c| c.id != target_id);
-                                }
+                                    let previous_len = s.sidebar_preferences.hidden_connection_ids.len();
+                                    s.sidebar_preferences
+                                        .hidden_connection_ids
+                                        .retain(|id| id != &target_id);
+                                    s.sidebar_preferences.hidden_connection_ids.len() != previous_len
+                                };
                                 save_config(&state);
+                                if sidebar_changed {
+                                    save_sidebar_preferences(&state);
+                                }
                                 delete_target.set(None);
                             },
                             "Delete"
@@ -11715,75 +11978,69 @@ mod tab_drag_tests {
     // parse_tab_drag_poll_response tests
     // ------------------------------------------------------------------
 
-    /// A valid in-progress response (done=0) parses correctly.
-    #[test]
-    fn tab_drag_parse_valid_in_progress_response() {
-        // x, y, done, container_left, container_top
-        let result = parse_tab_drag_poll_response("123.4,567.8,0,80.0,60.0").unwrap();
-        assert_eq!(result, (123.4, 567.8, false, 80.0, 60.0));
+    fn drag_poll_response(fields: &[&str]) -> String {
+        fields.join("\u{1f}")
     }
 
-    /// A valid done response (done=1) parses correctly.
     #[test]
-    fn tab_drag_parse_valid_done_response() {
-        let result = parse_tab_drag_poll_response("100.0,200.0,1,80.0,60.0").unwrap();
-        assert_eq!(result, (100.0, 200.0, true, 80.0, 60.0));
+    fn tab_drag_parse_valid_in_progress_response_without_group() {
+        let response = drag_poll_response(&["123.4", "567.8", "0", "80.0", "60.0", ""]);
+        let result = parse_tab_drag_poll_response(&response).unwrap();
+        assert_eq!(result, (123.4, 567.8, false, 80.0, 60.0, None));
     }
 
-    /// An empty response (globals not set yet) returns `None`.
     #[test]
-    fn tab_drag_parse_empty_returns_none() {
+    fn tab_drag_parse_valid_done_response_with_group() {
+        let response =
+            drag_poll_response(&["100.0", "200.0", "1", "80.0", "60.0", "group,with,commas"]);
+        let result = parse_tab_drag_poll_response(&response).unwrap();
+        assert_eq!(
+            result,
+            (
+                100.0,
+                200.0,
+                true,
+                80.0,
+                60.0,
+                Some("group,with,commas".to_string()),
+            )
+        );
+    }
+
+    #[test]
+    fn tab_drag_parse_empty_or_wrong_field_count_returns_none() {
         assert_eq!(parse_tab_drag_poll_response(""), None);
+        assert_eq!(
+            parse_tab_drag_poll_response(&drag_poll_response(&["100", "200", "0"])),
+            None
+        );
+        assert_eq!(
+            parse_tab_drag_poll_response(&drag_poll_response(&[
+                "1", "2", "0", "4", "5", "", "extra",
+            ])),
+            None
+        );
     }
 
-    /// A response with too few fields returns `None` (defensive against
-    /// a stale `tab_drag` signal after the listeners were removed).
-    #[test]
-    fn tab_drag_parse_too_few_fields_returns_none() {
-        // Only x, y, done — missing container_left/top.
-        assert_eq!(parse_tab_drag_poll_response("100.0,200.0,0"), None);
-        // Only x, y.
-        assert_eq!(parse_tab_drag_poll_response("100.0,200.0"), None);
-        // Only x.
-        assert_eq!(parse_tab_drag_poll_response("100.0"), None);
-    }
-
-    /// A response with too many fields returns `None` (defensive).
-    #[test]
-    fn tab_drag_parse_too_many_fields_returns_none() {
-        assert_eq!(parse_tab_drag_poll_response("1,2,3,4,5,6"), None);
-    }
-
-    /// A response with non-numeric coordinates returns `None`.
     #[test]
     fn tab_drag_parse_non_numeric_returns_none() {
-        assert_eq!(parse_tab_drag_poll_response("abc,def,0,80,60"), None);
-        assert_eq!(parse_tab_drag_poll_response("100.0,def,0,80,60"), None);
+        let response = drag_poll_response(&["abc", "200", "0", "80", "60", ""]);
+        assert_eq!(parse_tab_drag_poll_response(&response), None);
     }
 
-    /// A response with negative coordinates parses correctly (the
-    /// cursor CAN be at negative viewport coordinates if the user
-    /// drags outside the window — the JS listeners keep firing).
     #[test]
-    fn tab_drag_parse_negative_coordinates() {
-        let result = parse_tab_drag_poll_response("-50.0,-100.0,0,80.0,60.0").unwrap();
-        assert_eq!(result, (-50.0, -100.0, false, 80.0, 60.0));
-    }
+    fn tab_drag_parse_negative_and_integer_coordinates() {
+        let negative = drag_poll_response(&["-50.0", "-100.0", "0", "80", "60", ""]);
+        assert_eq!(
+            parse_tab_drag_poll_response(&negative),
+            Some((-50.0, -100.0, false, 80.0, 60.0, None))
+        );
 
-    /// A response with integer coordinates (no decimal point) parses
-    /// correctly — `f64::parse` handles both.
-    #[test]
-    fn tab_drag_parse_integer_coordinates() {
-        let result = parse_tab_drag_poll_response("100,200,0,80,60").unwrap();
-        assert_eq!(result, (100.0, 200.0, false, 80.0, 60.0));
-    }
-
-    /// A response with zero container offset parses correctly (e.g.,
-    /// if `#terminal-content` is at the viewport origin).
-    #[test]
-    fn tab_drag_parse_zero_container_offset() {
-        let result = parse_tab_drag_poll_response("100.0,200.0,0,0,0").unwrap();
-        assert_eq!(result, (100.0, 200.0, false, 0.0, 0.0));
+        let integer = drag_poll_response(&["100", "200", "0", "0", "0", ""]);
+        assert_eq!(
+            parse_tab_drag_poll_response(&integer),
+            Some((100.0, 200.0, false, 0.0, 0.0, None))
+        );
     }
 
     // ------------------------------------------------------------------

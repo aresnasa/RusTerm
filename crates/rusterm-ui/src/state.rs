@@ -5,7 +5,7 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
-use rusterm_core::config::{ConnectionConfig, FocusedTabAppearance, OneKey};
+use rusterm_core::config::{ConnectionConfig, FocusedTabAppearance, OneKey, SidebarPreferences};
 use rusterm_core::config_manager::ConfigManager;
 use rusterm_core::session::SessionType;
 use rusterm_core::session_log::SessionLog;
@@ -128,6 +128,7 @@ pub struct AppState {
     #[serde(default)]
     pub tabs: Vec<WorkspaceTab>,
     pub sidebar_open: bool,
+    pub sidebar_preferences: SidebarPreferences,
     pub connections: Vec<ConnectionConfig>,
     pub theme: Theme,
     #[serde(default)]
@@ -490,6 +491,7 @@ impl Default for AppState {
             active_session: None,
             tabs: Vec::new(),
             sidebar_open: true,
+            sidebar_preferences: SidebarPreferences::default(),
             connections: Vec::new(),
             theme: Theme::Dark,
             focused_tab_appearance: FocusedTabAppearance::default(),
@@ -542,6 +544,8 @@ impl AppState {
     /// - tail of `command_history` (last N entries, display-only — these are
     ///   NEVER re-executed on restore; they're just re-seeded into the
     ///   suggestion popup)
+    /// - terminal grid size (cols × rows + pixel dims) so the restored
+    ///   session opens at the same resolution
     ///
     /// NOT captured: scrollback (too large), env vars (would leak secrets),
     /// PTY process state (impossible to restore), input box content.
@@ -574,6 +578,18 @@ impl AppState {
                     _ => None,
                 };
 
+                // Capture the terminal's current grid size so the restored
+                // session opens at the same resolution instead of 80×24.
+                let terminal_size = self.terminals.get(&tab.id).map(|h| {
+                    let t = h.lock();
+                    rusterm_core::PersistedTerminalSize {
+                        cols: t.terminal.size().cols,
+                        rows: t.terminal.size().rows,
+                        pixel_width: t.terminal.size().pixel_width,
+                        pixel_height: t.terminal.size().pixel_height,
+                    }
+                });
+
                 rusterm_core::session_state::PersistedSession {
                     id: tab.id.clone(),
                     name: tab.name.clone(),
@@ -582,6 +598,7 @@ impl AppState {
                     connection_id,
                     cwd: tab.cwd.clone(),
                     command_history_tail: history_tail,
+                    terminal_size,
                 }
             })
             .collect();

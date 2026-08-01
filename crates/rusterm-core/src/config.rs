@@ -210,6 +210,81 @@ fn default_focused_tab_border_radius() -> u8 {
     4
 }
 
+pub const DEFAULT_SIDEBAR_WIDTH_PX: u16 = 260;
+pub const MIN_SIDEBAR_WIDTH_PX: u16 = 200;
+pub const MAX_SIDEBAR_WIDTH_PX: u16 = 600;
+
+/// A user-defined connection group shown in the connection sidebar.
+/// Connection membership is stored in `ConnectionConfig::group` using this
+/// stable id, so renaming a group does not rewrite every connection.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConnectionGroup {
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub collapsed: bool,
+}
+
+/// User-controlled connection-sidebar state. All fields have defaults so
+/// settings written by older RusTerm versions continue to load unchanged.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SidebarPreferences {
+    #[serde(default = "default_sidebar_width_px")]
+    pub width_px: u16,
+    #[serde(default)]
+    pub hidden_connection_ids: Vec<String>,
+    #[serde(default)]
+    pub groups: Vec<ConnectionGroup>,
+}
+
+impl Default for SidebarPreferences {
+    fn default() -> Self {
+        Self {
+            width_px: DEFAULT_SIDEBAR_WIDTH_PX,
+            hidden_connection_ids: Vec::new(),
+            groups: Vec::new(),
+        }
+    }
+}
+
+impl SidebarPreferences {
+    /// Clamp dimensions and discard duplicate/invalid ids before state is used
+    /// for CSS or written back to disk.
+    pub fn normalized(mut self) -> Self {
+        self.width_px = self
+            .width_px
+            .clamp(MIN_SIDEBAR_WIDTH_PX, MAX_SIDEBAR_WIDTH_PX);
+
+        let mut hidden_ids = Vec::with_capacity(self.hidden_connection_ids.len());
+        for id in self.hidden_connection_ids {
+            if !id.is_empty() && !hidden_ids.contains(&id) {
+                hidden_ids.push(id);
+            }
+        }
+        self.hidden_connection_ids = hidden_ids;
+
+        let mut groups = Vec::with_capacity(self.groups.len());
+        for mut group in self.groups {
+            group.id = group.id.trim().to_string();
+            group.name = group.name.trim().to_string();
+            if !group.id.is_empty()
+                && !group.name.is_empty()
+                && !groups
+                    .iter()
+                    .any(|existing: &ConnectionGroup| existing.id == group.id)
+            {
+                groups.push(group);
+            }
+        }
+        self.groups = groups;
+        self
+    }
+}
+
+fn default_sidebar_width_px() -> u16 {
+    DEFAULT_SIDEBAR_WIDTH_PX
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedConfig {
     pub version: u32,
@@ -244,6 +319,9 @@ pub struct PersistedConfig {
     /// the settings dialog or via the popup's own control.
     #[serde(default = "default_suggestion_count")]
     pub suggestion_count: u8,
+    /// Width, hidden connections, and custom groups for the connection sidebar.
+    #[serde(default)]
+    pub sidebar: SidebarPreferences,
 }
 
 /// Default for `PersistedConfig::confirm_close_on_exit`. Kept as a function
@@ -470,6 +548,57 @@ mod tests {
     }
 
     #[test]
+    fn sidebar_preferences_default_for_legacy_settings() {
+        let config: PersistedConfig =
+            serde_json::from_str(r#"{"version":1,"connections":[]}"#).unwrap();
+
+        assert_eq!(config.sidebar, SidebarPreferences::default());
+    }
+
+    #[test]
+    fn sidebar_preferences_normalize_width_and_duplicate_ids() {
+        let preferences = SidebarPreferences {
+            width_px: 10,
+            hidden_connection_ids: vec!["alpha".to_string(), "alpha".to_string(), String::new()],
+            groups: vec![
+                ConnectionGroup {
+                    id: "group-a".to_string(),
+                    name: " Group A ".to_string(),
+                    collapsed: true,
+                },
+                ConnectionGroup {
+                    id: "group-a".to_string(),
+                    name: "Duplicate".to_string(),
+                    collapsed: false,
+                },
+            ],
+        }
+        .normalized();
+
+        assert_eq!(preferences.width_px, MIN_SIDEBAR_WIDTH_PX);
+        assert_eq!(preferences.hidden_connection_ids, vec!["alpha"]);
+        assert_eq!(preferences.groups.len(), 1);
+        assert_eq!(preferences.groups[0].name, "Group A");
+        assert!(preferences.groups[0].collapsed);
+    }
+
+    #[test]
+    fn sidebar_preferences_roundtrip() {
+        let preferences = SidebarPreferences {
+            width_px: 412,
+            hidden_connection_ids: vec!["hidden-connection".to_string()],
+            groups: vec![ConnectionGroup {
+                id: "production".to_string(),
+                name: "Production".to_string(),
+                collapsed: true,
+            }],
+        };
+        let json = serde_json::to_string(&preferences).unwrap();
+        let parsed: SidebarPreferences = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, preferences);
+    }
+
+    #[test]
     fn focused_tab_appearance_defaults_for_legacy_settings() {
         let config: PersistedConfig =
             serde_json::from_str(r#"{"version":1,"connections":[]}"#).unwrap();
@@ -502,6 +631,7 @@ mod tests {
             focused_tab_appearance: FocusedTabAppearance::default(),
             suggestion_enabled: false,
             suggestion_count: 10,
+            sidebar: SidebarPreferences::default(),
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: PersistedConfig = serde_json::from_str(&json).unwrap();

@@ -1,11 +1,12 @@
-use dioxus::prelude::*;
-// `MouseButton` lives in `dioxus::html::input_data` (not re-exported by
-// `dioxus::prelude::*`). Used by `ConnItem`'s `onmousedown` handler to
-// filter for primary-button (left-click) drags only — mirrors the tab
-// bar + pane title bar wiring.
 use dioxus::html::input_data::MouseButton;
+use dioxus::prelude::*;
 
-use rusterm_core::config::{ConnectionConfig, ConnectionKind};
+use rusterm_core::config::{
+    ConnectionConfig, ConnectionGroup, ConnectionKind, MAX_SIDEBAR_WIDTH_PX, MIN_SIDEBAR_WIDTH_PX,
+    SidebarPreferences,
+};
+
+use super::icon::{Icon, IconName};
 
 fn kind_label(kind: &ConnectionKind) -> &'static str {
     match kind {
@@ -27,274 +28,462 @@ fn kind_color(kind: &ConnectionKind) -> &'static str {
     }
 }
 
+fn kind_icon(kind: &ConnectionKind) -> IconName {
+    match kind {
+        ConnectionKind::Ssh(_) => IconName::Ssh,
+        ConnectionKind::Serial(_) => IconName::Serial,
+        ConnectionKind::Telnet(_) => IconName::Telnet,
+        ConnectionKind::Shell(_) => IconName::Shell,
+        ConnectionKind::Tcp(_) => IconName::Tcp,
+    }
+}
+
+pub(crate) fn connection_is_visible(
+    preferences: &SidebarPreferences,
+    connection_id: &str,
+    show_hidden: bool,
+) -> bool {
+    show_hidden
+        || !preferences
+            .hidden_connection_ids
+            .iter()
+            .any(|id| id == connection_id)
+}
+
+fn connection_matches_search(connection: &ConnectionConfig, search: &str) -> bool {
+    search.is_empty()
+        || connection.name.to_lowercase().contains(search)
+        || kind_label(&connection.kind).to_lowercase().contains(search)
+}
+
+pub(crate) fn create_group(
+    preferences: &SidebarPreferences,
+    name: &str,
+) -> Option<SidebarPreferences> {
+    let name = name.trim();
+    if name.is_empty()
+        || preferences
+            .groups
+            .iter()
+            .any(|group| group.name.eq_ignore_ascii_case(name))
+    {
+        return None;
+    }
+
+    let mut updated = preferences.clone();
+    updated.groups.push(ConnectionGroup {
+        id: uuid::Uuid::new_v4().to_string(),
+        name: name.to_string(),
+        collapsed: false,
+    });
+    Some(updated)
+}
+
 #[component]
 pub fn Sidebar(
     connections: Vec<ConnectionConfig>,
+    preferences: SidebarPreferences,
+    drag_over_group: Option<String>,
+    on_preferences_change: EventHandler<SidebarPreferences>,
+    on_group_change: EventHandler<(String, Option<String>)>,
+    on_group_delete: EventHandler<String>,
     on_connect: EventHandler<String>,
     on_new: EventHandler<()>,
     on_copy: EventHandler<String>,
     on_onekey: EventHandler<()>,
-    /// Open the connection dialog in edit mode for the connection with this id.
     on_edit: EventHandler<String>,
-    /// Request deletion of the connection with this id (the App component
-    /// owns the confirm dialog — the sidebar only triggers it).
     on_delete: EventHandler<String>,
-    /// Sidebar → pane drag handoff (Task 22 extension). Fired by a
-    /// ConnItem's `onmousedown` (primary button) with
-    /// `(connection_config, display_name, x, y)`. The App wires this to
-    /// `start_tab_drag` with `DragKind::Connection`, reusing the entire
-    /// manual-mouse drag infrastructure built for tab drags. Replaces the
-    /// prior HTML5 `ondragstart` + `ondrop` wiring, which was unreliable
-    /// in dioxus 0.7's desktop webview. Plain click-to-connect still
-    /// works — the polling loop only fires the drop if the cursor
-    /// crossed the drag threshold.
     on_drag_start: EventHandler<(ConnectionConfig, String, f64, f64)>,
 ) -> Element {
     let mut search = use_signal(String::new);
-    let mut expanded_ssh = use_signal(|| true);
-    let mut expanded_shell = use_signal(|| true);
-    let mut expanded_other = use_signal(|| false);
+    let mut show_hidden = use_signal(|| false);
+    let mut creating_group = use_signal(|| false);
+    let mut new_group_name = use_signal(String::new);
     let mut context_menu = use_signal(|| Option::<(String, f64, f64)>::None);
+    let mut live_width = use_signal(|| preferences.clone().normalized().width_px);
+    let mut resize_drag = use_signal(|| Option::<(f64, u16)>::None);
 
-    let search_lower = search.read().to_lowercase();
-    let filtered: Vec<ConnectionConfig> = connections
+    let normalized_preferences = preferences.normalized();
+    let search_lower = search.read().trim().to_lowercase();
+    let hidden_count = normalized_preferences.hidden_connection_ids.len();
+    let visible_connections: Vec<ConnectionConfig> = connections
         .into_iter()
-        .filter(|c| {
-            if search_lower.is_empty() {
-                true
-            } else {
-                c.name.to_lowercase().contains(&search_lower)
-                    || kind_label(&c.kind).to_lowercase().contains(&search_lower)
-            }
+        .filter(|connection| {
+            connection_is_visible(&normalized_preferences, &connection.id, show_hidden())
+                && connection_matches_search(connection, &search_lower)
         })
         .collect();
 
-    let ssh_conns: Vec<&ConnectionConfig> = filtered
+    let grouped: Vec<(ConnectionGroup, Vec<ConnectionConfig>)> = normalized_preferences
+        .groups
         .iter()
-        .filter(|c| matches!(c.kind, ConnectionKind::Ssh(_)))
+        .cloned()
+        .map(|group| {
+            let members = visible_connections
+                .iter()
+                .filter(|connection| connection.group.as_deref() == Some(group.id.as_str()))
+                .cloned()
+                .collect();
+            (group, members)
+        })
         .collect();
-    let shell_conns: Vec<&ConnectionConfig> = filtered
+    let ungrouped: Vec<ConnectionConfig> = visible_connections
         .iter()
-        .filter(|c| matches!(c.kind, ConnectionKind::Shell(_)))
-        .collect();
-    let other_conns: Vec<&ConnectionConfig> = filtered
-        .iter()
-        .filter(|c| !matches!(c.kind, ConnectionKind::Ssh(_) | ConnectionKind::Shell(_)))
+        .filter(|connection| {
+            connection.group.as_ref().is_none_or(|group_id| {
+                !normalized_preferences
+                    .groups
+                    .iter()
+                    .any(|group| group.id == *group_id)
+            })
+        })
+        .cloned()
         .collect();
 
+    let sidebar_style = format!(
+        "position:relative;width:min({}px,45vw);min-width:min({}px,45vw);max-width:min({}px,45vw);flex:0 0 min({}px,45vw);background:#1a1b26;border-right:1px solid #2a2b3d;display:flex;flex-direction:column;height:100%;color:#c0caf5;user-select:none;box-sizing:border-box;",
+        live_width(),
+        MIN_SIDEBAR_WIDTH_PX,
+        MAX_SIDEBAR_WIDTH_PX,
+        live_width()
+    );
+    let hidden_button_title = if show_hidden() {
+        "Hide hidden connections again"
+    } else {
+        "Show hidden connections"
+    };
+    let hidden_button_color = if show_hidden() { "#7aa2f7" } else { "#787c99" };
+
+    let prefs_for_create_key = normalized_preferences.clone();
+    let prefs_for_create_click = normalized_preferences.clone();
+    let prefs_for_hidden = normalized_preferences.clone();
+    let prefs_for_resize = normalized_preferences.clone();
+    let prefs_for_resize_overlay = normalized_preferences.clone();
+    let groups_for_menu = normalized_preferences.groups.clone();
+    let hidden_ids_for_menu = normalized_preferences.hidden_connection_ids.clone();
+
     rsx! {
-        // Scoped CSS for the hover-revealed row action icons. Rendered inline
-        // (not in main.rs's head) so the sidebar is self-contained; class names
-        // are namespaced with `conn-` to avoid collisions.
         style { "
-            .conn-icons{{opacity:0;transition:opacity 0.12s;display:flex;gap:2px;align-items:center;}}
+            .sidebar-icon-button{{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;padding:0;border:1px solid #2a2b3d;border-radius:4px;background:transparent;color:#a9b1d6;cursor:pointer;}}
+            .sidebar-icon-button:hover{{background:#24283b;color:#7aa2f7;border-color:#414868;}}
+            .conn-icons{{opacity:0;transition:opacity .12s;display:flex;gap:1px;align-items:center;}}
             .conn-item:hover .conn-icons{{opacity:1;}}
-            .conn-edit{{color:#9ece6a;cursor:pointer;font-size:13px;padding:0 4px;line-height:1;user-select:none;}}
-            .conn-edit:hover{{color:#7aa2f7;}}
-            .conn-del{{color:#f7768e;cursor:pointer;font-size:13px;padding:0 4px;line-height:1;user-select:none;}}
-            .conn-del:hover{{color:#ff5e8f;}}
-            .ctx-item{{padding:6px 12px;font-size:12px;cursor:pointer;color:#c0caf5;}}
+            .conn-row-action{{display:inline-flex;align-items:center;justify-content:center;color:#787c99;cursor:pointer;padding:2px;}}
+            .conn-row-action:hover{{color:#7aa2f7;}}
+            .ctx-item{{padding:6px 12px;font-size:12px;cursor:pointer;color:#c0caf5;display:flex;align-items:center;gap:8px;white-space:nowrap;}}
             .ctx-item:hover{{background:#2a2b3d;}}
-            .ctx-danger:hover{{background:#2a2b3d;color:#f7768e;}}
+            .ctx-label{{padding:7px 12px 3px;font-size:10px;color:#565f89;text-transform:uppercase;letter-spacing:.5px;}}
+            .ctx-danger:hover{{color:#f7768e;}}
+            .sidebar-resize-handle:hover,.sidebar-resize-handle.active{{background:#7aa2f7;box-shadow:0 0 6px rgba(122,162,247,.55);}}
+            .connection-group-header{{border:1px solid transparent;border-radius:4px;transition:background .1s,border-color .1s,color .1s;}}
+            .connection-group-header.connection-group-drop-target{{background:rgba(122,162,247,.16);border-color:#7aa2f7;color:#c0caf5;}}
         " }
 
         div {
-            style: "
-                width: 260px;
-                background: #1a1b26;
-                border-right: 1px solid #2a2b3d;
-                display: flex;
-                flex-direction: column;
-                height: 100%;
-                color: #c0caf5;
-                user-select: none;
-            ",
+            style: "{sidebar_style}",
 
-            // Header
             div {
-                style: "padding: 12px; display: flex; justify-content: space-between; align-items: center;",
-                span { style: "font-weight: 600; font-size: 14px; letter-spacing: 0.3px;", "Connections" }
+                style: "padding:10px 10px 8px;display:flex;justify-content:space-between;align-items:center;gap:8px;",
+                span { style: "font-weight:600;font-size:14px;letter-spacing:.3px;", "Connections" }
                 div {
-                    style: "display: flex; gap: 6px;",
+                    style: "display:flex;gap:5px;",
                     button {
-                        class: "conn-btn",
-                        style: "background: transparent; border: 1px solid #2a2b3d; color: #c0caf5; border-radius: 4px; padding: 4px 10px; cursor: pointer; font-size: 12px;",
-                        title: "Configure OneKeys (Expect/Send auto-fill)",
-                        onclick: move |_| on_onekey.call(()),
-                        "OneKeys"
+                        class: "sidebar-icon-button",
+                        style: "color:{hidden_button_color};",
+                        title: "{hidden_button_title}",
+                        onclick: move |_| show_hidden.set(!show_hidden()),
+                        Icon { name: if show_hidden() { IconName::Eye } else { IconName::EyeOff }, size: 15 }
+                        if hidden_count > 0 {
+                            span { style: "font-size:9px;margin-left:1px;", "{hidden_count}" }
+                        }
                     }
                     button {
-                        class: "conn-btn",
-                        style: "background: #7aa2f7; border: none; color: #1a1b26; border-radius: 4px; padding: 4px 10px; cursor: pointer; font-size: 12px; font-weight: 600;",
+                        class: "sidebar-icon-button",
+                        title: "Create connection group",
+                        onclick: move |_| creating_group.set(!creating_group()),
+                        Icon { name: IconName::Folder, size: 15 }
+                        Icon { name: IconName::Plus, size: 10 }
+                    }
+                    button {
+                        class: "sidebar-icon-button",
+                        title: "Configure OneKeys",
+                        onclick: move |_| on_onekey.call(()),
+                        Icon { name: IconName::Key, size: 15 }
+                    }
+                    button {
+                        class: "sidebar-icon-button",
+                        style: "background:#7aa2f7;color:#1a1b26;border-color:#7aa2f7;",
+                        title: "Create connection",
                         onclick: move |_| on_new.call(()),
-                        "+ New"
+                        Icon { name: IconName::Plus, size: 16 }
                     }
                 }
             }
 
-            // Search
+            if creating_group() {
+                div {
+                    style: "padding:0 10px 8px;display:flex;gap:5px;",
+                    input {
+                        style: "min-width:0;flex:1;background:#24283b;border:1px solid #414868;border-radius:4px;padding:6px 8px;color:#c0caf5;font-size:12px;outline:none;",
+                        r#type: "text",
+                        placeholder: "Group name",
+                        value: "{new_group_name}",
+                        autofocus: true,
+                        oninput: move |event| new_group_name.set(event.value()),
+                        onkeydown: move |event: KeyboardEvent| {
+                            if matches!(event.key(), Key::Enter) {
+                                event.prevent_default();
+                                if let Some(updated) = create_group(&prefs_for_create_key, &new_group_name()) {
+                                    on_preferences_change.call(updated);
+                                    new_group_name.set(String::new());
+                                    creating_group.set(false);
+                                }
+                            } else if matches!(event.key(), Key::Escape) {
+                                event.prevent_default();
+                                new_group_name.set(String::new());
+                                creating_group.set(false);
+                            }
+                        },
+                    }
+                    button {
+                        class: "sidebar-icon-button",
+                        title: "Add group",
+                        onclick: move |_| {
+                            if let Some(updated) = create_group(&prefs_for_create_click, &new_group_name()) {
+                                on_preferences_change.call(updated);
+                                new_group_name.set(String::new());
+                                creating_group.set(false);
+                            }
+                        },
+                        Icon { name: IconName::Plus, size: 15 }
+                    }
+                }
+            }
+
             div {
-                style: "padding: 0 12px 8px;",
+                style: "padding:0 10px 8px;position:relative;",
+                span {
+                    style: "position:absolute;left:18px;top:7px;color:#565f89;display:inline-flex;pointer-events:none;",
+                    Icon { name: IconName::Search, size: 14 }
+                }
                 input {
-                    style: "width: 100%; background: #24283b; border: 1px solid #2a2b3d; border-radius: 4px; padding: 6px 8px; color: #c0caf5; font-size: 12px; box-sizing: border-box; outline: none;",
+                    style: "width:100%;background:#24283b;border:1px solid #2a2b3d;border-radius:4px;padding:6px 8px 6px 28px;color:#c0caf5;font-size:12px;box-sizing:border-box;outline:none;",
                     r#type: "text",
                     placeholder: "Search connections...",
                     value: "{search}",
-                    oninput: move |e| search.set(e.value()),
+                    oninput: move |event| search.set(event.value()),
                 }
             }
 
-            // Connection groups
             div {
-                style: "flex: 1; overflow-y: auto; padding: 0 4px;",
-
-                // SSH group
-                if !ssh_conns.is_empty() {
-                    {rsx! {
-                        div {
-                            style: "padding: 4px 8px; font-size: 11px; color: #565f89; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; cursor: pointer; display: flex; align-items: center; gap: 4px;",
-                            onclick: move |_| expanded_ssh.set(!expanded_ssh()),
-                            span { style: "font-size: 8px; color: #565f89;", if expanded_ssh() { "▼" } else { "▶" } }
-                            span { style: "color: #7aa2f7;", "●" }
-                            "SSH ({ssh_conns.len()})"
-                        }
-                        if expanded_ssh() {
-                            for conn in ssh_conns {
-                                {rsx! {
-                                    ConnItem {
-                                        key: "{conn.id}",
-                                        conn: conn.clone(),
-                                        on_connect: on_connect,
-                                        on_copy: on_copy,
-                                        on_edit: on_edit,
-                                        on_delete: on_delete,
-                                        on_drag_start: on_drag_start,
-                                        context_menu: context_menu,
-                                    }
-                                }}
-                            }
-                        }
-                    }}
+                style: "flex:1;overflow-y:auto;padding:0 4px 8px;",
+                for (group, members) in grouped {
+                    ConnectionGroupSection {
+                        key: "{group.id}",
+                        group,
+                        connections: members,
+                        drag_over_group: drag_over_group.clone(),
+                        hidden_ids: normalized_preferences.hidden_connection_ids.clone(),
+                        preferences: normalized_preferences.clone(),
+                        on_preferences_change,
+                        on_group_delete,
+                        on_connect,
+                        on_copy,
+                        on_edit,
+                        on_delete,
+                        on_drag_start,
+                        context_menu,
+                    }
                 }
 
-                // Shell group
-                if !shell_conns.is_empty() {
-                    {rsx! {
-                        div {
-                            style: "padding: 4px 8px; margin-top: 4px; font-size: 11px; color: #565f89; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; cursor: pointer; display: flex; align-items: center; gap: 4px;",
-                            onclick: move |_| expanded_shell.set(!expanded_shell()),
-                            span { style: "font-size: 8px; color: #565f89;", if expanded_shell() { "▼" } else { "▶" } }
-                            span { style: "color: #9ece6a;", "●" }
-                            "Shell ({shell_conns.len()})"
-                        }
-                        if expanded_shell() {
-                            for conn in shell_conns {
-                                {rsx! {
-                                    ConnItem {
-                                        key: "{conn.id}",
-                                        conn: conn.clone(),
-                                        on_connect: on_connect,
-                                        on_copy: on_copy,
-                                        on_edit: on_edit,
-                                        on_delete: on_delete,
-                                        on_drag_start: on_drag_start,
-                                        context_menu: context_menu,
-                                    }
-                                }}
-                            }
-                        }
-                    }}
-                }
-
-                // Other group (Serial, Telnet, TCP)
-                if !other_conns.is_empty() {
-                    {rsx! {
-                        div {
-                            style: "padding: 4px 8px; margin-top: 4px; font-size: 11px; color: #565f89; font-weight: 600; text-transform: uppercase; letter-spacing: 0.5px; cursor: pointer; display: flex; align-items: center; gap: 4px;",
-                            onclick: move |_| expanded_other.set(!expanded_other()),
-                            span { style: "font-size: 8px; color: #565f89;", if expanded_other() { "▼" } else { "▶" } }
-                            span { style: "color: #ff9e64;", "●" }
-                            "Other ({other_conns.len()})"
-                        }
-                        if expanded_other() {
-                            for conn in other_conns {
-                                {rsx! {
-                                    ConnItem {
-                                        key: "{conn.id}",
-                                        conn: conn.clone(),
-                                        on_connect: on_connect,
-                                        on_copy: on_copy,
-                                        on_edit: on_edit,
-                                        on_delete: on_delete,
-                                        on_drag_start: on_drag_start,
-                                        context_menu: context_menu,
-                                    }
-                                }}
-                            }
-                        }
-                    }}
-                }
-
-                if filtered.is_empty() {
+                if !ungrouped.is_empty() {
                     div {
-                        style: "padding: 24px 12px; text-align: center; color: #565f89; font-size: 12px;",
-                        if search_lower.is_empty() {
-                            "No connections yet.\nClick + New to add one."
-                        } else {
+                        style: "padding:5px 8px 3px;font-size:11px;color:#565f89;font-weight:600;text-transform:uppercase;letter-spacing:.5px;display:flex;align-items:center;gap:6px;",
+                        Icon { name: IconName::FolderOpen, size: 14 }
+                        "Ungrouped ({ungrouped.len()})"
+                    }
+                    for connection in ungrouped {
+                        ConnItem {
+                            key: "{connection.id}",
+                            hidden: normalized_preferences.hidden_connection_ids.iter().any(|id| id == &connection.id),
+                            conn: connection,
+                            on_connect,
+                            on_edit,
+                            on_delete,
+                            on_drag_start,
+                            context_menu,
+                        }
+                    }
+                }
+
+                if visible_connections.is_empty() {
+                    div {
+                        style: "padding:24px 12px;text-align:center;color:#565f89;font-size:12px;white-space:pre-line;",
+                        if !search_lower.is_empty() {
                             "No matching connections."
+                        } else if hidden_count > 0 && !show_hidden() {
+                            "All connections are hidden.\nUse the eye button to restore them."
+                        } else {
+                            "No connections yet.\nUse + to create one."
                         }
                     }
                 }
             }
+
+            if resize_drag().is_some() {
+                // Fallback for WebViews that do not keep sending mouse events
+                // to the narrow handle after the pointer leaves it. On
+                // platforms with implicit capture the handle remains primary;
+                // otherwise this fixed layer completes and persists the drag.
+                div {
+                    style: "position:fixed;inset:0;z-index:79;cursor:col-resize;background:transparent;",
+                    onmousemove: move |event: MouseEvent| {
+                        let Some((start_x, start_width)) = resize_drag() else { return; };
+                        event.prevent_default();
+                        let delta = event.client_coordinates().x - start_x;
+                        let width = (f64::from(start_width) + delta)
+                            .round()
+                            .clamp(f64::from(MIN_SIDEBAR_WIDTH_PX), f64::from(MAX_SIDEBAR_WIDTH_PX)) as u16;
+                        live_width.set(width);
+                    },
+                    onmouseup: move |event: MouseEvent| {
+                        event.prevent_default();
+                        resize_drag.set(None);
+                        let mut updated = prefs_for_resize_overlay.clone();
+                        updated.width_px = live_width();
+                        on_preferences_change.call(updated);
+                    },
+                }
+            }
+
+            div {
+                class: if resize_drag().is_some() { "sidebar-resize-handle active" } else { "sidebar-resize-handle" },
+                style: "position:absolute;right:-3px;top:0;width:6px;height:100%;z-index:80;cursor:col-resize;background:transparent;transition:background .1s;",
+                title: "Drag to resize connection sidebar",
+                onmousedown: move |event: MouseEvent| {
+                    if event.trigger_button() == Some(MouseButton::Primary) {
+                        event.prevent_default();
+                        event.stop_propagation();
+                        resize_drag.set(Some((event.client_coordinates().x, live_width())));
+                    }
+                },
+                onmousemove: move |event: MouseEvent| {
+                    let Some((start_x, start_width)) = resize_drag() else { return; };
+                    event.prevent_default();
+                    let delta = event.client_coordinates().x - start_x;
+                    let width = (f64::from(start_width) + delta)
+                        .round()
+                        .clamp(f64::from(MIN_SIDEBAR_WIDTH_PX), f64::from(MAX_SIDEBAR_WIDTH_PX)) as u16;
+                    live_width.set(width);
+                },
+                onmouseup: move |event: MouseEvent| {
+                    if resize_drag().is_none() { return; }
+                    event.prevent_default();
+                    event.stop_propagation();
+                    resize_drag.set(None);
+                    let mut updated = prefs_for_resize.clone();
+                    updated.width_px = live_width();
+                    on_preferences_change.call(updated);
+                },
+            }
         }
 
-        // Context menu overlay
         if let Some((ref _menu_id, x, y)) = context_menu() {
             div {
-                style: "position: fixed; top: 0; left: 0; right: 0; bottom: 0; z-index: 2999;",
+                style: "position:fixed;inset:0;z-index:2999;",
                 onclick: move |_| context_menu.set(None),
             }
             div {
-                style: "position: fixed; top: {y}px; left: {x}px; z-index: 3000; background: #24283b; border: 1px solid #2a2b3d; border-radius: 4px; padding: 4px 0; min-width: 140px; box-shadow: 0 4px 12px rgba(0,0,0,0.4);",
-
+                style: "position:fixed;top:{y}px;left:{x}px;z-index:3000;background:#24283b;border:1px solid #414868;border-radius:5px;padding:4px 0;min-width:180px;max-height:70vh;overflow-y:auto;box-shadow:0 6px 18px rgba(0,0,0,.5);",
                 div {
                     class: "ctx-item",
                     onclick: move |_| {
-                        if let Some((id, _, _)) = context_menu() {
-                            on_connect.call(id);
-                        }
+                        if let Some((id, _, _)) = context_menu() { on_connect.call(id); }
                         context_menu.set(None);
                     },
+                    Icon { name: IconName::Connect, size: 14 }
                     "Connect"
                 }
                 div {
                     class: "ctx-item",
                     onclick: move |_| {
-                        if let Some((id, _, _)) = context_menu() {
-                            on_copy.call(id);
-                        }
+                        if let Some((id, _, _)) = context_menu() { on_copy.call(id); }
                         context_menu.set(None);
                     },
-                    "Copy Session"
+                    Icon { name: IconName::Plus, size: 14 }
+                    "Copy connection"
+                }
+                div {
+                    class: "ctx-item",
+                    onclick: move |_| {
+                        if let Some((id, _, _)) = context_menu() { on_edit.call(id); }
+                        context_menu.set(None);
+                    },
+                    Icon { name: IconName::Edit, size: 14 }
+                    "Edit…"
                 }
                 div {
                     class: "ctx-item",
                     onclick: move |_| {
                         if let Some((id, _, _)) = context_menu() {
-                            on_edit.call(id);
+                            let mut updated = prefs_for_hidden.clone();
+                            if let Some(index) = updated.hidden_connection_ids.iter().position(|hidden| hidden == &id) {
+                                updated.hidden_connection_ids.remove(index);
+                            } else {
+                                updated.hidden_connection_ids.push(id);
+                            }
+                            on_preferences_change.call(updated);
                         }
                         context_menu.set(None);
                     },
-                    "Edit…"
+                    Icon {
+                        name: if context_menu().as_ref().is_some_and(|(id, _, _)| hidden_ids_for_menu.iter().any(|hidden| hidden == id)) {
+                            IconName::Eye
+                        } else {
+                            IconName::EyeOff
+                        },
+                        size: 14,
+                    }
+                    if context_menu().as_ref().is_some_and(|(id, _, _)| hidden_ids_for_menu.iter().any(|hidden| hidden == id)) {
+                        "Show in sidebar"
+                    } else {
+                        "Hide from sidebar"
+                    }
                 }
+
+                div { style: "height:1px;background:#414868;margin:4px 0;" }
+                div { class: "ctx-label", "Move to group" }
+                div {
+                    class: "ctx-item",
+                    onclick: move |_| {
+                        if let Some((id, _, _)) = context_menu() { on_group_change.call((id, None)); }
+                        context_menu.set(None);
+                    },
+                    Icon { name: IconName::FolderOpen, size: 14 }
+                    "Ungrouped"
+                }
+                for group in groups_for_menu {
+                    div {
+                        class: "ctx-item",
+                        onclick: move |_| {
+                            if let Some((id, _, _)) = context_menu() {
+                                on_group_change.call((id, Some(group.id.clone())));
+                            }
+                            context_menu.set(None);
+                        },
+                        Icon { name: IconName::Folder, size: 14 }
+                        "{group.name}"
+                    }
+                }
+
+                div { style: "height:1px;background:#414868;margin:4px 0;" }
                 div {
                     class: "ctx-item ctx-danger",
                     onclick: move |_| {
-                        if let Some((id, _, _)) = context_menu() {
-                            on_delete.call(id);
-                        }
+                        if let Some((id, _, _)) = context_menu() { on_delete.call(id); }
                         context_menu.set(None);
                     },
+                    Icon { name: IconName::Delete, size: 14 }
                     "Delete"
                 }
             }
@@ -302,136 +491,163 @@ pub fn Sidebar(
     }
 }
 
-/// Proper Dioxus component for a connection item — has its own hook context
-/// so that use_signal doesn't break the parent's hook ordering.
 #[component]
-fn ConnItem(
-    conn: ConnectionConfig,
+fn ConnectionGroupSection(
+    group: ConnectionGroup,
+    connections: Vec<ConnectionConfig>,
+    drag_over_group: Option<String>,
+    hidden_ids: Vec<String>,
+    preferences: SidebarPreferences,
+    on_preferences_change: EventHandler<SidebarPreferences>,
+    on_group_delete: EventHandler<String>,
     on_connect: EventHandler<String>,
     on_copy: EventHandler<String>,
     on_edit: EventHandler<String>,
     on_delete: EventHandler<String>,
-    /// Fired on primary-button `onmousedown` with
-    /// `(connection_config, display_name, x, y)`. The App wires this to
-    /// `start_tab_drag` with `DragKind::Connection`. See `Sidebar`'s
-    /// `on_drag_start` prop doc for the full rationale.
+    on_drag_start: EventHandler<(ConnectionConfig, String, f64, f64)>,
+    mut context_menu: Signal<Option<(String, f64, f64)>>,
+) -> Element {
+    let group_id = group.id.clone();
+    let group_id_for_delete = group.id.clone();
+    let preferences_for_toggle = preferences.clone();
+    let collapsed = group.collapsed;
+    let is_drop_target = drag_over_group.as_deref() == Some(group.id.as_str());
+    rsx! {
+        div {
+            class: if is_drop_target { "connection-group-header connection-group-drop-target" } else { "connection-group-header" },
+            "data-rusterm-group-id": "{group.id}",
+            style: "padding:5px 8px 3px;font-size:11px;color:#787c99;font-weight:600;text-transform:uppercase;letter-spacing:.5px;cursor:pointer;display:flex;align-items:center;gap:6px;",
+            onclick: move |_| {
+                let mut updated = preferences_for_toggle.clone();
+                if let Some(group) = updated.groups.iter_mut().find(|group| group.id == group_id) {
+                    group.collapsed = !group.collapsed;
+                }
+                on_preferences_change.call(updated);
+            },
+            Icon { name: if collapsed { IconName::ChevronRight } else { IconName::ChevronDown }, size: 12 }
+            Icon { name: if collapsed { IconName::Folder } else { IconName::FolderOpen }, size: 14 }
+            span { style: "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;", "{group.name} ({connections.len()})" }
+            span {
+                class: "conn-row-action",
+                title: "Delete group and move its connections to Ungrouped",
+                onclick: move |event: MouseEvent| {
+                    event.stop_propagation();
+                    on_group_delete.call(group_id_for_delete.clone());
+                },
+                Icon { name: IconName::Delete, size: 12 }
+            }
+        }
+        if !collapsed {
+            for connection in connections {
+                ConnItem {
+                    key: "{connection.id}",
+                    hidden: hidden_ids.iter().any(|id| id == &connection.id),
+                    conn: connection,
+                    on_connect,
+                    on_edit,
+                    on_delete,
+                    on_drag_start,
+                    context_menu,
+                }
+            }
+        }
+    }
+}
+
+#[component]
+fn ConnItem(
+    conn: ConnectionConfig,
+    hidden: bool,
+    on_connect: EventHandler<String>,
+    on_edit: EventHandler<String>,
+    on_delete: EventHandler<String>,
     on_drag_start: EventHandler<(ConnectionConfig, String, f64, f64)>,
     mut context_menu: Signal<Option<(String, f64, f64)>>,
 ) -> Element {
     let color = kind_color(&conn.kind);
+    let icon = kind_icon(&conn.kind);
     let id = conn.id.clone();
     let id_for_ctx = conn.id.clone();
     let id_for_edit = conn.id.clone();
-    let id_for_del = conn.id.clone();
-    let mut hovered = use_signal(|| false);
-    let bg = if hovered() { "#24283b" } else { "transparent" };
-
-    // Clone the connection config + name for the mousedown handoff.
-    // `on_drag_start` consumes both — the config drives `open_connection`
-    // in `finish_tab_drag`, and the name shows up in the drag ghost.
-    // We clone upfront because `conn` is moved into the rsx! tree (used
-    // by `conn.name` interpolation + kind_color etc.), so the mousedown
-    // closure can't borrow it.
+    let id_for_delete = conn.id.clone();
     let conn_for_drag = conn.clone();
     let name_for_drag = conn.name.clone();
+    let row_opacity = if hidden { "0.5" } else { "1" };
 
     rsx! {
         div {
             class: "conn-item",
-            // NOTE: NO `draggable: true` — that would start a native
-            // HTML5 drag alongside the manual mouse-based system,
-            // producing two ghosts and double-executing drops. The
-            // `onmousedown` handler below is the sole drag entry point
-            // (Task 22 extension for sidebar → pane drags; mirrors the
-            // tab bar + pane title bar wiring). HTML5 DnD was unreliable
-            // in dioxus 0.7's desktop webview, which is why the manual
-            // system exists. Plain click-to-connect still works:
-            // `onmousedown` only hands off to `start_tab_drag` with
-            // `dragging: false`; the polling loop only fires the drop
-            // if the cursor crossed the threshold, otherwise `onclick`
-            // fires normally.
-            style: "
-                padding: 6px 10px;
-                margin: 1px 4px;
-                border-radius: 4px;
-                cursor: pointer;
-                font-size: 12px;
-                display: flex;
-                align-items: center;
-                gap: 6px;
-                background: {bg};
-                transition: background 0.1s;
-            ",
-            onclick: move |_| {
-                on_connect.call(id.clone());
-            },
-            onmousedown: move |e: MouseEvent| {
-                // Only start a drag on primary button (left click).
-                // Middle/right clicks have other semantics (middle-click
-                // could be paste, right-click opens the context menu) and
-                // shouldn't initiate a drag.
-                if e.trigger_button() == Some(MouseButton::Primary) {
-                    // Prevent the browser from starting a native text-
-                    // selection drag on this mousedown (mirrors the tab
-                    // bar's onmousedown). preventDefault on mousedown
-                    // does NOT cancel the subsequent click event, so
-                    // click-to-connect still works.
-                    e.prevent_default();
-                    let c = e.client_coordinates();
-                    on_drag_start.call((
-                        conn_for_drag.clone(),
-                        name_for_drag.clone(),
-                        c.x,
-                        c.y,
-                    ));
+            style: "padding:6px 9px;margin:1px 4px;border-radius:4px;cursor:pointer;font-size:12px;display:flex;align-items:center;gap:7px;background:transparent;opacity:{row_opacity};transition:background .1s,opacity .1s;",
+            title: "{kind_label(&conn.kind)} · {conn.name}",
+            onclick: move |_| on_connect.call(id.clone()),
+            onmousedown: move |event: MouseEvent| {
+                if event.trigger_button() == Some(MouseButton::Primary) {
+                    event.prevent_default();
+                    let point = event.client_coordinates();
+                    on_drag_start.call((conn_for_drag.clone(), name_for_drag.clone(), point.x, point.y));
                 }
             },
-            onmouseenter: move |_| hovered.set(true),
-            onmouseleave: move |_| hovered.set(false),
-            oncontextmenu: move |e: MouseEvent| {
-                e.prevent_default();
-                context_menu.set(Some((id_for_ctx.clone(), e.client_coordinates().x, e.client_coordinates().y)));
+            oncontextmenu: move |event: MouseEvent| {
+                event.prevent_default();
+                context_menu.set(Some((id_for_ctx.clone(), event.client_coordinates().x, event.client_coordinates().y)));
             },
-
-            span {
-                style: "width: 6px; height: 6px; border-radius: 50%; background: {color}; flex-shrink: 0;",
-            }
-            span {
-                style: "flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;",
-                "{conn.name}"
+            span { style: "display:inline-flex;color:{color};flex-shrink:0;", Icon { name: icon, size: 15 } }
+            span { style: "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;", "{conn.name}" }
+            if hidden {
+                span { style: "display:inline-flex;color:#787c99;", Icon { name: IconName::EyeOff, size: 12 } }
             }
             if conn.onekey {
-                span {
-                    style: "font-size: 9px; background: #9ece6a; color: #1a1b26; padding: 1px 5px; border-radius: 3px; font-weight: 600; flex-shrink: 0;",
-                    "1-KEY"
-                }
+                span { style: "display:inline-flex;color:#9ece6a;", title: "OneKey enabled", Icon { name: IconName::Key, size: 12 } }
             }
-
-            // Hover-revealed inline action icons. `stop_propagation` on their
-            // clicks prevents the row's `onclick` (Connect) from also firing.
-            // The icons are always in the DOM (so CSS :hover on the row can
-            // drive their opacity) but invisible until the row is hovered.
             span {
                 class: "conn-icons",
                 span {
-                    class: "conn-edit",
+                    class: "conn-row-action",
                     title: "Edit connection",
-                    onclick: move |e: MouseEvent| {
-                        e.stop_propagation();
+                    onclick: move |event: MouseEvent| {
+                        event.stop_propagation();
                         on_edit.call(id_for_edit.clone());
                     },
-                    "✎"
+                    Icon { name: IconName::Edit, size: 13 }
                 }
                 span {
-                    class: "conn-del",
+                    class: "conn-row-action",
                     title: "Delete connection",
-                    onclick: move |e: MouseEvent| {
-                        e.stop_propagation();
-                        on_delete.call(id_for_del.clone());
+                    onclick: move |event: MouseEvent| {
+                        event.stop_propagation();
+                        on_delete.call(id_for_delete.clone());
                     },
-                    "✕"
+                    Icon { name: IconName::Delete, size: 13 }
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hidden_connections_are_filtered_until_reveal_is_enabled() {
+        let preferences = SidebarPreferences {
+            hidden_connection_ids: vec!["hidden".to_string()],
+            ..SidebarPreferences::default()
+        };
+        assert!(!connection_is_visible(&preferences, "hidden", false));
+        assert!(connection_is_visible(&preferences, "hidden", true));
+        assert!(connection_is_visible(&preferences, "visible", false));
+    }
+
+    #[test]
+    fn create_group_trims_name_and_rejects_empty_or_duplicate_names() {
+        let preferences = SidebarPreferences::default();
+        let updated = create_group(&preferences, "  Production  ").expect("valid group");
+        assert_eq!(updated.groups.len(), 1);
+        assert_eq!(updated.groups[0].name, "Production");
+        assert!(!updated.groups[0].id.is_empty());
+
+        assert!(create_group(&updated, "   ").is_none());
+        assert!(create_group(&updated, "production").is_none());
     }
 }

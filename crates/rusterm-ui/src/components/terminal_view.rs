@@ -420,25 +420,52 @@ fn html_escape(s: &str) -> String {
 /// Build CSS style string from cell attributes.
 fn cell_style(fg: &CellColor, bg: &CellColor, flags: CellFlags) -> String {
     let mut parts = Vec::new();
-    let fg_css = color_to_css(fg);
-    if !fg_css.is_empty() {
-        parts.push(fg_css);
+    let mut fg_css = color_to_css(fg);
+    let mut bg_css = color_to_css(bg);
+
+    if flags.contains(CellFlags::INVERSE) {
+        // A default color needs an explicit value after swapping; otherwise the
+        // browser would inherit the original terminal foreground/background.
+        if fg_css.is_empty() {
+            fg_css = "#c0caf5".to_string();
+        }
+        if bg_css.is_empty() {
+            bg_css = "#1a1b26".to_string();
+        }
+        std::mem::swap(&mut fg_css, &mut bg_css);
     }
-    let bg_css = color_to_css(bg);
+
+    if !fg_css.is_empty() {
+        parts.push(format!("color:{fg_css}"));
+    }
     if !bg_css.is_empty() {
-        parts.push(format!("background:{}", bg_css));
+        parts.push(format!("background:{bg_css}"));
     }
     if flags.contains(CellFlags::BOLD) {
         parts.push("font-weight:700".to_string());
     }
+    if flags.contains(CellFlags::DIM) {
+        parts.push("opacity:0.65".to_string());
+    }
     if flags.contains(CellFlags::ITALIC) {
         parts.push("font-style:italic".to_string());
     }
-    if flags.contains(CellFlags::UNDERLINE) {
-        parts.push("text-decoration:underline".to_string());
+
+    let mut decorations = Vec::new();
+    if flags.contains(CellFlags::UNDERLINE) || flags.contains(CellFlags::DOUBLE_UNDERLINE) {
+        decorations.push("underline");
     }
     if flags.contains(CellFlags::STRIKETHROUGH) {
-        parts.push("text-decoration:line-through".to_string());
+        decorations.push("line-through");
+    }
+    if !decorations.is_empty() {
+        parts.push(format!("text-decoration-line:{}", decorations.join(" ")));
+    }
+    if flags.contains(CellFlags::DOUBLE_UNDERLINE) {
+        parts.push("text-decoration-style:double".to_string());
+    }
+    if flags.contains(CellFlags::HIDDEN) {
+        parts.push("color:transparent".to_string());
     }
     parts.join(";")
 }
@@ -2168,9 +2195,9 @@ pub fn TerminalView(
 mod tests {
     use super::{
         ClipboardCopyOutcome, CopyShortcut, OneKeyKeyAction, TerminalOverlayKeyAction,
-        TextSelection, copy_text_to_clipboard, event_cell_from_coords, onekey_popup_key_action,
-        scroll_thumb_geometry, terminal_overlay_key_action, terminal_selection_text,
-        word_range_in_row,
+        TextSelection, cell_style, color_to_css, copy_text_to_clipboard, event_cell_from_coords,
+        onekey_popup_key_action, scroll_thumb_geometry, terminal_overlay_key_action,
+        terminal_selection_text, word_range_in_row,
     };
     use dioxus::prelude::Key;
     use rusterm_core::terminal::{RenderCell, RenderRow};
@@ -2617,5 +2644,52 @@ mod tests {
         // Tiny scrollback: thumb height clamped to >= 5% so it stays visible.
         let (_, _, height) = scroll_thumb_geometry(1, 0, 24);
         assert!(height >= 5.0);
+    }
+
+    #[test]
+    fn xterm_indexed_and_truecolor_cells_emit_valid_foreground_css() {
+        assert_eq!(
+            color_to_css(&rusterm_core::terminal::CellColor::Indexed(196)),
+            "#ff0000"
+        );
+        assert_eq!(
+            color_to_css(&rusterm_core::terminal::CellColor::Indexed(21)),
+            "#0000ff"
+        );
+        assert_eq!(
+            color_to_css(&rusterm_core::terminal::CellColor::Spec(vte::ansi::Rgb {
+                r: 12,
+                g: 34,
+                b: 56,
+            })),
+            "#0c2238"
+        );
+        assert_eq!(
+            cell_style(
+                &rusterm_core::terminal::CellColor::Indexed(196),
+                &rusterm_core::terminal::CellColor::Indexed(22),
+                rusterm_core::terminal::CellFlags::empty(),
+            ),
+            "color:#ff0000;background:#005f00"
+        );
+    }
+
+    #[test]
+    fn sgr_effects_compose_without_discarding_colors() {
+        let flags = rusterm_core::terminal::CellFlags::DIM
+            | rusterm_core::terminal::CellFlags::DOUBLE_UNDERLINE
+            | rusterm_core::terminal::CellFlags::STRIKETHROUGH
+            | rusterm_core::terminal::CellFlags::INVERSE;
+        let style = cell_style(
+            &rusterm_core::terminal::CellColor::Indexed(196),
+            &rusterm_core::terminal::CellColor::Indexed(22),
+            flags,
+        );
+
+        assert!(style.contains("color:#005f00"));
+        assert!(style.contains("background:#ff0000"));
+        assert!(style.contains("opacity:0.65"));
+        assert!(style.contains("text-decoration-line:underline line-through"));
+        assert!(style.contains("text-decoration-style:double"));
     }
 }

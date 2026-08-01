@@ -11,7 +11,7 @@ use crate::config::{
     ConnectionConfig, ConnectionKind, DEFAULT_ONEKEY_PASSWORD_EXPECT, EncryptedValue,
     FocusedTabAppearance, OneKey, OneKeyStep, PersistedConfig, PersistedConnection,
     PersistedConnectionKind, PersistedOneKey, PersistedOneKeyStep, PersistedSshAuth,
-    PersistedSshConfig, SshAuth, SshConfig,
+    PersistedSshConfig, SidebarPreferences, SshAuth, SshConfig,
 };
 use rusterm_crypto::{KeyringStore, decrypt_data, encrypt_data};
 
@@ -251,6 +251,7 @@ impl ConfigManager {
             focused_tab_appearance: appearance.normalized(),
             suggestion_enabled: existing.suggestion_enabled,
             suggestion_count: existing.suggestion_count,
+            sidebar: existing.sidebar,
         };
 
         let json =
@@ -279,6 +280,7 @@ impl ConfigManager {
             focused_tab_appearance: existing.focused_tab_appearance,
             suggestion_enabled: existing.suggestion_enabled,
             suggestion_count: existing.suggestion_count,
+            sidebar: existing.sidebar,
         };
 
         let json =
@@ -314,6 +316,7 @@ impl ConfigManager {
             focused_tab_appearance: existing.focused_tab_appearance,
             suggestion_enabled: existing.suggestion_enabled,
             suggestion_count: existing.suggestion_count,
+            sidebar: existing.sidebar,
         };
 
         let json =
@@ -354,6 +357,7 @@ impl ConfigManager {
             focused_tab_appearance: existing.focused_tab_appearance,
             suggestion_enabled: enabled,
             suggestion_count: count,
+            sidebar: existing.sidebar,
         };
 
         let json =
@@ -363,6 +367,36 @@ impl ConfigManager {
         fs::write(&temp_path, &json).context("Failed to write config file")?;
         fs::rename(&temp_path, &self.config_path).context("Failed to rename temp config file")?;
 
+        Ok(())
+    }
+
+    /// Load normalized connection-sidebar preferences from settings.json.
+    pub fn load_sidebar_preferences(&self) -> SidebarPreferences {
+        self.read_persisted().sidebar.normalized()
+    }
+
+    /// Persist connection-sidebar preferences while preserving encrypted
+    /// connections, OneKeys, and every unrelated setting.
+    pub fn save_sidebar_preferences(&self, sidebar: &SidebarPreferences) -> Result<()> {
+        let existing = self.read_persisted();
+        let persisted = PersistedConfig {
+            version: CONFIG_VERSION,
+            connections: existing.connections,
+            onekeys: existing.onekeys,
+            master_password_hash: self.master_password_hash.clone(),
+            restore_disabled: existing.restore_disabled,
+            confirm_close_on_exit: existing.confirm_close_on_exit,
+            focused_tab_appearance: existing.focused_tab_appearance,
+            suggestion_enabled: existing.suggestion_enabled,
+            suggestion_count: existing.suggestion_count,
+            sidebar: sidebar.clone().normalized(),
+        };
+
+        let json =
+            serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
+        let temp_path = self.config_path.with_extension("json.tmp");
+        fs::write(&temp_path, &json).context("Failed to write config file")?;
+        fs::rename(&temp_path, &self.config_path).context("Failed to rename temp config file")?;
         Ok(())
     }
 
@@ -427,6 +461,7 @@ impl ConfigManager {
             focused_tab_appearance: existing.focused_tab_appearance,
             suggestion_enabled: existing.suggestion_enabled,
             suggestion_count: existing.suggestion_count,
+            sidebar: existing.sidebar,
         };
 
         let json =
@@ -452,6 +487,7 @@ impl ConfigManager {
                 focused_tab_appearance: FocusedTabAppearance::default(),
                 suggestion_enabled: true,
                 suggestion_count: 3,
+                sidebar: SidebarPreferences::default(),
             };
         }
         fs::read_to_string(&self.config_path)
@@ -467,6 +503,7 @@ impl ConfigManager {
                 focused_tab_appearance: FocusedTabAppearance::default(),
                 suggestion_enabled: true,
                 suggestion_count: 3,
+                sidebar: SidebarPreferences::default(),
             })
     }
 
@@ -486,6 +523,7 @@ impl ConfigManager {
             focused_tab_appearance: existing.focused_tab_appearance,
             suggestion_enabled: existing.suggestion_enabled,
             suggestion_count: existing.suggestion_count,
+            sidebar: existing.sidebar,
         };
 
         let json =
@@ -689,8 +727,8 @@ impl ConfigManager {
 mod tests {
     use super::*;
     use crate::config::{
-        ConnectionKind, OneKey, OneKeyStep, SerialConfig, SshAuth, SshConfig, TcpConfig,
-        TelnetConfig, default_host_key_policy,
+        ConnectionGroup, ConnectionKind, OneKey, OneKeyStep, SerialConfig, SidebarPreferences,
+        SshAuth, SshConfig, TcpConfig, TelnetConfig, default_host_key_policy,
     };
 
     fn test_config_manager() -> (ConfigManager, tempfile::TempDir) {
@@ -724,6 +762,30 @@ mod tests {
 
         assert_eq!(cm.load_focused_tab_appearance(), appearance);
         assert!(cm.load_restore_disabled());
+    }
+
+    #[test]
+    fn sidebar_preferences_roundtrip_and_survive_other_saves() {
+        let (cm, _dir) = test_config_manager();
+        let preferences = SidebarPreferences {
+            width_px: 388,
+            hidden_connection_ids: vec!["hidden".to_string()],
+            groups: vec![ConnectionGroup {
+                id: "ops".to_string(),
+                name: "Operations".to_string(),
+                collapsed: true,
+            }],
+        };
+
+        cm.save_sidebar_preferences(&preferences).unwrap();
+        assert_eq!(cm.load_sidebar_preferences(), preferences);
+
+        cm.save_connections(&[]).unwrap();
+        cm.save_onekeys(&[]).unwrap();
+        cm.save_restore_disabled(true).unwrap();
+        cm.save_suggestion_settings(false, 10).unwrap();
+
+        assert_eq!(cm.load_sidebar_preferences(), preferences);
     }
 
     #[test]

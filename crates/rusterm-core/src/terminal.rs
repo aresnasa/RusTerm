@@ -331,6 +331,8 @@ struct ScreenSwitchState {
 
 // ── Terminal ────────────────────────────────────────────────────────
 
+const DYNAMIC_COLOR_SLOTS: usize = ansi::NamedColor::Cursor as usize + 1;
+
 pub struct Terminal {
     grid: Vec<Row>,
     size: TerminalSize,
@@ -341,6 +343,11 @@ pub struct Terminal {
     attrs_fg: CellColor,
     attrs_bg: CellColor,
     attrs_flags: CellFlags,
+
+    // OSC 4 / 10 / 11 / 12 may redefine palette entries for the current
+    // terminal. Keep overrides separate from cells, so a palette change also
+    // recolors already-rendered scrollback just like xterm.
+    color_overrides: Vec<Option<ansi::Rgb>>,
 
     saved_cursor: Option<CursorState>,
     screen_switch_cursor: Option<ScreenSwitchState>, // Saved by ESC[?1049h, restored by ESC[?1049l
@@ -416,6 +423,7 @@ impl Terminal {
             attrs_fg: CellColor::Default,
             attrs_bg: CellColor::Default,
             attrs_flags: CellFlags::empty(),
+            color_overrides: vec![None; DYNAMIC_COLOR_SLOTS],
             saved_cursor: None,
             screen_switch_cursor: None,
             scroll_top: 0,
@@ -708,6 +716,23 @@ impl Terminal {
             .collect()
     }
 
+    fn resolve_render_color(&self, color: CellColor, default_color: ansi::NamedColor) -> CellColor {
+        let override_for = |index: usize| self.color_overrides.get(index).and_then(|color| *color);
+
+        match color {
+            CellColor::Default => override_for(default_color as usize)
+                .map(CellColor::Spec)
+                .unwrap_or(CellColor::Default),
+            CellColor::Named(named) => override_for(named as usize)
+                .map(CellColor::Spec)
+                .unwrap_or(CellColor::Named(named)),
+            CellColor::Indexed(index) => override_for(index as usize)
+                .map(CellColor::Spec)
+                .unwrap_or(CellColor::Indexed(index)),
+            CellColor::Spec(color) => CellColor::Spec(color),
+        }
+    }
+
     pub fn render(&self) -> RenderOutput {
         self.render_with_scroll(0)
     }
@@ -722,8 +747,8 @@ impl Terminal {
                 .iter()
                 .map(|c| RenderCell {
                     character: c.character,
-                    fg: c.fg,
-                    bg: c.bg,
+                    fg: self.resolve_render_color(c.fg, ansi::NamedColor::Foreground),
+                    bg: self.resolve_render_color(c.bg, ansi::NamedColor::Background),
                     flags: c.flags,
                     wide: c.wide,
                     wide_next: c.wide_next,
@@ -1731,9 +1756,23 @@ impl Handler for Terminal {
     fn pop_title(&mut self) {}
     fn set_keypad_application_mode(&mut self) {}
     fn unset_keypad_application_mode(&mut self) {}
-    fn set_color(&mut self, _: usize, _: ansi::Rgb) {}
+    fn set_color(&mut self, index: usize, color: ansi::Rgb) {
+        if let Some(slot) = self.color_overrides.get_mut(index) {
+            *slot = Some(color);
+            self.mark_all_dirty();
+        }
+    }
+
+    // Color queries do not change terminal state. They are intentionally left
+    // unanswered until the UI exposes its configured base palette to core.
     fn dynamic_color_sequence(&mut self, _: String, _: usize, _: &str) {}
-    fn reset_color(&mut self, _: usize) {}
+
+    fn reset_color(&mut self, index: usize) {
+        if let Some(slot) = self.color_overrides.get_mut(index) {
+            *slot = None;
+            self.mark_all_dirty();
+        }
+    }
     fn clipboard_store(&mut self, _: u8, _: &[u8]) {}
     fn clipboard_load(&mut self, _: u8, _: &str) {}
     fn report_mode(&mut self, mode: ansi::Mode) {
@@ -1961,6 +2000,79 @@ mod tests {
         term.process(b"\x1b[?1003h\x1bc", &mut parser);
         assert!(!term.render().mode_mouse_reporting);
         assert!(!term.render().mode_mouse_sgr);
+    }
+
+    #[test]
+    fn sgr_extended_colors_are_preserved_for_the_renderer() {
+        let mut term = Terminal::new(TerminalSize::default());
+        let mut parser = vte::ansi::Processor::new();
+        term.process(
+            b"\x1b[38;5;196mA\x1b[48;5;22mB\x1b[38;2;12;34;56;48;2;65;43;21mC",
+            &mut parser,
+        );
+
+        let cells = &term.render().rows[0].cells;
+        assert_eq!(cells[0].fg, CellColor::Indexed(196));
+        assert_eq!(cells[1].bg, CellColor::Indexed(22));
+        assert_eq!(
+            cells[2].fg,
+            CellColor::Spec(ansi::Rgb {
+                r: 12,
+                g: 34,
+                b: 56,
+            })
+        );
+        assert_eq!(
+            cells[2].bg,
+            CellColor::Spec(ansi::Rgb {
+                r: 65,
+                g: 43,
+                b: 21,
+            })
+        );
+    }
+
+    #[test]
+    fn osc_palette_and_default_colors_recolor_existing_cells() {
+        let mut term = Terminal::new(TerminalSize::default());
+        let mut parser = vte::ansi::Processor::new();
+        term.process(b"\x1b[31mA\x1b[0mB", &mut parser);
+        term.process(
+            b"\x1b]4;1;#123456\x07\x1b]10;#345678;#56789a\x07",
+            &mut parser,
+        );
+
+        let cells = &term.render().rows[0].cells;
+        assert_eq!(
+            cells[0].fg,
+            CellColor::Spec(ansi::Rgb {
+                r: 0x12,
+                g: 0x34,
+                b: 0x56,
+            })
+        );
+        assert_eq!(
+            cells[1].fg,
+            CellColor::Spec(ansi::Rgb {
+                r: 0x34,
+                g: 0x56,
+                b: 0x78,
+            })
+        );
+        assert_eq!(
+            cells[1].bg,
+            CellColor::Spec(ansi::Rgb {
+                r: 0x56,
+                g: 0x78,
+                b: 0x9a,
+            })
+        );
+
+        term.process(b"\x1b]104;1\x07\x1b]110\x07\x1b]111\x07", &mut parser);
+        let cells = &term.render().rows[0].cells;
+        assert_eq!(cells[0].fg, CellColor::Named(ansi::NamedColor::Red));
+        assert_eq!(cells[1].fg, CellColor::Default);
+        assert_eq!(cells[1].bg, CellColor::Default);
     }
 
     #[test]

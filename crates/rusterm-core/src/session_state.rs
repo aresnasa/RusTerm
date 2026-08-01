@@ -136,6 +136,25 @@ pub struct PersistedSession {
     /// NEVER re-executed — they're display-only.
     #[serde(default)]
     pub command_history_tail: Vec<String>,
+
+    /// Last-known terminal grid resolution (cols × rows + pixel dims) for
+    /// this session. Persisted so the restored session opens at the same
+    /// size the user left it, rather than the 80×24 default. `None` for
+    /// legacy snapshots that predate the field — the caller falls back to
+    /// `TerminalSize::default()`.
+    #[serde(default)]
+    pub terminal_size: Option<PersistedTerminalSize>,
+}
+
+/// Serializable terminal grid size. Mirrors `TerminalSize` but is
+/// `Serialize + Deserialize` and lives in `rusterm-core` (no dependency on
+/// the terminal model's private fields).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct PersistedTerminalSize {
+    pub cols: u16,
+    pub rows: u16,
+    pub pixel_width: u32,
+    pub pixel_height: u32,
 }
 
 impl SessionState {
@@ -297,6 +316,7 @@ mod tests {
                 connection_id: Some("conn-1".to_string()),
                 cwd: Some("/home/user/projects".to_string()),
                 command_history_tail: vec!["ls -la".to_string(), "cd src".to_string()],
+                terminal_size: None,
             }],
             theme: Some("Dark".to_string()),
         }
@@ -391,6 +411,7 @@ mod tests {
                 connection_id: Some("conn-secret".to_string()),
                 cwd: Some("/home/user/secret-project".to_string()),
                 command_history_tail: vec!["ssh production-db".to_string()],
+                terminal_size: None,
             }],
             theme: Some("Dark".to_string()),
         };
@@ -476,6 +497,7 @@ mod tests {
                     connection_id: None,
                     cwd: Some("/tmp".to_string()),
                     command_history_tail: vec![],
+                    terminal_size: None,
                 },
                 PersistedSession {
                     id: "sess-2".to_string(),
@@ -485,6 +507,12 @@ mod tests {
                     connection_id: Some("conn-prod".to_string()),
                     cwd: Some("/var/log".to_string()),
                     command_history_tail: vec!["tail -f syslog".to_string()],
+                    terminal_size: Some(PersistedTerminalSize {
+                        cols: 180,
+                        rows: 48,
+                        pixel_width: 1440,
+                        pixel_height: 768,
+                    }),
                 },
                 PersistedSession {
                     id: "sess-3".to_string(),
@@ -494,6 +522,7 @@ mod tests {
                     connection_id: None,
                     cwd: None, // serial sessions don't report cwd
                     command_history_tail: vec![],
+                    terminal_size: None,
                 },
             ],
             theme: Some("Light".to_string()),
@@ -508,5 +537,26 @@ mod tests {
         assert_eq!(loaded.active_session, Some("sess-2".to_string()));
         // Serial session should have cwd=None preserved.
         assert!(loaded.sessions[2].cwd.is_none());
+        // Terminal size should round-trip.
+        assert_eq!(loaded.sessions[1].terminal_size.as_ref().unwrap().cols, 180);
+        assert_eq!(loaded.sessions[1].terminal_size.as_ref().unwrap().rows, 48);
+        assert_eq!(
+            loaded.sessions[1]
+                .terminal_size
+                .as_ref()
+                .unwrap()
+                .pixel_width,
+            1440
+        );
+        assert_eq!(
+            loaded.sessions[1]
+                .terminal_size
+                .as_ref()
+                .unwrap()
+                .pixel_height,
+            768
+        );
+        // Sessions without a persisted size should have None.
+        assert!(loaded.sessions[0].terminal_size.is_none());
     }
 }
