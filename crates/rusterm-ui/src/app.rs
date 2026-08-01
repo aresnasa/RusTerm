@@ -4074,11 +4074,7 @@ fn multi_pane_container(
             let diffs = crate::comparison::compute_comparison_diffs(&pane_texts);
             let summary = crate::comparison::diff_summary(&diffs);
 
-            if crate::comparison::should_warn_for_large_diff(
-                &summary,
-                warning_enabled,
-                confirmed,
-            ) {
+            if crate::comparison::should_warn_for_large_diff(&summary, warning_enabled, confirmed) {
                 // Too many differences — warn the user before highlighting.
                 // Don't apply highlights yet (set diffs to None so
                 // TerminalView doesn't render diff backgrounds).
