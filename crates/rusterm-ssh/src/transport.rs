@@ -58,7 +58,7 @@ async fn connect_transport_with_tls_config(
     let Some(proxy) = proxy else {
         return Ok(Box::new(
             connect_tcp(target_host, target_port, "direct TCP connect").await?,
-        ));
+        ) as BoxedTransport);
     };
 
     validate_host(&proxy.host, "proxy validation")?;
