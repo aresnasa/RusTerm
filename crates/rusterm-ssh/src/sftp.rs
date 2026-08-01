@@ -37,6 +37,12 @@ pub enum SftpError {
     PermissionDenied(String),
     #[error("operation is not supported: {0}")]
     Unsupported(String),
+    #[error("the SSH server rejected the SFTP subsystem request")]
+    SubsystemRejected,
+    #[error("unexpected SFTP subsystem reply: {0}")]
+    UnexpectedSubsystemReply(String),
+    #[error("the SSH channel closed before SFTP started")]
+    ChannelClosed,
     #[error("SFTP connection lost: {0}")]
     ConnectionLost(String),
     #[error("SFTP request timed out")]

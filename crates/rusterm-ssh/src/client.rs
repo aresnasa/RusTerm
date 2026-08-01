@@ -485,7 +485,7 @@ impl std::fmt::Debug for SshSession {
 impl SshSession {
     /// Open an SFTP subsystem over a new channel on this authenticated session.
     pub async fn open_sftp(&self) -> Result<SftpClient, crate::sftp::SftpError> {
-        let channel = self
+        let mut channel = self
             .handle
             .channel_open_session()
             .await
@@ -494,6 +494,20 @@ impl SshSession {
             .request_subsystem(true, "sftp")
             .await
             .map_err(map_ssh_error)?;
+        let subsystem_reply =
+            tokio::time::timeout(std::time::Duration::from_secs(10), channel.wait())
+                .await
+                .map_err(|_| crate::sftp::SftpError::Timeout)?;
+        match subsystem_reply {
+            Some(ChannelMsg::Success) => {}
+            Some(ChannelMsg::Failure) => return Err(crate::sftp::SftpError::SubsystemRejected),
+            Some(other) => {
+                return Err(crate::sftp::SftpError::UnexpectedSubsystemReply(format!(
+                    "{other:?}"
+                )));
+            }
+            None => return Err(crate::sftp::SftpError::ChannelClosed),
+        }
         let session = russh_sftp::client::SftpSession::new(channel.into_stream())
             .await
             .map_err(map_sftp_error)?;

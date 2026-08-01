@@ -105,6 +105,7 @@ async fn list_remote_directory(
         .list(path)
         .await
         .map_err(|error| format!("Unable to list remote directory: {error}"))?;
+    entries.retain(|entry| !matches!(entry.name.as_str(), "." | ".."));
     entries.sort_by(|left, right| {
         let left_is_directory = left.metadata.file_type == RemoteFileType::Directory;
         let right_is_directory = right.metadata.file_type == RemoteFileType::Directory;

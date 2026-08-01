@@ -48,12 +48,12 @@ use crate::state::{
     PendingCommandPayload, PendingDangerousCommand, SessionConnectionState, SessionTab,
     TabDropOutcome, TerminalEntry, UnlockState, activate_session, append_pane_to_active,
     begin_floating_pane_move, close_pane, close_session, close_workspace, command_send_targets,
-    distribute_sessions_across_panes, execute_tab_drop_on_pane, execute_tab_drop_on_pane_at,
-    focus_pane_for_layout, focused_pane_session, move_floating_pane_for_active,
-    move_session_to_leftmost, prepare_split_for_sidebar_drop, prepare_split_for_sidebar_drop_at,
-    push_workspace_tab, resize_layout_split, scroll_sync_targets, set_active_tab,
-    set_pane_session_for_layout, source_pane_for_copy, toggle_comparison_mode, toggle_pane_zoom,
-    toggle_split_mode,
+    distribute_sessions_across_panes, enqueue_pending_exit, execute_tab_drop_on_pane,
+    execute_tab_drop_on_pane_at, focus_pane_for_layout, focused_pane_session,
+    move_floating_pane_for_active, move_session_to_leftmost, prepare_split_for_sidebar_drop,
+    prepare_split_for_sidebar_drop_at, push_workspace_tab, resize_layout_split,
+    rollback_pending_exit, scroll_sync_targets, set_active_tab, set_pane_session_for_layout,
+    source_pane_for_copy, toggle_comparison_mode, toggle_pane_zoom, toggle_split_mode,
 };
 use crate::transfers::{FileEndpoint, TransferJob, TransferRequest, TransferStatus};
 
@@ -518,15 +518,7 @@ fn dispatch_approved_command(
         let history_id = uuid::Uuid::new_v4().to_string();
         {
             let mut app = state.write();
-            let queue = app
-                .pending_exit_check
-                .entry(session_id.clone())
-                .or_default();
-            const MAX_PENDING: usize = 32;
-            while queue.len() >= MAX_PENDING {
-                queue.pop_front();
-            }
-            queue.push_back((command.clone(), history_id.clone()));
+            enqueue_pending_exit(&mut app, &session_id, command.clone(), history_id.clone());
             if let Some(log) = app.session_logs.get(&session_id) {
                 log.lock().log_input(&bytes);
             }
@@ -541,11 +533,7 @@ fn dispatch_approved_command(
             sent += 1;
         } else {
             let mut app = state.write();
-            if let Some(queue) = app.pending_exit_check.get_mut(&session_id) {
-                if queue.back().is_some_and(|(_, id)| id == &history_id) {
-                    queue.pop_back();
-                }
-            }
+            let _ = rollback_pending_exit(&mut app, &session_id, &history_id);
             tracing::warn!("[COMMAND] target session unavailable: {session_id}");
         }
     }

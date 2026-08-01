@@ -980,6 +980,51 @@ pub fn rollback_pending_exit(state: &mut AppState, session_id: &str, history_id:
     }
 }
 
+#[cfg(test)]
+mod pending_exit_helpers_tests {
+    use super::*;
+
+    #[test]
+    fn pending_queue_caps_at_32_and_preserves_fifo_order() {
+        let mut state = AppState::default();
+        for index in 0..40 {
+            enqueue_pending_exit(
+                &mut state,
+                "session",
+                format!("command-{index}"),
+                format!("id-{index}"),
+            );
+        }
+        let queue = &state.pending_exit_check["session"];
+        assert_eq!(queue.len(), 32);
+        assert_eq!(queue.front().unwrap().0, "command-8");
+        assert_eq!(queue.back().unwrap().0, "command-39");
+    }
+
+    #[test]
+    fn rollback_only_removes_the_matching_newest_submission() {
+        let mut state = AppState::default();
+        enqueue_pending_exit(
+            &mut state,
+            "session",
+            "first".to_string(),
+            "first-id".to_string(),
+        );
+        enqueue_pending_exit(
+            &mut state,
+            "session",
+            "second".to_string(),
+            "second-id".to_string(),
+        );
+
+        assert!(!rollback_pending_exit(&mut state, "session", "first-id"));
+        assert!(rollback_pending_exit(&mut state, "session", "second-id"));
+        assert_eq!(state.pending_exit_check["session"].len(), 1);
+        assert!(rollback_pending_exit(&mut state, "session", "first-id"));
+        assert!(!state.pending_exit_check.contains_key("session"));
+    }
+}
+
 /// Helper: set the active tab and derive `active_session` from the tab's
 /// anchor. Use this whenever the active top TabBar entry changes so the two
 /// fields stay in sync (Step 1 compatibility).
