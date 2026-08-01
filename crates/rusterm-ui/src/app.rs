@@ -1055,6 +1055,7 @@ fn render_terminal_pane(
             let sid_for_ok_sel = tab.id.clone();
             let sid_for_ok_save = tab.id.clone();
             let sid_for_ok_dismiss = tab.id.clone();
+            let sid_for_focus_lost = tab.id.clone();
             let sid_for_reconnect = tab.id.clone();
             let senders = input_senders;
             let mut state_for_cmd = state;
@@ -1068,6 +1069,7 @@ fn render_terminal_pane(
             let ok_visible = ok_popup.visible;
             let ok_entries = ok_popup.matches.clone();
             let ok_selected = ok_popup.selected;
+            let ok_requires_explicit_cancel = onekey_popup_requires_explicit_cancel(&ok_popup);
             let ok_submission_feedback = state
                 .read()
                 .onekey_submission_feedback
@@ -1718,6 +1720,7 @@ fn render_terminal_pane(
                     onekey_visible: ok_visible,
                     onekey_entries: ok_entries,
                     onekey_selected: ok_selected,
+                    onekey_requires_explicit_cancel: ok_requires_explicit_cancel,
                     onekey_submission_feedback: ok_submission_feedback,
                     on_onekey_navigate: move |idx: Option<usize>| {
                         if let Some(i) = idx {
@@ -1847,10 +1850,17 @@ fn render_terminal_pane(
                         app.onekey_submission_cooldown.remove(&sid_for_ok_save);
                     },
                     on_onekey_dismiss: move |_: ()| {
-                        let mut app = state_for_cmd.write();
-                        app.onekey_popups.remove(&sid_for_ok_dismiss);
-                        app.onekey_submission_feedback.remove(&sid_for_ok_dismiss);
-                        app.onekey_submission_cooldown.remove(&sid_for_ok_dismiss);
+                        dismiss_onekey_popup(
+                            &mut state_for_cmd.write(),
+                            &sid_for_ok_dismiss,
+                            PopupDismissReason::UserCancelled,
+                        );
+                    },
+                    on_focus_lost: move |_: ()| {
+                        dismiss_terminal_popups_for_focus_change(
+                            &mut state_for_cmd.write(),
+                            &sid_for_focus_lost,
+                        );
                     },
                     disconnected: tab_disconnected,
                     on_reconnect: move |_: ()| {
@@ -5299,7 +5309,11 @@ fn take_onekey_selection(
             .get(index)
             .map(|entry| (entry.send.clone(), entry.matched_expect.clone()))
     });
-    if selection.is_some() {
+    if selection.is_some()
+        && popups
+            .get(session_id)
+            .is_some_and(|popup| should_hide_onekey_popup(popup, PopupDismissReason::Submitted))
+    {
         popups.remove(session_id);
     }
     selection
@@ -5395,6 +5409,23 @@ fn should_hide_onekey_popup(popup: &OneKeyPopupState, reason: PopupDismissReason
     }
 }
 
+fn dismiss_onekey_popup(
+    state: &mut AppState,
+    session_id: &str,
+    reason: PopupDismissReason,
+) -> bool {
+    let should_hide = state
+        .onekey_popups
+        .get(session_id)
+        .is_some_and(|popup| should_hide_onekey_popup(popup, reason));
+    if should_hide {
+        state.onekey_popups.remove(session_id);
+        state.onekey_submission_feedback.remove(session_id);
+        state.onekey_submission_cooldown.remove(session_id);
+    }
+    should_hide
+}
+
 fn dismiss_terminal_popups_for_focus_change(state: &mut AppState, session_id: &str) {
     if let Some(tab) = state.sessions.iter_mut().find(|tab| tab.id == session_id) {
         tab.suggestion_visible = false;
@@ -5403,15 +5434,7 @@ fn dismiss_terminal_popups_for_focus_change(state: &mut AppState, session_id: &s
         tab.suggestion_selected = 0;
     }
 
-    let hide_onekey = state
-        .onekey_popups
-        .get(session_id)
-        .is_some_and(|popup| should_hide_onekey_popup(popup, PopupDismissReason::FocusChanged));
-    if hide_onekey {
-        state.onekey_popups.remove(session_id);
-        state.onekey_submission_feedback.remove(session_id);
-        state.onekey_submission_cooldown.remove(session_id);
-    }
+    dismiss_onekey_popup(state, session_id, PopupDismissReason::FocusChanged);
 }
 
 fn onekey_step_label(step: &OneKeyStep) -> String {
