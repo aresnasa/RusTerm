@@ -162,3 +162,64 @@ fn shell_working_dir_is_honored() {
     );
     let _ = std::fs::remove_dir_all(&tmp);
 }
+
+#[test]
+fn close_terminates_a_long_running_child_process() {
+    let test_dir = tempfile::tempdir().expect("temporary test directory");
+    let pid_path = test_dir.path().join("child.pid");
+    let script = format!(
+        "echo $$ > '{}'; trap '' HUP TERM; while :; do sleep 1; done",
+        pid_path.display()
+    );
+    let config = ShellConfig {
+        command: Some("/bin/sh".to_string()),
+        args: vec!["-c".to_string(), script],
+        env: Vec::new(),
+        working_dir: None,
+    };
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel::<SessionEvent>();
+    let session = ShellConnection::open(
+        &config,
+        TerminalSize::default(),
+        "terminate-session".to_string(),
+        event_tx,
+    )
+    .expect("open long-running shell connection");
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !pid_path.exists() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let pid = std::fs::read_to_string(&pid_path)
+        .expect("child wrote its pid")
+        .trim()
+        .to_string();
+
+    session.close().expect("request shell close");
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    let mut disconnected = false;
+    while std::time::Instant::now() < deadline {
+        match event_rx.try_recv() {
+            Ok(SessionEvent::Disconnected(id, _)) if id == "terminate-session" => {
+                disconnected = true;
+            }
+            Ok(_) => {}
+            Err(mpsc::error::TryRecvError::Empty) => {}
+            Err(mpsc::error::TryRecvError::Disconnected) => break,
+        }
+        let alive = std::process::Command::new("/bin/kill")
+            .args(["-0", &pid])
+            .status()
+            .is_ok_and(|status| status.success());
+        if disconnected && !alive {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    let _ = std::process::Command::new("/bin/kill")
+        .args(["-9", &pid])
+        .status();
+    assert!(disconnected, "close must emit a Disconnected event");
+    panic!("child process {pid} survived ShellConnection close");
+}

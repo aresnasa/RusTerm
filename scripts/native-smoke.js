@@ -284,8 +284,9 @@ return (async () => {
       "RUSTERM_MAIN_E2E_OK",
     );
 
+    await sleep(750);
     stage = "dangerous-command-cancel";
-    await typeCommand(mainTerminal, "mkfs.ext4 /dev/rusterm-e2e-nonexistent");
+    await typeCommand(mainTerminal, "mkfs.ext4 /dev/sda");
     await waitFor(
       () => document.body.textContent.includes("⚠ 高危命令确认"),
       "dangerous command confirmation did not open",

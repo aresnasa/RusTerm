@@ -7069,6 +7069,7 @@ dependencies = [
  "rusterm-core",
  "serde",
  "serialport",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
  "tokio-util",
