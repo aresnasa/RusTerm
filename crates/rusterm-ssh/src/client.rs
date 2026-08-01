@@ -461,6 +461,29 @@ impl SshClient {
 
 type Handle = client::Handle<Handler>;
 
+#[derive(Debug, PartialEq, Eq)]
+enum SubsystemReplyAction {
+    Ready,
+    ContinueWaiting,
+    Error(crate::sftp::SftpError),
+}
+
+fn classify_subsystem_reply(reply: Option<ChannelMsg>) -> SubsystemReplyAction {
+    match reply {
+        Some(ChannelMsg::Success) => SubsystemReplyAction::Ready,
+        Some(ChannelMsg::Failure) => {
+            SubsystemReplyAction::Error(crate::sftp::SftpError::SubsystemRejected)
+        }
+        Some(ChannelMsg::WindowAdjusted { .. }) => SubsystemReplyAction::ContinueWaiting,
+        Some(ChannelMsg::Close | ChannelMsg::Eof) | None => {
+            SubsystemReplyAction::Error(crate::sftp::SftpError::ChannelClosed)
+        }
+        Some(other) => SubsystemReplyAction::Error(
+            crate::sftp::SftpError::UnexpectedSubsystemReply(format!("{other:?}")),
+        ),
+    }
+}
+
 #[derive(Clone)]
 pub struct SshSession {
     handle: Arc<Handle>,
@@ -483,7 +506,6 @@ impl std::fmt::Debug for SshSession {
 }
 
 impl SshSession {
-    /// Open an SFTP subsystem over a new channel on this authenticated session.
     pub async fn open_sftp(&self) -> Result<SftpClient, crate::sftp::SftpError> {
         let mut channel = self
             .handle
@@ -494,20 +516,19 @@ impl SshSession {
             .request_subsystem(true, "sftp")
             .await
             .map_err(map_ssh_error)?;
-        let subsystem_reply =
-            tokio::time::timeout(std::time::Duration::from_secs(10), channel.wait())
-                .await
-                .map_err(|_| crate::sftp::SftpError::Timeout)?;
-        match subsystem_reply {
-            Some(ChannelMsg::Success) => {}
-            Some(ChannelMsg::Failure) => return Err(crate::sftp::SftpError::SubsystemRejected),
-            Some(other) => {
-                return Err(crate::sftp::SftpError::UnexpectedSubsystemReply(format!(
-                    "{other:?}"
-                )));
+
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                match classify_subsystem_reply(channel.wait().await) {
+                    SubsystemReplyAction::Ready => return Ok(()),
+                    SubsystemReplyAction::ContinueWaiting => {}
+                    SubsystemReplyAction::Error(error) => return Err(error),
+                }
             }
-            None => return Err(crate::sftp::SftpError::ChannelClosed),
-        }
+        })
+        .await
+        .map_err(|_| crate::sftp::SftpError::Timeout)??;
+
         let session = russh_sftp::client::SftpSession::new(channel.into_stream())
             .await
             .map_err(map_sftp_error)?;
@@ -735,5 +756,44 @@ fn flush_cmd(
             out.push(c);
         }
         current.clear();
+    }
+}
+
+#[cfg(test)]
+mod sftp_subsystem_reply_tests {
+    use super::*;
+
+    #[test]
+    fn window_adjustment_is_non_terminal_while_waiting_for_subsystem_reply() {
+        assert_eq!(
+            classify_subsystem_reply(Some(ChannelMsg::WindowAdjusted {
+                new_size: 2_097_152
+            })),
+            SubsystemReplyAction::ContinueWaiting
+        );
+    }
+
+    #[test]
+    fn success_and_failure_are_terminal_subsystem_replies() {
+        assert_eq!(
+            classify_subsystem_reply(Some(ChannelMsg::Success)),
+            SubsystemReplyAction::Ready
+        );
+        assert_eq!(
+            classify_subsystem_reply(Some(ChannelMsg::Failure)),
+            SubsystemReplyAction::Error(crate::sftp::SftpError::SubsystemRejected)
+        );
+    }
+
+    #[test]
+    fn closed_channel_is_reported_as_closed_not_unexpected() {
+        assert_eq!(
+            classify_subsystem_reply(Some(ChannelMsg::Close)),
+            SubsystemReplyAction::Error(crate::sftp::SftpError::ChannelClosed)
+        );
+        assert_eq!(
+            classify_subsystem_reply(None),
+            SubsystemReplyAction::Error(crate::sftp::SftpError::ChannelClosed)
+        );
     }
 }

@@ -273,7 +273,7 @@ pub struct AppState {
     #[serde(skip)]
     pub transfers: crate::transfers::TransferState,
     #[serde(skip)]
-    pub transfer_cancellations: HashMap<String, CancellationToken>,
+    pub transfer_cancellations: HashMap<String, (u32, CancellationToken)>,
     /// Local PTY session rendered only inside the bottom dock Shell panel.
     #[serde(skip)]
     pub bottom_shell_session_id: Option<String>,
@@ -608,6 +608,19 @@ impl Default for AppState {
 }
 
 impl AppState {
+    /// Remove the cancellation token only when it belongs to the completing
+    /// transfer attempt. A stale completion must not remove a retry's token.
+    pub fn remove_transfer_cancellation_for_attempt(&mut self, job_id: &str, attempt: u32) -> bool {
+        let is_current = self
+            .transfer_cancellations
+            .get(job_id)
+            .is_some_and(|(current_attempt, _)| *current_attempt == attempt);
+        if is_current {
+            self.transfer_cancellations.remove(job_id);
+        }
+        is_current
+    }
+
     /// Build a `SessionState` snapshot from the current app state, suitable
     /// for saving to `session_state.enc`.
     ///
@@ -678,10 +691,17 @@ impl AppState {
             })
             .collect();
 
+        let active_session = self
+            .active_session
+            .as_ref()
+            .filter(|active_id| sessions.iter().any(|session| &session.id == *active_id))
+            .cloned()
+            .or_else(|| sessions.first().map(|session| session.id.clone()));
+
         rusterm_core::SessionState {
             schema_version: 1,
             saved_at: chrono::Utc::now(),
-            active_session: self.active_session.clone(),
+            active_session,
             sessions,
             theme: Some(theme_name.to_string()),
         }
@@ -2100,7 +2120,7 @@ pub fn close_session(
         .map(|job| job.id.clone())
         .collect::<Vec<_>>()
     {
-        if let Some(token) = state.transfer_cancellations.remove(&job_id) {
+        if let Some((_, token)) = state.transfer_cancellations.remove(&job_id) {
             token.cancel();
         }
     }
@@ -2265,7 +2285,7 @@ pub fn close_workspace(
             .map(|job| job.id.clone())
             .collect::<Vec<_>>()
         {
-            if let Some(token) = state.transfer_cancellations.remove(&job_id) {
+            if let Some((_, token)) = state.transfer_cancellations.remove(&job_id) {
                 token.cancel();
             }
         }
@@ -2690,6 +2710,53 @@ mod tests {
             });
         }
         state
+    }
+
+    #[test]
+    fn stale_transfer_attempt_cannot_remove_current_cancellation_token() {
+        let mut state = AppState::default();
+        let token = CancellationToken::new();
+        state
+            .transfer_cancellations
+            .insert("job".to_string(), (1, token.clone()));
+
+        assert!(!state.remove_transfer_cancellation_for_attempt("job", 0));
+        assert!(state.transfer_cancellations.contains_key("job"));
+        assert!(!token.is_cancelled());
+
+        assert!(state.remove_transfer_cancellation_for_attempt("job", 1));
+        assert!(!state.transfer_cancellations.contains_key("job"));
+    }
+
+    #[test]
+    fn session_snapshot_excludes_embedded_shell_and_uses_a_restorable_active_session() {
+        let mut state = state_with_tabs(&["workspace", "embedded-shell"]);
+        state.bottom_shell_session_id = Some("embedded-shell".to_string());
+        state.active_session = Some("embedded-shell".to_string());
+
+        let snapshot = state.build_session_state("Default Dark");
+
+        assert_eq!(
+            snapshot
+                .sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["workspace"]
+        );
+        assert_eq!(snapshot.active_session.as_deref(), Some("workspace"));
+    }
+
+    #[test]
+    fn session_snapshot_has_no_active_session_when_only_embedded_shell_exists() {
+        let mut state = state_with_tabs(&["embedded-shell"]);
+        state.bottom_shell_session_id = Some("embedded-shell".to_string());
+        state.active_session = Some("embedded-shell".to_string());
+
+        let snapshot = state.build_session_state("Default Dark");
+
+        assert!(snapshot.sessions.is_empty());
+        assert_eq!(snapshot.active_session, None);
     }
 
     /// move_session_to_leftmost must relocate the matching tab to index 0.

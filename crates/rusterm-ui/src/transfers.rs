@@ -182,6 +182,32 @@ impl TransferState {
         true
     }
 
+    pub fn report_progress_for_attempt(
+        &mut self,
+        id: &str,
+        attempt: u32,
+        transferred: u64,
+    ) -> bool {
+        if !self.find(id).is_some_and(|job| job.attempt == attempt) {
+            return false;
+        }
+        self.report_progress(id, transferred)
+    }
+
+    pub fn succeed_for_attempt(&mut self, id: &str, attempt: u32) -> bool {
+        if !self.find(id).is_some_and(|job| job.attempt == attempt) {
+            return false;
+        }
+        self.succeed(id)
+    }
+
+    pub fn fail_for_attempt(&mut self, id: &str, attempt: u32, reason: impl Into<String>) -> bool {
+        if !self.find(id).is_some_and(|job| job.attempt == attempt) {
+            return false;
+        }
+        self.fail(id, reason)
+    }
+
     pub fn succeed(&mut self, id: &str) -> bool {
         let Some(job) = self.find_mut(id) else {
             return false;
@@ -463,6 +489,37 @@ mod tests {
         assert!(state.fail("failed", "again"));
         assert!(state.retry("failed"));
         assert_eq!(state.find("failed").unwrap().attempt, 2);
+    }
+
+    #[test]
+    fn stale_attempt_progress_and_completion_cannot_overwrite_a_retry() {
+        let mut state = TransferState::default();
+        enqueue(&mut state, "job", "session", 100);
+        assert_eq!(state.start_next().unwrap().attempt, 0);
+        assert!(state.cancel("job"));
+        assert!(state.retry("job"));
+        assert_eq!(state.start_next().unwrap().attempt, 1);
+
+        assert!(!state.report_progress_for_attempt("job", 0, 64));
+        assert!(!state.succeed_for_attempt("job", 0));
+        assert!(!state.fail_for_attempt("job", 0, "late failure"));
+
+        let retried = state.find("job").unwrap();
+        assert_eq!(retried.attempt, 1);
+        assert_eq!(retried.transferred, 0);
+        assert_eq!(retried.status, TransferStatus::Running);
+    }
+
+    #[test]
+    fn current_attempt_progress_and_completion_are_applied() {
+        let mut state = TransferState::default();
+        enqueue(&mut state, "job", "session", 100);
+        assert_eq!(state.start_next().unwrap().attempt, 0);
+
+        assert!(state.report_progress_for_attempt("job", 0, 64));
+        assert!(state.succeed_for_attempt("job", 0));
+        assert_eq!(state.find("job").unwrap().transferred, 64);
+        assert_eq!(state.find("job").unwrap().status, TransferStatus::Succeeded);
     }
 
     #[test]

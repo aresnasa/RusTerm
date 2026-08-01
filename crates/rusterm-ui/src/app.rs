@@ -55,7 +55,7 @@ use crate::state::{
     rollback_pending_exit, scroll_sync_targets, set_active_tab, set_pane_session_for_layout,
     source_pane_for_copy, toggle_comparison_mode, toggle_pane_zoom, toggle_split_mode,
 };
-use crate::transfers::{FileEndpoint, TransferJob, TransferRequest, TransferStatus};
+use crate::transfers::{FileEndpoint, TransferJob, TransferRequest};
 
 fn save_config(state: &Signal<AppState>) {
     let s = state.read();
@@ -563,7 +563,7 @@ fn enqueue_transfer(mut state: Signal<AppState>, request: TransferRequest) -> Op
 fn cancel_transfer(mut state: Signal<AppState>, job_id: &str) -> bool {
     let cancelled = state.write().transfers.cancel(job_id);
     if cancelled {
-        if let Some(token) = state.write().transfer_cancellations.remove(job_id) {
+        if let Some((_, token)) = state.write().transfer_cancellations.remove(job_id) {
             token.cancel();
         }
         pump_transfer_queue(state);
@@ -588,27 +588,35 @@ fn pump_transfer_queue(mut state: Signal<AppState>) {
         state
             .write()
             .transfer_cancellations
-            .insert(job.id.clone(), cancellation.clone());
+            .insert(job.id.clone(), (job.attempt, cancellation.clone()));
         spawn(async move {
             let result = run_transfer_job(state, job.clone(), cancellation).await;
             {
                 let mut app = state.write();
-                app.transfer_cancellations.remove(&job.id);
-                let already_cancelled = app
+                let is_current_attempt = app
                     .transfers
                     .find(&job.id)
-                    .is_some_and(|queued| queued.status == TransferStatus::Cancelled);
-                if !already_cancelled {
+                    .is_some_and(|queued| queued.attempt == job.attempt);
+                app.remove_transfer_cancellation_for_attempt(&job.id, job.attempt);
+                if is_current_attempt {
                     match result {
                         Ok(bytes) => {
-                            let _ = app.transfers.report_progress(&job.id, bytes);
-                            let _ = app.transfers.succeed(&job.id);
+                            let _ = app.transfers.report_progress_for_attempt(
+                                &job.id,
+                                job.attempt,
+                                bytes,
+                            );
+                            let _ = app.transfers.succeed_for_attempt(&job.id, job.attempt);
                         }
                         Err(rusterm_ssh::SftpError::Cancelled) => {
                             let _ = app.transfers.cancel(&job.id);
                         }
                         Err(error) => {
-                            let _ = app.transfers.fail(&job.id, error.to_string());
+                            let _ = app.transfers.fail_for_attempt(
+                                &job.id,
+                                job.attempt,
+                                error.to_string(),
+                            );
                             if matches!(
                                 error,
                                 rusterm_ssh::SftpError::Connection(_)
@@ -661,7 +669,7 @@ async fn run_transfer_job(
         let _ = progress_state
             .write()
             .transfers
-            .report_progress(&progress_job_id, bytes);
+            .report_progress_for_attempt(&progress_job_id, job.attempt, bytes);
     };
 
     match (&job.source, &job.destination) {
@@ -7569,7 +7577,8 @@ fn start_ssh_connection(
                                     .map(|job| job.id.clone())
                                     .collect::<Vec<_>>();
                                 for job_id in job_ids {
-                                    if let Some(token) = app.transfer_cancellations.remove(&job_id)
+                                    if let Some((_, token)) =
+                                        app.transfer_cancellations.remove(&job_id)
                                     {
                                         token.cancel();
                                     }
@@ -9515,6 +9524,35 @@ pub fn App() -> Element {
                 }
             }
             tokio::time::sleep(std::time::Duration::from_millis(16)).await;
+        }
+    });
+
+    #[cfg(debug_assertions)]
+    let _native_e2e_runner = use_future(|| async move {
+        let Ok(script_path) = std::env::var("RUSTERM_E2E_SCRIPT_PATH") else {
+            return;
+        };
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let result = match std::fs::read_to_string(&script_path) {
+            Ok(script) => dioxus::document::eval(&script).await,
+            Err(error) => {
+                eprintln!("RUSTERM_E2E_ERROR=failed to read {script_path}: {error}");
+                std::process::exit(2);
+            }
+        };
+        match result {
+            Ok(value) if value.as_str() == Some("ok") => {
+                eprintln!("RUSTERM_E2E_RESULT=ok");
+                std::process::exit(0);
+            }
+            Ok(value) => {
+                eprintln!("RUSTERM_E2E_ERROR=unexpected result: {value}");
+                std::process::exit(1);
+            }
+            Err(error) => {
+                eprintln!("RUSTERM_E2E_ERROR={error}");
+                std::process::exit(1);
+            }
         }
     });
 
