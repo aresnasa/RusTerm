@@ -33,6 +33,7 @@ pub fn OneKeyPopup(
 
     rsx! {
         div {
+            "data-rusterm-terminal-popup": "true",
             style: "
                 position: absolute;
                 left: 0; right: 0;
@@ -51,8 +52,35 @@ pub fn OneKeyPopup(
             // Keep popup clicks out of TerminalView's selection/mouse-reporting
             // handlers. In mouse-reporting mode a leaked click would otherwise
             // be sent to the remote application before the credential.
-            onmousedown: move |e: Event<MouseData>| e.stop_propagation(),
+            onpointerdown: move |e: Event<PointerData>| {
+                e.prevent_default();
+                e.stop_propagation();
+            },
+            onmousedown: move |e: Event<MouseData>| {
+                e.prevent_default();
+                e.stop_propagation();
+            },
             onclick: move |e: Event<MouseData>| e.stop_propagation(),
+
+            button {
+                r#type: "button",
+                aria_label: "Cancel credential popup",
+                title: "Cancel credential popup (Escape)",
+                style: "position:absolute;right:6px;top:4px;z-index:1;border:0;background:transparent;color:#565f89;font:inherit;font-size:14px;font-weight:700;cursor:pointer;padding:0 5px;",
+                onpointerdown: move |e| {
+                    e.prevent_default();
+                    e.stop_propagation();
+                },
+                onmousedown: move |e| {
+                    e.prevent_default();
+                    e.stop_propagation();
+                },
+                onclick: move |e| {
+                    e.stop_propagation();
+                    on_dismiss.call(());
+                },
+                "×"
+            }
 
             if rejected {
                 div {

@@ -63,6 +63,7 @@ pub fn SuggestionPopup(
 
     rsx! {
         div {
+            "data-rusterm-terminal-popup": "true",
             style: "
                 position: absolute;
                 left: 0; right: 0;
@@ -83,9 +84,17 @@ pub fn SuggestionPopup(
             // TerminalView captures a pointer on its root to make drag-selection
             // reliable. Stop the pointer before it reaches that root; otherwise
             // WebKit retargets the ensuing click to the terminal and the × never
-            // receives its delete action.
-            onpointerdown: move |e| e.stop_propagation(),
-            onmousedown: move |e| e.stop_propagation(),
+            // receives its delete action. Preventing the default press also
+            // keeps focus on the terminal, so blur-driven popup cleanup cannot
+            // unmount the button before its click callback runs.
+            onpointerdown: move |e| {
+                e.prevent_default();
+                e.stop_propagation();
+            },
+            onmousedown: move |e| {
+                e.prevent_default();
+                e.stop_propagation();
+            },
             onmouseup: move |e| e.stop_propagation(),
             onclick: move |e| e.stop_propagation(),
             for (i, cmd) in visible.iter().enumerate() {
@@ -107,7 +116,7 @@ pub fn SuggestionPopup(
                     let del_color = if is_selected { "#9ece6a" } else { "#565f89" };
                     rsx! {
                         div {
-                            key: "{i}",
+                            key: "{cmd}",
                             class: "sug-row",
                             style: "display:flex;align-items:center;padding:3px 12px;{left_border}background:{bg};color:{fg};cursor:pointer;white-space:pre;overflow:hidden;",
                             onclick: move |_| on_select.call(cmd_for_select.clone()),
@@ -138,8 +147,14 @@ pub fn SuggestionPopup(
                                 aria_label: "Remove command from history",
                                 // Keep the event local even if this component is
                                 // later rendered outside its current popup root.
-                                onpointerdown: move |e| e.stop_propagation(),
-                                onmousedown: move |e| e.stop_propagation(),
+                                onpointerdown: move |e| {
+                                    e.prevent_default();
+                                    e.stop_propagation();
+                                },
+                                onmousedown: move |e| {
+                                    e.prevent_default();
+                                    e.stop_propagation();
+                                },
                                 onmouseup: move |e| e.stop_propagation(),
                                 onclick: move |e| {
                                     e.stop_propagation();

@@ -5370,6 +5370,50 @@ fn credential_kind(text: &str) -> Option<CredentialKind> {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PopupDismissReason {
+    FocusChanged,
+    UserCancelled,
+    Submitted,
+}
+
+fn onekey_popup_requires_explicit_cancel(popup: &OneKeyPopupState) -> bool {
+    popup
+        .matched_expect
+        .as_deref()
+        .is_some_and(|expect| credential_kind(expect) == Some(CredentialKind::Password))
+        || popup.matches.iter().any(|entry| {
+            credential_kind(&format!("{} {}", entry.label, entry.matched_expect))
+                == Some(CredentialKind::Password)
+        })
+}
+
+fn should_hide_onekey_popup(popup: &OneKeyPopupState, reason: PopupDismissReason) -> bool {
+    match reason {
+        PopupDismissReason::FocusChanged => !onekey_popup_requires_explicit_cancel(popup),
+        PopupDismissReason::UserCancelled | PopupDismissReason::Submitted => true,
+    }
+}
+
+fn dismiss_terminal_popups_for_focus_change(state: &mut AppState, session_id: &str) {
+    if let Some(tab) = state.sessions.iter_mut().find(|tab| tab.id == session_id) {
+        tab.suggestion_visible = false;
+        tab.suggestion = None;
+        tab.suggestions.clear();
+        tab.suggestion_selected = 0;
+    }
+
+    let hide_onekey = state
+        .onekey_popups
+        .get(session_id)
+        .is_some_and(|popup| should_hide_onekey_popup(popup, PopupDismissReason::FocusChanged));
+    if hide_onekey {
+        state.onekey_popups.remove(session_id);
+        state.onekey_submission_feedback.remove(session_id);
+        state.onekey_submission_cooldown.remove(session_id);
+    }
+}
+
 fn onekey_step_label(step: &OneKeyStep) -> String {
     if !step.label.trim().is_empty() {
         return step.label.trim().to_string();

@@ -133,7 +133,7 @@ fn cursor_key_seq(param: u8, final_byte: u8, app_cursor: bool, modifier: Option<
     } else if app_cursor {
         vec![0x1b, 0x4f, final_byte]
     } else {
-        csi_seq(param, None, final_byte)
+        vec![0x1b, 0x5b, final_byte]
     }
 }
 
@@ -214,36 +214,34 @@ fn code_to_char(code: &Code) -> u8 {
 /// the popup and falls through to the PTY" — is unit-testable.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OneKeyKeyAction {
-    /// Move the selection cursor to the given index.
-    Navigate(usize),
     /// Send the selected entry's value + Enter (autofill).
     Select,
     /// Close the popup without sending anything (Escape).
     Dismiss,
-    /// Close the popup AND forward the key to the PTY. The user started typing
-    /// (or editing) manually — the popup must not stay open and hijack the next
-    /// Enter, otherwise the typed text is concatenated with the popup's saved
-    /// value and the credential is sent mangled.
+    /// Keep a password popup visible while forwarding the key to the PTY.
+    Forward,
+    /// Close a non-password popup and forward the key to the PTY.
     DismissAndForward,
 }
 
-/// Decide what the OneKey popup does for `key` while visible (`selected` is the
-/// current index, `len` the number of matching entries).
-fn onekey_popup_key_action(key: &Key, selected: usize, len: usize) -> OneKeyKeyAction {
+/// Decide what the OneKey popup does for `key` while visible. Arrow keys always
+/// belong to the terminal. Password popups are persistent: focus changes and
+/// forwarded input cannot hide them; only an explicit cancel or submission can.
+fn onekey_popup_key_action(
+    key: &Key,
+    len: usize,
+    requires_explicit_cancel: bool,
+) -> OneKeyKeyAction {
     if len == 0 {
         return OneKeyKeyAction::Dismiss;
     }
-    let selected = selected.min(len - 1);
     match key {
-        Key::ArrowDown => OneKeyKeyAction::Navigate((selected + 1) % len),
-        Key::ArrowUp => {
-            OneKeyKeyAction::Navigate(if selected == 0 { len - 1 } else { selected - 1 })
-        }
         // Both Enter and Tab confirm the highlighted credential. The caller
         // returns immediately after Select, so the Enter used for confirmation
         // cannot fall through and reach the PTY a second time.
         Key::Enter | Key::Tab => OneKeyKeyAction::Select,
         Key::Escape => OneKeyKeyAction::Dismiss,
+        _ if requires_explicit_cancel => OneKeyKeyAction::Forward,
         _ => OneKeyKeyAction::DismissAndForward,
     }
 }
@@ -271,8 +269,9 @@ fn terminal_overlay_key_action(
     meta: bool,
     shift: bool,
     onekey_visible: bool,
-    onekey_selected: usize,
+    _onekey_selected: usize,
     onekey_len: usize,
+    onekey_requires_explicit_cancel: bool,
 ) -> TerminalOverlayKeyAction {
     let is_c = matches!(key, Key::Character(s) if s.eq_ignore_ascii_case("c"));
     if is_c && meta && !ctrl && !alt {
@@ -284,8 +283,8 @@ fn terminal_overlay_key_action(
     if onekey_visible && onekey_len > 0 {
         return TerminalOverlayKeyAction::OneKey(onekey_popup_key_action(
             key,
-            onekey_selected,
             onekey_len,
+            onekey_requires_explicit_cancel,
         ));
     }
     TerminalOverlayKeyAction::None
@@ -770,11 +769,14 @@ pub fn TerminalView(
     onekey_visible: bool,
     onekey_entries: Vec<OneKeyMatch>,
     onekey_selected: usize,
+    /// Password prompts remain visible across focus changes and forwarded keys.
+    onekey_requires_explicit_cancel: bool,
     onekey_submission_feedback: Option<OneKeySubmissionFeedback>,
     on_onekey_navigate: EventHandler<Option<usize>>,
     on_onekey_select: EventHandler<usize>,
     on_onekey_save: EventHandler<()>,
     on_onekey_dismiss: EventHandler<()>,
+    on_focus_lost: EventHandler<()>,
     /// True when the session's SSH/shell channel has dropped. While set, Enter
     /// triggers `on_reconnect` and all other keys are ignored (no live PTY).
     disconnected: bool,
@@ -828,6 +830,7 @@ pub fn TerminalView(
     // available for the rsx! rendering block below.
     let current_onekey_len = current_onekey_entries.len();
     let current_onekey_selected = onekey_selected;
+    let current_onekey_requires_explicit_cancel = onekey_requires_explicit_cancel;
     let current_onekey_submission_feedback = onekey_submission_feedback.clone();
     let current_disconnected = disconnected;
 
@@ -878,6 +881,7 @@ pub fn TerminalView(
             current_onekey_visible,
             current_onekey_selected,
             current_onekey_len,
+            current_onekey_requires_explicit_cancel,
         );
         match overlay_key_action {
             TerminalOverlayKeyAction::Copy(CopyShortcut::Command) => {
@@ -988,10 +992,6 @@ pub fn TerminalView(
         if let TerminalOverlayKeyAction::OneKey(action) = overlay_key_action {
             e.stop_propagation();
             match action {
-                OneKeyKeyAction::Navigate(idx) => {
-                    on_onekey_navigate.call(Some(idx));
-                    return;
-                }
                 OneKeyKeyAction::Select => {
                     let selected =
                         current_onekey_selected.min(current_onekey_len.saturating_sub(1));
@@ -1002,11 +1002,11 @@ pub fn TerminalView(
                     on_onekey_dismiss.call(());
                     return;
                 }
+                OneKeyKeyAction::Forward => {
+                    // Password prompts are persistent. Forward terminal input,
+                    // but keep the popup until Escape/× or credential submission.
+                }
                 OneKeyKeyAction::DismissAndForward => {
-                    // The user is typing/editing manually. Close the popup so it
-                    // can't hijack the next Enter (which would concatenate the
-                    // popup's saved value onto the typed credential), then let
-                    // the key fall through to the PTY — no `return`.
                     on_onekey_dismiss.call(());
                 }
             }
@@ -1943,7 +1943,7 @@ pub fn TerminalView(
                 let cid = container_id.clone();
                 spawn(async move {
                     let _ = dioxus::document::eval(&format!(
-                        "(function() {{ const el = document.getElementById('{cid}'); if (!el) return; el.style.caretColor = 'transparent'; el.style.webkitTapHighlightColor = 'transparent'; el.addEventListener('focus', function() {{ this.style.outline = 'none'; this.style.boxShadow = 'none'; }}); if (el.dataset.rustermPointerCapture !== '1') {{ el.dataset.rustermPointerCapture = '1'; el.addEventListener('pointerdown', function(event) {{ if (typeof this.setPointerCapture === 'function') {{ try {{ this.setPointerCapture(event.pointerId); }} catch (_) {{}} }} }}); }} }})()"
+                        "(function() {{ const el = document.getElementById('{cid}'); if (!el) return; el.style.caretColor = 'transparent'; el.style.webkitTapHighlightColor = 'transparent'; el.addEventListener('focus', function() {{ this.style.outline = 'none'; this.style.boxShadow = 'none'; }}); if (el.dataset.rustermPointerCapture !== '1') {{ el.dataset.rustermPointerCapture = '1'; el.addEventListener('pointerdown', function(event) {{ if (event.target && event.target.closest && event.target.closest('[data-rusterm-terminal-popup=\"true\"]')) return; if (typeof this.setPointerCapture === 'function') {{ try {{ this.setPointerCapture(event.pointerId); }} catch (_) {{}} }} }}); }} }})()"
                     )).await;
                 });
             },
@@ -1951,7 +1951,10 @@ pub fn TerminalView(
             onclick: onclick_focus,
             oncontextmenu: oncontextmenu_reconnect,
             onfocus: move |_| focused.set(true),
-            onblur: move |_| focused.set(false),
+            onblur: move |_| {
+                focused.set(false);
+                on_focus_lost.call(());
+            },
             onkeydown: handle_keydown,
             onmousedown: on_mouse_down,
             onmousemove: on_mouse_move,
@@ -2498,11 +2501,11 @@ mod tests {
         let key = Key::Character("c".into());
 
         assert_eq!(
-            terminal_overlay_key_action(&key, false, false, true, false, true, 0, 1),
+            terminal_overlay_key_action(&key, false, false, true, false, true, 0, 1, false),
             TerminalOverlayKeyAction::Copy(CopyShortcut::Command)
         );
         assert_eq!(
-            terminal_overlay_key_action(&key, true, false, false, true, true, 0, 1),
+            terminal_overlay_key_action(&key, true, false, false, true, true, 0, 1, false),
             TerminalOverlayKeyAction::Copy(CopyShortcut::CtrlShift)
         );
 
@@ -2529,6 +2532,7 @@ mod tests {
                 true,
                 0,
                 1,
+                false,
             ),
             TerminalOverlayKeyAction::OneKey(OneKeyKeyAction::DismissAndForward)
         );
@@ -2543,7 +2547,7 @@ mod tests {
             Key::ArrowRight,
         ] {
             assert_eq!(
-                onekey_popup_key_action(&key, 0, 3),
+                onekey_popup_key_action(&key, 3, false),
                 OneKeyKeyAction::DismissAndForward,
                 "{key:?} must reach the PTY instead of navigating the popup"
             );
@@ -2563,31 +2567,23 @@ mod tests {
     #[test]
     fn onekey_popup_tab_and_enter_select_escape_dismisses() {
         assert_eq!(
-            onekey_popup_key_action(&Key::Tab, 0, 3),
+            onekey_popup_key_action(&Key::Tab, 3, false),
             OneKeyKeyAction::Select
         );
         assert_eq!(
-            onekey_popup_key_action(&Key::Enter, 0, 3),
+            onekey_popup_key_action(&Key::Enter, 3, false),
             OneKeyKeyAction::Select
         );
         assert_eq!(
-            onekey_popup_key_action(&Key::Escape, 0, 3),
+            onekey_popup_key_action(&Key::Escape, 3, false),
             OneKeyKeyAction::Dismiss
         );
     }
 
     #[test]
-    fn onekey_popup_handles_empty_and_out_of_range_selection() {
+    fn onekey_popup_handles_empty_entries() {
         assert_eq!(
-            onekey_popup_key_action(&Key::Enter, 9, 3),
-            OneKeyKeyAction::Select
-        );
-        assert_eq!(
-            onekey_popup_key_action(&Key::ArrowDown, 9, 3),
-            OneKeyKeyAction::Navigate(0)
-        );
-        assert_eq!(
-            onekey_popup_key_action(&Key::Enter, 0, 0),
+            onekey_popup_key_action(&Key::Enter, 0, false),
             OneKeyKeyAction::Dismiss
         );
     }
@@ -2600,12 +2596,26 @@ mod tests {
         // value gets concatenated onto the manually-typed credential — which is
         // exactly how a correct password ends up "Access denied".
         assert_eq!(
-            onekey_popup_key_action(&Key::Character("x".into()), 0, 3),
+            onekey_popup_key_action(&Key::Character("x".into()), 3, false),
             OneKeyKeyAction::DismissAndForward
         );
         assert_eq!(
-            onekey_popup_key_action(&Key::Backspace, 0, 3),
+            onekey_popup_key_action(&Key::Backspace, 3, false),
             OneKeyKeyAction::DismissAndForward
+        );
+    }
+
+    #[test]
+    fn password_popup_stays_visible_while_forwarding_terminal_input() {
+        for key in [Key::ArrowLeft, Key::ArrowUp, Key::Backspace] {
+            assert_eq!(
+                onekey_popup_key_action(&key, 1, true),
+                OneKeyKeyAction::Forward
+            );
+        }
+        assert_eq!(
+            onekey_popup_key_action(&Key::Escape, 1, true),
+            OneKeyKeyAction::Dismiss
         );
     }
 
