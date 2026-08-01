@@ -194,6 +194,20 @@ pub struct AppState {
     /// an OneKey's expect regex; persists across focus changes (no re-scan).
     #[serde(skip)]
     pub onekey_popups: HashMap<String, OneKeyPopupState>,
+    /// Non-secret result of the most recent OneKey submission in each session.
+    /// This makes password prompts diagnosable even though the remote PTY turns
+    /// echo off: users can distinguish "sent but hidden" from "asked again".
+    #[serde(skip)]
+    pub onekey_submission_feedback: HashMap<String, OneKeySubmissionFeedback>,
+    /// Cooldown after a OneKey submission: `(matched_expect, submitted_at)`.
+    /// Prevents the terminal's residual prompt text (sudo prints "Password:"
+    /// and the cursor stays there while input is hidden) from re-triggering a
+    /// popup — and a false "Rejected" — before the remote has had time to
+    /// accept or reject the credential. The cooldown is short (a few seconds)
+    /// so a genuine wrong-password retry from the remote still surfaces a new
+    /// popup once the grace period elapses.
+    #[serde(skip)]
+    pub onekey_submission_cooldown: HashMap<String, (String, std::time::Instant)>,
     /// (session_id, skip-reason) pairs already reported at info level, so a
     /// repeated OneKey gate skip (e.g. `disabled_for_session` on every output
     /// chunk) logs exactly once per session instead of spamming — while never
@@ -327,6 +341,15 @@ pub enum SessionConnectionState {
     Reconnecting,
 }
 
+/// Non-secret lifecycle state for a submitted OneKey credential.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OneKeySubmissionFeedback {
+    /// The credential and one carriage return were queued for this session.
+    Submitted { matched_expect: String },
+    /// The remote emitted the same matching prompt again after submission.
+    Rejected { matched_expect: String },
+}
+
 /// State of the OneKey autofill popup for a single session.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct OneKeyPopupState {
@@ -346,6 +369,9 @@ pub struct OneKeyMatch {
     pub name: String,
     pub label: String,
     pub send: String,
+    /// Expect regex belonging to this exact match. Kept so selecting among
+    /// several matching OneKeys correlates rejection with the chosen entry.
+    pub matched_expect: String,
 }
 
 impl std::fmt::Debug for OneKeyMatch {
@@ -368,6 +394,7 @@ mod onekey_match_tests {
             name: "account".to_string(),
             label: "Password".to_string(),
             send: "never-log-this-secret".to_string(),
+            matched_expect: r"password:".to_string(),
         };
         let debug = format!("{entry:?}");
         assert!(debug.contains("<redacted>"));
@@ -446,6 +473,8 @@ impl Default for AppState {
             recent_failed_commands: HashSet::new(),
             onekeys: Vec::new(),
             onekey_popups: HashMap::new(),
+            onekey_submission_feedback: HashMap::new(),
+            onekey_submission_cooldown: HashMap::new(),
             onekey_skip_logged: HashSet::new(),
             session_configs: HashMap::new(),
             session_connection_states: HashMap::new(),
@@ -1544,6 +1573,7 @@ pub fn close_session(
     state.resize_senders.remove(id);
     state.terminals.remove(id);
     state.onekey_popups.remove(id);
+    state.onekey_submission_feedback.remove(id);
     state.session_connection_states.remove(id);
     state.session_configs.remove(id);
     state.pending_exit_check.remove(id);
@@ -1684,6 +1714,7 @@ pub fn close_workspace(
         state.resize_senders.remove(sid);
         state.terminals.remove(sid);
         state.onekey_popups.remove(sid);
+        state.onekey_submission_feedback.remove(sid);
         state.session_connection_states.remove(sid);
         state.session_configs.remove(sid);
         state.pending_exit_check.remove(sid);

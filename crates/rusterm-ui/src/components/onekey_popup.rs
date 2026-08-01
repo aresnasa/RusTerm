@@ -1,6 +1,6 @@
 use dioxus::prelude::*;
 
-use crate::state::OneKeyMatch;
+use crate::state::{OneKeyMatch, OneKeySubmissionFeedback};
 
 /// OneKey autofill popup. Renders above the current cursor row using the same
 /// pane-relative coordinate as command suggestions. Secrets are never rendered:
@@ -10,11 +10,17 @@ use crate::state::OneKeyMatch;
 pub fn OneKeyPopup(
     entries: Vec<OneKeyMatch>,
     selected: usize,
+    submission_feedback: Option<OneKeySubmissionFeedback>,
     on_highlight: EventHandler<usize>,
     on_select: EventHandler<usize>,
     on_save: EventHandler<()>,
     on_dismiss: EventHandler<()>,
 ) -> Element {
+    let rejected = matches!(
+        submission_feedback,
+        Some(OneKeySubmissionFeedback::Rejected { .. })
+    );
+
     rsx! {
         div {
             style: "
@@ -38,6 +44,13 @@ pub fn OneKeyPopup(
             // be sent to the remote application before the credential.
             onmousedown: move |e: Event<MouseData>| e.stop_propagation(),
             onclick: move |e: Event<MouseData>| e.stop_propagation(),
+
+            if rejected {
+                div {
+                    style: "padding:6px 12px;color:#f7768e;background:rgba(247,118,142,0.08);border-bottom:1px solid #2a2b3d;font-size:11px;",
+                    "Credential was sent, but the remote requested it again. Verify the saved value."
+                }
+            }
 
             for (i, m) in entries.iter().enumerate() {
                 {

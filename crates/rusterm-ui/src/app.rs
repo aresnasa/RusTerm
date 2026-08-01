@@ -29,14 +29,15 @@ use crate::components::TerminalView;
 use crate::components::connection_dialog::NewConnectionForm;
 use crate::layout::{PaneLayout, SplitAxis, SplitDirection};
 use crate::state::{
-    AppState, Modal, OneKeyMatch, OneKeyPopupState, PendingDangerousCommand,
-    SessionConnectionState, SessionTab, TabDropOutcome, TerminalEntry, UnlockState,
-    append_pane_to_active, begin_floating_pane_move, close_pane, close_session, close_workspace,
-    distribute_sessions_across_panes, execute_tab_drop_on_pane, execute_tab_drop_on_pane_at,
-    focus_pane_for_layout, focused_pane_session, move_floating_pane_for_active,
-    move_session_to_leftmost, prepare_split_for_sidebar_drop, prepare_split_for_sidebar_drop_at,
-    push_workspace_tab, resize_layout_split, set_active_tab, set_pane_session_for_layout,
-    source_pane_for_copy, toggle_comparison_mode, toggle_pane_zoom, toggle_split_mode,
+    AppState, Modal, OneKeyMatch, OneKeyPopupState, OneKeySubmissionFeedback,
+    PendingDangerousCommand, SessionConnectionState, SessionTab, TabDropOutcome, TerminalEntry,
+    UnlockState, append_pane_to_active, begin_floating_pane_move, close_pane, close_session,
+    close_workspace, distribute_sessions_across_panes, execute_tab_drop_on_pane,
+    execute_tab_drop_on_pane_at, focus_pane_for_layout, focused_pane_session,
+    move_floating_pane_for_active, move_session_to_leftmost, prepare_split_for_sidebar_drop,
+    prepare_split_for_sidebar_drop_at, push_workspace_tab, resize_layout_split, set_active_tab,
+    set_pane_session_for_layout, source_pane_for_copy, toggle_comparison_mode, toggle_pane_zoom,
+    toggle_split_mode,
 };
 
 fn save_config(state: &Signal<AppState>) {
@@ -187,6 +188,11 @@ fn render_terminal_pane(
             let ok_visible = ok_popup.visible;
             let ok_entries = ok_popup.matches.clone();
             let ok_selected = ok_popup.selected;
+            let ok_submission_feedback = state
+                .read()
+                .onekey_submission_feedback
+                .get(&tab.id)
+                .cloned();
             // Both disconnected and reconnecting sessions have no live input
             // channel. Repeated Enter during `Reconnecting` is ignored by the
             // atomic state transition in `reconnect_session`.
@@ -223,13 +229,17 @@ fn render_terminal_pane(
                         }
                     },
                     on_input: move |data: Vec<u8>| {
+                        // Any manual input supersedes the previous OneKey result.
+                        state_for_cmd
+                            .write()
+                            .onekey_submission_feedback
+                            .remove(&sid_clone);
                         let is_enter = data.contains(&0x0d);
                         tracing::info!(
-                            "[INPUT] session={} is_enter={} data_len={} data={:?}",
+                            "[INPUT] session={} is_enter={} data_len={}",
                             &sid_clone[..sid_clone.len().min(8)],
                             is_enter,
-                            data.len(),
-                            &data[..data.len().min(32)]
+                            data.len()
                         );
                         // --- Dangerous-command protection (feature #17) ---
                         // Before sending Enter to the PTY, run the current
@@ -854,6 +864,7 @@ fn render_terminal_pane(
                     onekey_visible: ok_visible,
                     onekey_entries: ok_entries,
                     onekey_selected: ok_selected,
+                    onekey_submission_feedback: ok_submission_feedback,
                     on_onekey_navigate: move |idx: Option<usize>| {
                         if let Some(i) = idx {
                             state_for_cmd.write().onekey_popups
@@ -866,19 +877,15 @@ fn render_terminal_pane(
                         // state rather than accepting plaintext back from the UI.
                         // Remove the popup in the same write so a duplicate click
                         // or key event cannot submit the credential twice.
-                        let send = {
+                        let selection = {
                             let mut app = state_for_cmd.write();
-                            let send = app
-                                .onekey_popups
-                                .get(&sid_for_ok_sel)
-                                .and_then(|popup| popup.matches.get(index))
-                                .map(|entry| entry.send.clone());
-                            if send.is_some() {
-                                app.onekey_popups.remove(&sid_for_ok_sel);
-                            }
-                            send
+                            take_onekey_selection(
+                                &mut app.onekey_popups,
+                                &sid_for_ok_sel,
+                                index,
+                            )
                         };
-                        let Some(send) = send else {
+                        let Some((send, matched_expect)) = selection else {
                             tracing::warn!(
                                 "[ONEKEY-SELECT] session={} ignored invalid selection index={}",
                                 &sid_for_ok_sel[..sid_for_ok_sel.len().min(8)],
@@ -886,19 +893,46 @@ fn render_terminal_pane(
                             );
                             return;
                         };
+                        let sid_short = &sid_for_ok_sel[..sid_for_ok_sel.len().min(8)];
                         tracing::info!(
                             "[ONEKEY-SELECT] session={} submitting selected credential",
-                            &sid_for_ok_sel[..sid_for_ok_sel.len().min(8)]
+                            sid_short
                         );
-                        if let Some(sender) = senders.read().get(&sid_for_ok_sel) {
-                            let mut data = send.into_bytes();
-                            // Match physical Enter exactly. This callback consumes
-                            // the UI Enter/Tab event, so only this one CR is sent.
-                            data.push(b'\r');
-                            if sender.send(data).is_err() {
+
+                        let submission_result = {
+                            let senders = senders.read();
+                            send_onekey_submission(&senders, &sid_for_ok_sel, &send)
+                        };
+                        match submission_result {
+                            Ok(()) => {
+                                let mut app = state_for_cmd.write();
+                                app.onekey_submission_feedback.insert(
+                                    sid_for_ok_sel.clone(),
+                                    OneKeySubmissionFeedback::Submitted {
+                                        matched_expect: matched_expect.clone(),
+                                    },
+                                );
+                                app.onekey_submission_cooldown.insert(
+                                    sid_for_ok_sel.clone(),
+                                    (matched_expect, std::time::Instant::now()),
+                                );
+                            }
+                            Err(OneKeySubmissionSendError::ChannelClosed) => {
+                                let mut app = state_for_cmd.write();
+                                app.onekey_submission_feedback.remove(&sid_for_ok_sel);
+                                app.onekey_submission_cooldown.remove(&sid_for_ok_sel);
                                 tracing::warn!(
                                     "[ONEKEY-SELECT] session={} input channel closed",
-                                    &sid_for_ok_sel[..sid_for_ok_sel.len().min(8)]
+                                    sid_short
+                                );
+                            }
+                            Err(OneKeySubmissionSendError::SenderMissing) => {
+                                let mut app = state_for_cmd.write();
+                                app.onekey_submission_feedback.remove(&sid_for_ok_sel);
+                                app.onekey_submission_cooldown.remove(&sid_for_ok_sel);
+                                tracing::warn!(
+                                    "[ONEKEY-SELECT] session={} input sender missing",
+                                    sid_short
                                 );
                             }
                         }
@@ -953,10 +987,16 @@ fn render_terminal_pane(
                                 state_for_cmd.write().onekeys = all;
                             }
                         }
-                        state_for_cmd.write().onekey_popups.remove(&sid_for_ok_save);
+                        let mut app = state_for_cmd.write();
+                        app.onekey_popups.remove(&sid_for_ok_save);
+                        app.onekey_submission_feedback.remove(&sid_for_ok_save);
+                        app.onekey_submission_cooldown.remove(&sid_for_ok_save);
                     },
                     on_onekey_dismiss: move |_: ()| {
-                        state_for_cmd.write().onekey_popups.remove(&sid_for_ok_dismiss);
+                        let mut app = state_for_cmd.write();
+                        app.onekey_popups.remove(&sid_for_ok_dismiss);
+                        app.onekey_submission_feedback.remove(&sid_for_ok_dismiss);
+                        app.onekey_submission_cooldown.remove(&sid_for_ok_dismiss);
                     },
                     disconnected: tab_disconnected,
                     on_reconnect: move |_: ()| {
@@ -4181,6 +4221,68 @@ enum CredentialKind {
     Username,
 }
 
+/// Atomically resolve and remove one popup selection. Removing the popup in the
+/// same operation means duplicate click/keyboard callbacks cannot submit twice.
+fn take_onekey_selection(
+    popups: &mut HashMap<String, OneKeyPopupState>,
+    session_id: &str,
+    index: usize,
+) -> Option<(String, String)> {
+    let selection = popups.get(session_id).and_then(|popup| {
+        popup
+            .matches
+            .get(index)
+            .map(|entry| (entry.send.clone(), entry.matched_expect.clone()))
+    });
+    if selection.is_some() {
+        popups.remove(session_id);
+    }
+    selection
+}
+
+/// Convert a stored credential into one PTY submission. Newlines sometimes
+/// enter persisted values through imports or multiline editors; strip only
+/// trailing CR/LF bytes so the submission ends with exactly one physical Enter.
+/// Other whitespace can be part of a credential and must remain untouched.
+fn onekey_submission_bytes(send: &str) -> Vec<u8> {
+    let credential = send.trim_end_matches(['\r', '\n']);
+    let mut data = Vec::with_capacity(credential.len() + 1);
+    data.extend_from_slice(credential.as_bytes());
+    data.push(b'\r');
+    data
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OneKeySubmissionSendError {
+    SenderMissing,
+    ChannelClosed,
+}
+
+/// Queue one credential submission onto the same per-session input channel used
+/// by physical keyboard input. The credential is never returned or logged.
+fn send_onekey_submission(
+    senders: &HashMap<String, mpsc::UnboundedSender<Vec<u8>>>,
+    session_id: &str,
+    credential: &str,
+) -> Result<(), OneKeySubmissionSendError> {
+    let sender = senders
+        .get(session_id)
+        .ok_or(OneKeySubmissionSendError::SenderMissing)?;
+    let data = onekey_submission_bytes(credential);
+    let payload_len = data.len();
+    let ends_with_cr = data.last() == Some(&b'\r');
+    sender
+        .send(data)
+        .map_err(|_| OneKeySubmissionSendError::ChannelClosed)?;
+    tracing::info!(
+        "[ONEKEY-SEND] session={} queued payload_len={} ends_with_cr={}",
+        &session_id[..session_id.len().min(8)],
+        payload_len,
+        ends_with_cr
+    );
+    Ok(())
+}
+
 /// Infer a credential kind from a prompt, step label, or expect pattern. The
 /// ordering is intentional: password prompts often contain a username/URL, so
 /// password must win over the more generic `user` keyword.
@@ -4295,6 +4397,7 @@ const ONEKEY_SKIP_POPUP_VISIBLE: OneKeySkip = "popup_already_visible";
 const ONEKEY_SKIP_ALT_SCREEN: OneKeySkip =
     "alt_screen_active (a full-screen app like vim/less owns the terminal)";
 const ONEKEY_SKIP_NO_MATCH: OneKeySkip = "no_match";
+const ONEKEY_SKIP_COOLDOWN: OneKeySkip = "submission_cooldown";
 
 fn onekey_popup_for_output(
     state: &AppState,
@@ -4322,6 +4425,32 @@ fn onekey_popup_for_output(
         .is_some_and(|handle| handle.lock().terminal.is_alt_screen())
     {
         return Err(ONEKEY_SKIP_ALT_SCREEN);
+    }
+    // Cooldown: if a credential was submitted for this session very recently
+    // (within ONEKEY_SUBMISSION_COOLDOWN), the terminal still shows the prompt
+    // text because password input is hidden.  Suppress popup creation so the
+    // residual text doesn't trigger a false "Rejected" or a duplicate popup
+    // before the remote has had time to respond.  The cooldown entry carries
+    // the matched expect so a DIFFERENT prompt (next step in a multi-step
+    // exchange) is never suppressed.
+    if let Some((cooldown_expect, submitted_at)) = state.onekey_submission_cooldown.get(session_id)
+    {
+        if submitted_at.elapsed() < ONEKEY_SUBMISSION_COOLDOWN {
+            // Peek at what the prompt WOULD match without creating a popup.
+            let text = onekey_prompt_text(state, session_id, data);
+            let last_line = text
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("");
+            let same_prompt = state.onekeys.iter().any(|ok| {
+                first_matching_step(ok, last_line)
+                    .is_some_and(|step| step.expect == *cooldown_expect)
+            });
+            if same_prompt {
+                return Err(ONEKEY_SKIP_COOLDOWN);
+            }
+        }
     }
 
     let text = onekey_prompt_text(state, session_id, data);
@@ -4354,6 +4483,7 @@ fn onekey_popup_for_output(
             name: onekey.name.clone(),
             label: onekey_step_label(step),
             send: step.send.clone(),
+            matched_expect: step.expect.clone(),
         });
     }
     if matches.is_empty() {
@@ -4368,9 +4498,47 @@ fn onekey_popup_for_output(
     })
 }
 
+fn note_onekey_prompt_after_submission(
+    state: &mut AppState,
+    session_id: &str,
+    popup: &OneKeyPopupState,
+) {
+    let Some(previous) = state.onekey_submission_feedback.get(session_id).cloned() else {
+        return;
+    };
+    let previous_expect = match &previous {
+        OneKeySubmissionFeedback::Submitted { matched_expect }
+        | OneKeySubmissionFeedback::Rejected { matched_expect } => matched_expect,
+    };
+
+    match popup.matched_expect.as_deref() {
+        Some(current_expect) if current_expect == previous_expect => {
+            if matches!(&previous, OneKeySubmissionFeedback::Submitted { .. }) {
+                tracing::info!(
+                    "[ONEKEY-RESULT] session={} remote requested the same credential again",
+                    &session_id[..session_id.len().min(8)]
+                );
+            }
+            state.onekey_submission_feedback.insert(
+                session_id.to_string(),
+                OneKeySubmissionFeedback::Rejected {
+                    matched_expect: current_expect.to_string(),
+                },
+            );
+        }
+        Some(_) => {
+            // A different matching prompt is the next step of a multi-step
+            // exchange, not a rejection of the previous credential.
+            state.onekey_submission_feedback.remove(session_id);
+        }
+        None => {}
+    }
+}
+
 #[cfg(test)]
 fn check_onekey_match_in_state(state: &mut AppState, session_id: &str, data: &[u8]) {
     if let Ok(popup) = onekey_popup_for_output(state, session_id, data) {
+        note_onekey_prompt_after_submission(state, session_id, &popup);
         state.onekey_popups.insert(session_id.to_string(), popup);
     }
 }
@@ -4449,10 +4617,9 @@ fn check_onekey_match(mut state: Signal<AppState>, session_id: &str, data: &[u8]
     };
     match outcome {
         Ok(popup) => {
-            state
-                .write()
-                .onekey_popups
-                .insert(session_id.to_string(), popup);
+            let mut app = state.write();
+            note_onekey_prompt_after_submission(&mut app, session_id, &popup);
+            app.onekey_popups.insert(session_id.to_string(), popup);
         }
         Err(reason) => {
             let mut s = state.write();
@@ -4469,6 +4636,14 @@ fn check_onekey_match(mut state: Signal<AppState>, session_id: &str, data: &[u8]
 }
 
 const SHELL_INTEGRATION_QUIET_PERIOD: std::time::Duration = std::time::Duration::from_millis(1_200);
+
+/// Grace period after a OneKey credential submission during which a matching
+/// prompt with the SAME expect is treated as residual terminal text rather than
+/// a genuine re-prompt from the remote. SSH round-trip + sudo processing time
+/// is typically well under 1 s even on a slow link; 3 s gives ample margin
+/// without hiding a real wrong-password rejection for too long.
+const ONEKEY_SUBMISSION_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3);
+const SHELL_INTEGRATION_ERASE_ECHO_LINE: &[u8] = b"\r\x1b[2K";
 
 /// Debounces the remote shell's initial output before injecting shell
 /// integration. Unlike a fixed startup sleep, every late MOTD/banner chunk
@@ -4496,6 +4671,132 @@ impl InitialOutputQuiescence {
     }
 }
 
+#[derive(Default)]
+struct ShellIntegrationEchoFilter {
+    expected: Vec<u8>,
+    buffered: Vec<u8>,
+    state: ShellIntegrationEchoFilterState,
+}
+
+#[derive(Default)]
+enum ShellIntegrationEchoFilterState {
+    #[default]
+    Idle,
+    Matching,
+    AfterEcho,
+    AfterCarriageReturn,
+}
+
+impl ShellIntegrationEchoFilter {
+    fn arm(&mut self, setup: &[u8]) {
+        self.expected = setup
+            .strip_suffix(b"\n")
+            .or_else(|| setup.strip_suffix(b"\r"))
+            .unwrap_or(setup)
+            .to_vec();
+        self.buffered.clear();
+        self.state = if self.expected.is_empty() {
+            ShellIntegrationEchoFilterState::Idle
+        } else {
+            ShellIntegrationEchoFilterState::Matching
+        };
+    }
+
+    fn cancel(&mut self) {
+        self.expected.clear();
+        self.buffered.clear();
+        self.state = ShellIntegrationEchoFilterState::Idle;
+    }
+
+    fn filter(&mut self, data: &[u8]) -> Vec<u8> {
+        match self.state {
+            ShellIntegrationEchoFilterState::Idle => data.to_vec(),
+            ShellIntegrationEchoFilterState::Matching => self.filter_until_echo(data),
+            ShellIntegrationEchoFilterState::AfterEcho
+            | ShellIntegrationEchoFilterState::AfterCarriageReturn => {
+                self.filter_echo_line_ending(data)
+            }
+        }
+    }
+
+    fn filter_until_echo(&mut self, data: &[u8]) -> Vec<u8> {
+        self.buffered.extend_from_slice(data);
+        if let Some(start) = find_subslice(&self.buffered, &self.expected) {
+            let mut visible = self.buffered[..start].to_vec();
+            let trailing = self.buffered[start + self.expected.len()..].to_vec();
+            self.expected.clear();
+            self.buffered.clear();
+            self.state = ShellIntegrationEchoFilterState::AfterEcho;
+            // The shell will print a fresh prompt after executing the setup.
+            // Erase the old prompt line locally so suppressing the echoed newline
+            // cannot concatenate the old and new prompts.
+            visible.extend_from_slice(SHELL_INTEGRATION_ERASE_ECHO_LINE);
+            visible.extend(self.filter_echo_line_ending(&trailing));
+            return visible;
+        }
+
+        let retained = longest_suffix_matching_prefix(&self.buffered, &self.expected);
+        let visible_len = self.buffered.len() - retained;
+        let visible = self.buffered[..visible_len].to_vec();
+        self.buffered.drain(..visible_len);
+        visible
+    }
+
+    fn filter_echo_line_ending(&mut self, data: &[u8]) -> Vec<u8> {
+        match self.state {
+            ShellIntegrationEchoFilterState::AfterEcho => match data.first() {
+                None => Vec::new(),
+                Some(b'\r') => {
+                    self.state = ShellIntegrationEchoFilterState::AfterCarriageReturn;
+                    self.filter_echo_line_ending(&data[1..])
+                }
+                Some(b'\n') => {
+                    self.state = ShellIntegrationEchoFilterState::Idle;
+                    data[1..].to_vec()
+                }
+                Some(_) => {
+                    self.state = ShellIntegrationEchoFilterState::Idle;
+                    data.to_vec()
+                }
+            },
+            ShellIntegrationEchoFilterState::AfterCarriageReturn => match data.first() {
+                None => Vec::new(),
+                Some(b'\n') => {
+                    self.state = ShellIntegrationEchoFilterState::Idle;
+                    data[1..].to_vec()
+                }
+                Some(_) => {
+                    self.state = ShellIntegrationEchoFilterState::Idle;
+                    let mut visible = Vec::with_capacity(data.len() + 1);
+                    visible.push(b'\r');
+                    visible.extend_from_slice(data);
+                    visible
+                }
+            },
+            ShellIntegrationEchoFilterState::Idle | ShellIntegrationEchoFilterState::Matching => {
+                data.to_vec()
+            }
+        }
+    }
+}
+
+fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
+    if needle.is_empty() {
+        return None;
+    }
+    haystack
+        .windows(needle.len())
+        .position(|window| window == needle)
+}
+
+fn longest_suffix_matching_prefix(data: &[u8], expected: &[u8]) -> usize {
+    let max_len = data.len().min(expected.len().saturating_sub(1));
+    (1..=max_len)
+        .rev()
+        .find(|&len| data[data.len() - len..] == expected[..len])
+        .unwrap_or(0)
+}
+
 fn shell_integration_setup() -> Vec<u8> {
     let mut setup = r#"__rusterm_precmd() { printf '\e]133;D;%s\e\\' "$?"; printf '\e]133;A\e\\'; printf '\e]7;file://%s%s\e\\' "${HOSTNAME:-localhost}" "$PWD"; }; if [ -n "$ZSH_VERSION" ]; then precmd_functions+=(__rusterm_precmd); elif [ -n "$BASH_VERSION" ]; then PROMPT_COMMAND="__rusterm_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"; fi"#
         .as_bytes()
@@ -4507,6 +4808,7 @@ fn shell_integration_setup() -> Vec<u8> {
 async fn inject_shell_integration_when_quiet(
     mut output_activity: mpsc::UnboundedReceiver<()>,
     integration_tx: mpsc::UnboundedSender<Vec<u8>>,
+    echo_filter: Arc<Mutex<ShellIntegrationEchoFilter>>,
     session_id: String,
 ) {
     // Require actual remote output (normally banner/MOTD/prompt) before any
@@ -4529,11 +4831,15 @@ async fn inject_shell_integration_when_quiet(
         }
     }
 
-    if integration_tx.send(shell_integration_setup()).is_ok() {
+    let setup = shell_integration_setup();
+    echo_filter.lock().arm(&setup);
+    if integration_tx.send(setup).is_ok() {
         tracing::info!(
             "[SSH] injected shell integration after initial-output quiet period for {}",
             session_id
         );
+    } else {
+        echo_filter.lock().cancel();
     }
 }
 
@@ -4601,6 +4907,49 @@ mod session_startup_tests {
             gate.remaining(started_at + Duration::from_millis(2_500), quiet_period),
             Some(Duration::ZERO),
         );
+    }
+
+    #[test]
+    fn shell_integration_echo_is_hidden_without_hiding_prompt_or_osc() {
+        let setup = shell_integration_setup();
+        let command = &setup[..setup.len() - 1];
+        let mut filter = ShellIntegrationEchoFilter::default();
+        filter.arm(&setup);
+
+        let mut output = command.to_vec();
+        output.extend_from_slice(b"\r\n\x1b]133;A\x1b\\ecs-user@host:~$ ");
+
+        assert_eq!(
+            filter.filter(&output),
+            b"\r\x1b[2K\x1b]133;A\x1b\\ecs-user@host:~$ "
+        );
+        assert_eq!(filter.filter(b"echo visible\r\n"), b"echo visible\r\n");
+    }
+
+    #[test]
+    fn shell_integration_echo_filter_handles_chunked_echo_and_line_ending() {
+        let setup = shell_integration_setup();
+        let command = &setup[..setup.len() - 1];
+        let mut filter = ShellIntegrationEchoFilter::default();
+        filter.arm(&setup);
+
+        assert!(filter.filter(&command[..37]).is_empty());
+        assert_eq!(
+            filter.filter(&command[37..]),
+            SHELL_INTEGRATION_ERASE_ECHO_LINE
+        );
+        assert!(filter.filter(b"\r").is_empty());
+        assert_eq!(filter.filter(b"\nprompt$ "), b"prompt$ ");
+    }
+
+    #[test]
+    fn shell_integration_echo_filter_never_drops_nonmatching_output() {
+        let setup = shell_integration_setup();
+        let mut filter = ShellIntegrationEchoFilter::default();
+        filter.arm(&setup);
+
+        let unrelated = b"__rusterm_not_the_injected_command\r\n";
+        assert_eq!(filter.filter(unrelated), unrelated);
     }
 
     #[test]
@@ -4736,6 +5085,85 @@ mod session_startup_tests {
         assert!(popup.visible);
         assert_eq!(popup.matches.len(), 1);
         assert_eq!(popup.matches[0].label, "Password");
+    }
+
+    #[test]
+    fn repeated_password_prompt_marks_the_submitted_credential_as_rejected() {
+        let session_id = "sudo-pane";
+        let expect = r"password:";
+        let prompt = b"[sudo: authenticate] Password: ";
+        let mut state = state_with_enabled_onekey(expect);
+
+        check_onekey_match_in_state(&mut state, session_id, prompt);
+        state.onekey_popups.remove(session_id);
+        state.onekey_submission_feedback.insert(
+            session_id.to_string(),
+            OneKeySubmissionFeedback::Submitted {
+                matched_expect: expect.to_string(),
+            },
+        );
+        // Simulate a submission that happened long enough ago that the cooldown
+        // has elapsed — a genuine re-prompt from the remote should still be
+        // detected and marked as Rejected.
+        state.onekey_submission_cooldown.insert(
+            session_id.to_string(),
+            (
+                expect.to_string(),
+                std::time::Instant::now()
+                    - ONEKEY_SUBMISSION_COOLDOWN
+                    - std::time::Duration::from_secs(1),
+            ),
+        );
+
+        check_onekey_match_in_state(&mut state, session_id, prompt);
+
+        assert!(state.onekey_popups.contains_key(session_id));
+        assert_eq!(
+            state.onekey_submission_feedback.get(session_id),
+            Some(&OneKeySubmissionFeedback::Rejected {
+                matched_expect: expect.to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn submission_cooldown_suppresses_duplicate_popup_from_residual_prompt() {
+        let session_id = "sudo-pane";
+        let expect = r"password:";
+        let prompt = b"[sudo: authenticate] Password: ";
+        let mut state = state_with_enabled_onekey(expect);
+
+        // First prompt → popup appears.
+        check_onekey_match_in_state(&mut state, session_id, prompt);
+        assert!(state.onekey_popups.contains_key(session_id));
+
+        // User selects a credential → popup removed, cooldown armed.
+        state.onekey_popups.remove(session_id);
+        state.onekey_submission_feedback.insert(
+            session_id.to_string(),
+            OneKeySubmissionFeedback::Submitted {
+                matched_expect: expect.to_string(),
+            },
+        );
+        state.onekey_submission_cooldown.insert(
+            session_id.to_string(),
+            (expect.to_string(), std::time::Instant::now()),
+        );
+
+        // A stray output chunk arrives while the Password prompt is still on
+        // the terminal (password input is hidden, so the cursor hasn't moved).
+        // The cooldown must prevent a false re-match.
+        check_onekey_match_in_state(&mut state, session_id, b"\r\n");
+
+        assert!(
+            !state.onekey_popups.contains_key(session_id),
+            "cooldown must suppress popup from residual prompt text"
+        );
+        // Feedback stays Submitted, not Rejected.
+        assert!(matches!(
+            state.onekey_submission_feedback.get(session_id),
+            Some(OneKeySubmissionFeedback::Submitted { .. })
+        ));
     }
 
     #[test]
@@ -5390,9 +5818,12 @@ fn start_ssh_connection(
                 // front of login text that is still arriving.
                 let (initial_output_activity_tx, initial_output_activity_rx) =
                     mpsc::unbounded_channel();
+                let shell_integration_echo_filter =
+                    Arc::new(Mutex::new(ShellIntegrationEchoFilter::default()));
                 spawn(inject_shell_integration_when_quiet(
                     initial_output_activity_rx,
                     session.input_tx.clone(),
+                    shell_integration_echo_filter.clone(),
                     tab_id.clone(),
                 ));
 
@@ -5833,6 +6264,10 @@ fn start_ssh_connection(
                             // capture filtering; hidden history-import output is
                             // still remote activity and must postpone injection.
                             let _ = initial_output_activity_tx.send(());
+                            let data = shell_integration_echo_filter.lock().filter(&data);
+                            if data.is_empty() {
+                                continue;
+                            }
                             // Capture raw output for history import if active. While
                             // capturing (the interactive history-import dump), SKIP
                             // rendering/logging/matching: the ~77KB dump would
@@ -6137,6 +6572,8 @@ fn start_ssh_connection(
                                 s.session_connection_states
                                     .insert(id.clone(), SessionConnectionState::Disconnected);
                                 s.onekey_popups.remove(&id);
+                                s.onekey_submission_feedback.remove(&id);
+                                s.onekey_submission_cooldown.remove(&id);
                                 if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
                                     tab.render_output = render_result;
                                     tab.version += 1;
@@ -6242,31 +6679,24 @@ fn start_shell_connection(
             }
 
             // Inject shell integration (OSC 133) for local shells too, so the
-            // shell reports each command's exit code. This lets the app drop
-            // failed commands from the suggestion popup (the user doesn't want
-            // their typos and broken commands showing up as autocomplete).
-            //
-            // The setup code is sent inline (same approach as SSH). It WILL be
-            // echoed on screen as a one-time `__rusterm_precmd() {...}` line,
-            // but that's a cosmetic trade-off we accept in exchange for correct
-            // exit-code tracking. We do NOT send a trailing Ctrl+L to hide the
-            // echo — Ctrl+L clears the WHOLE screen, which wipes the MOTD /
-            // banner content into scrollback and leaves a blank terminal.
-            // The one-time setup echo is left visible rather than blanking the
-            // session.
-            //
-            // Previously this was disabled for local shells, but that meant
-            // failed commands stayed in `command_history` and showed up as
-            // inline suggestions — exactly what the user complained about.
+            // shell reports each command's exit code. The per-session echo
+            // filter hides only this automatic setup line; prompt and OSC output
+            // remain visible and continue through the terminal parser.
+            let shell_integration_echo_filter =
+                Arc::new(Mutex::new(ShellIntegrationEchoFilter::default()));
             {
                 let integration_tx = session.input_tx.clone();
+                let echo_filter = shell_integration_echo_filter.clone();
                 let int_sid = tab_id.clone();
-                let mut setup: Vec<u8> = r#"__rusterm_precmd() { printf '\e]133;D;%s\e\\' "$?"; printf '\e]133;A\e\\'; printf '\e]7;file://%s%s\e\\' "${HOSTNAME:-localhost}" "$PWD"; }; if [ -n "$ZSH_VERSION" ]; then precmd_functions+=(__rusterm_precmd); elif [ -n "$BASH_VERSION" ]; then PROMPT_COMMAND="__rusterm_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"; fi"#.as_bytes().to_vec();
-                setup.push(b'\n');
                 spawn(async move {
                     tokio::time::sleep(std::time::Duration::from_millis(400)).await;
-                    let _ = integration_tx.send(setup);
-                    tracing::info!("[local] injected shell integration for {}", int_sid);
+                    let setup = shell_integration_setup();
+                    echo_filter.lock().arm(&setup);
+                    if integration_tx.send(setup).is_ok() {
+                        tracing::info!("[local] injected shell integration for {}", int_sid);
+                    } else {
+                        echo_filter.lock().cancel();
+                    }
                 });
             }
 
@@ -6321,6 +6751,10 @@ fn start_shell_connection(
                 while let Some(event) = event_rx.recv().await {
                     match event {
                         SessionEvent::Output(id, data) => {
+                            let data = shell_integration_echo_filter.lock().filter(&data);
+                            if data.is_empty() {
+                                continue;
+                            }
                             {
                                 let logs = state.read().session_logs.clone();
                                 if let Some(log) = logs.get(&id) {
@@ -6578,6 +7012,8 @@ fn start_shell_connection(
                                 s.session_connection_states
                                     .insert(id.clone(), SessionConnectionState::Disconnected);
                                 s.onekey_popups.remove(&id);
+                                s.onekey_submission_feedback.remove(&id);
+                                s.onekey_submission_cooldown.remove(&id);
                                 if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
                                     tab.render_output = render_result;
                                     tab.version += 1;
@@ -7442,6 +7878,8 @@ fn reconnect_session(
         s.resize_senders.remove(&tab_id);
         s.terminals.remove(&tab_id);
         s.onekey_popups.remove(&tab_id);
+        s.onekey_submission_feedback.remove(&tab_id);
+        s.onekey_submission_cooldown.remove(&tab_id);
         s.pending_exit_check.remove(&tab_id);
     }
     input_senders.write().remove(&tab_id);
@@ -9844,10 +10282,82 @@ fn looks_like_command(s: &str) -> bool {
 #[cfg(test)]
 mod onekey_tests {
     use super::{
-        CredentialKind, credential_kind, first_matching_step, onekey_step_label, strip_ansi,
+        CredentialKind, credential_kind, first_matching_step, onekey_step_label,
+        onekey_submission_bytes, send_onekey_submission, strip_ansi, take_onekey_selection,
     };
+    use crate::state::{OneKeyMatch, OneKeyPopupState};
     use regex::Regex;
     use rusterm_core::config::{OneKey, OneKeyStep};
+    use std::collections::HashMap;
+    use tokio::sync::mpsc;
+
+    #[test]
+    fn onekey_submission_replaces_trailing_line_endings_with_one_carriage_return() {
+        for (credential, expected) in [
+            ("credential", b"credential\r".as_slice()),
+            ("credential\n", b"credential\r".as_slice()),
+            ("credential\r", b"credential\r".as_slice()),
+            ("credential\r\n", b"credential\r".as_slice()),
+            ("credential\n\r", b"credential\r".as_slice()),
+        ] {
+            assert_eq!(onekey_submission_bytes(credential), expected);
+        }
+
+        assert_eq!(
+            onekey_submission_bytes(" credential "),
+            b" credential \r",
+            "spaces are valid credential bytes and must not be trimmed"
+        );
+    }
+
+    #[test]
+    fn onekey_submission_reaches_the_session_input_receiver() {
+        let session_id = "session-a";
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let mut senders = HashMap::new();
+        senders.insert(session_id.to_string(), sender);
+
+        assert_eq!(
+            send_onekey_submission(&senders, session_id, "credential"),
+            Ok(())
+        );
+        assert_eq!(receiver.try_recv().unwrap(), b"credential\r");
+    }
+
+    #[test]
+    fn duplicate_popup_selection_queues_exactly_one_submission() {
+        let session_id = "session-a";
+        let mut popups = HashMap::from([(
+            session_id.to_string(),
+            OneKeyPopupState {
+                visible: true,
+                matches: vec![OneKeyMatch {
+                    name: "saved account".to_string(),
+                    label: "sudo Password".to_string(),
+                    send: "credential".to_string(),
+                    matched_expect: "password:".to_string(),
+                }],
+                selected: 0,
+                matched_expect: Some("password:".to_string()),
+            },
+        )]);
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let senders = HashMap::from([(session_id.to_string(), sender)]);
+
+        for _ in 0..2 {
+            if let Some((send, _matched_expect)) = take_onekey_selection(&mut popups, session_id, 0)
+            {
+                send_onekey_submission(&senders, session_id, &send).unwrap();
+            }
+        }
+
+        assert!(receiver.try_recv().is_ok());
+        assert!(
+            receiver.try_recv().is_err(),
+            "duplicate selection queued twice"
+        );
+        assert!(!popups.contains_key(session_id));
+    }
 
     #[test]
     fn expect_matches_git_prompts_case_insensitively() {

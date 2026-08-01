@@ -10,7 +10,7 @@ use rusterm_core::terminal::{
 
 use crate::components::OneKeyPopup;
 use crate::components::SuggestionPopup;
-use crate::state::OneKeyMatch;
+use crate::state::{OneKeyMatch, OneKeySubmissionFeedback};
 
 // ── Clipboard helpers ───────────────────────────────────────────────
 //
@@ -22,16 +22,28 @@ use crate::state::OneKeyMatch;
 // paste was swallowing the error and doing nothing. Native access has no such
 // restriction and works on every platform.
 
-/// Copy text to the OS clipboard. Synchronous (NSPasteboard / Win32 / X11
-/// writes are sub-millisecond). Returns the char count on success for
-/// logging, or 0 on failure.
-fn copy_text_to_clipboard(text: String) -> usize {
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ClipboardCopyOutcome {
+    Copied(usize),
+    SkippedEmpty,
+    Failed,
+}
+
+/// Copy non-empty text to the OS clipboard. Synchronous (NSPasteboard / Win32
+/// / X11 writes are sub-millisecond). Empty input is rejected so a missed
+/// terminal mouseup can never erase the user's existing clipboard contents.
+fn copy_text_to_clipboard(text: String) -> ClipboardCopyOutcome {
+    if text.is_empty() {
+        tracing::debug!("[COPY] refused to replace clipboard with empty text");
+        return ClipboardCopyOutcome::SkippedEmpty;
+    }
+
     let n = text.chars().count();
     match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text)) {
-        Ok(()) => n,
+        Ok(()) => ClipboardCopyOutcome::Copied(n),
         Err(e) => {
             tracing::info!("[COPY] native set_text failed: {e} chars={n}");
-            0
+            ClipboardCopyOutcome::Failed
         }
     }
 }
@@ -75,6 +87,30 @@ fn paste_from_clipboard(on_input: &EventHandler<Vec<u8>>, bracketed: bool) {
 struct TextSelection {
     anchor: (usize, usize),
     head: (usize, usize),
+}
+
+/// Resolve the current terminal-owned selection to clipboard text.
+///
+/// The cached text is normally populated on mouseup. Keeping this fallback at
+/// the copy boundary also covers a drag released outside the terminal before
+/// its mouseup handler can update that cache.
+fn terminal_selection_text(
+    cached: &str,
+    selection: Option<TextSelection>,
+    rows: &[RenderRow],
+) -> String {
+    if !cached.is_empty() {
+        return cached.to_owned();
+    }
+
+    let Some(selection) = selection else {
+        return String::new();
+    };
+    if selection.anchor == selection.head {
+        return String::new();
+    }
+
+    extract_selection(rows, selection.anchor, selection.head)
 }
 
 // ── Terminal key encoding helpers ──────────────────────────────────
@@ -175,7 +211,7 @@ fn code_to_char(code: &Code) -> u8 {
 /// What the OneKey autofill popup should do with a key while it is visible.
 /// Extracted as a pure function so the routing — especially "typing dismisses
 /// the popup and falls through to the PTY" — is unit-testable.
-#[derive(Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum OneKeyKeyAction {
     /// Move the selection cursor to the given index.
     Navigate(usize),
@@ -209,6 +245,49 @@ fn onekey_popup_key_action(key: &Key, selected: usize, len: usize) -> OneKeyKeyA
         Key::Escape => OneKeyKeyAction::Dismiss,
         _ => OneKeyKeyAction::DismissAndForward,
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CopyShortcut {
+    Command,
+    CtrlShift,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TerminalOverlayKeyAction {
+    Copy(CopyShortcut),
+    OneKey(OneKeyKeyAction),
+    None,
+}
+
+/// Resolve copy shortcuts before popup keyboard handling. This keeps a popup in
+/// one terminal pane from dismissing itself or forwarding bytes when the user
+/// copies that pane's existing selection.
+fn terminal_overlay_key_action(
+    key: &Key,
+    ctrl: bool,
+    alt: bool,
+    meta: bool,
+    shift: bool,
+    onekey_visible: bool,
+    onekey_selected: usize,
+    onekey_len: usize,
+) -> TerminalOverlayKeyAction {
+    let is_c = matches!(key, Key::Character(s) if s.eq_ignore_ascii_case("c"));
+    if is_c && meta && !ctrl && !alt {
+        return TerminalOverlayKeyAction::Copy(CopyShortcut::Command);
+    }
+    if is_c && ctrl && shift && !alt && !meta {
+        return TerminalOverlayKeyAction::Copy(CopyShortcut::CtrlShift);
+    }
+    if onekey_visible && onekey_len > 0 {
+        return TerminalOverlayKeyAction::OneKey(onekey_popup_key_action(
+            key,
+            onekey_selected,
+            onekey_len,
+        ));
+    }
+    TerminalOverlayKeyAction::None
 }
 
 /// Geometry of the scroll-position indicator thumb: `(visible, top_pct, height_pct)`.
@@ -654,6 +733,7 @@ pub fn TerminalView(
     onekey_visible: bool,
     onekey_entries: Vec<OneKeyMatch>,
     onekey_selected: usize,
+    onekey_submission_feedback: Option<OneKeySubmissionFeedback>,
     on_onekey_navigate: EventHandler<Option<usize>>,
     on_onekey_select: EventHandler<usize>,
     on_onekey_save: EventHandler<()>,
@@ -691,11 +771,13 @@ pub fn TerminalView(
     let current_onekey_visible = onekey_visible;
     let current_onekey_entries = onekey_entries.clone();
     let current_onekey_selected = onekey_selected;
+    let current_onekey_submission_feedback = onekey_submission_feedback.clone();
     let current_disconnected = disconnected;
 
     let closure_suggestions = current_suggestions.clone();
     let sid_for_keydown_log = session_id.clone();
     let sid_for_copy = session_id.clone();
+    let copy_rows = render_output.rows.clone();
     let handle_keydown = move |e: KeyboardEvent| {
         let key = e.key();
         let code = e.code();
@@ -715,9 +797,9 @@ pub fn TerminalView(
             shift
         );
 
-        // macOS conventions: Cmd+C copies the terminal-owned selection text
-        // (falls through if there is none so other focused inputs keep their
-        // native copy), Cmd+V always pastes into the PTY.
+        // macOS conventions: Cmd+V always pastes into the PTY. Copy is
+        // routed together with Ctrl+Shift+C below so both shortcuts take
+        // priority over a visible OneKey popup.
         if meta && !ctrl && !alt {
             if let Key::Character(ref s) = key {
                 if s.eq_ignore_ascii_case("v") {
@@ -726,15 +808,80 @@ pub fn TerminalView(
                     paste_from_clipboard(&on_input, bracketed);
                     return;
                 }
-                if s.eq_ignore_ascii_case("c") {
-                    let text = selection_text();
-                    if !text.is_empty() {
-                        e.prevent_default();
-                        copy_text_to_clipboard(text);
+            }
+        }
+
+        let overlay_key_action = terminal_overlay_key_action(
+            &key,
+            ctrl,
+            alt,
+            meta,
+            shift,
+            current_onekey_visible,
+            current_onekey_selected,
+            current_onekey_entries.len(),
+        );
+        match overlay_key_action {
+            TerminalOverlayKeyAction::Copy(CopyShortcut::Command) => {
+                // Mouseup can occur outside this pane. Recompute from the
+                // terminal-owned cell range when its mouseup cache is empty.
+                let text = terminal_selection_text(&selection_text(), selection(), &copy_rows);
+                if !text.is_empty() {
+                    e.prevent_default();
+                    copy_text_to_clipboard(text);
+                }
+                // With no terminal-owned selection, preserve the browser's
+                // native copy behavior for popup/input DOM selections.
+                return;
+            }
+            TerminalOverlayKeyAction::Copy(CopyShortcut::CtrlShift) => {
+                e.prevent_default();
+                let text = terminal_selection_text(&selection_text(), selection(), &copy_rows);
+                if !text.is_empty() {
+                    if let ClipboardCopyOutcome::Copied(n) = copy_text_to_clipboard(text) {
+                        tracing::info!("[COPY] Ctrl+Shift+C copied {n} chars (terminal selection)");
                     }
                     return;
                 }
+                // No terminal-owned selection — fall back to the DOM selection
+                // (or an active INPUT/TEXTAREA). The selection text is only
+                // available from JS, so eval to read it, then write it to the
+                // clipboard natively (arboard) once it comes back.
+                let sid_for_copy_log = sid_for_copy.clone();
+                spawn(async move {
+                    let js = "\
+                        var sel = window.getSelection();
+                        var text = sel ? sel.toString() : '';
+                        if (!text) {
+                            var a = document.activeElement;
+                            if (a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA') && typeof a.selectionStart === 'number' && typeof a.selectionEnd === 'number') {
+                                text = a.value.substring(a.selectionStart, a.selectionEnd);
+                            }
+                        }
+                        return text || '';
+";
+                    let text: String = match dioxus::document::eval(js).await {
+                        Ok(v) => v.as_str().unwrap_or("").to_string(),
+                        Err(_) => String::new(),
+                    };
+                    if !text.is_empty() {
+                        if let ClipboardCopyOutcome::Copied(n) = copy_text_to_clipboard(text) {
+                            tracing::info!(
+                                "[COPY] Ctrl+Shift+C copied {} chars for session {:?}",
+                                n,
+                                &sid_for_copy_log[..sid_for_copy_log.len().min(8)]
+                            );
+                        }
+                    } else {
+                        tracing::debug!(
+                            "[COPY] Ctrl+Shift+C fired but no selection for session {:?}",
+                            &sid_for_copy_log[..sid_for_copy_log.len().min(8)]
+                        );
+                    }
+                });
+                return;
             }
+            TerminalOverlayKeyAction::OneKey(_) | TerminalOverlayKeyAction::None => {}
         }
 
         if meta {
@@ -767,13 +914,12 @@ pub fn TerminalView(
             return;
         }
 
-        // OneKey autofill popup — takes precedence when visible.
-        if current_onekey_visible && !current_onekey_entries.is_empty() {
-            match onekey_popup_key_action(
-                &key,
-                current_onekey_selected,
-                current_onekey_entries.len(),
-            ) {
+        // OneKey autofill popup — takes precedence when visible. Keep every
+        // handled key inside this TerminalView so Enter/Tab cannot bubble to an
+        // ancestor keyboard handler after selecting a credential.
+        if let TerminalOverlayKeyAction::OneKey(action) = overlay_key_action {
+            e.stop_propagation();
+            match action {
                 OneKeyKeyAction::Navigate(idx) => {
                     on_onekey_navigate.call(Some(idx));
                     return;
@@ -825,59 +971,6 @@ pub fn TerminalView(
                 search_match_index.set(0);
                 return;
             }
-            return;
-        }
-
-        // Ctrl+Shift+C: copy selection. The terminal-owned drag selection's
-        // captured text takes priority; fall back to the native DOM selection
-        // (or an active INPUT/TEXTAREA) for non-terminal focus cases.
-        if ctrl && shift && matches!(key, Key::Character(ref s) if s == "c" || s == "C") {
-            let text = selection_text();
-            if !text.is_empty() {
-                let n = copy_text_to_clipboard(text);
-                tracing::info!("[COPY] Ctrl+Shift+C copied {n} chars (terminal selection)");
-                return;
-            }
-            // No terminal-owned selection — fall back to the DOM selection
-            // (or an active INPUT/TEXTAREA). The selection text is only
-            // available from JS, so eval to read it, then write it to the
-            // clipboard natively (arboard) once it comes back.
-            let sid_for_copy_log = sid_for_copy.clone();
-            spawn(async move {
-                // Read the DOM selection (or an INPUT/TEXTAREA selection) via
-                // JS — this text lives in the WebView, not Rust. The clipboard
-                // write happens natively (arboard) once the text comes back.
-                // Explicit `return` so the eval resolves to the string, not
-                // `undefined` (dioxus eval scripts are AsyncFunction bodies).
-                let js = "\
-                    var sel = window.getSelection();
-                    var text = sel ? sel.toString() : '';
-                    if (!text) {
-                        var a = document.activeElement;
-                        if (a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA') && typeof a.selectionStart === 'number' && typeof a.selectionEnd === 'number') {
-                            text = a.value.substring(a.selectionStart, a.selectionEnd);
-                        }
-                    }
-                    return text || '';
-";
-                let text: String = match dioxus::document::eval(js).await {
-                    Ok(v) => v.as_str().unwrap_or("").to_string(),
-                    Err(_) => String::new(),
-                };
-                if !text.is_empty() {
-                    let n = copy_text_to_clipboard(text);
-                    tracing::info!(
-                        "[COPY] Ctrl+Shift+C copied {} chars for session {:?}",
-                        n,
-                        &sid_for_copy_log[..sid_for_copy_log.len().min(8)]
-                    );
-                } else {
-                    tracing::debug!(
-                        "[COPY] Ctrl+Shift+C fired but no selection for session {:?}",
-                        &sid_for_copy_log[..sid_for_copy_log.len().min(8)]
-                    );
-                }
-            });
             return;
         }
 
@@ -1778,7 +1871,7 @@ pub fn TerminalView(
                 let cid = container_id.clone();
                 spawn(async move {
                     let _ = dioxus::document::eval(&format!(
-                        "(function() {{ const el = document.getElementById('{cid}'); if (!el) return; el.style.caretColor = 'transparent'; el.style.webkitTapHighlightColor = 'transparent'; el.addEventListener('focus', function() {{ this.style.outline = 'none'; this.style.boxShadow = 'none'; }}); }})()"
+                        "(function() {{ const el = document.getElementById('{cid}'); if (!el) return; el.style.caretColor = 'transparent'; el.style.webkitTapHighlightColor = 'transparent'; el.addEventListener('focus', function() {{ this.style.outline = 'none'; this.style.boxShadow = 'none'; }}); if (el.dataset.rustermPointerCapture !== '1') {{ el.dataset.rustermPointerCapture = '1'; el.addEventListener('pointerdown', function(event) {{ if (typeof this.setPointerCapture === 'function') {{ try {{ this.setPointerCapture(event.pointerId); }} catch (_) {{}} }} }}); }} }})()"
                     )).await;
                 });
             },
@@ -2006,12 +2099,23 @@ pub fn TerminalView(
                 }
             }
 
+            if matches!(
+                current_onekey_submission_feedback,
+                Some(OneKeySubmissionFeedback::Submitted { .. })
+            ) {
+                div {
+                    style: "position:absolute;right:10px;bottom:var(--suggestion-bottom, 2em);z-index:19;padding:5px 9px;background:#1a1b26;border:1px solid #9ece6a;border-radius:4px;color:#9ece6a;font-size:11px;pointer-events:none;",
+                    "Credential sent · input hidden by remote"
+                }
+            }
+
             // OneKey autofill popup for this TerminalView's session. It is
             // positioned relative to this pane and grows above the cursor.
             if onekey_visible && !onekey_entries.is_empty() {
                 OneKeyPopup {
                     entries: onekey_entries.clone(),
                     selected: onekey_selected.min(onekey_entries.len().saturating_sub(1)),
+                    submission_feedback: onekey_submission_feedback.clone(),
                     on_highlight: move |index: usize| {
                         on_onekey_navigate.call(Some(index));
                     },
@@ -2033,7 +2137,9 @@ pub fn TerminalView(
 #[cfg(test)]
 mod tests {
     use super::{
-        OneKeyKeyAction, event_cell_from_coords, onekey_popup_key_action, scroll_thumb_geometry,
+        ClipboardCopyOutcome, CopyShortcut, OneKeyKeyAction, TerminalOverlayKeyAction,
+        TextSelection, copy_text_to_clipboard, event_cell_from_coords, onekey_popup_key_action,
+        scroll_thumb_geometry, terminal_overlay_key_action, terminal_selection_text,
         word_range_in_row,
     };
     use dioxus::prelude::Key;
@@ -2095,6 +2201,13 @@ mod tests {
                 ..Default::default()
             })
             .collect()
+    }
+
+    fn row_from(s: &str) -> RenderRow {
+        RenderRow {
+            cells: cells_from(s),
+            wrapped: false,
+        }
     }
 
     // Helper: build a cell with `wide`/`wide_next` flags set, for CJK glyphs.
@@ -2229,6 +2342,123 @@ mod tests {
         assert_eq!(word_range_in_row(&cells, 1), (0, 3));
         assert_eq!(word_range_in_row(&cells, 2), (0, 3));
         assert_eq!(word_range_in_row(&cells, 3), (0, 3));
+    }
+
+    #[test]
+    fn empty_copy_is_rejected_before_native_clipboard_access() {
+        assert_eq!(
+            copy_text_to_clipboard(String::new()),
+            ClipboardCopyOutcome::SkippedEmpty
+        );
+    }
+
+    #[test]
+    fn terminal_selection_recomputes_empty_mouseup_cache_for_error_output() {
+        let rows = vec![
+            row_from("error: permission denied"),
+            row_from("caused by: 无权限"),
+        ];
+        let selection = TextSelection {
+            anchor: (1, rows[1].cells.len() - 1),
+            head: (0, 0),
+        };
+
+        assert_eq!(
+            terminal_selection_text("", Some(selection), &rows),
+            "error: permission denied\ncaused by: 无权限"
+        );
+    }
+
+    #[test]
+    fn terminal_selection_recompute_preserves_wide_characters() {
+        let rows = vec![RenderRow {
+            cells: vec![
+                wide_cell('错'),
+                wide_next_cell(),
+                wide_cell('误'),
+                wide_next_cell(),
+            ],
+            wrapped: false,
+        }];
+        let selection = TextSelection {
+            anchor: (0, 0),
+            head: (0, 3),
+        };
+
+        assert_eq!(terminal_selection_text("", Some(selection), &rows), "错误");
+    }
+
+    #[test]
+    fn terminal_selection_cache_and_panes_remain_independent() {
+        let old_rows = vec![row_from("new output")];
+        let first_rows = vec![row_from("pane one error")];
+        let second_rows = vec![row_from("pane two warning")];
+        let first_selection = TextSelection {
+            anchor: (0, 0),
+            head: (0, first_rows[0].cells.len() - 1),
+        };
+        let second_selection = TextSelection {
+            anchor: (0, 0),
+            head: (0, second_rows[0].cells.len() - 1),
+        };
+
+        assert_eq!(
+            terminal_selection_text(
+                "captured before output shifted",
+                Some(first_selection),
+                &old_rows
+            ),
+            "captured before output shifted"
+        );
+        assert_eq!(
+            terminal_selection_text("", Some(first_selection), &first_rows),
+            "pane one error"
+        );
+        assert_eq!(
+            terminal_selection_text("", Some(second_selection), &second_rows),
+            "pane two warning"
+        );
+    }
+
+    #[test]
+    fn copy_shortcuts_take_priority_while_onekey_popup_is_visible() {
+        let key = Key::Character("c".into());
+
+        assert_eq!(
+            terminal_overlay_key_action(&key, false, false, true, false, true, 0, 1),
+            TerminalOverlayKeyAction::Copy(CopyShortcut::Command)
+        );
+        assert_eq!(
+            terminal_overlay_key_action(&key, true, false, false, true, true, 0, 1),
+            TerminalOverlayKeyAction::Copy(CopyShortcut::CtrlShift)
+        );
+
+        let rows = vec![row_from("permission denied")];
+        let selection = TextSelection {
+            anchor: (0, 0),
+            head: (0, rows[0].cells.len() - 1),
+        };
+        assert_eq!(
+            terminal_selection_text("", Some(selection), &rows),
+            "permission denied"
+        );
+    }
+
+    #[test]
+    fn non_copy_key_still_routes_to_visible_onekey_popup() {
+        assert_eq!(
+            terminal_overlay_key_action(
+                &Key::Character("x".into()),
+                false,
+                false,
+                false,
+                false,
+                true,
+                0,
+                1,
+            ),
+            TerminalOverlayKeyAction::OneKey(OneKeyKeyAction::DismissAndForward)
+        );
     }
 
     #[test]

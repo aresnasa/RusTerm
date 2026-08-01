@@ -59,6 +59,13 @@ pub fn SuggestionPopup(
                 scrollbar-width: thin;
                 scrollbar-color: #2a2b3d transparent;
             ",
+            // TerminalView captures a pointer on its root to make drag-selection
+            // reliable. Stop the pointer before it reaches that root; otherwise
+            // WebKit retargets the ensuing click to the terminal and the × never
+            // receives its delete action.
+            onpointerdown: move |e| e.stop_propagation(),
+            onmousedown: move |e| e.stop_propagation(),
+            onmouseup: move |e| e.stop_propagation(),
             onclick: move |e| e.stop_propagation(),
             for (i, cmd) in suggestions.iter().enumerate() {
                 {
@@ -87,21 +94,32 @@ pub fn SuggestionPopup(
                                 style: "flex:1;overflow:hidden;text-overflow:ellipsis;",
                                 "{cmd}"
                             }
-                            span {
+                            button {
                                 class: "sug-del",
+                                r#type: "button",
                                 style: "
                                     margin-left:8px;
                                     padding:0 6px;
                                     color:{del_color};
+                                    font:inherit;
                                     font-size:14px;
                                     font-weight:700;
+                                    line-height:1;
                                     cursor:pointer;
                                     user-select:none;
+                                    -webkit-user-select:none;
+                                    border:0;
                                     border-radius:3px;
-                                    line-height:1;
+                                    background:transparent;
                                     flex-shrink:0;
                                 ",
                                 title: "Remove from history (Shift+Del)",
+                                aria_label: "Remove command from history",
+                                // Keep the event local even if this component is
+                                // later rendered outside its current popup root.
+                                onpointerdown: move |e| e.stop_propagation(),
+                                onmousedown: move |e| e.stop_propagation(),
+                                onmouseup: move |e| e.stop_propagation(),
                                 onclick: move |e| {
                                     e.stop_propagation();
                                     on_delete.call(cmd_for_delete.clone());

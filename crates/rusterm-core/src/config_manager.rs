@@ -740,6 +740,51 @@ mod tests {
     }
 
     #[test]
+    fn onekey_credentials_roundtrip_after_manager_recreation() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("test_settings.json");
+        let master_password = "test-only master password";
+        let saved = vec![OneKey {
+            id: "restart-roundtrip".to_string(),
+            name: "special credentials".to_string(),
+            steps: [
+                " leading and trailing spaces ",
+                "quotes-'\"-and-symbols-!@#$%^&*()",
+                "unicode-sëcret-🔒-密码",
+                "trailing-line-endings\r\n",
+            ]
+            .into_iter()
+            .enumerate()
+            .map(|(index, send)| OneKeyStep {
+                label: format!("Credential {index}"),
+                expect: format!(r"prompt-{index}:"),
+                send: send.to_string(),
+            })
+            .collect(),
+        }];
+
+        let writer = ConfigManager {
+            config_path: config_path.clone(),
+            master_key: rusterm_crypto::derive_key(master_password, KEY_DERIVATION_SALT).unwrap(),
+            master_password_hash: Some(ConfigManager::hash_password(master_password).unwrap()),
+        };
+        writer.save_onekeys(&saved).unwrap();
+        drop(writer);
+
+        let reader = ConfigManager {
+            config_path,
+            master_key: rusterm_crypto::derive_key(master_password, KEY_DERIVATION_SALT).unwrap(),
+            master_password_hash: Some(ConfigManager::hash_password(master_password).unwrap()),
+        };
+        let loaded = reader.load_onekeys().unwrap();
+
+        assert!(
+            loaded == saved,
+            "OneKey credential data changed after recreating ConfigManager"
+        );
+    }
+
+    #[test]
     fn test_onekey_password_expect_migrated_for_git_https() {
         let (cm, _dir) = test_config_manager();
         let onekeys = vec![OneKey {

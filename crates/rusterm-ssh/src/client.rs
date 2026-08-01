@@ -386,9 +386,17 @@ impl SshClient {
             loop {
                 tokio::select! {
                     Some(data) = input_rx.recv() => {
+                        let payload_len = data.len();
+                        let ends_with_cr = data.last() == Some(&b'\r');
+                        let sid_short = &sid_write[..sid_write.len().min(8)];
                         if let Err(e) = write_half.data_bytes(data).await {
                             consecutive_errors += 1;
-                            tracing::warn!("[SSH] write failed for {} (attempt {consecutive_errors}): {e}", &sid_write[..sid_write.len().min(8)]);
+                            tracing::warn!(
+                                "[SSH] write failed for {} payload_len={} ends_with_cr={} (attempt {consecutive_errors}): {e}",
+                                sid_short,
+                                payload_len,
+                                ends_with_cr
+                            );
                             if consecutive_errors >= 3 {
                                 tracing::error!("[SSH] too many write errors for {}, closing input writer", &sid_write[..sid_write.len().min(8)]);
                                 break;
@@ -397,6 +405,12 @@ impl SshClient {
                             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                         } else {
                             consecutive_errors = 0;
+                            tracing::info!(
+                                "[SSH] write succeeded for {} payload_len={} ends_with_cr={}",
+                                sid_short,
+                                payload_len,
+                                ends_with_cr
+                            );
                         }
                     }
                     Some((cols, rows, pw, ph)) = resize_rx.recv() => {

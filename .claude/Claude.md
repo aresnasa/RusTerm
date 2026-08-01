@@ -40,4 +40,5 @@
 40. 无法使用鼠标选中复制，继续调整代码
 41. 支持鼠标选择复制了，但是还需要支持双击关键字并复制，需要继续修复代码
 42. 同时需要调整下切换app 时使用的 app 图标，太大了，需要使用 mac 默认的图标大小，改造一下
-43.
+43. 每次登录新的会话后都会在终端显示的输出ecs-user@bidbot-prod:~$ __rusterm_precmd() { printf '\e]133;D;%s\e\\' "$?"; printf '\e]133;A\e\\'; printf '\e]7;file://%s%s\e\\' "${HOSTNAME:-localhost}" "$PWD"; }; if [ -n "$ZSH_VERSION" ]; then precmd _functions+=(__rusterm_precmd); elif [ -n "$BASH_VERSION" ]; then PROMPT_COMMAND="__rusterm_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"; fi    这个不符合预期，需要隐藏，避免干扰用户，同时继续修复 onekey 问题[@Image](zed:///agent/pasted-image?name=Image) ，同时所有终端中的弹窗会话都要支持俘获（复制异常），强化相关代码
+44.
