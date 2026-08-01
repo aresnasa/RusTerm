@@ -817,9 +817,9 @@ pub fn TerminalView(
     let current_suggestion_selected = suggestion_selected;
 
     let current_onekey_visible = onekey_visible;
-    // Cap the entries used for both keyboard navigation and rendering to
-    // MAX_VISIBLE_ROWS so arrow-key wrapping and the popup's visible items
-    // stay in sync.
+    // Cap the entries used for selection and rendering to MAX_VISIBLE_ROWS so
+    // the selected index always addresses a visible popup item. Arrow keys are
+    // reserved for terminal cursor/history movement.
     let current_onekey_entries: Vec<OneKeyMatch> = onekey_entries
         .iter()
         .take(crate::components::suggestion_popup::MAX_VISIBLE_ROWS)

@@ -26,8 +26,7 @@ pub fn OneKeyPopup(
     );
 
     // Cap to the first MAX_VISIBLE_ROWS entries so the popup stays compact.
-    // The parent (TerminalView) also caps the entry list it uses for arrow-key
-    // navigation, so indices stay consistent between display and navigation.
+    // TerminalView applies the same cap when resolving the selected index.
     let visible: Vec<&OneKeyMatch> = entries.iter().take(MAX_VISIBLE_ROWS).collect();
     let selected = selected.min(visible.len().saturating_sub(1));
 
@@ -112,7 +111,7 @@ pub fn OneKeyPopup(
                     rsx! {
                         div {
                             key: "{i}",
-                            style: "display:flex;align-items:center;padding:5px 12px;{border_left}background:{bg};color:{fg};cursor:pointer;overflow:hidden;",
+                            style: "display:flex;align-items:center;padding:5px 32px 5px 12px;{border_left}background:{bg};color:{fg};cursor:pointer;overflow:hidden;",
                             title: "Use {m.name} · {label} (Enter or Tab)",
                             onmouseenter: move |_| on_highlight.call(i),
                             onclick: move |_| on_select.call(i),

@@ -565,6 +565,7 @@ return (async () => {
       "RUSTERM_MAIN_E2E_OK",
     );
 
+    await sleep(750);
     stage = "suggestion-delete-click";
     const suggestionCommand = "printf RUSTERM_SUGGEST_DELETE_E2E";
     const suggestionPrefix = "printf RUSTERM_SUGGEST_DEL";
