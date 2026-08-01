@@ -53,6 +53,31 @@ fn save_config(state: &Signal<AppState>) {
     }
 }
 
+fn apply_connection_edit(state: &mut AppState, updated: ConnectionConfig) -> bool {
+    let connection_id = updated.id.clone();
+    let onekey = updated.onekey;
+    let Some(slot) = state
+        .connections
+        .iter_mut()
+        .find(|connection| connection.id == connection_id)
+    else {
+        return false;
+    };
+    *slot = updated;
+
+    // Runtime sessions are keyed by their own UUID, while the stored config
+    // retains the originating saved connection id. OneKey is a live matching
+    // policy, so toggling it must affect every session opened from that saved
+    // connection without waiting for a reconnect. Other connection fields stay
+    // unchanged here because changing them cannot alter an established session.
+    for session_config in state.session_configs.values_mut() {
+        if session_config.id == connection_id {
+            session_config.onekey = onekey;
+        }
+    }
+    true
+}
+
 /// Human-readable label for the active tab's current layout, shown in the
 /// status bar's layout toolbar. Reads the actual pane count from the layout
 /// (not `state.layout_preset`, which no longer reflects reality after
@@ -836,28 +861,47 @@ fn render_terminal_pane(
                                 .and_modify(|p| p.selected = i);
                         }
                     },
-                    on_onekey_select: move |send: String| {
-                        // Send the selected OneKey's value + Enter, then dismiss.
-                        // `send` is the DECRYPTED plaintext (OneKeyMatch.send comes
-                        // from AppState.onekeys, which is decrypted on unlock). Log
-                        // the length to confirm the plaintext (not the encrypted
-                        // blob) is being sent.
+                    on_onekey_select: move |index: usize| {
+                        // Resolve the index against this session's current popup
+                        // state rather than accepting plaintext back from the UI.
+                        // Remove the popup in the same write so a duplicate click
+                        // or key event cannot submit the credential twice.
+                        let send = {
+                            let mut app = state_for_cmd.write();
+                            let send = app
+                                .onekey_popups
+                                .get(&sid_for_ok_sel)
+                                .and_then(|popup| popup.matches.get(index))
+                                .map(|entry| entry.send.clone());
+                            if send.is_some() {
+                                app.onekey_popups.remove(&sid_for_ok_sel);
+                            }
+                            send
+                        };
+                        let Some(send) = send else {
+                            tracing::warn!(
+                                "[ONEKEY-SELECT] session={} ignored invalid selection index={}",
+                                &sid_for_ok_sel[..sid_for_ok_sel.len().min(8)],
+                                index
+                            );
+                            return;
+                        };
                         tracing::info!(
-                            "[ONEKEY-SELECT] session={} send_len={}",
-                            &sid_for_ok_sel[..sid_for_ok_sel.len().min(8)],
-                            send.len()
+                            "[ONEKEY-SELECT] session={} submitting selected credential",
+                            &sid_for_ok_sel[..sid_for_ok_sel.len().min(8)]
                         );
                         if let Some(sender) = senders.read().get(&sid_for_ok_sel) {
                             let mut data = send.into_bytes();
-                            // Use \r (carriage return) — the same byte the terminal
-                            // sends for Enter (Key::Enter → 0x0d). The PTY's ICRNL
-                            // converts it to \n for the program. Using \r matches
-                            // real keyboard input exactly.
+                            // Match physical Enter exactly. This callback consumes
+                            // the UI Enter/Tab event, so only this one CR is sent.
                             data.push(b'\r');
-                            let _ = sender.send(data);
+                            if sender.send(data).is_err() {
+                                tracing::warn!(
+                                    "[ONEKEY-SELECT] session={} input channel closed",
+                                    &sid_for_ok_sel[..sid_for_ok_sel.len().min(8)]
+                                );
+                            }
                         }
-                        state_for_cmd.write().onekey_popups
-                            .remove(&sid_for_ok_sel);
                     },
                     on_onekey_save: move |_: ()| {
                         // Save a new OneKey: expect = the matched prompt,
@@ -880,12 +924,19 @@ fn render_terminal_pane(
                             } else {
                                 line.trim().to_string()
                             };
-                            let name = if send.is_empty() { "onekey".to_string() } else { send.clone() };
+                            let label = match credential_kind(&expect) {
+                                Some(CredentialKind::Password) => "Password",
+                                Some(CredentialKind::Token) => "Token",
+                                Some(CredentialKind::Username) => "Username",
+                                None => "Credential",
+                            };
                             OneKey {
                                 id: uuid::Uuid::new_v4().to_string(),
-                                name,
+                                // Never use `send` as a display name: it may be a
+                                // password and popup labels are intentionally visible.
+                                name: format!("Saved {label}"),
                                 steps: vec![OneKeyStep {
-                                    label: String::new(),
+                                    label: label.to_string(),
                                     expect,
                                     send: send.clone(),
                                 }],
@@ -4123,20 +4174,75 @@ fn strip_ansi(s: &str) -> String {
     re.replace_all(s, "").to_string()
 }
 
-/// Find the first step in `ok` whose `expect` regex matches `line`
-/// (case-insensitively). A OneKey is a sequence of Expect/Send steps; only the
-/// first matching step is offered for a given prompt, so a Username step and a
-/// Password step (with different expects) are correctly distinguished.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CredentialKind {
+    Password,
+    Token,
+    Username,
+}
+
+/// Infer a credential kind from a prompt, step label, or expect pattern. The
+/// ordering is intentional: password prompts often contain a username/URL, so
+/// password must win over the more generic `user` keyword.
+fn credential_kind(text: &str) -> Option<CredentialKind> {
+    let lower = text.to_lowercase();
+    if ["password", "passwd", "passphrase", "pwd", "pin"]
+        .iter()
+        .any(|word| lower.contains(word))
+    {
+        Some(CredentialKind::Password)
+    } else if ["token", "otp"].iter().any(|word| lower.contains(word)) {
+        Some(CredentialKind::Token)
+    } else if ["username", "user name", "login"]
+        .iter()
+        .any(|word| lower.contains(word))
+    {
+        Some(CredentialKind::Username)
+    } else {
+        None
+    }
+}
+
+fn onekey_step_label(step: &OneKeyStep) -> String {
+    if !step.label.trim().is_empty() {
+        return step.label.trim().to_string();
+    }
+    match credential_kind(&step.expect) {
+        Some(CredentialKind::Password) => "Password".to_string(),
+        Some(CredentialKind::Token) => "Token".to_string(),
+        Some(CredentialKind::Username) => "Username".to_string(),
+        None => "Credential".to_string(),
+    }
+}
+
+/// Find the best step in `ok` whose `expect` regex matches `line`
+/// (case-insensitively). When overlapping patterns match, prefer a step whose
+/// label/expect has the same credential kind as the prompt. This prevents a
+/// broad Username rule placed first from supplying a username at a Password
+/// prompt. Configuration order remains the fallback for unclassified prompts.
 fn first_matching_step<'a>(ok: &'a OneKey, line: &str) -> Option<&'a OneKeyStep> {
+    let prompt_kind = credential_kind(line);
+    let mut first_match = None;
+
     for step in &ok.steps {
         let pattern = format!("(?i){}", step.expect);
-        if let Ok(re) = regex::Regex::new(&pattern) {
-            if re.is_match(line) {
+        let Ok(re) = regex::Regex::new(&pattern) else {
+            continue;
+        };
+        if !re.is_match(line) {
+            continue;
+        }
+
+        first_match.get_or_insert(step);
+        if let Some(prompt_kind) = prompt_kind {
+            let step_kind = credential_kind(&format!("{} {}", step.label, step.expect));
+            if step_kind == Some(prompt_kind) {
                 return Some(step);
             }
         }
     }
-    None
+
+    first_match
 }
 
 fn onekey_prompt_text(state: &AppState, session_id: &str, data: &[u8]) -> String {
@@ -4175,151 +4281,165 @@ fn onekey_prompt_text(state: &AppState, session_id: &str, data: &[u8]) -> String
         .unwrap_or_default()
 }
 
-/// Scan new terminal output for OneKey expect-pattern matches. If any OneKey's
-/// expect regex matches and the session's popup isn't already showing, show the
-/// popup with the matching entries. Persists across focus changes (only new
-/// output triggers this — focus changes produce no output, so no re-scan).
-///
-/// Diagnostic logging: every early-return path emits a `[ONEKEY-SKIP]` line so
-/// the user can see WHY the popup didn't fire (OneKey disabled, vault locked,
-/// popup already visible, alt-screen active, or no expect matched the prompt).
-/// The successful-match path keeps its existing `[ONEKEY-MATCH]` log.
-fn check_onekey_match(mut state: Signal<AppState>, session_id: &str, data: &[u8]) {
+fn onekey_popup_for_output(
+    state: &AppState,
+    session_id: &str,
+    data: &[u8],
+) -> Option<OneKeyPopupState> {
     let sid_short = &session_id[..session_id.len().min(8)];
-    if !onekey_enabled_for_session(&state.read(), session_id) {
+    if !onekey_enabled_for_session(state, session_id) {
         tracing::debug!(
             "[ONEKEY-SKIP] session={} reason=disabled_for_session \
              (toggle 'One-Key Connect' on the connection)",
             sid_short
         );
-        return;
+        return None;
     }
-    let onekeys = state.read().onekeys.clone();
+    let onekeys = state.onekeys.clone();
     if onekeys.is_empty() {
-        // Most common real-world cause: the master password hasn't been
-        // unlocked, so AppState.onekeys is still empty even though the user
-        // saved OneKeys to disk. Logging at info (not debug) because users hit
-        // this regularly and it's not obvious from the UI.
         tracing::info!(
             "[ONEKEY-SKIP] session={} reason=onekeys_empty \
              (unlock the master password to load saved OneKeys)",
             sid_short
         );
-        return;
+        return None;
     }
-    // Don't re-trigger while the popup is already showing (persist).
-    let already_visible = state
-        .read()
+    if state
         .onekey_popups
         .get(session_id)
-        .map(|p| p.visible)
-        .unwrap_or(false);
-    if already_visible {
+        .is_some_and(|popup| popup.visible)
+    {
         tracing::debug!(
             "[ONEKEY-SKIP] session={} reason=popup_already_visible",
             sid_short
         );
-        return;
+        return None;
     }
-    // Suppress matching while a full-screen app (vim/less/man/tmux copy-mode)
-    // owns the alternate screen: the cursor line is not a shell prompt and
-    // matching against it would surface credentials inside the editor.
-    let on_alt_screen = state
-        .read()
+    if state
         .terminals
         .get(session_id)
-        .map(|h| h.lock().terminal.is_alt_screen())
-        .unwrap_or(false);
-    if on_alt_screen {
+        .is_some_and(|handle| handle.lock().terminal.is_alt_screen())
+    {
         tracing::debug!(
             "[ONEKEY-SKIP] session={} reason=alt_screen_active \
              (a full-screen app like vim/less owns the terminal)",
             sid_short
         );
-        return;
+        return None;
     }
-    // Read the assembled current line from this session's own terminal model.
-    // Credential prompts are frequently split across SSH output chunks; matching
-    // only `data` would miss `"Pass" + "word:"`. The terminal has already
-    // processed this output at both call sites, so its current line is the
-    // correct pane-local matching boundary. `onekey_prompt_text` also walks a
-    // few rows above the cursor when the prompt left the cursor on col 0 of
-    // the next row (newline-terminated prompts).
-    let text = onekey_prompt_text(&state.read(), session_id, data);
-    // Match only the final non-empty line. Matching full scrollback/history
-    // output could surface credentials for an old command in the wrong prompt.
+
+    let text = onekey_prompt_text(state, session_id, data);
     let last_line = text
         .lines()
         .rev()
         .find(|line| !line.trim().is_empty())
         .unwrap_or("");
-    // For each OneKey, find the FIRST step whose expect matches the last line
-    // (case-insensitive). first_matching_step picks the right step per prompt,
-    // so a Username step and a Password step are distinguished correctly.
-    let mut matches: Vec<OneKeyMatch> = Vec::new();
-    let mut matched_expect: Option<String> = None;
-    for ok in &onekeys {
-        let Some(step) = first_matching_step(ok, last_line) else {
+    let mut matches = Vec::new();
+    let mut matched_expect = None;
+    for onekey in &onekeys {
+        let Some(step) = first_matching_step(onekey, last_line) else {
             continue;
         };
         if matched_expect.is_none() {
             matched_expect = Some(step.expect.clone());
         }
-        // `step.send` is the DECRYPTED plaintext (AppState.onekeys is decrypted
-        // on unlock / kept plaintext after a manager save). Log the matched step
-        // + ALL steps (label/expect/send_len) so we can verify the password
-        // step exists and its expect matches the prompt (e.g. git's
-        // "Password for '…':").
-        let steps_summary: Vec<String> = ok
-            .steps
-            .iter()
-            .map(|s| {
-                format!(
-                    "{{label={:?},expect={:?},send_len={}}}",
-                    s.label,
-                    s.expect,
-                    s.send.len()
-                )
-            })
-            .collect();
         tracing::info!(
-            "[ONEKEY-MATCH] session={} onekey={} matched_expect={:?} send_len={} all_steps=[{}]",
-            sid_short,
-            ok.name,
-            step.expect,
-            step.send.len(),
-            steps_summary.join(", ")
+            "[ONEKEY-MATCH] session={} matched one credential step",
+            sid_short
         );
+        if step.send.is_empty() {
+            tracing::warn!(
+                "[ONEKEY-SKIP] session={} reason=matched_step_has_empty_send",
+                sid_short
+            );
+            continue;
+        }
         matches.push(OneKeyMatch {
-            name: ok.name.clone(),
+            name: onekey.name.clone(),
+            label: onekey_step_label(step),
             send: step.send.clone(),
         });
     }
     if matches.is_empty() {
-        // Log the prompt we couldn't match, so the user can see what the
-        // terminal actually had on the current line and adjust their OneKey's
-        // `expect` accordingly. Truncate to avoid flooding the log with long
-        // MOTD/banner lines. Don't log the raw `data` chunk — it could be
-        // huge and the current-line view is what we match against.
-        let preview: String = last_line.chars().take(120).collect();
         tracing::debug!(
-            "[ONEKEY-SKIP] session={} reason=no_match last_line_preview={:?} \
-             onekeys_count={}",
+            "[ONEKEY-SKIP] session={} reason=no_match onekeys_count={}",
             sid_short,
-            preview,
             onekeys.len()
         );
-        return;
+        return None;
     }
-    state.write().onekey_popups.insert(
-        session_id.to_string(),
-        OneKeyPopupState {
-            visible: true,
-            matches,
-            selected: 0,
-            matched_expect,
-        },
-    );
+
+    Some(OneKeyPopupState {
+        visible: true,
+        matches,
+        selected: 0,
+        matched_expect,
+    })
+}
+
+#[cfg(test)]
+fn check_onekey_match_in_state(state: &mut AppState, session_id: &str, data: &[u8]) {
+    if let Some(popup) = onekey_popup_for_output(state, session_id, data) {
+        state.onekey_popups.insert(session_id.to_string(), popup);
+    }
+}
+
+fn current_prompt_onekey_popups(state: &AppState) -> Vec<(String, OneKeyPopupState)> {
+    let enabled_session_ids: Vec<String> = state
+        .session_configs
+        .iter()
+        .filter(|(_, config)| config.onekey)
+        .map(|(session_id, _)| session_id.clone())
+        .collect();
+
+    enabled_session_ids
+        .into_iter()
+        .filter_map(|session_id| {
+            onekey_popup_for_output(state, &session_id, b"").map(|popup| (session_id, popup))
+        })
+        .collect()
+}
+
+fn insert_refreshed_onekey_popups(state: &mut AppState, popups: Vec<(String, OneKeyPopupState)>) {
+    for (session_id, popup) in popups {
+        let already_visible = state
+            .onekey_popups
+            .get(&session_id)
+            .is_some_and(|current| current.visible);
+        if !already_visible {
+            state.onekey_popups.insert(session_id, popup);
+        }
+    }
+}
+
+#[cfg(test)]
+fn refresh_onekey_popups_for_current_prompts_in_state(state: &mut AppState) {
+    let popups = current_prompt_onekey_popups(state);
+    insert_refreshed_onekey_popups(state, popups);
+}
+
+fn refresh_onekey_popups_for_current_prompts(mut state: Signal<AppState>) {
+    // Compute from a read snapshot first. `onekey_popup_for_output` briefly
+    // locks each terminal to inspect its current line; those terminal locks and
+    // the AppState read guard are gone before we acquire the AppState write
+    // guard below.
+    let popups = {
+        let snapshot = state.read();
+        current_prompt_onekey_popups(&snapshot)
+    };
+    if !popups.is_empty() {
+        insert_refreshed_onekey_popups(&mut state.write(), popups);
+    }
+}
+
+fn check_onekey_match(mut state: Signal<AppState>, session_id: &str, data: &[u8]) {
+    let popup = onekey_popup_for_output(&state.read(), session_id, data);
+    if let Some(popup) = popup {
+        state
+            .write()
+            .onekey_popups
+            .insert(session_id.to_string(), popup);
+    }
 }
 
 const SHELL_INTEGRATION_QUIET_PERIOD: std::time::Duration = std::time::Duration::from_millis(1_200);
@@ -4529,6 +4649,213 @@ mod session_startup_tests {
         assert_eq!(
             onekey_prompt_text(&state, "pane-a", b"Username: "),
             "Username: ",
+        );
+    }
+
+    fn state_with_enabled_onekey_for_prompt(expect: &str, prompt: &[u8]) -> AppState {
+        let session_id = "sudo-pane";
+        let mut entry = TerminalEntry {
+            terminal: Terminal::new(TerminalSize::default()),
+            parser: vte::ansi::Processor::new(),
+            scroll_offset: 0,
+        };
+        entry.process_and_render(prompt);
+
+        let mut state = AppState::default();
+        state
+            .terminals
+            .insert(session_id.to_string(), Arc::new(Mutex::new(entry)));
+        state.session_configs.insert(
+            session_id.to_string(),
+            ConnectionConfig {
+                id: session_id.to_string(),
+                name: "sudo".to_string(),
+                kind: ConnectionKind::Shell(ShellConfig {
+                    command: None,
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    working_dir: None,
+                }),
+                group: None,
+                tags: Vec::new(),
+                onekey: true,
+            },
+        );
+        state.onekeys.push(OneKey {
+            id: "sudo-credential".to_string(),
+            name: "sudo".to_string(),
+            steps: vec![OneKeyStep {
+                label: "Password".to_string(),
+                expect: expect.to_string(),
+                send: "test-secret".to_string(),
+            }],
+        });
+        state
+    }
+
+    fn state_with_enabled_onekey(expect: &str) -> AppState {
+        state_with_enabled_onekey_for_prompt(expect, b"[sudo: authenticate] Password: ")
+    }
+
+    #[test]
+    fn sudo_password_prompt_creates_popup_through_the_full_matching_chain() {
+        let mut state = state_with_enabled_onekey(r"password:");
+
+        check_onekey_match_in_state(&mut state, "sudo-pane", b"[sudo: authenticate] Password: ");
+
+        let popup = state
+            .onekey_popups
+            .get("sudo-pane")
+            .expect("sudo password prompt should create a popup");
+        assert!(popup.visible);
+        assert_eq!(popup.matches.len(), 1);
+        assert_eq!(popup.matches[0].label, "Password");
+    }
+
+    #[test]
+    fn default_password_expect_creates_popup_for_sudo_prompt() {
+        let mut state =
+            state_with_enabled_onekey(rusterm_core::config::DEFAULT_ONEKEY_PASSWORD_EXPECT);
+
+        check_onekey_match_in_state(&mut state, "sudo-pane", b"[sudo: authenticate] Password: ");
+
+        assert!(
+            state.onekey_popups.contains_key("sudo-pane"),
+            "the default Password step must cover sudo's bare Password: prompt"
+        );
+    }
+
+    #[test]
+    fn default_password_expect_matches_common_prompts_without_matching_status_text() {
+        let expect = rusterm_core::config::DEFAULT_ONEKEY_PASSWORD_EXPECT;
+        let matching_prompts: &[&[u8]] = &[
+            b"Password: ",
+            b"password: ",
+            b"Password for ecs-user: ",
+            b"[sudo] password for ecs-user: ",
+            b"[sudo: authenticate] Password: ",
+            b"[sudo: authenticated] Password: ",
+            b"Enter password: ",
+            b"ecs-user's password: ",
+            b"Passphrase for key '/home/user/.ssh/id_ed25519': ",
+        ];
+
+        for prompt in matching_prompts {
+            let mut state = state_with_enabled_onekey_for_prompt(expect, prompt);
+            check_onekey_match_in_state(&mut state, "sudo-pane", prompt);
+            assert!(
+                state.onekey_popups.contains_key("sudo-pane"),
+                "default Password prompt preset should match this prompt shape"
+            );
+        }
+
+        let status_lines: &[&[u8]] = &[
+            b"Password authentication is enabled.",
+            b"Your password policy expires in 30 days.",
+            b"No password is required.",
+        ];
+
+        for line in status_lines {
+            let mut state = state_with_enabled_onekey_for_prompt(expect, line);
+            check_onekey_match_in_state(&mut state, "sudo-pane", line);
+            assert!(
+                !state.onekey_popups.contains_key("sudo-pane"),
+                "ordinary password-related status text must not open the popup"
+            );
+        }
+    }
+
+    #[test]
+    fn saving_matching_onekeys_rechecks_prompt_already_on_terminal() {
+        let session_id = "sudo-pane";
+        let prompt = b"[sudo: authenticate] Password: ";
+        let mut state = state_with_enabled_onekey(r"Username for \S+:");
+
+        check_onekey_match_in_state(&mut state, session_id, prompt);
+        assert!(
+            !state.onekey_popups.contains_key(session_id),
+            "the old rule should not match the existing password prompt"
+        );
+
+        state.onekeys[0].steps[0].expect =
+            rusterm_core::config::DEFAULT_ONEKEY_PASSWORD_EXPECT.to_string();
+        refresh_onekey_popups_for_current_prompts_in_state(&mut state);
+
+        assert!(
+            state.onekey_popups.contains_key(session_id),
+            "saving a matching rule must recheck the prompt already visible on the terminal"
+        );
+    }
+
+    #[test]
+    fn saving_onekeys_does_not_recheck_disabled_session() {
+        let session_id = "sudo-pane";
+        let mut state = state_with_enabled_onekey(r"Username for \S+:");
+        state
+            .session_configs
+            .get_mut(session_id)
+            .expect("test session config")
+            .onekey = false;
+        state.onekeys[0].steps[0].expect =
+            rusterm_core::config::DEFAULT_ONEKEY_PASSWORD_EXPECT.to_string();
+
+        refresh_onekey_popups_for_current_prompts_in_state(&mut state);
+
+        assert!(
+            !state.onekey_popups.contains_key(session_id),
+            "saving rules must not bypass the connection's One-Key Connect gate"
+        );
+    }
+
+    #[test]
+    fn saving_onekeys_does_not_replace_an_existing_visible_popup() {
+        let session_id = "sudo-pane";
+        let mut state =
+            state_with_enabled_onekey(rusterm_core::config::DEFAULT_ONEKEY_PASSWORD_EXPECT);
+        check_onekey_match_in_state(&mut state, session_id, b"");
+        state
+            .onekey_popups
+            .get_mut(session_id)
+            .expect("initial popup")
+            .selected = 7;
+
+        refresh_onekey_popups_for_current_prompts_in_state(&mut state);
+
+        assert_eq!(
+            state
+                .onekey_popups
+                .get(session_id)
+                .expect("visible popup should remain")
+                .selected,
+            7,
+            "refreshing rules must not reset a popup the user is already navigating"
+        );
+    }
+
+    #[test]
+    fn enabling_onekey_on_saved_connection_updates_its_running_session() {
+        let mut state =
+            state_with_enabled_onekey(rusterm_core::config::DEFAULT_ONEKEY_PASSWORD_EXPECT);
+        let session_id = "sudo-pane";
+        let connection_id = "saved-connection";
+
+        let running_config = state
+            .session_configs
+            .get_mut(session_id)
+            .expect("test session config");
+        running_config.id = connection_id.to_string();
+        running_config.onekey = false;
+        state.connections.push(running_config.clone());
+
+        let mut updated = running_config.clone();
+        updated.onekey = true;
+        assert!(apply_connection_edit(&mut state, updated));
+
+        refresh_onekey_popups_for_current_prompts_in_state(&mut state);
+
+        assert!(
+            state.onekey_popups.contains_key(session_id),
+            "editing One-Key Connect must affect sessions already opened from that saved connection"
         );
     }
 
@@ -8664,17 +8991,13 @@ pub fn App() -> Element {
                 // form (preserving id + non-form fields), replace it in place,
                 // and persist. We deliberately do NOT start a new session —
                 // editing a saved connection is not the same as connecting to
-                // it. Any live session tab for this connection keeps running
-                // with the old config; its reconnect path reads from
-                // `session_configs`, which is also stale, but that's
-                // acceptable — the user can close the tab and reconnect to
-                // pick up the new config.
+                // it. Established sessions keep their connection parameters,
+                // but the OneKey matching policy is synchronized immediately.
                 let original = state.read().connections.iter().find(|c| c.id == id).cloned();
                 if let Some(original) = original {
                     let updated = rebuild_connection(&original, &form);
-                    if let Some(slot) = state.write().connections.iter_mut().find(|c| c.id == id) {
-                        *slot = updated;
-                    }
+                    apply_connection_edit(&mut state.write(), updated);
+                    refresh_onekey_popups_for_current_prompts(state);
                     save_config(&state);
                 }
                 editing_conn.set(None);
@@ -8743,14 +9066,18 @@ pub fn App() -> Element {
                 onekeys: state.read().onekeys.clone(),
                 on_close: move |_| modal.set(Modal::None),
                 on_save: move |onekeys: Vec<OneKey>| {
-                    let cm = state.read().config_manager.clone();
-                    if let Some(cm) = cm {
-                        if let Err(e) = cm.save_onekeys(&onekeys) {
-                            tracing::error!("Failed to save OneKeys: {}", e);
+                    let Some(cm) = state.read().config_manager.clone() else {
+                        tracing::warn!("Cannot save OneKeys while the credential vault is locked");
+                        return;
+                    };
+                    match cm.save_onekeys(&onekeys) {
+                        Ok(()) => {
+                            state.write().onekeys = onekeys;
+                            refresh_onekey_popups_for_current_prompts(state);
+                            modal.set(Modal::None);
                         }
+                        Err(e) => tracing::error!("Failed to save OneKeys: {}", e),
                     }
-                    state.write().onekeys = onekeys;
-                    modal.set(Modal::None);
                 },
             }
         }
@@ -9184,7 +9511,9 @@ fn looks_like_command(s: &str) -> bool {
 
 #[cfg(test)]
 mod onekey_tests {
-    use super::{first_matching_step, strip_ansi};
+    use super::{
+        CredentialKind, credential_kind, first_matching_step, onekey_step_label, strip_ansi,
+    };
     use regex::Regex;
     use rusterm_core::config::{OneKey, OneKeyStep};
 
@@ -9276,39 +9605,55 @@ mod onekey_tests {
     }
 
     #[test]
-    fn migrated_password_expect_matches_git_password_prompt() {
-        // The bug this guards against: a user saved a git-HTTPS OneKey with a
-        // password step whose expect was a bare `password:`. Git's actual prompt
-        // is `Password for 'host': ` — the `for 'host'` sits between "Password"
-        // and ":", so `password:` does NOT match, the popup never fires for the
-        // password step, and the user has to type the password manually.
-        //
-        // ConfigManager::load_onekeys migrates `password:` -> `password for \S+:`
-        // when a Username step is present (see test_onekey_password_expect_migrated_for_git_https
-        // in rusterm-core). This test verifies that AFTER migration, the password
-        // step's expect correctly matches git's prompt — i.e. the popup will fire.
-        let git_password_prompt = "Password for 'https://xuchao@gitlab.example.com': ";
-
-        // Before migration: bare `password:` does NOT match git's prompt.
-        assert!(
-            !Regex::new(r"(?i)password:")
-                .unwrap()
-                .is_match(git_password_prompt),
-            "bare 'password:' must NOT match git's 'Password for ...' prompt (the bug)"
-        );
-
-        // After migration: `password for \S+:` DOES match git's prompt.
-        assert!(
-            Regex::new(r"(?i)password for \S+:")
-                .unwrap()
-                .is_match(git_password_prompt),
-            "migrated 'password for \\S+:' expect must match git's password prompt"
-        );
-
-        // And the full multi-step OneKey picks the password step for the password prompt.
+    fn overlapping_steps_prefer_the_prompts_credential_kind() {
         let ok = OneKey {
+            id: "overlap".to_string(),
+            name: "account".to_string(),
+            steps: vec![
+                OneKeyStep {
+                    label: "Username".to_string(),
+                    expect: r".+:".to_string(),
+                    send: "wrong-user".to_string(),
+                },
+                OneKeyStep {
+                    label: "Password".to_string(),
+                    expect: r"password.*:".to_string(),
+                    send: "correct-password".to_string(),
+                },
+            ],
+        };
+
+        let step = first_matching_step(&ok, "root@host's password: ").unwrap();
+        assert_eq!(step.send, "correct-password");
+    }
+
+    #[test]
+    fn password_prompt_kind_wins_even_when_prompt_contains_a_username() {
+        assert_eq!(
+            credential_kind("Password for 'https://user@example.com':"),
+            Some(CredentialKind::Password)
+        );
+        let step = OneKeyStep {
+            label: String::new(),
+            expect: "password:".to_string(),
+            send: "secret".to_string(),
+        };
+        assert_eq!(onekey_step_label(&step), "Password");
+    }
+
+    #[test]
+    fn migrated_password_expect_matches_git_and_sudo_prompts() {
+        let expect = rusterm_core::config::DEFAULT_ONEKEY_PASSWORD_EXPECT;
+        let regex = Regex::new(&format!("(?i){expect}")).unwrap();
+        let git_prompt = "Password for 'https://xuchao@gitlab.example.com': ";
+        let sudo_prompt = "[sudo: authenticate] Password: ";
+
+        assert!(regex.is_match(git_prompt));
+        assert!(regex.is_match(sudo_prompt));
+
+        let onekey = OneKey {
             id: "migrated".to_string(),
-            name: "gitlab".to_string(),
+            name: "account".to_string(),
             steps: vec![
                 OneKeyStep {
                     label: "Username".to_string(),
@@ -9316,17 +9661,20 @@ mod onekey_tests {
                     send: "user".to_string(),
                 },
                 OneKeyStep {
-                    label: "".to_string(),
-                    // This is the migrated expect (was `password:` before migration).
-                    expect: r"password for \S+:".to_string(),
+                    label: "Password".to_string(),
+                    expect: expect.to_string(),
                     send: "pass".to_string(),
                 },
             ],
         };
-        let step = first_matching_step(&ok, git_password_prompt).unwrap();
+
         assert_eq!(
-            step.send, "pass",
-            "after migration, git's password prompt must pick the password step"
+            first_matching_step(&onekey, git_prompt).unwrap().send,
+            "pass"
+        );
+        assert_eq!(
+            first_matching_step(&onekey, sudo_prompt).unwrap().send,
+            "pass"
         );
     }
 

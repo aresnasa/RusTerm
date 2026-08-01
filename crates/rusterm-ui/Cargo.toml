@@ -17,6 +17,7 @@ dirs.workspace = true
 parking_lot.workspace = true
 vte = { workspace = true, features = ["ansi"] }
 regex.workspace = true
+arboard.workspace = true
 
 rusterm-core.workspace = true
 rusterm-ssh.workspace = true

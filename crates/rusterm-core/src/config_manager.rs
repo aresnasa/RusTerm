@@ -8,9 +8,10 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rand::RngCore;
 
 use crate::config::{
-    ConnectionConfig, ConnectionKind, EncryptedValue, FocusedTabAppearance, OneKey, OneKeyStep,
-    PersistedConfig, PersistedConnection, PersistedConnectionKind, PersistedOneKey,
-    PersistedOneKeyStep, PersistedSshAuth, PersistedSshConfig, SshAuth, SshConfig,
+    ConnectionConfig, ConnectionKind, DEFAULT_ONEKEY_PASSWORD_EXPECT, EncryptedValue,
+    FocusedTabAppearance, OneKey, OneKeyStep, PersistedConfig, PersistedConnection,
+    PersistedConnectionKind, PersistedOneKey, PersistedOneKeyStep, PersistedSshAuth,
+    PersistedSshConfig, SshAuth, SshConfig,
 };
 use rusterm_crypto::{KeyringStore, decrypt_data, encrypt_data};
 
@@ -476,30 +477,34 @@ impl ConfigManager {
         let steps = pok
             .steps
             .into_iter()
-            .map(|s| self.decrypt_step(s))
+            .map(|step| self.decrypt_step(step))
             .collect::<Result<Vec<_>>>()?;
-        // Migration: if this OneKey has a `Username for \S+:` step (git HTTPS
-        // pattern) AND a password step with a bare `password:` expect, the
-        // password expect won't match git's actual `Password for 'host': `
-        // prompt (the `for 'host'` sits between "Password" and ":"). Upgrade
-        // it to `password for \S+:` so the popup fires for the password step.
-        // Without this, the username popup fires but the password popup never
-        // does, forcing the user to type the password manually — exactly the
-        // scenario OneKeys exists to prevent.
-        let has_username_step = steps.iter().any(|s| s.expect.starts_with("Username for"));
+
+        // Earlier releases used incomplete password defaults: bare `password:`,
+        // Git-only `password for \S+:`, and a combined rule that still omitted
+        // SSH key passphrases. Upgrade only those known defaults; leave every
+        // other user-authored regex unchanged.
+        let has_git_username_step = steps
+            .iter()
+            .any(|step| step.expect.starts_with("Username for"));
         let steps = steps
             .into_iter()
-            .map(|mut s| {
-                if has_username_step && s.expect.trim() == "password:" {
+            .map(|mut step| {
+                let expect = step.expect.trim();
+                let is_legacy_default = matches!(
+                    expect,
+                    r"password(?: for \S+)?:" | r"password for \S+:"
+                ) || (has_git_username_step && expect == "password:");
+                if is_legacy_default {
                     tracing::info!(
-                        "Migrating OneKey '{}': upgrading password step expect 'password:' -> 'password for \\S+:' (git HTTPS pattern)",
-                        &pok.name
+                        "Migrated a legacy OneKey Password expect to the general password prompt pattern"
                     );
-                    s.expect = r"password for \S+:".to_string();
+                    step.expect = DEFAULT_ONEKEY_PASSWORD_EXPECT.to_string();
                 }
-                s
+                step
             })
-            .collect::<Vec<_>>();
+            .collect();
+
         Ok(OneKey {
             id: pok.id,
             name: pok.name,
@@ -718,11 +723,8 @@ mod tests {
                 },
                 OneKeyStep {
                     label: "Password".to_string(),
-                    // Use the git-HTTPS-shaped expect here so the migration
-                    // in `decrypt_onekey` (which upgrades a bare `password:`
-                    // to `password for \S+:` when a Username step is present)
-                    // doesn't rewrite it on load — keeping this a pure round-trip.
-                    expect: r"password for \S+:".to_string(),
+                    // Use the current default so this remains a pure round-trip.
+                    expect: DEFAULT_ONEKEY_PASSWORD_EXPECT.to_string(),
                     send: "secret-token-123".to_string(),
                 },
             ],
@@ -739,13 +741,6 @@ mod tests {
 
     #[test]
     fn test_onekey_password_expect_migrated_for_git_https() {
-        // The bug this guards: a user saves a git-HTTPS OneKey with a Username
-        // step (`Username for \S+:`) and a Password step whose expect is a bare
-        // `password:`. Git's actual prompt is `Password for 'host': ` — the
-        // `for 'host'` sits between "Password" and ":", so `password:` does
-        // NOT match, the popup never fires for the password step, and the user
-        // has to type the password manually. The migration upgrades the expect
-        // to `password for \S+:` on load so the popup fires correctly.
         let (cm, _dir) = test_config_manager();
         let onekeys = vec![OneKey {
             id: "ok-migrate".to_string(),
@@ -757,26 +752,60 @@ mod tests {
                     send: "user".to_string(),
                 },
                 OneKeyStep {
-                    label: "".to_string(),
-                    expect: r"password:".to_string(),
+                    label: "Password".to_string(),
+                    expect: "password:".to_string(),
                     send: "pass".to_string(),
                 },
             ],
         }];
+
         cm.save_onekeys(&onekeys).unwrap();
         let loaded = cm.load_onekeys().unwrap();
-        assert_eq!(loaded.len(), 1);
         let steps = &loaded[0].steps;
-        assert_eq!(steps.len(), 2);
-        // Username step is untouched.
+
         assert_eq!(steps[0].expect, r"Username for \S+:");
-        // Password step's expect was migrated.
-        assert_eq!(
-            steps[1].expect, r"password for \S+:",
-            "bare 'password:' expect must be migrated to 'password for \\S+:' when a Username step is present"
-        );
-        // The send value survives the migration (decrypted correctly).
+        assert_eq!(steps[1].expect, DEFAULT_ONEKEY_PASSWORD_EXPECT);
         assert_eq!(steps[1].send, "pass");
+    }
+
+    #[test]
+    fn test_legacy_git_password_default_is_migrated_to_general_pattern() {
+        let (cm, _dir) = test_config_manager();
+        let onekeys = vec![OneKey {
+            id: "ok-legacy-default".to_string(),
+            name: "account".to_string(),
+            steps: vec![OneKeyStep {
+                label: "Password".to_string(),
+                expect: r"password for \S+:".to_string(),
+                send: "pass".to_string(),
+            }],
+        }];
+
+        cm.save_onekeys(&onekeys).unwrap();
+        let loaded = cm.load_onekeys().unwrap();
+
+        assert_eq!(loaded[0].steps[0].expect, DEFAULT_ONEKEY_PASSWORD_EXPECT);
+        assert_eq!(loaded[0].steps[0].send, "pass");
+    }
+
+    #[test]
+    fn test_previous_general_password_default_is_migrated_for_passphrases() {
+        let (cm, _dir) = test_config_manager();
+        let onekeys = vec![OneKey {
+            id: "ok-previous-default".to_string(),
+            name: "account".to_string(),
+            steps: vec![OneKeyStep {
+                label: "Password".to_string(),
+                expect: r"password(?: for \S+)?:".to_string(),
+                send: "pass".to_string(),
+            }],
+        }];
+
+        cm.save_onekeys(&onekeys).unwrap();
+        let loaded = cm.load_onekeys().unwrap();
+
+        assert_eq!(loaded[0].steps[0].expect, DEFAULT_ONEKEY_PASSWORD_EXPECT);
+        assert_eq!(loaded[0].steps[0].send, "pass");
     }
 
     #[test]

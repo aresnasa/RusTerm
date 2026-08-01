@@ -13,65 +13,56 @@ use crate::components::SuggestionPopup;
 use crate::state::OneKeyMatch;
 
 // ── Clipboard helpers ───────────────────────────────────────────────
+//
+// All clipboard I/O goes through `arboard` (native OS pasteboard) rather than
+// `navigator.clipboard`. WKWebView's async Clipboard API (`readText`/
+// `writeText`) silently rejects with NotAllowedError outside a real browser
+// context — the dioxus `dioxus:` protocol is a secure context, but WKWebView
+// still gates `readText` behind a permission the host app can't grant, so
+// paste was swallowing the error and doing nothing. Native access has no such
+// restriction and works on every platform.
 
-/// Copy text to the OS clipboard (async, fire-and-forget from the caller's
-/// perspective — `spawn` this).
-async fn copy_text_to_clipboard(text: String) {
-    let escaped = text
-        .replace('\\', "\\\\")
-        .replace('`', "\\`")
-        .replace("${", "\\${");
-    // Script is the dioxus eval AsyncFunction body: `return` the promise so
-    // the eval result tells us whether the write actually landed (WKWebView
-    // needs a secure context + user gesture — the dioxus: protocol counts).
-    // An IIFE-expression version would resolve to `undefined` instead.
-    let js = format!(
-        "if (!(navigator.clipboard && navigator.clipboard.writeText)) {{ return 'no-clipboard-API'; }}\
-         return navigator.clipboard.writeText(`{escaped}`).then(\
-             function() {{ return 'ok'; }},\
-             function(err) {{ return 'err:' + (err && err.message ? err.message : String(err)); }}\
-         );"
-    );
-    match dioxus::document::eval(&js).await {
-        Ok(v) => {
-            let status = v.as_str().unwrap_or("<non-string>");
-            if status != "ok" {
-                tracing::info!(
-                    "[COPY] writeText status={status} chars={}",
-                    text.chars().count()
-                );
-            }
-        }
+/// Copy text to the OS clipboard. Synchronous (NSPasteboard / Win32 / X11
+/// writes are sub-millisecond). Returns the char count on success for
+/// logging, or 0 on failure.
+fn copy_text_to_clipboard(text: String) -> usize {
+    let n = text.chars().count();
+    match arboard::Clipboard::new().and_then(|mut cb| cb.set_text(text)) {
+        Ok(()) => n,
         Err(e) => {
-            tracing::info!(
-                "[COPY] writeText eval failed: {e:?} chars={}",
-                text.chars().count()
-            );
+            tracing::info!("[COPY] native set_text failed: {e} chars={n}");
+            0
         }
     }
 }
 
 /// Read the OS clipboard and send it to the PTY (with bracketed-paste
 /// wrapping when the application asked for it, mode 2004).
-async fn paste_from_clipboard(on_input: EventHandler<Vec<u8>>, bracketed: bool) {
-    // `return` the promise: dioxus eval scripts are AsyncFunction bodies, so
-    // an expression statement would resolve to `undefined`, not the text.
-    if let Ok(result) = dioxus::document::eval("return navigator.clipboard.readText();").await {
-        if let Some(text) = result.as_str() {
-            if !text.is_empty() {
-                let data = if bracketed {
-                    let mut buf = Vec::with_capacity(text.len() + 12);
-                    buf.extend_from_slice(b"\x1b[200~");
-                    buf.extend_from_slice(text.as_bytes());
-                    buf.extend_from_slice(b"\x1b[201~");
-                    buf
-                } else {
-                    text.as_bytes().to_vec()
-                };
-                on_input.call(data);
-            }
+fn paste_from_clipboard(on_input: &EventHandler<Vec<u8>>, bracketed: bool) {
+    let text = match arboard::Clipboard::new().and_then(|mut cb| cb.get_text()) {
+        Ok(t) => t,
+        Err(arboard::Error::ContentNotAvailable) => {
+            tracing::debug!("[PASTE] clipboard has no text");
+            return;
         }
+        Err(e) => {
+            tracing::info!("[PASTE] native get_text failed: {e}");
+            return;
+        }
+    };
+    if text.is_empty() {
+        return;
     }
+    let data = if bracketed {
+        let mut buf = Vec::with_capacity(text.len() + 12);
+        buf.extend_from_slice(b"\x1b[200~");
+        buf.extend_from_slice(text.as_bytes());
+        buf.extend_from_slice(b"\x1b[201~");
+        buf
+    } else {
+        text.into_bytes()
+    };
+    on_input.call(data);
 }
 
 // ── Mouse selection ──────────────────────────────────────────────────
@@ -202,27 +193,19 @@ enum OneKeyKeyAction {
 /// Decide what the OneKey popup does for `key` while visible (`selected` is the
 /// current index, `len` the number of matching entries).
 fn onekey_popup_key_action(key: &Key, selected: usize, len: usize) -> OneKeyKeyAction {
+    if len == 0 {
+        return OneKeyKeyAction::Dismiss;
+    }
+    let selected = selected.min(len - 1);
     match key {
-        Key::ArrowDown => {
-            let next = if selected + 1 >= len { 0 } else { selected + 1 };
-            OneKeyKeyAction::Navigate(next)
-        }
+        Key::ArrowDown => OneKeyKeyAction::Navigate((selected + 1) % len),
         Key::ArrowUp => {
-            let prev = if selected == 0 {
-                len.saturating_sub(1)
-            } else {
-                selected - 1
-            };
-            OneKeyKeyAction::Navigate(prev)
+            OneKeyKeyAction::Navigate(if selected == 0 { len - 1 } else { selected - 1 })
         }
-        // Tab autofills the selected OneKey (sends its value + Enter). Enter is
-        // deliberately NOT bound to Select: at non-credential prompts that
-        // happen to match an expect (e.g. interactive menus), the popup
-        // re-triggers on every echoed output, so binding Enter to Select would
-        // hijack Enter and stop the user from submitting their typed selection.
-        // Enter (and any other key) dismisses the popup and falls through to the
-        // PTY — matching the suggestion popup (Tab accepts, Enter submits).
-        Key::Tab => OneKeyKeyAction::Select,
+        // Both Enter and Tab confirm the highlighted credential. The caller
+        // returns immediately after Select, so the Enter used for confirmation
+        // cannot fall through and reach the PTY a second time.
+        Key::Enter | Key::Tab => OneKeyKeyAction::Select,
         Key::Escape => OneKeyKeyAction::Dismiss,
         _ => OneKeyKeyAction::DismissAndForward,
     }
@@ -672,7 +655,7 @@ pub fn TerminalView(
     onekey_entries: Vec<OneKeyMatch>,
     onekey_selected: usize,
     on_onekey_navigate: EventHandler<Option<usize>>,
-    on_onekey_select: EventHandler<String>,
+    on_onekey_select: EventHandler<usize>,
     on_onekey_save: EventHandler<()>,
     on_onekey_dismiss: EventHandler<()>,
     /// True when the session's SSH/shell channel has dropped. While set, Enter
@@ -740,18 +723,14 @@ pub fn TerminalView(
                 if s.eq_ignore_ascii_case("v") {
                     e.prevent_default();
                     let bracketed = render_output.mode_bracketed_paste;
-                    spawn(async move {
-                        paste_from_clipboard(on_input, bracketed).await;
-                    });
+                    paste_from_clipboard(&on_input, bracketed);
                     return;
                 }
                 if s.eq_ignore_ascii_case("c") {
                     let text = selection_text();
                     if !text.is_empty() {
                         e.prevent_default();
-                        spawn(async move {
-                            copy_text_to_clipboard(text).await;
-                        });
+                        copy_text_to_clipboard(text);
                     }
                     return;
                 }
@@ -800,9 +779,9 @@ pub fn TerminalView(
                     return;
                 }
                 OneKeyKeyAction::Select => {
-                    if let Some(ok) = current_onekey_entries.get(current_onekey_selected) {
-                        on_onekey_select.call(ok.send.clone());
-                    }
+                    let selected =
+                        current_onekey_selected.min(current_onekey_entries.len().saturating_sub(1));
+                    on_onekey_select.call(selected);
                     return;
                 }
                 OneKeyKeyAction::Dismiss => {
@@ -855,37 +834,38 @@ pub fn TerminalView(
         if ctrl && shift && matches!(key, Key::Character(ref s) if s == "c" || s == "C") {
             let text = selection_text();
             if !text.is_empty() {
-                let n = text.chars().count();
-                spawn(async move {
-                    copy_text_to_clipboard(text).await;
-                });
+                let n = copy_text_to_clipboard(text);
                 tracing::info!("[COPY] Ctrl+Shift+C copied {n} chars (terminal selection)");
                 return;
             }
+            // No terminal-owned selection — fall back to the DOM selection
+            // (or an active INPUT/TEXTAREA). The selection text is only
+            // available from JS, so eval to read it, then write it to the
+            // clipboard natively (arboard) once it comes back.
             let sid_for_copy_log = sid_for_copy.clone();
             spawn(async move {
-                // AsyncFunction body (see copy_text_to_clipboard): explicit
-                // `return`s, no IIFE wrapper, else the counts read as 0.
+                // Read the DOM selection (or an INPUT/TEXTAREA selection) via
+                // JS — this text lives in the WebView, not Rust. The clipboard
+                // write happens natively (arboard) once the text comes back.
+                // Explicit `return` so the eval resolves to the string, not
+                // `undefined` (dioxus eval scripts are AsyncFunction bodies).
                 let js = "\
-                    var sel = window.getSelection();\
-                    var text = sel ? sel.toString() : '';\
-                    if (!text) {\
-                        var a = document.activeElement;\
-                        if (a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA') && typeof a.selectionStart === 'number' && typeof a.selectionEnd === 'number') {\
-                            text = a.value.substring(a.selectionStart, a.selectionEnd);\
-                        }\
-                    }\
-                    if (!text) { return '0'; }\
-                    if (navigator.clipboard && navigator.clipboard.writeText) {\
-                        navigator.clipboard.writeText(text);\
-                    }\
-                    return String(text.length);";
-                let result = dioxus::document::eval(js).await;
-                let n: usize = result
-                    .ok()
-                    .and_then(|r| r.as_str().and_then(|s| s.parse::<usize>().ok()))
-                    .unwrap_or(0);
-                if n > 0 {
+                    var sel = window.getSelection();
+                    var text = sel ? sel.toString() : '';
+                    if (!text) {
+                        var a = document.activeElement;
+                        if (a && (a.tagName === 'INPUT' || a.tagName === 'TEXTAREA') && typeof a.selectionStart === 'number' && typeof a.selectionEnd === 'number') {
+                            text = a.value.substring(a.selectionStart, a.selectionEnd);
+                        }
+                    }
+                    return text || '';
+";
+                let text: String = match dioxus::document::eval(js).await {
+                    Ok(v) => v.as_str().unwrap_or("").to_string(),
+                    Err(_) => String::new(),
+                };
+                if !text.is_empty() {
+                    let n = copy_text_to_clipboard(text);
                     tracing::info!(
                         "[COPY] Ctrl+Shift+C copied {} chars for session {:?}",
                         n,
@@ -905,29 +885,8 @@ pub fn TerminalView(
         if (ctrl && shift && matches!(key, Key::Character(ref s) if s == "v" || s == "V"))
             || (shift && matches!(key, Key::Insert))
         {
-            let input_cb = on_input;
             let bracketed = render_output.mode_bracketed_paste;
-            spawn(async move {
-                // `return` the promise (see paste_from_clipboard).
-                if let Ok(result) =
-                    dioxus::document::eval("return navigator.clipboard.readText();").await
-                {
-                    if let Some(text) = result.as_str() {
-                        if !text.is_empty() {
-                            let data = if bracketed {
-                                let mut buf = Vec::with_capacity(text.len() + 12);
-                                buf.extend_from_slice(b"\x1b[200~");
-                                buf.extend_from_slice(text.as_bytes());
-                                buf.extend_from_slice(b"\x1b[201~");
-                                buf
-                            } else {
-                                text.as_bytes().to_vec()
-                            };
-                            input_cb.call(data);
-                        }
-                    }
-                }
-            });
+            paste_from_clipboard(&on_input, bracketed);
             return;
         }
 
@@ -1384,9 +1343,7 @@ pub fn TerminalView(
             );
             on_reconnect.call(());
         } else if !contextmenu_reporting {
-            spawn(async move {
-                paste_from_clipboard(contextmenu_on_input, contextmenu_bracketed).await;
-            });
+            paste_from_clipboard(&contextmenu_on_input, contextmenu_bracketed);
         }
     };
 
@@ -1483,9 +1440,7 @@ pub fn TerminalView(
             // Middle-click paste (xterm convention; consistent with
             // copy-on-select, the OS clipboard carries the selection).
             let bracketed = render_output.mode_bracketed_paste;
-            spawn(async move {
-                paste_from_clipboard(on_input, bracketed).await;
-            });
+            paste_from_clipboard(&on_input, bracketed);
         }
     };
 
@@ -1571,9 +1526,7 @@ pub fn TerminalView(
             selection_text.set(text.clone());
             // Copy-on-select (WindTerm default): the selection text is in
             // the clipboard the moment the button is released.
-            spawn(async move {
-                copy_text_to_clipboard(text).await;
-            });
+            copy_text_to_clipboard(text);
         }
     };
 
@@ -1634,9 +1587,7 @@ pub fn TerminalView(
         let text = extract_selection(&dbl_rows, anchor, head);
         if !text.is_empty() {
             selection_text.set(text.clone());
-            spawn(async move {
-                copy_text_to_clipboard(text).await;
-            });
+            copy_text_to_clipboard(text);
         } else {
             selection_text.set(String::new());
         }
@@ -1997,9 +1948,16 @@ pub fn TerminalView(
                 id: "{scroll_id}",
                 style: "display:flex;height:100%;width:100%;",
 
-                // Line number gutter
+                // Line number gutter.
+                // `user-select:none` alone is insufficient on macOS WKWebView
+                // (dioxus desktop via wry): WebKit needs the `-webkit-` prefix
+                // to actually disable native text selection. Without it the
+                // gutter numbers remain mouse-selectable, which lets a native
+                // DOM selection compete with the terminal-owned (cell-based)
+                // selection. The content div below uses both prefixes for the
+                // same reason — keep them in sync.
                 div {
-                    style: "flex-shrink:0;width:{gutter_width}ch;padding-right:8px;text-align:right;color:#3b4261;user-select:none;line-height:1.5;",
+                    style: "flex-shrink:0;width:{gutter_width}ch;padding-right:8px;text-align:right;color:#3b4261;user-select:none;-webkit-user-select:none;line-height:1.5;",
                     dangerous_inner_html: "{gutter_html}",
                 }
 
@@ -2053,9 +2011,12 @@ pub fn TerminalView(
             if onekey_visible && !onekey_entries.is_empty() {
                 OneKeyPopup {
                     entries: onekey_entries.clone(),
-                    selected: onekey_selected,
-                    on_select: move |send: String| {
-                        on_onekey_select.call(send);
+                    selected: onekey_selected.min(onekey_entries.len().saturating_sub(1)),
+                    on_highlight: move |index: usize| {
+                        on_onekey_navigate.call(Some(index));
+                    },
+                    on_select: move |index: usize| {
+                        on_onekey_select.call(index);
                     },
                     on_save: move |_: ()| {
                         on_onekey_save.call(());
@@ -2291,19 +2252,33 @@ mod tests {
     }
 
     #[test]
-    fn onekey_popup_tab_selects_enter_submits_escape_dismisses() {
-        // Tab autofills (Select); Enter submits (DismissAndForward) so it isn't
-        // hijacked at non-credential prompts that match an expect (e.g. menus).
+    fn onekey_popup_tab_and_enter_select_escape_dismisses() {
         assert_eq!(
             onekey_popup_key_action(&Key::Tab, 0, 3),
             OneKeyKeyAction::Select
         );
         assert_eq!(
             onekey_popup_key_action(&Key::Enter, 0, 3),
-            OneKeyKeyAction::DismissAndForward
+            OneKeyKeyAction::Select
         );
         assert_eq!(
             onekey_popup_key_action(&Key::Escape, 0, 3),
+            OneKeyKeyAction::Dismiss
+        );
+    }
+
+    #[test]
+    fn onekey_popup_handles_empty_and_out_of_range_selection() {
+        assert_eq!(
+            onekey_popup_key_action(&Key::Enter, 9, 3),
+            OneKeyKeyAction::Select
+        );
+        assert_eq!(
+            onekey_popup_key_action(&Key::ArrowDown, 9, 3),
+            OneKeyKeyAction::Navigate(0)
+        );
+        assert_eq!(
+            onekey_popup_key_action(&Key::Enter, 0, 0),
             OneKeyKeyAction::Dismiss
         );
     }

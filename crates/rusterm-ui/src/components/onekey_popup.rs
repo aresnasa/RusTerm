@@ -3,15 +3,15 @@ use dioxus::prelude::*;
 use crate::state::OneKeyMatch;
 
 /// OneKey autofill popup. Renders above the current cursor row using the same
-/// pane-relative coordinate as command suggestions. Login/password prompts
-/// normally sit near the bottom of a terminal, so growing upward keeps the
-/// list visible inside the owning pane instead of letting `overflow: hidden`
-/// clip a downward-growing popup. Long lists remain scrollable.
+/// pane-relative coordinate as command suggestions. Secrets are never rendered:
+/// the popup only emits the selected index, which the owning session resolves
+/// back to the current match before sending it to the PTY.
 #[component]
 pub fn OneKeyPopup(
     entries: Vec<OneKeyMatch>,
     selected: usize,
-    on_select: EventHandler<String>,
+    on_highlight: EventHandler<usize>,
+    on_select: EventHandler<usize>,
     on_save: EventHandler<()>,
     on_dismiss: EventHandler<()>,
 ) -> Element {
@@ -33,27 +33,28 @@ pub fn OneKeyPopup(
                 line-height: 1.5;
                 z-index: 20;
             ",
+            // Keep popup clicks out of TerminalView's selection/mouse-reporting
+            // handlers. In mouse-reporting mode a leaked click would otherwise
+            // be sent to the remote application before the credential.
+            onmousedown: move |e: Event<MouseData>| e.stop_propagation(),
+            onclick: move |e: Event<MouseData>| e.stop_propagation(),
+
             for (i, m) in entries.iter().enumerate() {
                 {
                     let is_sel = i == selected;
                     let bg = if is_sel { "#283457" } else { "transparent" };
                     let fg = if is_sel { "#c0caf5" } else { "#a9b1d6" };
                     let border_left = if is_sel { "border-left:2px solid #9ece6a;" } else { "border-left:2px solid transparent;" };
-                    let send_val = m.send.clone();
-                    // Badge reflects the kind of credential this entry carries.
-                    // Heuristic on the entry's name: "password"/"pass"/"pwd" → P
-                    // (secret, masked), "token" → T, otherwise U (username-like).
-                    // Saves the user from accidentally sending a password into a
-                    // username field when both kinds of entries match a prompt.
-                    let name_lower = m.name.to_lowercase();
-                    let (badge, badge_color, badge_title) = if name_lower.contains("password")
-                        || name_lower.contains("passwd")
-                        || name_lower.contains(" pass")
-                        || name_lower.ends_with(" pass")
-                        || name_lower.contains("pwd")
+                    let label = if m.label.trim().is_empty() { "Credential" } else { m.label.trim() };
+                    let label_lower = label.to_lowercase();
+                    let (badge, badge_color, badge_title) = if label_lower.contains("password")
+                        || label_lower.contains("passwd")
+                        || label_lower.contains("secret")
+                        || label_lower.contains("passphrase")
+                        || label_lower.contains("pwd")
                     {
                         ("P", "#f7768e", "Password / secret")
-                    } else if name_lower.contains("token") || name_lower.contains("otp") {
+                    } else if label_lower.contains("token") || label_lower.contains("otp") {
                         ("T", "#e0af68", "Token / OTP")
                     } else {
                         ("U", "#9ece6a", "Username / account")
@@ -61,9 +62,15 @@ pub fn OneKeyPopup(
                     rsx! {
                         div {
                             key: "{i}",
-                            style: "display:flex;align-items:center;padding:4px 12px;{border_left}background:{bg};color:{fg};cursor:pointer;white-space:pre;overflow:hidden;text-overflow:ellipsis;",
-                            onclick: move |_| on_select.call(send_val.clone()),
-                            span { style: "flex:1;", "{m.name}" }
+                            style: "display:flex;align-items:center;padding:5px 12px;{border_left}background:{bg};color:{fg};cursor:pointer;overflow:hidden;",
+                            title: "Use {m.name} · {label} (Enter or Tab)",
+                            onmouseenter: move |_| on_highlight.call(i),
+                            onclick: move |_| on_select.call(i),
+                            span {
+                                style: "display:flex;flex:1;min-width:0;align-items:baseline;gap:8px;",
+                                span { style: "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;", "{m.name}" }
+                                span { style: "color:#565f89;font-size:11px;white-space:nowrap;", "{label}" }
+                            }
                             span {
                                 style: "color:{badge_color};font-size:10px;margin-left:8px;font-weight:700;border:1px solid {badge_color};border-radius:3px;padding:0 4px;",
                                 title: "{badge_title}",
@@ -73,14 +80,12 @@ pub fn OneKeyPopup(
                     }
                 }
             }
-            // Save In OneKeys row
             div {
                 style: "display:flex;align-items:center;padding:4px 12px;border-top:1px solid #2a2b3d;color:#565f89;cursor:pointer;",
                 onclick: move |_| on_save.call(()),
                 span { style: "flex:1;", "Save In OneKeys" }
                 span { style: "color:#7aa2f7;", "+" }
             }
-            // Hidden dismiss hint (Escape handled in TerminalView)
             div { style: "display:none;", onclick: move |_| on_dismiss.call(()), "" }
         }
     }

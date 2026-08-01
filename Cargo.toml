@@ -94,6 +94,12 @@ unicode-width = "0.2"
 dioxus = { version = "0.7", features = ["desktop"] }
 dioxus-router = "0.7"
 
+# Native clipboard access. WKWebView's `navigator.clipboard.readText()`
+# silently rejects (NotAllowedError) outside a browser context, so paste
+# must go through the OS pasteboard directly. `arboard` wraps NSPasteboard
+# (macOS), XCLIPBOARD (Linux) and the Win32 clipboard.
+arboard = "3"
+
 # Cross-crate deps
 rusterm-core = { path = "crates/rusterm-core" }
 rusterm-ssh = { path = "crates/rusterm-ssh" }

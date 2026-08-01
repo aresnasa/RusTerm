@@ -333,12 +333,40 @@ pub struct OneKeyPopupState {
     pub matched_expect: Option<String>,
 }
 
-/// A single match in the OneKey popup: the OneKey's name + the matched step's
-/// send value (sent on selection).
-#[derive(Debug, Clone, Default, PartialEq)]
+/// A single match in the OneKey popup. `send` is the decrypted value of the
+/// exact step that matched the current prompt; it must never appear in logs.
+#[derive(Clone, Default, PartialEq)]
 pub struct OneKeyMatch {
     pub name: String,
+    pub label: String,
     pub send: String,
+}
+
+impl std::fmt::Debug for OneKeyMatch {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("OneKeyMatch")
+            .field("name", &self.name)
+            .field("label", &self.label)
+            .field("send", &"<redacted>")
+            .finish()
+    }
+}
+
+#[cfg(test)]
+mod onekey_match_tests {
+    use super::OneKeyMatch;
+
+    #[test]
+    fn debug_redacts_the_decrypted_send_value() {
+        let entry = OneKeyMatch {
+            name: "account".to_string(),
+            label: "Password".to_string(),
+            send: "never-log-this-secret".to_string(),
+        };
+        let debug = format!("{entry:?}");
+        assert!(debug.contains("<redacted>"));
+        assert!(!debug.contains("never-log-this-secret"));
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]

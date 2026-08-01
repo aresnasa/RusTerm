@@ -245,6 +245,14 @@ fn default_confirm_close_on_exit() -> bool {
 
 // --- OneKeys (ZOC-style Expect/Send auto-fill) ---
 
+/// Built-in matcher for password and SSH key passphrase prompts. Matching is
+/// case-insensitive and runs against the terminal's current prompt line.
+pub const DEFAULT_ONEKEY_PASSWORD_EXPECT: &str =
+    r"(?:password(?:\s+for\s+[^\r\n]+)?|passphrase(?:\s+for\s+(?:key\s+)?[^\r\n]+)?):\s*$";
+
+/// Built-in matcher for Git HTTPS username prompts.
+pub const DEFAULT_ONEKEY_USERNAME_EXPECT: &str = r"Username for \S+:";
+
 /// In-memory OneKey entry: a named sequence of Expect/Send steps.
 /// When terminal output matches a step's `expect`, that step's `send` is offered.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
