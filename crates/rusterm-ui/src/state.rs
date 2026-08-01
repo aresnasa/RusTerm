@@ -1107,6 +1107,46 @@ mod pending_exit_helpers_tests {
         assert!(rollback_pending_exit(&mut state, "session", "first-id"));
         assert!(!state.pending_exit_check.contains_key("session"));
     }
+
+    #[test]
+    fn rapid_terminal_input_is_tracked_without_waiting_for_pty_echo() {
+        let mut state = AppState::default();
+        let sessions = vec!["one".to_string(), "two".to_string()];
+
+        track_terminal_input(&mut state, &sessions, b"printf RUSTERM_COMPARE_E2E_OK");
+
+        for session in &sessions {
+            assert_eq!(
+                tracked_terminal_command(&state, session).as_deref(),
+                Some("printf RUSTERM_COMPARE_E2E_OK")
+            );
+        }
+    }
+
+    #[test]
+    fn terminal_input_tracking_handles_editing_and_unreliable_navigation() {
+        let mut state = AppState::default();
+        let sessions = vec!["session".to_string()];
+        track_terminal_input(&mut state, &sessions, b"echo oops");
+        track_terminal_input(&mut state, &sessions, &[0x7f]);
+        assert_eq!(
+            tracked_terminal_command(&state, "session").as_deref(),
+            Some("echo oop")
+        );
+
+        track_terminal_input(&mut state, &sessions, b"\x1b[A");
+        assert_eq!(tracked_terminal_command(&state, "session"), None);
+
+        track_terminal_input(&mut state, &sessions, &[0x03]);
+        track_terminal_input(&mut state, &sessions, b"pwd");
+        assert_eq!(
+            tracked_terminal_command(&state, "session").as_deref(),
+            Some("pwd")
+        );
+
+        clear_terminal_command_lines(&mut state, &sessions);
+        assert_eq!(tracked_terminal_command(&state, "session"), None);
+    }
 }
 
 /// Helper: set the active tab and derive `active_session` from the tab's

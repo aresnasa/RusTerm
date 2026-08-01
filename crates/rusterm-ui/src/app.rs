@@ -47,13 +47,14 @@ use crate::state::{
     AppState, Modal, OneKeyMatch, OneKeyPopupState, OneKeySubmissionFeedback,
     PendingCommandPayload, PendingDangerousCommand, SessionConnectionState, SessionTab,
     TabDropOutcome, TerminalEntry, UnlockState, activate_session, append_pane_to_active,
-    begin_floating_pane_move, close_pane, close_session, close_workspace, command_send_targets,
-    distribute_sessions_across_panes, enqueue_pending_exit, execute_tab_drop_on_pane,
-    execute_tab_drop_on_pane_at, focus_pane_for_layout, focused_pane_session,
-    move_floating_pane_for_active, move_session_to_leftmost, prepare_split_for_sidebar_drop,
-    prepare_split_for_sidebar_drop_at, push_workspace_tab, resize_layout_split,
-    rollback_pending_exit, scroll_sync_targets, set_active_tab, set_pane_session_for_layout,
-    source_pane_for_copy, toggle_comparison_mode, toggle_pane_zoom, toggle_split_mode,
+    begin_floating_pane_move, clear_terminal_command_lines, close_pane, close_session,
+    close_workspace, command_send_targets, distribute_sessions_across_panes, enqueue_pending_exit,
+    execute_tab_drop_on_pane, execute_tab_drop_on_pane_at, focus_pane_for_layout,
+    focused_pane_session, move_floating_pane_for_active, move_session_to_leftmost,
+    prepare_split_for_sidebar_drop, prepare_split_for_sidebar_drop_at, push_workspace_tab,
+    resize_layout_split, rollback_pending_exit, scroll_sync_targets, set_active_tab,
+    set_pane_session_for_layout, source_pane_for_copy, toggle_comparison_mode, toggle_pane_zoom,
+    toggle_split_mode, track_terminal_input, tracked_terminal_command,
 };
 use crate::transfers::{FileEndpoint, TransferJob, TransferRequest};
 
@@ -1134,39 +1135,56 @@ fn render_terminal_pane(
                             is_enter,
                             data.len()
                         );
+                        let input_targets = if isolated {
+                            vec![sid_clone.clone()]
+                        } else {
+                            let targets = crate::state::broadcast_targets(&state_for_cmd.read());
+                            if targets.len() > 1 {
+                                targets
+                            } else {
+                                vec![sid_clone.clone()]
+                            }
+                        };
                         // Enter is a command submission, not raw input. Route it
                         // through the shared safety/history/Compare dispatcher so
                         // panel, history, AI and terminal submissions have the same
                         // semantics and failed sends cannot poison the exit-code FIFO.
                         if is_enter {
-                            let line = {
+                            let tracked = tracked_terminal_command(&state_for_cmd.read(), &sid_clone);
+                            let command = tracked.unwrap_or_else(|| {
                                 let terminals = state_for_cmd.read().terminals.clone();
-                                terminals
+                                let line = terminals
                                     .get(&sid_clone)
                                     .map(|handle| handle.lock().terminal.extract_current_line())
-                                    .unwrap_or_default()
-                            };
-                            let command = strip_prompt(line.trim()).to_string();
+                                    .unwrap_or_default();
+                                strip_prompt(line.trim()).to_string()
+                            });
                             if !command.is_empty() {
-                                let comparison_targets = if isolated {
-                                    vec![sid_clone.clone()]
-                                } else {
-                                    let targets = crate::state::broadcast_targets(&state_for_cmd.read());
-                                    if targets.len() > 1 {
-                                        targets
-                                    } else {
-                                        vec![sid_clone.clone()]
-                                    }
-                                };
-                                let _ = request_command_submission(
+                                let sent = request_command_submission(
                                     state_for_cmd,
                                     senders,
                                     command,
-                                    comparison_targets,
+                                    input_targets.clone(),
                                     PendingCommandPayload::EnterOnly(data),
                                 );
+                                if sent > 0 {
+                                    clear_terminal_command_lines(
+                                        &mut state_for_cmd.write(),
+                                        &input_targets,
+                                    );
+                                }
                                 return;
                             }
+                            clear_terminal_command_lines(
+                                &mut state_for_cmd.write(),
+                                &input_targets,
+                            );
+                        } else {
+                            track_terminal_input(
+                                &mut state_for_cmd.write(),
+                                &input_targets,
+                                &data,
+                            );
                         }
                         // Log input
                         {
@@ -1207,11 +1225,7 @@ fn render_terminal_pane(
                         // would surface a popup mid-navigation and hijack the
                         // next arrow keypress).
                         let is_arrow = is_arrow_key_seq(&data);
-                        let broadcast_targets = if isolated {
-                            vec![sid_clone.clone()]
-                        } else {
-                            crate::state::broadcast_targets(&state_for_cmd.read())
-                        };
+                        let broadcast_targets = input_targets;
                         let is_broadcast = !isolated && broadcast_targets.len() > 1;
                         if is_broadcast {
                             tracing::info!(
@@ -11299,13 +11313,19 @@ pub fn App() -> Element {
                 on_proceed: move |_| {
                     let pending = state.write().pending_dangerous_command.take();
                     if let Some(pending) = pending {
-                        let _ = dispatch_approved_command(
+                        let clear_tracked_line =
+                            matches!(&pending.payload, PendingCommandPayload::EnterOnly(_));
+                        let targets = pending.targets.clone();
+                        let sent = dispatch_approved_command(
                             state,
                             input_senders,
                             pending.command,
                             pending.targets,
                             pending.payload,
                         );
+                        if clear_tracked_line && sent > 0 {
+                            clear_terminal_command_lines(&mut state.write(), &targets);
+                        }
                     }
                 },
                 on_cancel: move |_| {
