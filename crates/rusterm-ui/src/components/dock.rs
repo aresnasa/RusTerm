@@ -158,9 +158,13 @@ pub async fn poll_dock_drag_state() -> Option<(f64, f64, bool, Option<DockDropTa
                 if (x < rect.left || x >= rect.right || y < rect.top || y >= rect.bottom) continue;\n\
                 var tabs = Array.from(element.querySelectorAll('[data-rusterm-dock-tab-index]'));\n\
                 var insertion = tabs.length;\n\
-                for (var tabIndex = 0; tabIndex < tabs.length; tabIndex++) {\n\
-                    var tabRect = tabs[tabIndex].getBoundingClientRect();\n\
-                    if (x < tabRect.left + tabRect.width / 2) { insertion = tabIndex; break; }\n\
+                var tabStrip = element.querySelector('[data-rusterm-dock-tabs]');\n\
+                var tabStripRect = tabStrip ? tabStrip.getBoundingClientRect() : null;\n\
+                if (tabStripRect && y >= tabStripRect.top && y < tabStripRect.bottom) {\n\
+                    for (var tabIndex = 0; tabIndex < tabs.length; tabIndex++) {\n\
+                        var tabRect = tabs[tabIndex].getBoundingClientRect();\n\
+                        if (x < tabRect.left + tabRect.width / 2) { insertion = tabIndex; break; }\n\
+                    }\n\
                 }\n\
                 targetZone = zone;\n\
                 targetIndex = String(insertion);\n\
@@ -288,6 +292,7 @@ pub fn DockZoneView(
             "data-rusterm-dock-panel-count": "{panel_count}",
             style: "{outer_style}",
             div {
+                "data-rusterm-dock-tabs": "true",
                 style: "height:31px;min-height:31px;display:flex;align-items:stretch;border-bottom:1px solid var(--skin-border);min-width:0;overflow-x:auto;overflow-y:hidden;",
                 for (index, panel) in stack.panels.iter().copied().enumerate() {
                     if target_index == Some(index) {
