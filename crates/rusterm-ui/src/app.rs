@@ -378,7 +378,27 @@ fn render_terminal_pane(
                         // would then hijack the next arrow keypress. Only
                         // actual text input should refresh suggestions.
                         if !is_enter && !is_arrow {
+                            // Skip the entire suggestion pipeline when the user
+                            // has disabled suggestions — no debounce spawn, no
+                            // DB query, no popup.
+                            if !state_for_cmd.read().suggestion_enabled {
+                                // Also clear any stale suggestion that might be
+                                // showing from before the user toggled it off.
+                                state_for_cmd.write().sessions.iter_mut()
+                                    .find(|t| t.id == sid_clone)
+                                    .map(|tab| {
+                                        tab.suggestion = None;
+                                        tab.suggestions = Vec::new();
+                                        tab.suggestion_visible = false;
+                                        tab.suggestion_selected = 0;
+                                    });
+                            } else {
                             let sid_sug = sid_clone.clone();
+                            // Read the user's preferred suggestion count (3/5/10)
+                            // before entering the async spawn so the value is
+                            // captured by move and doesn't require another read
+                            // inside the closure.
+                            let sug_count = state_for_cmd.read().suggestion_count as usize;
                             let epoch = {
                                 let mut s = state_for_cmd.write();
                                 s.suggestion_epoch += 1;
@@ -485,7 +505,7 @@ fn render_terminal_pane(
                                 }
                                 let mut freq_vec: Vec<(&String, usize)> = freq.into_iter().collect();
                                 freq_vec.sort_by(|a, b| b.1.cmp(&a.1));
-                                for (cmd, _count) in freq_vec.iter().take(15) {
+                                for (cmd, _count) in freq_vec.iter().take(sug_count) {
                                     seen.insert(cmd.to_lowercase().clone());
                                     all_suggestions.push((*cmd).clone());
                                 }
@@ -501,7 +521,7 @@ fn render_terminal_pane(
                                         .join("rusterm")
                                         .join("rusterm.db");
                                     if let Ok(db) = rusterm_db::Database::open(Some(db_path)).await {
-                                        if let Ok(results) = db.search_history(&cmd_part, 30).await {
+                                        if let Ok(results) = db.search_history(&cmd_part, sug_count * 2).await {
                                             for entry in results {
                                                 if entry.command.to_lowercase().starts_with(&cmd_lower)
                                                     && entry.command != cmd_part
@@ -521,8 +541,8 @@ fn render_terminal_pane(
                                     return;
                                 }
 
-                                // Truncate to 8 suggestions max
-                                all_suggestions.truncate(15);
+                                // Truncate to the user's preferred count
+                                all_suggestions.truncate(sug_count);
 
                                 tracing::info!(
                                     "[SUGGESTION-QUERY] session={} cmd_part={:?} epoch={} current_epoch={} results={:?} recent_failed={:?}",
@@ -561,6 +581,7 @@ fn render_terminal_pane(
                                         });
                                 }
                             });
+                            } // end else (suggestions enabled)
                         }
                     },
                     on_command: move |_: String| {
@@ -1012,6 +1033,7 @@ fn render_terminal_pane(
                         reconnect_session(state_for_cmd, senders, sid_for_reconnect.clone());
                     },
                     row_diffs: row_diffs.clone(),
+                    suggestion_max_rows: state.read().suggestion_count as usize,
                 }
             }
         }
@@ -8871,6 +8893,9 @@ pub fn App() -> Element {
                                 s.restore_disabled = cm.load_restore_disabled();
                                 s.confirm_close_on_exit = cm.load_confirm_close_on_exit();
                                 s.focused_tab_appearance = cm.load_focused_tab_appearance();
+                                let (sug_enabled, sug_count) = cm.load_suggestion_settings();
+                                s.suggestion_enabled = sug_enabled;
+                                s.suggestion_count = sug_count;
                                 s.config_manager = Some(cm);
                                 s.connections = connections;
                                 s.onekeys = onekeys;
@@ -9817,6 +9842,8 @@ pub fn App() -> Element {
         if matches!(modal(), Modal::Settings) {
             SettingsDialog {
                 appearance: state.read().focused_tab_appearance.clone(),
+                suggestion_enabled: state.read().suggestion_enabled,
+                suggestion_count: state.read().suggestion_count,
                 on_close: move |_| modal.set(Modal::None),
                 on_save: move |appearance: rusterm_core::FocusedTabAppearance| {
                     let appearance = appearance.normalized();
@@ -9824,13 +9851,28 @@ pub fn App() -> Element {
                         if let Err(e) = cm.save_focused_tab_appearance(appearance.clone()) {
                             tracing::error!("Failed to save focused tab appearance: {}", e);
                         }
-                    } else {
-                        tracing::error!(
-                            "ConfigManager not initialized, cannot save focused tab appearance"
-                        );
                     }
                     state.write().focused_tab_appearance = appearance;
                     modal.set(Modal::None);
+                },
+                on_save_suggestions: move |(enabled, count): (bool, u8)| {
+                    if let Some(cm) = state.read().config_manager.clone() {
+                        if let Err(e) = cm.save_suggestion_settings(enabled, count) {
+                            tracing::error!("Failed to save suggestion settings: {}", e);
+                        }
+                    }
+                    let mut s = state.write();
+                    s.suggestion_enabled = enabled;
+                    s.suggestion_count = count;
+                    // If suggestions were just disabled, clear any showing popup.
+                    if !enabled {
+                        for tab in &mut s.sessions {
+                            tab.suggestion = None;
+                            tab.suggestions = Vec::new();
+                            tab.suggestion_visible = false;
+                            tab.suggestion_selected = 0;
+                        }
+                    }
                 },
             }
         }

@@ -288,6 +288,13 @@ pub struct AppState {
     /// dialog's "下次关闭时不再询问" checkbox survives across launches.
     /// Loaded from settings on unlock (see the unlock handler in `app.rs`).
     pub confirm_close_on_exit: bool,
+    /// Whether the inline fish-style command suggestion popup is enabled.
+    /// Persisted in settings.json. When false, no suggestions are computed
+    /// or shown — the user types with no ghost text or dropdown.
+    pub suggestion_enabled: bool,
+    /// Maximum number of suggestion items shown in the dropdown (3, 5, or 10).
+    /// Persisted in settings.json. Default 3 for a compact popup.
+    pub suggestion_count: u8,
     /// Whether the close-confirmation dialog is currently visible. This is a
     /// transient UI flag (not persisted) — it's set by the `CloseRequested`
     /// wry event handler and cleared by the dialog's "取消" / "确认" buttons.
@@ -511,6 +518,8 @@ impl Default for AppState {
             restore_pending: None,
             restore_disabled: false,
             confirm_close_on_exit: true,
+            suggestion_enabled: true,
+            suggestion_count: 3,
             close_dialog_visible: false,
             close_dialog_dont_ask_again: true,
             pending_dangerous_command: None,

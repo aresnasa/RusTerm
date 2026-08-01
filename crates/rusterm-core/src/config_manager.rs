@@ -249,6 +249,8 @@ impl ConfigManager {
             restore_disabled: existing.restore_disabled,
             confirm_close_on_exit: existing.confirm_close_on_exit,
             focused_tab_appearance: appearance.normalized(),
+            suggestion_enabled: existing.suggestion_enabled,
+            suggestion_count: existing.suggestion_count,
         };
 
         let json =
@@ -275,6 +277,8 @@ impl ConfigManager {
             restore_disabled,
             confirm_close_on_exit: existing.confirm_close_on_exit,
             focused_tab_appearance: existing.focused_tab_appearance,
+            suggestion_enabled: existing.suggestion_enabled,
+            suggestion_count: existing.suggestion_count,
         };
 
         let json =
@@ -308,6 +312,48 @@ impl ConfigManager {
             restore_disabled: existing.restore_disabled,
             confirm_close_on_exit,
             focused_tab_appearance: existing.focused_tab_appearance,
+            suggestion_enabled: existing.suggestion_enabled,
+            suggestion_count: existing.suggestion_count,
+        };
+
+        let json =
+            serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
+
+        let temp_path = self.config_path.with_extension("json.tmp");
+        fs::write(&temp_path, &json).context("Failed to write config file")?;
+        fs::rename(&temp_path, &self.config_path).context("Failed to rename temp config file")?;
+
+        Ok(())
+    }
+
+    /// Read the suggestion-popup settings from settings.json. Returns
+    /// `(enabled, count)` where `enabled` controls whether suggestions are
+    /// shown at all, and `count` is the max number of items (3/5/10).
+    pub fn load_suggestion_settings(&self) -> (bool, u8) {
+        let cfg = self.read_persisted();
+        (cfg.suggestion_enabled, cfg.suggestion_count)
+    }
+
+    /// Persist the suggestion-popup settings to settings.json. Preserves all
+    /// other fields (read-modify-write). `count` is clamped to {3, 5, 10} with
+    /// a fallback to 3 for invalid values.
+    pub fn save_suggestion_settings(&self, enabled: bool, count: u8) -> Result<()> {
+        let count = match count {
+            5 => 5,
+            10 => 10,
+            _ => 3, // 3 is the default/compact value
+        };
+        let existing = self.read_persisted();
+        let persisted = PersistedConfig {
+            version: CONFIG_VERSION,
+            connections: existing.connections,
+            onekeys: existing.onekeys,
+            master_password_hash: self.master_password_hash.clone(),
+            restore_disabled: existing.restore_disabled,
+            confirm_close_on_exit: existing.confirm_close_on_exit,
+            focused_tab_appearance: existing.focused_tab_appearance,
+            suggestion_enabled: enabled,
+            suggestion_count: count,
         };
 
         let json =
@@ -379,6 +425,8 @@ impl ConfigManager {
             restore_disabled: existing.restore_disabled,
             confirm_close_on_exit: existing.confirm_close_on_exit,
             focused_tab_appearance: existing.focused_tab_appearance,
+            suggestion_enabled: existing.suggestion_enabled,
+            suggestion_count: existing.suggestion_count,
         };
 
         let json =
@@ -402,6 +450,8 @@ impl ConfigManager {
                 restore_disabled: false,
                 confirm_close_on_exit: true,
                 focused_tab_appearance: FocusedTabAppearance::default(),
+                suggestion_enabled: true,
+                suggestion_count: 3,
             };
         }
         fs::read_to_string(&self.config_path)
@@ -415,6 +465,8 @@ impl ConfigManager {
                 restore_disabled: false,
                 confirm_close_on_exit: true,
                 focused_tab_appearance: FocusedTabAppearance::default(),
+                suggestion_enabled: true,
+                suggestion_count: 3,
             })
     }
 
@@ -432,6 +484,8 @@ impl ConfigManager {
             restore_disabled: existing.restore_disabled,
             confirm_close_on_exit: existing.confirm_close_on_exit,
             focused_tab_appearance: existing.focused_tab_appearance,
+            suggestion_enabled: existing.suggestion_enabled,
+            suggestion_count: existing.suggestion_count,
         };
 
         let json =

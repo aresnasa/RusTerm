@@ -41,14 +41,24 @@ pub fn SuggestionPopup(
     on_select: EventHandler<String>,
     on_dismiss: EventHandler<()>,
     on_delete: EventHandler<String>,
+    /// Maximum number of rows to display. Defaults to [`MAX_VISIBLE_ROWS`] (3)
+    /// when not specified. The caller passes the user's configured value
+    /// (3, 5, or 10) from `AppState::suggestion_count`.
+    #[props(default)]
+    max_rows: usize,
 ) -> Element {
     if suggestions.is_empty() {
         return rsx! {};
     }
 
-    // Cap to the most relevant MAX_VISIBLE_ROWS matches so the popup stays
+    // Cap to the most relevant `max_rows` matches so the popup stays
     // compact and never covers a large swath of terminal output.
-    let visible: Vec<&String> = suggestions.iter().take(MAX_VISIBLE_ROWS).collect();
+    let limit = if max_rows > 0 {
+        max_rows
+    } else {
+        MAX_VISIBLE_ROWS
+    };
+    let visible: Vec<&String> = suggestions.iter().take(limit).collect();
     let current_selected = selected_index.min(visible.len().saturating_sub(1));
 
     rsx! {

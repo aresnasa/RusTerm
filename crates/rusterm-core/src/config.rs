@@ -234,6 +234,16 @@ pub struct PersistedConfig {
     /// Appearance of the complete outline around the focused pane's top tab.
     #[serde(default)]
     pub focused_tab_appearance: FocusedTabAppearance,
+    /// Whether the inline fish-style command suggestion popup is enabled.
+    /// Default true (on by default). When false, no suggestions are shown
+    /// at all — the user typed with no ghost-text or dropdown.
+    #[serde(default = "default_suggestion_enabled")]
+    pub suggestion_enabled: bool,
+    /// Maximum number of suggestions shown in the dropdown (3, 5, or 10).
+    /// Default 3 to keep the popup compact. The user can change this in
+    /// the settings dialog or via the popup's own control.
+    #[serde(default = "default_suggestion_count")]
+    pub suggestion_count: u8,
 }
 
 /// Default for `PersistedConfig::confirm_close_on_exit`. Kept as a function
@@ -241,6 +251,19 @@ pub struct PersistedConfig {
 /// because the safe default is to always ask before closing the app.
 fn default_confirm_close_on_exit() -> bool {
     true
+}
+
+/// Default for `PersistedConfig::suggestion_enabled`. True because the
+/// suggestion popup is a core productivity feature.
+fn default_suggestion_enabled() -> bool {
+    true
+}
+
+/// Default for `PersistedConfig::suggestion_count`. 3 keeps the popup
+/// compact (it grows below the cursor and shouldn't cover too much output).
+/// Valid values are 3, 5, or 10.
+fn default_suggestion_count() -> u8 {
+    3
 }
 
 // --- OneKeys (ZOC-style Expect/Send auto-fill) ---
@@ -455,6 +478,35 @@ mod tests {
             config.focused_tab_appearance,
             FocusedTabAppearance::default()
         );
+    }
+
+    #[test]
+    fn suggestion_settings_default_for_legacy_settings() {
+        // A legacy settings.json that predates the suggestion fields should
+        // deserialize with sensible defaults (enabled=true, count=3).
+        let config: PersistedConfig =
+            serde_json::from_str(r#"{"version":1,"connections":[]}"#).unwrap();
+        assert!(config.suggestion_enabled);
+        assert_eq!(config.suggestion_count, 3);
+    }
+
+    #[test]
+    fn suggestion_settings_roundtrip() {
+        let config = PersistedConfig {
+            version: 1,
+            connections: vec![],
+            onekeys: vec![],
+            master_password_hash: None,
+            restore_disabled: false,
+            confirm_close_on_exit: true,
+            focused_tab_appearance: FocusedTabAppearance::default(),
+            suggestion_enabled: false,
+            suggestion_count: 10,
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: PersistedConfig = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.suggestion_enabled);
+        assert_eq!(parsed.suggestion_count, 10);
     }
 
     #[test]

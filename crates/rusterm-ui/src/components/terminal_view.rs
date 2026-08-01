@@ -747,6 +747,10 @@ pub fn TerminalView(
     /// [`RowDiff::Different`] get a muted red background so the user can
     /// spot where outputs diverge across panes.
     row_diffs: Option<Vec<crate::comparison::RowDiff>>,
+    /// Maximum number of suggestion rows to display (from the user's
+    /// configured `suggestion_count`). Passed through to `SuggestionPopup`.
+    #[props(default)]
+    suggestion_max_rows: usize,
 ) -> Element {
     let mut focused = use_signal(|| false);
     let mut search_visible = use_signal(|| false);
@@ -2121,6 +2125,7 @@ pub fn TerminalView(
                     on_delete: move |cmd: String| {
                         on_suggestion_delete.call(cmd);
                     },
+                    max_rows: suggestion_max_rows,
                 }
             }
 

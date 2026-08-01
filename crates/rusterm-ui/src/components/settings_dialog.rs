@@ -2,11 +2,25 @@ use dioxus::prelude::*;
 
 use rusterm_core::FocusedTabAppearance;
 
+/// Settings dialog: appearance + suggestion preferences.
+///
+/// The dialog manages two independent groups of settings via separate
+/// `on_save_*` callbacks so the caller can persist each to its own
+/// `ConfigManager::save_*` method. Both callbacks fire on "Save".
 #[component]
 pub fn SettingsDialog(
     appearance: FocusedTabAppearance,
+    /// Current suggestion-enabled state (loaded from settings.json).
+    #[props(default)]
+    suggestion_enabled: bool,
+    /// Current suggestion count (3, 5, or 10).
+    #[props(default)]
+    suggestion_count: u8,
     on_close: EventHandler<()>,
     on_save: EventHandler<FocusedTabAppearance>,
+    /// Fires with `(enabled, count)` when the user clicks Save.
+    #[props(default)]
+    on_save_suggestions: EventHandler<(bool, u8)>,
 ) -> Element {
     let mut draft = use_signal(|| appearance.normalized());
     let preview = draft().normalized();
@@ -16,12 +30,16 @@ pub fn SettingsDialog(
     );
     let preview_radius = format!("{}px", preview.border_radius);
 
+    // Suggestion draft state — edited locally, committed on Save.
+    let mut sug_enabled = use_signal(|| suggestion_enabled);
+    let mut sug_count = use_signal(|| suggestion_count);
+
     rsx! {
         div {
             style: "position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; justify-content: center; align-items: center; z-index: 1000;",
 
             div {
-                style: "background: #24283b; border-radius: 8px; padding: 24px; width: 420px; color: #c0caf5; box-shadow: 0 12px 36px rgba(0,0,0,0.45);",
+                style: "background: #24283b; border-radius: 8px; padding: 24px; width: 460px; max-height: 85vh; overflow-y: auto; color: #c0caf5; box-shadow: 0 12px 36px rgba(0,0,0,0.45);",
 
                 h3 { style: "margin: 0 0 6px; font-size: 16px;", "Appearance" }
                 p {
@@ -106,11 +124,89 @@ pub fn SettingsDialog(
                     }
                 }
 
+                // ── Suggestion preferences ──────────────────────────────────
+                h3 {
+                    style: "margin: 24px 0 6px; font-size: 16px;",
+                    "Command suggestions"
+                }
+                p {
+                    style: "margin: 0 0 16px; color: #7f849c; font-size: 12px; line-height: 1.5;",
+                    "Inline fish-style suggestions based on your command history."
+                }
+
+                div {
+                    style: "display: flex; flex-direction: column; gap: 16px;",
+
+                    // Enable / disable toggle
+                    div {
+                        style: "display: flex; align-items: center; justify-content: space-between; gap: 16px;",
+                        label { style: "font-size: 12px; color: #a9b1d6;", "Enable suggestions" }
+                        div {
+                            style: "display: flex; align-items: center; gap: 8px;",
+                            input {
+                                r#type: "checkbox",
+                                checked: "{sug_enabled()}",
+                                style: "width: 16px; height: 16px; cursor: pointer; accent-color: #7aa2f7;",
+                                onchange: move |e| sug_enabled.set(e.checked()),
+                            }
+                            span {
+                                style: "font-size: 11px; color: #565f89;",
+                                {sug_enabled().then_some("ON").unwrap_or("OFF")}
+                            }
+                        }
+                    }
+
+                    // Suggestion count selector (3 / 5 / 10)
+                    div {
+                        style: "display: flex; align-items: center; justify-content: space-between; gap: 16px;",
+                        label { style: "font-size: 12px; color: #a9b1d6;", "Max suggestions shown" }
+                        div {
+                            style: "display: flex; gap: 6px;",
+                            for &count in &[3u8, 5, 10] {
+                                {
+                                    let is_active = sug_count() == count;
+                                    let bg = if is_active { "#7aa2f7" } else { "#1a1b26" };
+                                    let color = if is_active { "#1a1b26" } else { "#a9b1d6" };
+                                    let border = if is_active { "#7aa2f7" } else { "#414868" };
+                                    let weight = if is_active { "600" } else { "400" };
+                                    rsx! {
+                                        button {
+                                            key: "sug-{count}",
+                                            style: "background: {bg}; color: {color}; border: 1px solid {border}; border-radius: 4px; padding: 4px 14px; cursor: pointer; font-size: 12px; font-weight: {weight};",
+                                            onclick: move |_| sug_count.set(count),
+                                            "{count}"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Description of the current selection
+                    div {
+                        style: "font-size: 11px; color: #565f89; line-height: 1.5;",
+                        {
+                            let c = sug_count();
+                            let desc = match c {
+                                3 => "3 — compact popup, minimal screen coverage",
+                                5 => "5 — balanced view of recent commands",
+                                10 => "10 — extensive history at a glance",
+                                _ => "compact popup, minimal screen coverage",
+                            };
+                            rsx! { "{desc}" }
+                        }
+                    }
+                }
+
                 div {
                     style: "display: flex; justify-content: space-between; gap: 8px; margin-top: 20px;",
                     button {
                         style: "background: transparent; border: 1px solid #414868; color: #a9b1d6; border-radius: 4px; padding: 8px 12px; cursor: pointer; font-size: 12px;",
-                        onclick: move |_| draft.set(FocusedTabAppearance::default()),
+                        onclick: move |_| {
+                            draft.set(FocusedTabAppearance::default());
+                            sug_enabled.set(true);
+                            sug_count.set(3);
+                        },
                         "Reset default"
                     }
                     div {
@@ -122,7 +218,10 @@ pub fn SettingsDialog(
                         }
                         button {
                             style: "background: #7aa2f7; border: none; color: #1a1b26; border-radius: 4px; padding: 8px 16px; cursor: pointer; font-size: 13px; font-weight: 600;",
-                            onclick: move |_| on_save.call(draft().normalized()),
+                            onclick: move |_| {
+                                on_save.call(draft().normalized());
+                                on_save_suggestions.call((sug_enabled(), sug_count()));
+                            },
                             "Save"
                         }
                     }
