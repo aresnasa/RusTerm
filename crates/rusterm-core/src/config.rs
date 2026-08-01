@@ -1146,6 +1146,11 @@ pub struct PersistedConfig {
     /// checkbox survives across launches.
     #[serde(default = "default_confirm_close_on_exit")]
     pub confirm_close_on_exit: bool,
+    /// Whether to warn before highlighting a comparison where more than half
+    /// of the visible rows differ. Default true so legacy settings keep the
+    /// existing safety prompt.
+    #[serde(default = "default_comparison_diff_warning_enabled")]
+    pub comparison_diff_warning_enabled: bool,
     /// Appearance of the complete outline around the focused pane's top tab.
     #[serde(default)]
     pub focused_tab_appearance: FocusedTabAppearance,
@@ -1179,6 +1184,12 @@ pub struct PersistedConfig {
 /// (not a constant) so `#[serde(default = "...")]` can reference it. True
 /// because the safe default is to always ask before closing the app.
 fn default_confirm_close_on_exit() -> bool {
+    true
+}
+
+/// Default for `PersistedConfig::comparison_diff_warning_enabled`. True keeps
+/// the existing protective prompt for new and upgraded installations.
+fn default_comparison_diff_warning_enabled() -> bool {
     true
 }
 
@@ -1672,6 +1683,7 @@ mod tests {
             serde_json::from_str(r#"{"version":1,"connections":[]}"#).unwrap();
         assert!(config.suggestion_enabled);
         assert_eq!(config.suggestion_count, 3);
+        assert!(config.comparison_diff_warning_enabled);
     }
 
     #[test]
@@ -1741,6 +1753,7 @@ mod tests {
             master_password_hash: None,
             restore_disabled: false,
             confirm_close_on_exit: true,
+            comparison_diff_warning_enabled: false,
             focused_tab_appearance: FocusedTabAppearance::default(),
             suggestion_enabled: false,
             suggestion_count: 10,
@@ -1753,6 +1766,7 @@ mod tests {
         let parsed: PersistedConfig = serde_json::from_str(&json).unwrap();
         assert!(!parsed.suggestion_enabled);
         assert_eq!(parsed.suggestion_count, 10);
+        assert!(!parsed.comparison_diff_warning_enabled);
     }
 
     #[test]

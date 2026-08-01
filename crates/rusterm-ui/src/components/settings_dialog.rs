@@ -45,6 +45,10 @@ pub fn SettingsDialog(
     /// Fires with `(enabled, count)` when the user clicks Save.
     #[props(default)]
     on_save_suggestions: EventHandler<(bool, u8)>,
+    /// Whether comparison mode warns before highlighting large diffs.
+    comparison_diff_warning_enabled: bool,
+    /// Fires with the comparison warning preference when the user clicks Save.
+    on_save_comparison_diff_warning: EventHandler<bool>,
     #[props(default)] keybindings: Keybindings,
     #[props(default)] on_save_keybindings: EventHandler<Keybindings>,
     #[props(default)] skin: SkinSettings,
@@ -61,6 +65,7 @@ pub fn SettingsDialog(
     // Suggestion draft state — edited locally, committed on Save.
     let mut sug_enabled = use_signal(|| suggestion_enabled);
     let mut sug_count = use_signal(|| suggestion_count);
+    let mut comparison_warning_enabled = use_signal(|| comparison_diff_warning_enabled);
     let mut keybinding_draft = use_signal(|| keybindings.normalized());
     let mut skin_draft = use_signal(|| skin.normalized());
     let skin_preview = skin_draft().palette();

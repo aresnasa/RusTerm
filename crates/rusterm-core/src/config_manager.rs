@@ -249,6 +249,7 @@ impl ConfigManager {
             master_password_hash: self.master_password_hash.clone(),
             restore_disabled: existing.restore_disabled,
             confirm_close_on_exit: existing.confirm_close_on_exit,
+            comparison_diff_warning_enabled: existing.comparison_diff_warning_enabled,
             focused_tab_appearance: appearance.normalized(),
             suggestion_enabled: existing.suggestion_enabled,
             suggestion_count: existing.suggestion_count,
@@ -281,6 +282,7 @@ impl ConfigManager {
             master_password_hash: self.master_password_hash.clone(),
             restore_disabled,
             confirm_close_on_exit: existing.confirm_close_on_exit,
+            comparison_diff_warning_enabled: existing.comparison_diff_warning_enabled,
             focused_tab_appearance: existing.focused_tab_appearance,
             suggestion_enabled: existing.suggestion_enabled,
             suggestion_count: existing.suggestion_count,
@@ -320,6 +322,7 @@ impl ConfigManager {
             master_password_hash: self.master_password_hash.clone(),
             restore_disabled: existing.restore_disabled,
             confirm_close_on_exit,
+            comparison_diff_warning_enabled: existing.comparison_diff_warning_enabled,
             focused_tab_appearance: existing.focused_tab_appearance,
             suggestion_enabled: existing.suggestion_enabled,
             suggestion_count: existing.suggestion_count,
@@ -339,6 +342,41 @@ impl ConfigManager {
         Ok(())
     }
 
+    /// Read whether comparison mode should warn before highlighting a result
+    /// where more than half of the visible rows differ.
+    pub fn load_comparison_diff_warning_enabled(&self) -> bool {
+        self.read_persisted().comparison_diff_warning_enabled
+    }
+
+    /// Persist the large-diff warning preference while preserving encrypted
+    /// connections, OneKeys, and every unrelated setting.
+    pub fn save_comparison_diff_warning_enabled(&self, enabled: bool) -> Result<()> {
+        let existing = self.read_persisted();
+        let persisted = PersistedConfig {
+            version: CONFIG_VERSION,
+            connections: existing.connections,
+            onekeys: existing.onekeys,
+            master_password_hash: self.master_password_hash.clone(),
+            restore_disabled: existing.restore_disabled,
+            confirm_close_on_exit: existing.confirm_close_on_exit,
+            comparison_diff_warning_enabled: enabled,
+            focused_tab_appearance: existing.focused_tab_appearance,
+            suggestion_enabled: existing.suggestion_enabled,
+            suggestion_count: existing.suggestion_count,
+            sidebar: existing.sidebar,
+            workspace: existing.workspace,
+            keybindings: existing.keybindings,
+            skin: existing.skin,
+        };
+
+        let json =
+            serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
+        let temp_path = self.config_path.with_extension("json.tmp");
+        fs::write(&temp_path, &json).context("Failed to write config file")?;
+        fs::rename(&temp_path, &self.config_path).context("Failed to rename temp config file")?;
+        Ok(())
+    }
+
     /// Load normalized application keybindings from settings.json.
     pub fn load_keybindings(&self) -> Keybindings {
         self.read_persisted().keybindings.normalized()
@@ -355,6 +393,7 @@ impl ConfigManager {
             master_password_hash: self.master_password_hash.clone(),
             restore_disabled: existing.restore_disabled,
             confirm_close_on_exit: existing.confirm_close_on_exit,
+            comparison_diff_warning_enabled: existing.comparison_diff_warning_enabled,
             focused_tab_appearance: existing.focused_tab_appearance,
             suggestion_enabled: existing.suggestion_enabled,
             suggestion_count: existing.suggestion_count,
@@ -388,6 +427,7 @@ impl ConfigManager {
             master_password_hash: self.master_password_hash.clone(),
             restore_disabled: existing.restore_disabled,
             confirm_close_on_exit: existing.confirm_close_on_exit,
+            comparison_diff_warning_enabled: existing.comparison_diff_warning_enabled,
             focused_tab_appearance: existing.focused_tab_appearance,
             suggestion_enabled: existing.suggestion_enabled,
             suggestion_count: existing.suggestion_count,
@@ -429,6 +469,7 @@ impl ConfigManager {
             master_password_hash: self.master_password_hash.clone(),
             restore_disabled: existing.restore_disabled,
             confirm_close_on_exit: existing.confirm_close_on_exit,
+            comparison_diff_warning_enabled: existing.comparison_diff_warning_enabled,
             focused_tab_appearance: existing.focused_tab_appearance,
             suggestion_enabled: enabled,
             suggestion_count: count,
@@ -464,6 +505,7 @@ impl ConfigManager {
             master_password_hash: self.master_password_hash.clone(),
             restore_disabled: existing.restore_disabled,
             confirm_close_on_exit: existing.confirm_close_on_exit,
+            comparison_diff_warning_enabled: existing.comparison_diff_warning_enabled,
             focused_tab_appearance: existing.focused_tab_appearance,
             suggestion_enabled: existing.suggestion_enabled,
             suggestion_count: existing.suggestion_count,
@@ -497,6 +539,7 @@ impl ConfigManager {
             master_password_hash: self.master_password_hash.clone(),
             restore_disabled: existing.restore_disabled,
             confirm_close_on_exit: existing.confirm_close_on_exit,
+            comparison_diff_warning_enabled: existing.comparison_diff_warning_enabled,
             focused_tab_appearance: existing.focused_tab_appearance,
             suggestion_enabled: existing.suggestion_enabled,
             suggestion_count: existing.suggestion_count,
@@ -572,6 +615,7 @@ impl ConfigManager {
             master_password_hash: self.master_password_hash.clone(),
             restore_disabled: existing.restore_disabled,
             confirm_close_on_exit: existing.confirm_close_on_exit,
+            comparison_diff_warning_enabled: existing.comparison_diff_warning_enabled,
             focused_tab_appearance: existing.focused_tab_appearance,
             suggestion_enabled: existing.suggestion_enabled,
             suggestion_count: existing.suggestion_count,
@@ -600,6 +644,7 @@ impl ConfigManager {
             master_password_hash: None,
             restore_disabled: false,
             confirm_close_on_exit: true,
+            comparison_diff_warning_enabled: true,
             focused_tab_appearance: FocusedTabAppearance::default(),
             suggestion_enabled: true,
             suggestion_count: 3,
@@ -634,6 +679,7 @@ impl ConfigManager {
             master_password_hash: self.master_password_hash.clone(),
             restore_disabled: existing.restore_disabled,
             confirm_close_on_exit: existing.confirm_close_on_exit,
+            comparison_diff_warning_enabled: existing.comparison_diff_warning_enabled,
             focused_tab_appearance: existing.focused_tab_appearance,
             suggestion_enabled: existing.suggestion_enabled,
             suggestion_count: existing.suggestion_count,

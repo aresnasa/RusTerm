@@ -168,6 +168,17 @@ pub fn diff_summary(diffs: &[(String, Vec<RowDiff>)]) -> DiffSummary {
     }
 }
 
+/// Whether a comparison result should pause for the large-diff warning.
+/// The persisted preference and the current comparison session's one-time
+/// confirmation are intentionally separate concerns.
+pub fn should_warn_for_large_diff(
+    summary: &DiffSummary,
+    warning_enabled: bool,
+    confirmed_for_session: bool,
+) -> bool {
+    warning_enabled && !confirmed_for_session && summary.exceeds_threshold()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

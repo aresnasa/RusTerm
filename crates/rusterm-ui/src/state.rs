@@ -347,6 +347,9 @@ pub struct AppState {
     /// dialog's "下次关闭时不再询问" checkbox survives across launches.
     /// Loaded from settings on unlock (see the unlock handler in `app.rs`).
     pub confirm_close_on_exit: bool,
+    /// Whether comparison mode warns before highlighting large diffs.
+    /// Persisted in settings.json and defaulted to true for existing users.
+    pub comparison_diff_warning_enabled: bool,
     /// Whether the inline fish-style command suggestion popup is enabled.
     /// Persisted in settings.json. When false, no suggestions are computed
     /// or shown — the user types with no ghost text or dropdown.
@@ -605,6 +608,7 @@ impl Default for AppState {
             restore_pending: None,
             restore_disabled: false,
             confirm_close_on_exit: true,
+            comparison_diff_warning_enabled: true,
             suggestion_enabled: true,
             suggestion_count: 3,
             close_dialog_visible: false,
@@ -1360,6 +1364,15 @@ pub fn toggle_comparison_mode(state: &mut AppState) -> Option<bool> {
     state.comparison_diff_warning = None;
     state.comparison_diff_confirmed = false;
     Some(now_on)
+}
+
+/// Disable future large-diff warnings and approve the currently pending diff.
+/// Persistence is handled by the UI caller because `AppState` does not own
+/// configuration I/O.
+pub fn suppress_comparison_diff_warning(state: &mut AppState) {
+    state.comparison_diff_warning_enabled = false;
+    state.comparison_diff_confirmed = true;
+    state.comparison_diff_warning = None;
 }
 
 /// Toggle the split-pane mode for the active tab.
