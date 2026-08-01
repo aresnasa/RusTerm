@@ -42,4 +42,5 @@
 42. 同时需要调整下切换app 时使用的 app 图标，太大了，需要使用 mac 默认的图标大小，改造一下
 43. 每次登录新的会话后都会在终端显示的输出ecs-user@bidbot-prod:~$ __rusterm_precmd() { printf '\e]133;D;%s\e\\' "$?"; printf '\e]133;A\e\\'; printf '\e]7;file://%s%s\e\\' "${HOSTNAME:-localhost}" "$PWD"; }; if [ -n "$ZSH_VERSION" ]; then precmd _functions+=(__rusterm_precmd); elif [ -n "$BASH_VERSION" ]; then PROMPT_COMMAND="__rusterm_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"; fi    这个不符合预期，需要隐藏，避免干扰用户，同时继续修复 onekey 问题[@Image](zed:///agent/pasted-image?name=Image) ，同时所有终端中的弹窗会话都要支持俘获（复制异常），强化相关代码
 44. 检查会话顶部弹窗的显示逻辑这里不能遮挡相关命令，可以在非主焦点显示弹窗，弹窗触发逻辑也需要优化，避免遮挡视线，优化相关代码
-45.
+45. 前端页面的布局支持用户自定义，然后自动保存相关布局，而不是调整配置文件，这里需要在后端定期记录并同步到配置中，每个会话需要一个独立的配置 json 段保证用户的自定义框能够被正确的保存
+46.

@@ -326,7 +326,7 @@ impl PaneLayout {
         } else {
             // Keep normal moves surgical (only the target changes). Rebase
             // rarely so pane windows never overtake the z=100 comparison
-            // banner after many drag operations.
+            // indicator badge after many drag operations.
             let mut order: Vec<usize> = (0..self.panes.len())
                 .filter(|idx| *idx != pane_idx)
                 .collect();

@@ -3075,12 +3075,17 @@ fn session_type_accent_color(kind: &SessionType) -> &'static str {
 ///
 /// ## Cross-terminal comparison mode
 ///
-/// When the layout's `comparison` flag is set, a banner is displayed at the
-/// top warning the user that input is being broadcast. The actual broadcast
-/// logic lives in each pane's `on_input` handler — when comparison is on,
-/// `app.rs`'s input routing sends the keystrokes to every pane's PTY
-/// (not just the focused one). This component only renders the banner;
-/// the broadcast happens in the input handler.
+/// When the layout's `comparison` flag is set, a compact badge is shown in
+/// the top-right corner warning the user that input is being broadcast. The
+/// actual broadcast logic lives in each pane's `on_input` handler — when
+/// comparison is on, `app.rs`'s input routing sends the keystrokes to every
+/// pane's PTY (not just the focused one). This component only renders the
+/// indicator badge; the broadcast happens in the input handler.
+///
+/// The badge is positioned in a corner (not across the top) so it never
+/// overlays the first row of terminal output or the command line, and is
+/// only shown when there are 2+ occupied panes (a single-pane broadcast is
+/// a no-op).
 ///
 /// ## Why this is a function, not a separate component file
 ///
@@ -3119,6 +3124,12 @@ fn multi_pane_container(
         .collect();
 
     let comparison_on = layout.comparison;
+    // The comparison banner only makes sense when there are 2+ non-empty
+    // panes to broadcast to. With a single occupied pane the broadcast is
+    // a no-op, so we suppress the indicator to avoid showing a misleading
+    // prompt that would only obscure the terminal view for no benefit.
+    let occupied_panes = visible.iter().filter(|(_, sid, _)| !sid.is_empty()).count();
+    let show_comparison_banner = comparison_on && occupied_panes > 1;
     let layout_floating = layout.is_floating();
     let layout_owner_tab_id = state.read().active_tab.clone().unwrap_or_default();
     let focused_pane = state.read().focused_pane.clone();
@@ -3484,35 +3495,42 @@ fn multi_pane_container(
                 .pane-accent-strip {{ transition: width 0.12s ease; }}
             " }
 
-            // Comparison-mode banner.
+            // Comparison-mode indicator.
             //
-            // Sits at the top of the terminal area as a non-interactive
-            // overlay (`pointer-events: none` so it never blocks clicks on
-            // the terminal below). Uses a subtle vertical gradient instead
-            // of a flat fill so it reads as a status strip rather than a
-            // solid block covering terminal content. The 1px bottom border
-            // + box-shadow give it depth so the user can visually separate
-            // it from the terminal output underneath.
-            {comparison_on.then(|| rsx! {
+            // Rendered as a compact badge pinned to the top-right corner
+            // (`pointer-events: none` so it never blocks clicks on the
+            // terminal below). The previous design was a full-width strip
+            // across the very top of the terminal area, which overlaid the
+            // first row of output / the prompt line and obscured terminal
+            // commands. Moving it to a small corner badge keeps the status
+            // visible without covering any terminal content, and keeps it
+            // out of the primary focus area (the prompt line and the body
+            // of the output) where the user's attention actually lives.
+            //
+            // Visibility is gated by `show_comparison_banner`, which is only
+            // true when comparison is on AND there are 2+ occupied panes —
+            // a single-pane broadcast is a no-op, so the indicator would be
+            // misleading and is suppressed.
+            {show_comparison_banner.then(|| rsx! {
                 div {
                     style: "
                         position: absolute;
-                        top: 0; left: 0; right: 0;
-                        height: 18px;
-                        background: linear-gradient(180deg, #7aa2f7 0%, #6a92e8 100%);
+                        top: 4px;
+                        right: 4px;
+                        padding: 2px 8px;
+                        background: rgba(122,162,247,0.92);
                         color: #1a1b26;
                         font-size: 10px;
                         font-weight: 600;
-                        letter-spacing: 0.3px;
-                        display: flex;
-                        align-items: center;
-                        justify-content: center;
+                        letter-spacing: 0.2px;
+                        border-radius: 3px;
                         z-index: 100;
                         pointer-events: none;
-                        border-bottom: 1px solid #414868;
-                        box-shadow: 0 1px 4px rgba(0,0,0,0.3);
+                        box-shadow: 0 1px 4px rgba(0,0,0,0.35);
+                        white-space: nowrap;
+                        border: 1px solid rgba(255,255,255,0.18);
                     ",
-                    "⚠ Comparison mode ON — input is broadcast to all panes"
+                    "⚠ Comparison mode ON"
                 }
             })}
 
