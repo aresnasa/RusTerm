@@ -6203,6 +6203,49 @@ mod session_startup_tests {
     }
 
     #[test]
+    fn focus_change_hides_non_password_popups_but_keeps_password_prompts() {
+        let username_popup = OneKeyPopupState {
+            visible: true,
+            matches: vec![OneKeyMatch {
+                name: "account".to_string(),
+                label: "Username".to_string(),
+                send: "user".to_string(),
+                matched_expect: "login:".to_string(),
+            }],
+            selected: 0,
+            matched_expect: Some("login:".to_string()),
+        };
+        let password_popup = OneKeyPopupState {
+            visible: true,
+            matches: vec![OneKeyMatch {
+                name: "account".to_string(),
+                label: "Password".to_string(),
+                send: "secret".to_string(),
+                matched_expect: ".+:".to_string(),
+            }],
+            selected: 0,
+            matched_expect: Some(".+:".to_string()),
+        };
+
+        assert!(should_hide_onekey_popup(
+            &username_popup,
+            PopupDismissReason::FocusChanged
+        ));
+        assert!(!should_hide_onekey_popup(
+            &password_popup,
+            PopupDismissReason::FocusChanged
+        ));
+        assert!(should_hide_onekey_popup(
+            &password_popup,
+            PopupDismissReason::UserCancelled
+        ));
+        assert!(should_hide_onekey_popup(
+            &password_popup,
+            PopupDismissReason::Submitted
+        ));
+    }
+
+    #[test]
     fn onekey_enablement_is_scoped_to_the_pane_session() {
         let enabled = ConnectionConfig {
             id: "enabled".to_string(),
