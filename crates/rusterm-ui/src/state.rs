@@ -3615,6 +3615,23 @@ mod tests {
     }
 
     #[test]
+    fn suppress_comparison_diff_warning_disables_future_prompts_and_confirms_current_diff() {
+        let mut state = AppState {
+            comparison_diff_warning: Some(crate::comparison::DiffSummary {
+                diff_rows: 3,
+                total_rows: 4,
+            }),
+            ..AppState::default()
+        };
+
+        suppress_comparison_diff_warning(&mut state);
+
+        assert!(!state.comparison_diff_warning_enabled);
+        assert!(state.comparison_diff_confirmed);
+        assert!(state.comparison_diff_warning.is_none());
+    }
+
+    #[test]
     fn toggle_comparison_mode_returns_none_with_no_layout() {
         let mut state = state_with_active_session(&["alpha"]);
         // No layout — comparison toggle has nothing to act on.

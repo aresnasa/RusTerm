@@ -338,6 +338,18 @@ mod tests {
     }
 
     #[test]
+    fn large_diff_warning_respects_preference_and_session_confirmation() {
+        let summary = DiffSummary {
+            diff_rows: 3,
+            total_rows: 4,
+        };
+
+        assert!(should_warn_for_large_diff(&summary, true, false));
+        assert!(!should_warn_for_large_diff(&summary, false, false));
+        assert!(!should_warn_for_large_diff(&summary, true, true));
+    }
+
+    #[test]
     fn diff_fraction_zero_for_empty() {
         let summary = DiffSummary {
             diff_rows: 0,

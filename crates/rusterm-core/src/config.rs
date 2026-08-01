@@ -1683,7 +1683,26 @@ mod tests {
             serde_json::from_str(r#"{"version":1,"connections":[]}"#).unwrap();
         assert!(config.suggestion_enabled);
         assert_eq!(config.suggestion_count, 3);
+    }
+
+    #[test]
+    fn comparison_diff_warning_defaults_to_enabled_for_legacy_settings() {
+        let config: PersistedConfig =
+            serde_json::from_str(r#"{"version":1,"connections":[]}"#).unwrap();
+
         assert!(config.comparison_diff_warning_enabled);
+    }
+
+    #[test]
+    fn comparison_diff_warning_roundtrips() {
+        let config: PersistedConfig = serde_json::from_str(
+            r#"{"version":1,"connections":[],"comparison_diff_warning_enabled":false}"#,
+        )
+        .unwrap();
+        let json = serde_json::to_string(&config).unwrap();
+        let parsed: PersistedConfig = serde_json::from_str(&json).unwrap();
+
+        assert!(!parsed.comparison_diff_warning_enabled);
     }
 
     #[test]
@@ -1753,7 +1772,7 @@ mod tests {
             master_password_hash: None,
             restore_disabled: false,
             confirm_close_on_exit: true,
-            comparison_diff_warning_enabled: false,
+            comparison_diff_warning_enabled: true,
             focused_tab_appearance: FocusedTabAppearance::default(),
             suggestion_enabled: false,
             suggestion_count: 10,
@@ -1766,7 +1785,6 @@ mod tests {
         let parsed: PersistedConfig = serde_json::from_str(&json).unwrap();
         assert!(!parsed.suggestion_enabled);
         assert_eq!(parsed.suggestion_count, 10);
-        assert!(!parsed.comparison_diff_warning_enabled);
     }
 
     #[test]

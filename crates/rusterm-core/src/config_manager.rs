@@ -1122,6 +1122,26 @@ mod tests {
     }
 
     #[test]
+    fn comparison_diff_warning_defaults_to_true_and_roundtrips() {
+        let (cm, _dir) = test_config_manager();
+        assert!(cm.load_comparison_diff_warning_enabled());
+
+        cm.save_comparison_diff_warning_enabled(false).unwrap();
+        assert!(!cm.load_comparison_diff_warning_enabled());
+
+        cm.save_connections(&[]).unwrap();
+        cm.save_onekeys(&[]).unwrap();
+        cm.save_suggestion_settings(false, 10).unwrap();
+        assert!(
+            !cm.load_comparison_diff_warning_enabled(),
+            "comparison warning preference must survive unrelated saves"
+        );
+
+        cm.save_comparison_diff_warning_enabled(true).unwrap();
+        assert!(cm.load_comparison_diff_warning_enabled());
+    }
+
+    #[test]
     fn test_save_and_load_empty() {
         let (cm, _dir) = test_config_manager();
         cm.save_connections(&[]).unwrap();
