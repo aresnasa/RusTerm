@@ -19,10 +19,15 @@ parking_lot.workspace = true
 futures.workspace = true
 bytes.workspace = true
 dirs.workspace = true
+base64.workspace = true
+rustls.workspace = true
+tokio-rustls.workspace = true
+webpki-roots.workspace = true
 
 rusterm-core.workspace = true
 
 [dev-dependencies]
+rcgen = "0.14"
 rusterm-db = { path = "../rusterm-db" }
 tempfile = "3"
 uuid.workspace = true

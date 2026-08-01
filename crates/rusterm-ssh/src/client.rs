@@ -11,6 +11,7 @@ use rusterm_core::terminal::TerminalSize;
 
 use crate::known_hosts::{HostKeyPolicy, verify_server_key};
 use crate::sftp::{SftpClient, map_sftp_error, map_ssh_error};
+use crate::transport::connect_transport;
 
 /// russh `Handler` carrying the per-connection state needed to verify
 /// the server's host key against `known_hosts`.
@@ -166,12 +167,13 @@ impl SshClient {
         let policy = HostKeyPolicy::parse(&self.config.host_key_policy);
         let handler = Handler::new(self.config.host.clone(), policy);
 
-        let mut handle = client::connect(
-            config,
-            (self.config.host.as_str(), self.config.port),
-            handler,
+        let stream = connect_transport(
+            &self.config.host,
+            self.config.port,
+            self.config.proxy.as_ref(),
         )
         .await?;
+        let mut handle = client::connect_stream(config, stream, handler).await?;
 
         match &self.config.auth {
             SshAuth::Password { password } => {

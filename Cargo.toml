@@ -34,6 +34,9 @@ regex = "1"
 russh = { version = "0.61", features = ["aws-lc-rs"] }
 russh-config = "0.58"
 russh-sftp = "2.3"
+rustls = "0.23"
+tokio-rustls = "0.26"
+webpki-roots = "1"
 
 # Crypto & Security
 aes-gcm = "0.10"

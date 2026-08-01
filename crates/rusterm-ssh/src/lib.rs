@@ -3,6 +3,7 @@ pub mod client;
 pub mod known_hosts;
 pub mod sftp;
 pub mod ssh_config;
+pub mod transport;
 
 pub use client::{SshClient, SshSession, parse_remote_history};
 pub use sftp::{
