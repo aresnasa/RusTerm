@@ -948,6 +948,38 @@ pub fn build_session_tree(state: &AppState) -> Vec<WorkspaceNode> {
         .collect()
 }
 
+pub fn enqueue_pending_exit(
+    state: &mut AppState,
+    session_id: &str,
+    command: String,
+    history_id: String,
+) {
+    let queue = state
+        .pending_exit_check
+        .entry(session_id.to_string())
+        .or_default();
+    const MAX_PENDING: usize = 32;
+    while queue.len() >= MAX_PENDING {
+        queue.pop_front();
+    }
+    queue.push_back((command, history_id));
+}
+
+pub fn rollback_pending_exit(state: &mut AppState, session_id: &str, history_id: &str) -> bool {
+    let Some(queue) = state.pending_exit_check.get_mut(session_id) else {
+        return false;
+    };
+    if queue.back().is_some_and(|(_, id)| id == history_id) {
+        queue.pop_back();
+        if queue.is_empty() {
+            state.pending_exit_check.remove(session_id);
+        }
+        true
+    } else {
+        false
+    }
+}
+
 /// Helper: set the active tab and derive `active_session` from the tab's
 /// anchor. Use this whenever the active top TabBar entry changes so the two
 /// fields stay in sync (Step 1 compatibility).
