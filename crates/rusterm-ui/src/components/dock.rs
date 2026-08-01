@@ -149,35 +149,35 @@ pub async fn poll_dock_drag_state() -> Option<(f64, f64, bool, Option<DockDropTa
             if (!Number.isFinite(x) || !Number.isFinite(y)) return '';\n\
             var targetZone = '';\n\
             var targetIndex = '';\n\
-            var zones = ['left', 'right', 'bottom'];\n\
-            for (var zoneIndex = 0; zoneIndex < zones.length; zoneIndex++) {\n\
-                var zone = zones[zoneIndex];\n\
-                var element = document.querySelector('[data-rusterm-dock-zone=\"' + zone + '\"]');\n\
-                if (!element) continue;\n\
-                var rect = element.getBoundingClientRect();\n\
-                if (x < rect.left || x >= rect.right || y < rect.top || y >= rect.bottom) continue;\n\
-                var tabs = Array.from(element.querySelectorAll('[data-rusterm-dock-tab-index]'));\n\
-                var insertion = tabs.length;\n\
-                var tabStrip = element.querySelector('[data-rusterm-dock-tabs]');\n\
-                var tabStripRect = tabStrip ? tabStrip.getBoundingClientRect() : null;\n\
-                if (tabStripRect && y >= tabStripRect.top && y < tabStripRect.bottom) {\n\
-                    for (var tabIndex = 0; tabIndex < tabs.length; tabIndex++) {\n\
-                        var tabRect = tabs[tabIndex].getBoundingClientRect();\n\
-                        if (x < tabRect.left + tabRect.width / 2) { insertion = tabIndex; break; }\n\
-                    }\n\
-                }\n\
-                targetZone = zone;\n\
-                targetIndex = String(insertion);\n\
+            var rails = Array.from(document.querySelectorAll('[data-rusterm-dock-hidden-edge]'));\n\
+            for (var railIndex = 0; railIndex < rails.length; railIndex++) {\n\
+                var rail = rails[railIndex];\n\
+                var railRect = rail.getBoundingClientRect();\n\
+                if (x < railRect.left || x >= railRect.right || y < railRect.top || y >= railRect.bottom) continue;\n\
+                targetZone = rail.getAttribute('data-rusterm-dock-hidden-edge') || '';\n\
+                targetIndex = rail.getAttribute('data-rusterm-dock-panel-count') || '0';\n\
                 break;\n\
             }\n\
             if (!targetZone) {\n\
-                var rails = Array.from(document.querySelectorAll('[data-rusterm-dock-hidden-edge]'));\n\
-                for (var railIndex = 0; railIndex < rails.length; railIndex++) {\n\
-                    var rail = rails[railIndex];\n\
-                    var railRect = rail.getBoundingClientRect();\n\
-                    if (x < railRect.left || x >= railRect.right || y < railRect.top || y >= railRect.bottom) continue;\n\
-                    targetZone = rail.getAttribute('data-rusterm-dock-hidden-edge') || '';\n\
-                    targetIndex = rail.getAttribute('data-rusterm-dock-panel-count') || '0';\n\
+                var zones = ['left', 'right', 'bottom'];\n\
+                for (var zoneIndex = 0; zoneIndex < zones.length; zoneIndex++) {\n\
+                    var zone = zones[zoneIndex];\n\
+                    var element = document.querySelector('[data-rusterm-dock-zone=\"' + zone + '\"]');\n\
+                    if (!element) continue;\n\
+                    var rect = element.getBoundingClientRect();\n\
+                    if (x < rect.left || x >= rect.right || y < rect.top || y >= rect.bottom) continue;\n\
+                    var tabs = Array.from(element.querySelectorAll('[data-rusterm-dock-tab-index]'));\n\
+                    var insertion = tabs.length;\n\
+                    var tabStrip = element.querySelector('[data-rusterm-dock-tabs]');\n\
+                    var tabStripRect = tabStrip ? tabStrip.getBoundingClientRect() : null;\n\
+                    if (tabStripRect && y >= tabStripRect.top && y < tabStripRect.bottom) {\n\
+                        for (var tabIndex = 0; tabIndex < tabs.length; tabIndex++) {\n\
+                            var tabRect = tabs[tabIndex].getBoundingClientRect();\n\
+                            if (x < tabRect.left + tabRect.width / 2) { insertion = tabIndex; break; }\n\
+                        }\n\
+                    }\n\
+                    targetZone = zone;\n\
+                    targetIndex = String(insertion);\n\
                     break;\n\
                 }\n\
             }\n\
