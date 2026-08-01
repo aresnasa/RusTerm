@@ -312,6 +312,44 @@ return (async () => {
       "RUSTERM_AFTER_CANCEL_OK",
     );
 
+    stage = "comparison-broadcast";
+    await clickTitle("Open a local shell (zsh/bash)");
+    await sleep(500);
+    await clickTitle(
+      "Distribute — toggle split + fill panes with all sessions (off = tab tiling)",
+    );
+    await clickTitle(
+      "Distribute — toggle split + fill panes with all sessions (off = tab tiling)",
+    );
+    const workspaceTerminals = await waitFor(() => {
+      const terminals = [
+        ...document.querySelectorAll(
+          '#terminal-content [id^="terminal-input-"]',
+        ),
+      ];
+      return terminals.length >= 2 ? terminals : null;
+    }, "two workspace terminals did not render after distribute");
+    await clickTitle("Toggle comparison mode (sync scroll + broadcast input)");
+    await waitFor(
+      () => document.querySelector(".compare-btn-on"),
+      "comparison mode did not turn on",
+    );
+    await sendCommand(
+      workspaceTerminals[0],
+      "printf RUSTERM_COMPARE_E2E_OK",
+      "RUSTERM_COMPARE_E2E_OK",
+    );
+    await waitFor(
+      () =>
+        workspaceTerminals.every((terminal) =>
+          terminal.textContent.includes("RUSTERM_COMPARE_E2E_OK"),
+        ),
+      "comparison command was not broadcast to every workspace terminal",
+    );
+    const currentMainTerminal = document.getElementById(mainTerminal.id);
+    if (!currentMainTerminal)
+      throw new Error("main terminal disappeared after distribute");
+
     stage = "open-bottom-shell";
     await ensureZone("bottom", "Show or hide Send, Shell, and Transfers");
     await activateDockTab("Shell");
@@ -324,6 +362,7 @@ return (async () => {
       "embedded shell did not open",
     );
     const bottomTerminalId = bottomTerminal.id;
+    await sleep(750);
     if (bottomTerminalId === mainTerminal.id)
       throw new Error("main and bottom shell reused a DOM id");
     await sendCommand(
@@ -331,7 +370,7 @@ return (async () => {
       "printf RUSTERM_BOTTOM_E2E_OK",
       "RUSTERM_BOTTOM_E2E_OK",
     );
-    if (mainTerminal.textContent.includes("RUSTERM_BOTTOM_E2E_OK")) {
+    if (currentMainTerminal.textContent.includes("RUSTERM_BOTTOM_E2E_OK")) {
       throw new Error("bottom shell input leaked into main terminal");
     }
 

@@ -209,6 +209,8 @@ fn close_terminates_a_long_running_child_process() {
         }
         let alive = std::process::Command::new("/bin/kill")
             .args(["-0", &pid])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .status()
             .is_ok_and(|status| status.success());
         if disconnected && !alive {
@@ -219,6 +221,8 @@ fn close_terminates_a_long_running_child_process() {
 
     let _ = std::process::Command::new("/bin/kill")
         .args(["-9", &pid])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
         .status();
     assert!(disconnected, "close must emit a Disconnected event");
     panic!("child process {pid} survived ShellConnection close");

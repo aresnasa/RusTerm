@@ -7,6 +7,7 @@
 //! ```sh
 //! RUSTERM_LIVE_SSH_TEST=1 \
 //! RUSTERM_LIVE_SSH_HOST=10.9.202.216 \
+//! RUSTERM_LIVE_SSH_PORT=2222 \
 //! RUSTERM_LIVE_SSH_USER=root \
 //! RUSTERM_LIVE_SSH_PASS=123 \
 //! cargo test -p rusterm-ssh --test live_pwdwd_scenario -- --nocapture --ignored
@@ -61,7 +62,11 @@ async fn connect_and_run(
         host.to_string(),
         rusterm_ssh::known_hosts::HostKeyPolicy::Disabled,
     );
-    let mut handle = client::connect(config, (host, 22), handler).await?;
+    let port = std::env::var("RUSTERM_LIVE_SSH_PORT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(22);
+    let mut handle = client::connect(config, (host, port), handler).await?;
 
     // Try publickey auth first (the test host has ~/.ssh/id_rsa set up).
     let mut authed = false;

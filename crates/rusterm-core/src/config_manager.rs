@@ -4,16 +4,16 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use argon2::password_hash::{PasswordHasher, SaltString};
 use argon2::{Algorithm, Argon2, Params, Version};
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
+use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rand::RngCore;
 
 use crate::config::{
-    ConnectionConfig, ConnectionKind, EncryptedValue, FocusedTabAppearance, Keybindings, OneKey,
-    OneKeyStep, PersistedConfig, PersistedConnection, PersistedConnectionKind, PersistedOneKey,
-    PersistedOneKeyStep, PersistedSshAuth, PersistedSshConfig, SidebarPreferences, SkinSettings,
-    SshAuth, SshConfig, WorkspacePreferences, DEFAULT_ONEKEY_PASSWORD_EXPECT,
+    ConnectionConfig, ConnectionKind, DEFAULT_ONEKEY_PASSWORD_EXPECT, EncryptedValue,
+    FocusedTabAppearance, Keybindings, OneKey, OneKeyStep, PersistedConfig, PersistedConnection,
+    PersistedConnectionKind, PersistedOneKey, PersistedOneKeyStep, PersistedSshAuth,
+    PersistedSshConfig, SidebarPreferences, SkinSettings, SshAuth, SshConfig, WorkspacePreferences,
 };
-use rusterm_crypto::{decrypt_data, encrypt_data, KeyringStore};
+use rusterm_crypto::{KeyringStore, decrypt_data, encrypt_data};
 
 const CONFIG_FILE_NAME: &str = "settings.json";
 const CONFIG_VERSION: u32 = 1;
@@ -843,9 +843,9 @@ impl ConfigManager {
 mod tests {
     use super::*;
     use crate::config::{
-        default_host_key_policy, ConnectionGroup, ConnectionKind, KeyChord, Keybindings, OneKey,
-        OneKeyStep, SerialConfig, SidebarPreferences, SkinKind, SkinPalette, SkinSettings, SshAuth,
-        SshConfig, TcpConfig, TelnetConfig,
+        ConnectionGroup, ConnectionKind, DockZone, KeyChord, Keybindings, OneKey, OneKeyStep,
+        PanelId, SerialConfig, SidebarPreferences, SkinKind, SkinPalette, SkinSettings, SshAuth,
+        SshConfig, TcpConfig, TelnetConfig, default_host_key_policy,
     };
 
     fn test_config_manager() -> (ConfigManager, tempfile::TempDir) {
@@ -977,6 +977,36 @@ mod tests {
         cm.save_skin_settings(&SkinSettings::default()).unwrap();
 
         assert_eq!(cm.load_workspace_preferences(), preferences);
+    }
+
+    #[test]
+    fn cross_zone_dock_order_active_visibility_and_extents_roundtrip() {
+        let (cm, _dir) = test_config_manager();
+        let mut preferences = WorkspacePreferences::default().normalized();
+        preferences.move_panel(PanelId::RemoteFiles, DockZone::Right, 1);
+        preferences.move_panel(PanelId::History, DockZone::Left, 0);
+        preferences.dock_layout.left.active = Some(PanelId::History);
+        preferences.dock_layout.right.active = Some(PanelId::RemoteFiles);
+        preferences.set_zone_visible(DockZone::Left, false);
+        preferences.set_zone_visible(DockZone::Right, true);
+        preferences.set_zone_visible(DockZone::Bottom, true);
+        preferences.dock_layout.left.extent_px = 333;
+        preferences.right_width_px = 444;
+        preferences.bottom_height_px = 277;
+        let preferences = preferences.normalized();
+
+        cm.save_workspace_preferences(&preferences).unwrap();
+        let restored = cm.load_workspace_preferences();
+
+        assert_eq!(restored, preferences);
+        assert_eq!(restored.dock_layout.left.panels[0], PanelId::History);
+        assert_eq!(
+            restored.dock_layout.right.active,
+            Some(PanelId::RemoteFiles)
+        );
+        assert_eq!(restored.dock_layout.left.extent_px, 333);
+        assert_eq!(restored.dock_layout.right.extent_px, 444);
+        assert_eq!(restored.dock_layout.bottom.extent_px, 277);
     }
 
     #[test]

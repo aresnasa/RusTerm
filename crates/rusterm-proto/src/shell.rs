@@ -49,7 +49,7 @@ impl ShellConnection {
             cmd.env(key, value);
         }
 
-        let _child = pair.slave.spawn_command(cmd)?;
+        let mut child = pair.slave.spawn_command(cmd)?;
 
         let reader = pair.master.try_clone_reader()?;
         let mut writer = pair.master.take_writer()?;
@@ -136,6 +136,13 @@ impl ShellConnection {
                     break;
                 }
             }
+            // `close` is a terminate operation, not merely an input-channel
+            // shutdown. Keep ownership of the child handle until this thread
+            // exits so a long-running process cannot survive after its UI
+            // session is removed.
+            let _ = child.kill();
+            let _ = child.wait();
+
             if disconnected_write
                 .compare_exchange(
                     false,

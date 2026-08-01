@@ -53,3 +53,15 @@ env \
     RUSTERM_SFTP_SYMLINK_PATH=/home/rusterm-test/work/symlink-link \
     RUSTERM_SFTP_SYMLINK_TARGET=/home/rusterm-test/work/symlink-target.txt \
     cargo test -p rusterm-ssh --test sftp_live live_sftp_round_trip -- --ignored --nocapture
+
+env \
+    HOME="$EMPTY_HOME" \
+    CARGO_HOME="$ORIGINAL_CARGO_HOME" \
+    RUSTUP_HOME="$ORIGINAL_RUSTUP_HOME" \
+    SSH_AUTH_SOCK= \
+    RUSTERM_LIVE_SSH_TEST=1 \
+    RUSTERM_LIVE_SSH_HOST=127.0.0.1 \
+    RUSTERM_LIVE_SSH_PORT="$PORT" \
+    RUSTERM_LIVE_SSH_USER=rusterm-test \
+    RUSTERM_LIVE_SSH_PASS=rusterm-test-only \
+    cargo test -p rusterm-ssh --test live_pwdwd_scenario -- --ignored --nocapture
