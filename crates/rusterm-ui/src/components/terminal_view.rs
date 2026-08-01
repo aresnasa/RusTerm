@@ -2211,9 +2211,9 @@ pub fn TerminalView(
 mod tests {
     use super::{
         ClipboardCopyOutcome, CopyShortcut, OneKeyKeyAction, TerminalOverlayKeyAction,
-        TextSelection, cell_style, color_to_css, copy_text_to_clipboard, event_cell_from_coords,
-        onekey_popup_key_action, scroll_thumb_geometry, terminal_overlay_key_action,
-        terminal_selection_text, word_range_in_row,
+        TextSelection, cell_style, color_to_css, copy_text_to_clipboard, cursor_key_seq,
+        event_cell_from_coords, onekey_popup_key_action, scroll_thumb_geometry,
+        terminal_overlay_key_action, terminal_selection_text, word_range_in_row,
     };
     use dioxus::prelude::Key;
     use rusterm_core::terminal::{CellColor, RenderCell, RenderRow};
