@@ -2031,20 +2031,20 @@ pub fn TerminalView(
                                 align-items: center;
                                 gap: 8px;
                                 padding: 6px 10px;
-                                background: #24283b;
-                                border-bottom: 1px solid #2a2b3d;
+                                background: var(--skin-surface);
+                                border-bottom: 1px solid var(--skin-border);
                                 border-radius: 4px 4px 0 0;
                             ",
-                            span { style: "color: #565f89; font-size: 12px; white-space: nowrap;", "Find:" }
+                            span { style: "color: var(--skin-text-muted); font-size: 12px; white-space: nowrap;", "Find:" }
                             input {
                                 r#type: "text",
                                 value: "{query}",
                                 style: "
                                     flex: 1;
-                                    background: #1a1b26;
-                                    border: 1px solid #2a2b3d;
+                                    background: var(--skin-bg);
+                                    border: 1px solid var(--skin-border);
                                     border-radius: 3px;
-                                    color: #c0caf5;
+                                    color: var(--skin-text);
                                     padding: 3px 8px;
                                     font-size: 12px;
                                     font-family: 'JetBrains Mono', monospace;
@@ -2070,9 +2070,9 @@ pub fn TerminalView(
                                     }
                                 },
                             }
-                            span { style: "color: #565f89; font-size: 11px; white-space: nowrap; min-width: 60px; text-align: right;", "{match_info}" }
+                            span { style: "color: var(--skin-text-muted); font-size: 11px; white-space: nowrap; min-width: 60px; text-align: right;", "{match_info}" }
                             button {
-                                style: "background:none;border:none;color:#565f89;cursor:pointer;font-size:14px;padding:0 4px;",
+                                style: "background:none;border:none;color:var(--skin-text-muted);cursor:pointer;font-size:14px;padding:0 4px;",
                                 onclick: move |_| {
                                     let matches = search_matches();
                                     if !matches.is_empty() {
@@ -2083,7 +2083,7 @@ pub fn TerminalView(
                                 "\u{25BC}"
                             }
                             button {
-                                style: "background:none;border:none;color:#565f89;cursor:pointer;font-size:14px;padding:0 4px;",
+                                style: "background:none;border:none;color:var(--skin-text-muted);cursor:pointer;font-size:14px;padding:0 4px;",
                                 onclick: move |_| {
                                     let matches = search_matches();
                                     if !matches.is_empty() {
@@ -2094,7 +2094,7 @@ pub fn TerminalView(
                                 "\u{25B2}"
                             }
                             button {
-                                style: "background:none;border:none;color:#565f89;cursor:pointer;font-size:14px;padding:0 4px;",
+                                style: "background:none;border:none;color:var(--skin-text-muted);cursor:pointer;font-size:14px;padding:0 4px;",
                                 onclick: move |_| {
                                     search_visible.set(false);
                                     search_query.set(String::new());
@@ -2177,7 +2177,7 @@ pub fn TerminalView(
                 Some(OneKeySubmissionFeedback::Submitted { .. })
             ) {
                 div {
-                    style: "position:absolute;right:10px;top:var(--suggestion-top, 2em);z-index:19;padding:5px 9px;background:#1a1b26;border:1px solid #9ece6a;border-radius:4px;color:#9ece6a;font-size:11px;pointer-events:none;",
+                    style: "position:absolute;right:10px;top:var(--suggestion-top, 2em);z-index:19;padding:5px 9px;background:var(--skin-bg);border:1px solid var(--skin-success);border-radius:4px;color:var(--skin-success);font-size:11px;pointer-events:none;",
                     "Credential sent · input hidden by remote"
                 }
             }

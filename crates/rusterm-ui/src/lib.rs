@@ -5,6 +5,7 @@ pub mod components;
 pub mod keybindings;
 pub mod layout;
 pub mod layout_state;
+pub mod skin;
 pub mod state;
 
 pub use app::App;

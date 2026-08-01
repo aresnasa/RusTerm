@@ -1,9 +1,29 @@
 use dioxus::prelude::*;
 
 use rusterm_core::FocusedTabAppearance;
-use rusterm_core::config::{KeybindingAction, Keybindings};
+use rusterm_core::config::{KeybindingAction, Keybindings, SkinKind, SkinSettings};
 
 use crate::keybindings::{event_chord, format_key_chord};
+
+#[component]
+fn SkinColorField(label: &'static str, value: String, on_change: EventHandler<String>) -> Element {
+    rsx! {
+        div {
+            style: "display:flex;align-items:center;justify-content:space-between;gap:12px;",
+            label { style: "font-size:12px;color:var(--skin-text);", "{label}" }
+            div {
+                style: "display:flex;align-items:center;gap:8px;",
+                input {
+                    r#type: "color",
+                    value: "{value}",
+                    style: "width:34px;height:26px;padding:1px;border:1px solid var(--skin-border-strong);border-radius:4px;background:var(--skin-bg);cursor:pointer;",
+                    oninput: move |event| on_change.call(event.value()),
+                }
+                code { style: "min-width:64px;color:var(--skin-text);font-size:11px;", "{value}" }
+            }
+        }
+    }
+}
 
 /// Settings dialog: appearance + suggestion preferences.
 ///
@@ -26,6 +46,8 @@ pub fn SettingsDialog(
     on_save_suggestions: EventHandler<(bool, u8)>,
     #[props(default)] keybindings: Keybindings,
     #[props(default)] on_save_keybindings: EventHandler<Keybindings>,
+    #[props(default)] skin: SkinSettings,
+    #[props(default)] on_save_skin: EventHandler<SkinSettings>,
 ) -> Element {
     let mut draft = use_signal(|| appearance.normalized());
     let preview = draft().normalized();
@@ -39,6 +61,8 @@ pub fn SettingsDialog(
     let mut sug_enabled = use_signal(|| suggestion_enabled);
     let mut sug_count = use_signal(|| suggestion_count);
     let mut keybinding_draft = use_signal(|| keybindings.normalized());
+    let mut skin_draft = use_signal(|| skin.normalized());
+    let skin_preview = skin_draft().palette();
     let mut capturing_keybinding: Signal<Option<KeybindingAction>> = use_signal(|| None);
     let mut keybinding_error: Signal<Option<String>> = use_signal(|| None);
 
@@ -47,11 +71,11 @@ pub fn SettingsDialog(
             style: "position: fixed; inset: 0; background: rgba(0,0,0,0.6); display: flex; justify-content: center; align-items: center; z-index: 1000;",
 
             div {
-                style: "background: #24283b; border-radius: 8px; padding: 24px; width: 460px; max-height: 85vh; overflow-y: auto; color: #c0caf5; box-shadow: 0 12px 36px rgba(0,0,0,0.45);",
+                style: "background: var(--skin-surface); border-radius: 8px; padding: 24px; width: 460px; max-height: 85vh; overflow-y: auto; color: var(--skin-text); box-shadow: 0 12px 36px rgba(0,0,0,0.45);",
 
                 h3 { style: "margin: 0 0 6px; font-size: 16px;", "Appearance" }
                 p {
-                    style: "margin: 0 0 20px; color: #7f849c; font-size: 12px; line-height: 1.5;",
+                    style: "margin: 0 0 20px; color: var(--skin-text-muted); font-size: 12px; line-height: 1.5;",
                     "Customize the complete outline around the top tab for the focused pane."
                 }
 
@@ -60,17 +84,17 @@ pub fn SettingsDialog(
 
                     div {
                         style: "display: flex; align-items: center; justify-content: space-between; gap: 16px;",
-                        label { style: "font-size: 12px; color: #a9b1d6;", "Outline color" }
+                        label { style: "font-size: 12px; color: var(--skin-text);", "Outline color" }
                         div {
                             style: "display: flex; align-items: center; gap: 8px;",
                             input {
                                 r#type: "color",
                                 value: "{draft().border_color}",
-                                style: "width: 38px; height: 28px; padding: 2px; border: 1px solid #414868; border-radius: 4px; background: #1a1b26; cursor: pointer;",
+                                style: "width: 38px; height: 28px; padding: 2px; border: 1px solid var(--skin-border-strong); border-radius: 4px; background: var(--skin-bg); cursor: pointer;",
                                 oninput: move |e| draft.write().border_color = e.value(),
                             }
                             code {
-                                style: "min-width: 64px; color: #c0caf5; font-size: 12px;",
+                                style: "min-width: 64px; color: var(--skin-text); font-size: 12px;",
                                 "{draft().border_color}"
                             }
                         }
@@ -78,7 +102,7 @@ pub fn SettingsDialog(
 
                     div {
                         style: "display: flex; align-items: center; justify-content: space-between; gap: 16px;",
-                        label { style: "font-size: 12px; color: #a9b1d6;", "Outline width" }
+                        label { style: "font-size: 12px; color: var(--skin-text);", "Outline width" }
                         div {
                             style: "display: flex; align-items: center; gap: 10px;",
                             input {
@@ -99,7 +123,7 @@ pub fn SettingsDialog(
 
                     div {
                         style: "display: flex; align-items: center; justify-content: space-between; gap: 16px;",
-                        label { style: "font-size: 12px; color: #a9b1d6;", "Corner radius" }
+                        label { style: "font-size: 12px; color: var(--skin-text);", "Corner radius" }
                         div {
                             style: "display: flex; align-items: center; gap: 10px;",
                             input {
@@ -119,16 +143,74 @@ pub fn SettingsDialog(
                     }
 
                     div {
-                        style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 6px; padding: 14px;",
-                        div { style: "margin-bottom: 10px; color: #7f849c; font-size: 11px;", "Preview" }
+                        style: "background: var(--skin-bg); border: 1px solid var(--skin-border); border-radius: 6px; padding: 14px;",
+                        div { style: "margin-bottom: 10px; color: var(--skin-text-muted); font-size: 11px;", "Preview" }
                         div {
-                            style: "height: 36px; display: flex; align-items: stretch; border-bottom: 1px solid #2a2b3d;",
+                            style: "height: 36px; display: flex; align-items: stretch; border-bottom: 1px solid var(--skin-border);",
                             div {
-                                style: "display: flex; align-items: center; gap: 6px; padding: 0 12px; color: #c0caf5; background: #24283b; border-bottom: 2px solid #7aa2f7; box-shadow: {preview_shadow}; border-radius: {preview_radius}; font-size: 12px;",
-                                span { style: "width: 6px; height: 6px; border-radius: 50%; background: #7aa2f7;" }
+                                style: "display: flex; align-items: center; gap: 6px; padding: 0 12px; color: var(--skin-text); background: var(--skin-surface); border-bottom: 2px solid var(--skin-accent); box-shadow: {preview_shadow}; border-radius: {preview_radius}; font-size: 12px;",
+                                span { style: "width: 6px; height: 6px; border-radius: 50%; background: var(--skin-accent);" }
                                 "Focused session"
                             }
                         }
+                    }
+                }
+
+                // ── Application skin ────────────────────────────────────────
+                h3 { style: "margin:24px 0 6px;font-size:16px;", "Application skin" }
+                p {
+                    style: "margin:0 0 12px;color:var(--skin-text-muted);font-size:12px;line-height:1.5;",
+                    "Choose a built-in skin or tune the Custom palette. This changes application chrome only; terminal ANSI and xterm colors remain independent."
+                }
+                div {
+                    style: "display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px;",
+                    for kind in SkinKind::ALL {
+                        {
+                            let selected = skin_draft().kind == kind;
+                            let background = if selected { "var(--skin-accent)" } else { "var(--skin-bg)" };
+                            let color = if selected { "var(--skin-bg)" } else { "var(--skin-text)" };
+                            let border = if selected { "var(--skin-accent)" } else { "var(--skin-border-strong)" };
+                            let label = kind.label();
+                            rsx! {
+                                button {
+                                    key: "skin-{label}",
+                                    style: "background:{background};color:{color};border:1px solid {border};border-radius:4px;padding:5px 9px;cursor:pointer;font-size:11px;",
+                                    onclick: move |_| skin_draft.write().kind = kind,
+                                    "{label}"
+                                }
+                            }
+                        }
+                    }
+                }
+                div {
+                    style: "border:1px solid var(--skin-border);border-radius:6px;overflow:hidden;margin-bottom:12px;",
+                    div {
+                        style: "background:{skin_preview.background};color:{skin_preview.text};padding:10px;display:flex;align-items:center;justify-content:space-between;",
+                        span { style: "font-size:12px;font-weight:600;", "Skin preview" }
+                        span { style: "font-size:11px;color:{skin_preview.text_muted};", "{skin_draft().kind.label()}" }
+                    }
+                    div {
+                        style: "background:{skin_preview.surface};color:{skin_preview.text};padding:9px;display:flex;align-items:center;gap:8px;",
+                        span { style: "width:8px;height:8px;border-radius:50%;background:{skin_preview.success};" }
+                        span { style: "font-size:11px;", "Connected" }
+                        button { style: "margin-left:auto;background:{skin_preview.accent};color:{skin_preview.background};border:0;border-radius:3px;padding:3px 7px;font-size:10px;", "Action" }
+                    }
+                }
+                if skin_draft().kind == SkinKind::Custom {
+                    div {
+                        style: "display:flex;flex-direction:column;gap:8px;background:var(--skin-bg);border:1px solid var(--skin-border);border-radius:6px;padding:12px;margin-bottom:12px;",
+                        SkinColorField { label: "Background", value: skin_draft().custom.background.clone(), on_change: move |value| skin_draft.write().custom.background = value }
+                        SkinColorField { label: "Surface", value: skin_draft().custom.surface.clone(), on_change: move |value| skin_draft.write().custom.surface = value }
+                        SkinColorField { label: "Surface hover", value: skin_draft().custom.surface_hover.clone(), on_change: move |value| skin_draft.write().custom.surface_hover = value }
+                        SkinColorField { label: "Border", value: skin_draft().custom.border.clone(), on_change: move |value| skin_draft.write().custom.border = value }
+                        SkinColorField { label: "Strong border", value: skin_draft().custom.border_strong.clone(), on_change: move |value| skin_draft.write().custom.border_strong = value }
+                        SkinColorField { label: "Text", value: skin_draft().custom.text.clone(), on_change: move |value| skin_draft.write().custom.text = value }
+                        SkinColorField { label: "Muted text", value: skin_draft().custom.text_muted.clone(), on_change: move |value| skin_draft.write().custom.text_muted = value }
+                        SkinColorField { label: "Accent", value: skin_draft().custom.accent.clone(), on_change: move |value| skin_draft.write().custom.accent = value }
+                        SkinColorField { label: "Secondary accent", value: skin_draft().custom.accent_secondary.clone(), on_change: move |value| skin_draft.write().custom.accent_secondary = value }
+                        SkinColorField { label: "Success", value: skin_draft().custom.success.clone(), on_change: move |value| skin_draft.write().custom.success = value }
+                        SkinColorField { label: "Warning", value: skin_draft().custom.warning.clone(), on_change: move |value| skin_draft.write().custom.warning = value }
+                        SkinColorField { label: "Danger", value: skin_draft().custom.danger.clone(), on_change: move |value| skin_draft.write().custom.danger = value }
                     }
                 }
 
@@ -138,7 +220,7 @@ pub fn SettingsDialog(
                     "Command suggestions"
                 }
                 p {
-                    style: "margin: 0 0 16px; color: #7f849c; font-size: 12px; line-height: 1.5;",
+                    style: "margin: 0 0 16px; color: var(--skin-text-muted); font-size: 12px; line-height: 1.5;",
                     "Inline fish-style suggestions based on your command history."
                 }
 
@@ -148,17 +230,17 @@ pub fn SettingsDialog(
                     // Enable / disable toggle
                     div {
                         style: "display: flex; align-items: center; justify-content: space-between; gap: 16px;",
-                        label { style: "font-size: 12px; color: #a9b1d6;", "Enable suggestions" }
+                        label { style: "font-size: 12px; color: var(--skin-text);", "Enable suggestions" }
                         div {
                             style: "display: flex; align-items: center; gap: 8px;",
                             input {
                                 r#type: "checkbox",
                                 checked: "{sug_enabled()}",
-                                style: "width: 16px; height: 16px; cursor: pointer; accent-color: #7aa2f7;",
+                                style: "width: 16px; height: 16px; cursor: pointer; accent-color: var(--skin-accent);",
                                 onchange: move |e| sug_enabled.set(e.checked()),
                             }
                             span {
-                                style: "font-size: 11px; color: #565f89;",
+                                style: "font-size: 11px; color: var(--skin-text-muted);",
                                 {sug_enabled().then_some("ON").unwrap_or("OFF")}
                             }
                         }
@@ -167,15 +249,15 @@ pub fn SettingsDialog(
                     // Suggestion count selector (3 / 5 / 10)
                     div {
                         style: "display: flex; align-items: center; justify-content: space-between; gap: 16px;",
-                        label { style: "font-size: 12px; color: #a9b1d6;", "Max suggestions shown" }
+                        label { style: "font-size: 12px; color: var(--skin-text);", "Max suggestions shown" }
                         div {
                             style: "display: flex; gap: 6px;",
                             for &count in &[3u8, 5, 10] {
                                 {
                                     let is_active = sug_count() == count;
-                                    let bg = if is_active { "#7aa2f7" } else { "#1a1b26" };
-                                    let color = if is_active { "#1a1b26" } else { "#a9b1d6" };
-                                    let border = if is_active { "#7aa2f7" } else { "#414868" };
+                                    let bg = if is_active { "var(--skin-accent)" } else { "var(--skin-bg)" };
+                                    let color = if is_active { "var(--skin-bg)" } else { "var(--skin-text)" };
+                                    let border = if is_active { "var(--skin-accent)" } else { "var(--skin-border-strong)" };
                                     let weight = if is_active { "600" } else { "400" };
                                     rsx! {
                                         button {
@@ -192,7 +274,7 @@ pub fn SettingsDialog(
 
                     // Description of the current selection
                     div {
-                        style: "font-size: 11px; color: #565f89; line-height: 1.5;",
+                        style: "font-size: 11px; color: var(--skin-text-muted); line-height: 1.5;",
                         {
                             let c = sug_count();
                             let desc = match c {
@@ -211,7 +293,7 @@ pub fn SettingsDialog(
                     "Keyboard shortcuts"
                 }
                 p {
-                    style: "margin: 0 0 12px; color: #7f849c; font-size: 12px; line-height: 1.5;",
+                    style: "margin: 0 0 12px; color: var(--skin-text-muted); font-size: 12px; line-height: 1.5;",
                     "Click a shortcut, then press a new combination. Application shortcuts require Cmd/Ctrl + Shift so standard terminal controls remain available."
                 }
                 div {
@@ -225,16 +307,16 @@ pub fn SettingsDialog(
                             } else {
                                 format_key_chord(keybinding_draft().chord(action))
                             };
-                            let button_border = if is_capturing { "#7aa2f7" } else { "#414868" };
-                            let button_bg = if is_capturing { "#2f3b5f" } else { "#1a1b26" };
+                            let button_border = if is_capturing { "var(--skin-accent)" } else { "var(--skin-border-strong)" };
+                            let button_bg = if is_capturing { "var(--skin-surface-hover)" } else { "var(--skin-bg)" };
                             rsx! {
                                 div {
                                     key: "keybinding-{action_label}",
                                     style: "display: flex; align-items: center; justify-content: space-between; gap: 12px;",
-                                    span { style: "font-size: 12px; color: #a9b1d6;", "{action_label}" }
+                                    span { style: "font-size: 12px; color: var(--skin-text);", "{action_label}" }
                                     div { style: "display: flex; align-items: center; gap: 6px;",
                                         button {
-                                            style: "min-width: 146px; background: {button_bg}; border: 1px solid {button_border}; color: #c0caf5; border-radius: 4px; padding: 6px 8px; cursor: pointer; font-family: 'JetBrains Mono', monospace; font-size: 12px;",
+                                            style: "min-width: 146px; background: {button_bg}; border: 1px solid {button_border}; color: var(--skin-text); border-radius: 4px; padding: 6px 8px; cursor: pointer; font-family: 'JetBrains Mono', monospace; font-size: 12px;",
                                             onclick: move |_| {
                                                 capturing_keybinding.set(Some(action));
                                                 keybinding_error.set(None);
@@ -280,7 +362,7 @@ pub fn SettingsDialog(
                                             "{chord_label}"
                                         }
                                         button {
-                                            style: "background: transparent; border: 1px solid #414868; color: #7f849c; border-radius: 4px; padding: 5px 7px; cursor: pointer; font-size: 11px;",
+                                            style: "background: transparent; border: 1px solid var(--skin-border-strong); color: var(--skin-text-muted); border-radius: 4px; padding: 5px 7px; cursor: pointer; font-size: 11px;",
                                             onclick: move |_| {
                                                 keybinding_draft.write().set_chord(action, None);
                                                 if capturing_keybinding() == Some(action) {
@@ -296,19 +378,20 @@ pub fn SettingsDialog(
                         }
                     }
                     if let Some(error) = keybinding_error() {
-                        div { style: "font-size: 11px; color: #f7768e; margin-top: 2px;", "{error}" }
+                        div { style: "font-size: 11px; color: var(--skin-danger); margin-top: 2px;", "{error}" }
                     }
                 }
 
                 div {
                     style: "display: flex; justify-content: space-between; gap: 8px; margin-top: 20px;",
                     button {
-                        style: "background: transparent; border: 1px solid #414868; color: #a9b1d6; border-radius: 4px; padding: 8px 12px; cursor: pointer; font-size: 12px;",
+                        style: "background: transparent; border: 1px solid var(--skin-border-strong); color: var(--skin-text); border-radius: 4px; padding: 8px 12px; cursor: pointer; font-size: 12px;",
                         onclick: move |_| {
                             draft.set(FocusedTabAppearance::default());
                             sug_enabled.set(true);
                             sug_count.set(3);
                             keybinding_draft.set(Keybindings::default());
+                            skin_draft.set(SkinSettings::default());
                             capturing_keybinding.set(None);
                             keybinding_error.set(None);
                         },
@@ -317,16 +400,17 @@ pub fn SettingsDialog(
                     div {
                         style: "display: flex; gap: 8px;",
                         button {
-                            style: "background: transparent; border: 1px solid #2a2b3d; color: #c0caf5; border-radius: 4px; padding: 8px 16px; cursor: pointer; font-size: 13px;",
+                            style: "background: transparent; border: 1px solid var(--skin-border); color: var(--skin-text); border-radius: 4px; padding: 8px 16px; cursor: pointer; font-size: 13px;",
                             onclick: move |_| on_close.call(()),
                             "Cancel"
                         }
                         button {
-                            style: "background: #7aa2f7; border: none; color: #1a1b26; border-radius: 4px; padding: 8px 16px; cursor: pointer; font-size: 13px; font-weight: 600;",
+                            style: "background: var(--skin-accent); border: none; color: var(--skin-bg); border-radius: 4px; padding: 8px 16px; cursor: pointer; font-size: 13px; font-weight: 600;",
                             onclick: move |_| {
                                 on_save.call(draft().normalized());
                                 on_save_suggestions.call((sug_enabled(), sug_count()));
                                 on_save_keybindings.call(keybinding_draft().normalized());
+                                on_save_skin.call(skin_draft().normalized());
                             },
                             "Save"
                         }

@@ -115,8 +115,8 @@ pub fn TabBar(
         div {
             style: "
                 display: flex;
-                background: #1a1b26;
-                border-bottom: 1px solid #2a2b3d;
+                background: var(--skin-bg);
+                border-bottom: 1px solid var(--skin-border);
                 height: 36px;
                 align-items: stretch;
                 overflow-x: auto;
@@ -130,7 +130,7 @@ pub fn TabBar(
                     let is_hover = hover_tab() == Some(tab.id.clone());
                     let color = session_type_color(&kind);
                     let _label = session_type_label(&kind);
-                    let bg = if is_active { "#24283b" } else if is_hover { "#1f2335" } else { "transparent" };
+                    let bg = if is_active { "var(--skin-surface)" } else if is_hover { "var(--skin-surface-hover)" } else { "transparent" };
                     let border_bottom = if is_active { format!("2px solid {color}") } else { "2px solid transparent".to_string() };
                     let (pane_focus_shadow, pane_focus_radius) =
                         focused_tab_chrome(is_pane_focused, &focused_appearance);
@@ -161,7 +161,7 @@ pub fn TabBar(
                                 padding: 0 12px;
                                 cursor: pointer;
                                 font-size: 12px;
-                                color: #c0caf5;
+                                color: var(--skin-text);
                                 background: {bg};
                                 border-bottom: {border_bottom};
                                 box-shadow: {pane_focus_shadow};
@@ -224,7 +224,7 @@ pub fn TabBar(
                                     style: "
                                         background: none;
                                         border: none;
-                                        color: #565f89;
+                                        color: var(--skin-text-muted);
                                         cursor: pointer;
                                         font-size: 12px;
                                         padding: 2px 4px;

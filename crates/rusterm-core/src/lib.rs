@@ -11,7 +11,9 @@ pub mod terminal;
 pub mod window_state;
 
 pub use command_safety::{CommandSafetyChecker, SafetyVerdict};
-pub use config::{ConnectionConfig, FocusedTabAppearance, HostConfig};
+pub use config::{
+    ConnectionConfig, FocusedTabAppearance, HostConfig, SkinKind, SkinPalette, SkinSettings,
+};
 pub use config_manager::ConfigManager;
 pub use event::{SessionEvent, TerminalEvent};
 pub use logging::{LogGuard, init_logging, log_dir, redact};

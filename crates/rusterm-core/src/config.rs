@@ -198,6 +198,238 @@ impl FocusedTabAppearance {
     }
 }
 
+/// Palette for the non-terminal application chrome. Each value is restricted
+/// to a hexadecimal CSS color before it is interpolated into the UI.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkinPalette {
+    #[serde(default = "default_skin_background")]
+    pub background: String,
+    #[serde(default = "default_skin_surface")]
+    pub surface: String,
+    #[serde(default = "default_skin_surface_hover")]
+    pub surface_hover: String,
+    #[serde(default = "default_skin_border")]
+    pub border: String,
+    #[serde(default = "default_skin_border_strong")]
+    pub border_strong: String,
+    #[serde(default = "default_skin_text")]
+    pub text: String,
+    #[serde(default = "default_skin_text_muted")]
+    pub text_muted: String,
+    #[serde(default = "default_skin_accent")]
+    pub accent: String,
+    #[serde(default = "default_skin_accent_secondary")]
+    pub accent_secondary: String,
+    #[serde(default = "default_skin_success")]
+    pub success: String,
+    #[serde(default = "default_skin_warning")]
+    pub warning: String,
+    #[serde(default = "default_skin_danger")]
+    pub danger: String,
+}
+
+impl Default for SkinPalette {
+    fn default() -> Self {
+        Self::tokyo_night()
+    }
+}
+
+impl SkinPalette {
+    pub fn tokyo_night() -> Self {
+        Self {
+            background: default_skin_background(),
+            surface: default_skin_surface(),
+            surface_hover: default_skin_surface_hover(),
+            border: default_skin_border(),
+            border_strong: default_skin_border_strong(),
+            text: default_skin_text(),
+            text_muted: default_skin_text_muted(),
+            accent: default_skin_accent(),
+            accent_secondary: default_skin_accent_secondary(),
+            success: default_skin_success(),
+            warning: default_skin_warning(),
+            danger: default_skin_danger(),
+        }
+    }
+
+    pub fn one_dark() -> Self {
+        Self {
+            background: "#282c34".to_string(),
+            surface: "#21252b".to_string(),
+            surface_hover: "#2c313c".to_string(),
+            border: "#3e4451".to_string(),
+            border_strong: "#5c6370".to_string(),
+            text: "#abb2bf".to_string(),
+            text_muted: "#7f848e".to_string(),
+            accent: "#61afef".to_string(),
+            accent_secondary: "#c678dd".to_string(),
+            success: "#98c379".to_string(),
+            warning: "#e5c07b".to_string(),
+            danger: "#e06c75".to_string(),
+        }
+    }
+
+    pub fn solarized_dark() -> Self {
+        Self {
+            background: "#002b36".to_string(),
+            surface: "#073642".to_string(),
+            surface_hover: "#0b4351".to_string(),
+            border: "#164b57".to_string(),
+            border_strong: "#2a6572".to_string(),
+            text: "#93a1a1".to_string(),
+            text_muted: "#657b83".to_string(),
+            accent: "#268bd2".to_string(),
+            accent_secondary: "#6c71c4".to_string(),
+            success: "#859900".to_string(),
+            warning: "#b58900".to_string(),
+            danger: "#dc322f".to_string(),
+        }
+    }
+
+    /// Normalize colors originating from manually edited settings files before
+    /// using them in an inline style string.
+    pub fn normalized(mut self) -> Self {
+        let fallback = Self::default();
+        for (value, default) in [
+            (&mut self.background, &fallback.background),
+            (&mut self.surface, &fallback.surface),
+            (&mut self.surface_hover, &fallback.surface_hover),
+            (&mut self.border, &fallback.border),
+            (&mut self.border_strong, &fallback.border_strong),
+            (&mut self.text, &fallback.text),
+            (&mut self.text_muted, &fallback.text_muted),
+            (&mut self.accent, &fallback.accent),
+            (&mut self.accent_secondary, &fallback.accent_secondary),
+            (&mut self.success, &fallback.success),
+            (&mut self.warning, &fallback.warning),
+            (&mut self.danger, &fallback.danger),
+        ] {
+            if !is_css_hex_color(value) {
+                *value = default.clone();
+            }
+        }
+        self
+    }
+}
+
+/// The selected built-in palette or the user-editable custom palette.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum SkinKind {
+    #[default]
+    TokyoNight,
+    OneDark,
+    SolarizedDark,
+    Custom,
+}
+
+impl SkinKind {
+    pub const ALL: [Self; 4] = [
+        Self::TokyoNight,
+        Self::OneDark,
+        Self::SolarizedDark,
+        Self::Custom,
+    ];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::TokyoNight => "Tokyo Night",
+            Self::OneDark => "One Dark",
+            Self::SolarizedDark => "Solarized Dark",
+            Self::Custom => "Custom",
+        }
+    }
+}
+
+/// Persisted application-chrome skin preferences. Terminal ANSI/xterm colors
+/// are intentionally separate and continue to be controlled by the terminal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SkinSettings {
+    #[serde(default)]
+    pub kind: SkinKind,
+    #[serde(default)]
+    pub custom: SkinPalette,
+}
+
+impl Default for SkinSettings {
+    fn default() -> Self {
+        Self {
+            kind: SkinKind::TokyoNight,
+            custom: SkinPalette::default(),
+        }
+    }
+}
+
+impl SkinSettings {
+    pub fn palette(&self) -> SkinPalette {
+        match self.kind {
+            SkinKind::TokyoNight => SkinPalette::tokyo_night(),
+            SkinKind::OneDark => SkinPalette::one_dark(),
+            SkinKind::SolarizedDark => SkinPalette::solarized_dark(),
+            SkinKind::Custom => self.custom.clone().normalized(),
+        }
+    }
+
+    pub fn normalized(mut self) -> Self {
+        self.custom = self.custom.normalized();
+        self
+    }
+}
+
+fn is_css_hex_color(value: &str) -> bool {
+    matches!(value.len(), 4 | 7)
+        && value.starts_with('#')
+        && value[1..].bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn default_skin_background() -> String {
+    "#1a1b26".to_string()
+}
+
+fn default_skin_surface() -> String {
+    "#24283b".to_string()
+}
+
+fn default_skin_surface_hover() -> String {
+    "#1f2335".to_string()
+}
+
+fn default_skin_border() -> String {
+    "#2a2b3d".to_string()
+}
+
+fn default_skin_border_strong() -> String {
+    "#414868".to_string()
+}
+
+fn default_skin_text() -> String {
+    "#c0caf5".to_string()
+}
+
+fn default_skin_text_muted() -> String {
+    "#7f849c".to_string()
+}
+
+fn default_skin_accent() -> String {
+    "#7aa2f7".to_string()
+}
+
+fn default_skin_accent_secondary() -> String {
+    "#bb9af7".to_string()
+}
+
+fn default_skin_success() -> String {
+    "#9ece6a".to_string()
+}
+
+fn default_skin_warning() -> String {
+    "#e0af68".to_string()
+}
+
+fn default_skin_danger() -> String {
+    "#f7768e".to_string()
+}
+
 fn default_focused_tab_border_color() -> String {
     "#c0caf5".to_string()
 }
@@ -473,6 +705,10 @@ pub struct PersistedConfig {
     /// means the established defaults are used.
     #[serde(default)]
     pub keybindings: Keybindings,
+    /// Application-chrome skin. Missing in legacy settings files means Tokyo
+    /// Night remains the default.
+    #[serde(default)]
+    pub skin: SkinSettings,
 }
 
 /// Default for `PersistedConfig::confirm_close_on_exit`. Kept as a function
@@ -779,6 +1015,23 @@ mod tests {
     }
 
     #[test]
+    fn skin_defaults_for_legacy_settings_and_normalizes_custom_colors() {
+        let config: PersistedConfig =
+            serde_json::from_str(r#"{"version":1,"connections":[]}"#).unwrap();
+        assert_eq!(config.skin, SkinSettings::default());
+
+        let skin = SkinSettings {
+            kind: SkinKind::Custom,
+            custom: SkinPalette {
+                accent: "not-a-color;display:none".to_string(),
+                ..SkinPalette::default()
+            },
+        }
+        .normalized();
+        assert_eq!(skin.custom.accent, SkinPalette::default().accent);
+    }
+
+    #[test]
     fn keybindings_normalize_unsafe_manual_values() {
         let keybindings = Keybindings {
             close_focused_pane: Some(KeyChord {
@@ -825,6 +1078,7 @@ mod tests {
             suggestion_count: 10,
             sidebar: SidebarPreferences::default(),
             keybindings: Keybindings::default(),
+            skin: SkinSettings::default(),
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: PersistedConfig = serde_json::from_str(&json).unwrap();

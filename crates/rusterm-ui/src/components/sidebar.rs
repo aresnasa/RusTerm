@@ -20,10 +20,10 @@ fn kind_label(kind: &ConnectionKind) -> &'static str {
 
 fn kind_color(kind: &ConnectionKind) -> &'static str {
     match kind {
-        ConnectionKind::Ssh(_) => "#7aa2f7",
-        ConnectionKind::Serial(_) => "#e0af68",
+        ConnectionKind::Ssh(_) => "var(--skin-accent)",
+        ConnectionKind::Serial(_) => "var(--skin-warning)",
         ConnectionKind::Telnet(_) => "#ff9e64",
-        ConnectionKind::Shell(_) => "#9ece6a",
+        ConnectionKind::Shell(_) => "var(--skin-success)",
         ConnectionKind::Tcp(_) => "#7dcfff",
     }
 }
@@ -141,7 +141,7 @@ pub fn Sidebar(
         .collect();
 
     let sidebar_style = format!(
-        "position:relative;width:min({}px,45vw);min-width:min({}px,45vw);max-width:min({}px,45vw);flex:0 0 min({}px,45vw);background:#1a1b26;border-right:1px solid #2a2b3d;display:flex;flex-direction:column;height:100%;color:#c0caf5;user-select:none;box-sizing:border-box;",
+        "position:relative;width:min({}px,45vw);min-width:min({}px,45vw);max-width:min({}px,45vw);flex:0 0 min({}px,45vw);background:var(--skin-bg);border-right:1px solid var(--skin-border);display:flex;flex-direction:column;height:100%;color:var(--skin-text);user-select:none;box-sizing:border-box;",
         live_width(),
         MIN_SIDEBAR_WIDTH_PX,
         MAX_SIDEBAR_WIDTH_PX,
@@ -152,7 +152,11 @@ pub fn Sidebar(
     } else {
         "Show hidden connections"
     };
-    let hidden_button_color = if show_hidden() { "#7aa2f7" } else { "#787c99" };
+    let hidden_button_color = if show_hidden() {
+        "var(--skin-accent)"
+    } else {
+        "var(--skin-text-muted)"
+    };
 
     let prefs_for_create_key = normalized_preferences.clone();
     let prefs_for_create_click = normalized_preferences.clone();
@@ -164,19 +168,19 @@ pub fn Sidebar(
 
     rsx! {
         style { "
-            .sidebar-icon-button{{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;padding:0;border:1px solid #2a2b3d;border-radius:4px;background:transparent;color:#a9b1d6;cursor:pointer;}}
-            .sidebar-icon-button:hover{{background:#24283b;color:#7aa2f7;border-color:#414868;}}
+            .sidebar-icon-button{{display:inline-flex;align-items:center;justify-content:center;width:26px;height:26px;padding:0;border:1px solid var(--skin-border);border-radius:4px;background:transparent;color:var(--skin-text);cursor:pointer;}}
+            .sidebar-icon-button:hover{{background:var(--skin-surface);color:var(--skin-accent);border-color:var(--skin-border-strong);}}
             .conn-icons{{opacity:0;transition:opacity .12s;display:flex;gap:1px;align-items:center;}}
             .conn-item:hover .conn-icons{{opacity:1;}}
-            .conn-row-action{{display:inline-flex;align-items:center;justify-content:center;color:#787c99;cursor:pointer;padding:2px;}}
-            .conn-row-action:hover{{color:#7aa2f7;}}
-            .ctx-item{{padding:6px 12px;font-size:12px;cursor:pointer;color:#c0caf5;display:flex;align-items:center;gap:8px;white-space:nowrap;}}
-            .ctx-item:hover{{background:#2a2b3d;}}
-            .ctx-label{{padding:7px 12px 3px;font-size:10px;color:#565f89;text-transform:uppercase;letter-spacing:.5px;}}
-            .ctx-danger:hover{{color:#f7768e;}}
-            .sidebar-resize-handle:hover,.sidebar-resize-handle.active{{background:#7aa2f7;box-shadow:0 0 6px rgba(122,162,247,.55);}}
+            .conn-row-action{{display:inline-flex;align-items:center;justify-content:center;color:var(--skin-text-muted);cursor:pointer;padding:2px;}}
+            .conn-row-action:hover{{color:var(--skin-accent);}}
+            .ctx-item{{padding:6px 12px;font-size:12px;cursor:pointer;color:var(--skin-text);display:flex;align-items:center;gap:8px;white-space:nowrap;}}
+            .ctx-item:hover{{background:var(--skin-border);}}
+            .ctx-label{{padding:7px 12px 3px;font-size:10px;color:var(--skin-text-muted);text-transform:uppercase;letter-spacing:.5px;}}
+            .ctx-danger:hover{{color:var(--skin-danger);}}
+            .sidebar-resize-handle:hover,.sidebar-resize-handle.active{{background:var(--skin-accent);box-shadow:0 0 6px rgba(122,162,247,.55);}}
             .connection-group-header{{border:1px solid transparent;border-radius:4px;transition:background .1s,border-color .1s,color .1s;}}
-            .connection-group-header.connection-group-drop-target{{background:rgba(122,162,247,.16);border-color:#7aa2f7;color:#c0caf5;}}
+            .connection-group-header.connection-group-drop-target{{background:rgba(122,162,247,.16);border-color:var(--skin-accent);color:var(--skin-text);}}
         " }
 
         div {
@@ -212,7 +216,7 @@ pub fn Sidebar(
                     }
                     button {
                         class: "sidebar-icon-button",
-                        style: "background:#7aa2f7;color:#1a1b26;border-color:#7aa2f7;",
+                        style: "background:var(--skin-accent);color:var(--skin-bg);border-color:var(--skin-accent);",
                         title: "Create connection",
                         onclick: move |_| on_new.call(()),
                         Icon { name: IconName::Plus, size: 16 }
@@ -224,7 +228,7 @@ pub fn Sidebar(
                 div {
                     style: "padding:0 10px 8px;display:flex;gap:5px;",
                     input {
-                        style: "min-width:0;flex:1;background:#24283b;border:1px solid #414868;border-radius:4px;padding:6px 8px;color:#c0caf5;font-size:12px;outline:none;",
+                        style: "min-width:0;flex:1;background:var(--skin-surface);border:1px solid var(--skin-border-strong);border-radius:4px;padding:6px 8px;color:var(--skin-text);font-size:12px;outline:none;",
                         r#type: "text",
                         placeholder: "Group name",
                         value: "{new_group_name}",
@@ -263,11 +267,11 @@ pub fn Sidebar(
             div {
                 style: "padding:0 10px 8px;position:relative;",
                 span {
-                    style: "position:absolute;left:18px;top:7px;color:#565f89;display:inline-flex;pointer-events:none;",
+                    style: "position:absolute;left:18px;top:7px;color:var(--skin-text-muted);display:inline-flex;pointer-events:none;",
                     Icon { name: IconName::Search, size: 14 }
                 }
                 input {
-                    style: "width:100%;background:#24283b;border:1px solid #2a2b3d;border-radius:4px;padding:6px 8px 6px 28px;color:#c0caf5;font-size:12px;box-sizing:border-box;outline:none;",
+                    style: "width:100%;background:var(--skin-surface);border:1px solid var(--skin-border);border-radius:4px;padding:6px 8px 6px 28px;color:var(--skin-text);font-size:12px;box-sizing:border-box;outline:none;",
                     r#type: "text",
                     placeholder: "Search connections...",
                     value: "{search}",
@@ -298,7 +302,7 @@ pub fn Sidebar(
 
                 if !ungrouped.is_empty() {
                     div {
-                        style: "padding:5px 8px 3px;font-size:11px;color:#565f89;font-weight:600;text-transform:uppercase;letter-spacing:.5px;display:flex;align-items:center;gap:6px;",
+                        style: "padding:5px 8px 3px;font-size:11px;color:var(--skin-text-muted);font-weight:600;text-transform:uppercase;letter-spacing:.5px;display:flex;align-items:center;gap:6px;",
                         Icon { name: IconName::FolderOpen, size: 14 }
                         "Ungrouped ({ungrouped.len()})"
                     }
@@ -318,7 +322,7 @@ pub fn Sidebar(
 
                 if visible_connections.is_empty() {
                     div {
-                        style: "padding:24px 12px;text-align:center;color:#565f89;font-size:12px;white-space:pre-line;",
+                        style: "padding:24px 12px;text-align:center;color:var(--skin-text-muted);font-size:12px;white-space:pre-line;",
                         if !search_lower.is_empty() {
                             "No matching connections."
                         } else if hidden_count > 0 && !show_hidden() {
@@ -394,7 +398,7 @@ pub fn Sidebar(
                 onclick: move |_| context_menu.set(None),
             }
             div {
-                style: "position:fixed;top:{y}px;left:{x}px;z-index:3000;background:#24283b;border:1px solid #414868;border-radius:5px;padding:4px 0;min-width:180px;max-height:70vh;overflow-y:auto;box-shadow:0 6px 18px rgba(0,0,0,.5);",
+                style: "position:fixed;top:{y}px;left:{x}px;z-index:3000;background:var(--skin-surface);border:1px solid var(--skin-border-strong);border-radius:5px;padding:4px 0;min-width:180px;max-height:70vh;overflow-y:auto;box-shadow:0 6px 18px rgba(0,0,0,.5);",
                 div {
                     class: "ctx-item",
                     onclick: move |_| {
@@ -451,7 +455,7 @@ pub fn Sidebar(
                     }
                 }
 
-                div { style: "height:1px;background:#414868;margin:4px 0;" }
+                div { style: "height:1px;background:var(--skin-border-strong);margin:4px 0;" }
                 div { class: "ctx-label", "Move to group" }
                 div {
                     class: "ctx-item",
@@ -476,7 +480,7 @@ pub fn Sidebar(
                     }
                 }
 
-                div { style: "height:1px;background:#414868;margin:4px 0;" }
+                div { style: "height:1px;background:var(--skin-border-strong);margin:4px 0;" }
                 div {
                     class: "ctx-item ctx-danger",
                     onclick: move |_| {
@@ -516,7 +520,7 @@ fn ConnectionGroupSection(
         div {
             class: if is_drop_target { "connection-group-header connection-group-drop-target" } else { "connection-group-header" },
             "data-rusterm-group-id": "{group.id}",
-            style: "padding:5px 8px 3px;font-size:11px;color:#787c99;font-weight:600;text-transform:uppercase;letter-spacing:.5px;cursor:pointer;display:flex;align-items:center;gap:6px;",
+            style: "padding:5px 8px 3px;font-size:11px;color:var(--skin-text-muted);font-weight:600;text-transform:uppercase;letter-spacing:.5px;cursor:pointer;display:flex;align-items:center;gap:6px;",
             onclick: move |_| {
                 let mut updated = preferences_for_toggle.clone();
                 if let Some(group) = updated.groups.iter_mut().find(|group| group.id == group_id) {
@@ -594,10 +598,10 @@ fn ConnItem(
             span { style: "display:inline-flex;color:{color};flex-shrink:0;", Icon { name: icon, size: 15 } }
             span { style: "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;", "{conn.name}" }
             if hidden {
-                span { style: "display:inline-flex;color:#787c99;", Icon { name: IconName::EyeOff, size: 12 } }
+                span { style: "display:inline-flex;color:var(--skin-text-muted);", Icon { name: IconName::EyeOff, size: 12 } }
             }
             if conn.onekey {
-                span { style: "display:inline-flex;color:#9ece6a;", title: "OneKey enabled", Icon { name: IconName::Key, size: 12 } }
+                span { style: "display:inline-flex;color:var(--skin-success);", title: "OneKey enabled", Icon { name: IconName::Key, size: 12 } }
             }
             span {
                 class: "conn-icons",

@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::mpsc;
 
 use rusterm_core::config::{
-    ConnectionConfig, FocusedTabAppearance, Keybindings, OneKey, SidebarPreferences,
+    ConnectionConfig, FocusedTabAppearance, Keybindings, OneKey, SidebarPreferences, SkinSettings,
 };
 use rusterm_core::config_manager::ConfigManager;
 use rusterm_core::session::SessionType;
@@ -137,6 +137,8 @@ pub struct AppState {
     pub focused_tab_appearance: FocusedTabAppearance,
     #[serde(default)]
     pub keybindings: Keybindings,
+    #[serde(default)]
+    pub skin: SkinSettings,
     #[serde(skip)]
     pub close_senders: Vec<(String, mpsc::UnboundedSender<()>)>,
     #[serde(skip)]
@@ -500,6 +502,7 @@ impl Default for AppState {
             theme: Theme::Dark,
             focused_tab_appearance: FocusedTabAppearance::default(),
             keybindings: Keybindings::default(),
+            skin: SkinSettings::default(),
             close_senders: Vec::new(),
             resize_senders: HashMap::new(),
             config_manager: None,
@@ -635,12 +638,9 @@ impl AppState {
         state.save(master_key)
     }
 
-    /// Returns the current theme as a string name (for persistence).
+    /// Returns the selected application skin name for session persistence.
     pub fn theme_name(&self) -> &'static str {
-        match self.theme {
-            Theme::Dark => "Dark",
-            Theme::Light => "Light",
-        }
+        self.skin.kind.label()
     }
 
     // ── Pane-layout persistence ───────────────────────────────────────────
@@ -1155,18 +1155,29 @@ pub fn broadcast_targets(state: &AppState) -> Vec<String> {
     targets
 }
 
-/// Get the list of session IDs whose terminals should scroll together
-/// when the user scrolls in any pane (the synchronized-scroll half of
-/// comparison mode). Same contract as `broadcast_targets` but for scroll
-/// events: returns every non-empty pane session when comparison is on,
-/// or just the active session when comparison is off or no layout exists.
+/// Get the list of sessions whose terminals should move in response to a
+/// wheel event from `source_session_id`.
 ///
-/// This is a separate function from `broadcast_targets` because scroll
-/// sync and input broadcast are conceptually distinct (a future feature
-/// might want scroll sync without input broadcast, or vice versa), even
-/// though today they share the same `comparison` flag.
-pub fn scroll_sync_targets(state: &AppState) -> Vec<String> {
-    broadcast_targets(state)
+/// Comparison mode synchronizes every non-empty pane in the active layout.
+/// Otherwise the source pane scrolls locally. Unlike keyboard input routing,
+/// a wheel event must preserve its source pane when comparison mode is off:
+/// `active_tab` identifies the layout owner, not the currently focused pane.
+///
+/// This remains separate from `broadcast_targets` because scroll sync and
+/// input broadcast are conceptually distinct, even though they share the
+/// comparison flag today.
+pub fn scroll_sync_targets(state: &AppState, source_session_id: &str) -> Vec<String> {
+    let comparison_enabled = state
+        .active_tab
+        .as_ref()
+        .and_then(|id| state.layouts.get(id))
+        .is_some_and(|layout| layout.comparison);
+
+    if comparison_enabled {
+        broadcast_targets(state)
+    } else {
+        vec![source_session_id.to_string()]
+    }
 }
 
 // ======================================================================
@@ -3866,25 +3877,28 @@ mod tests {
     }
 
     #[test]
-    fn scroll_sync_targets_matches_broadcast_targets() {
-        // Today scroll sync and input broadcast share the same `comparison`
-        // flag, so scroll_sync_targets should return the same list as
-        // broadcast_targets. This test pins that contract — if they ever
-        // diverge (e.g., the user wants scroll sync without input
-        // broadcast), this test will need updating, forcing a conscious
-        // decision rather than a silent behavioural change.
+    fn scroll_sync_targets_matches_broadcast_targets_when_comparison_on() {
+        // With comparison mode enabled, wheel scrolling and PTY input target
+        // the same non-empty panes.
         let mut state = state_with_active_session(&["alpha", "beta", "gamma"]);
         apply_layout_preset(&mut state, LayoutPreset::Grid4);
         toggle_comparison_mode(&mut state);
-        assert_eq!(scroll_sync_targets(&state), broadcast_targets(&state));
+        assert_eq!(
+            scroll_sync_targets(&state, "beta"),
+            broadcast_targets(&state)
+        );
     }
 
     #[test]
-    fn scroll_sync_targets_returns_active_only_when_comparison_off() {
+    fn scroll_sync_targets_keeps_the_source_pane_when_comparison_off() {
         let mut state = state_with_active_session(&["alpha", "beta"]);
         apply_layout_preset(&mut state, LayoutPreset::Split2H);
-        // comparison off → only the active session scrolls.
-        assert_eq!(scroll_sync_targets(&state), vec!["alpha".to_string()]);
+        // A wheel event in pane beta must stay local while comparison is off;
+        // the active tab anchor (alpha) is not a focused-pane pointer.
+        assert_eq!(
+            scroll_sync_targets(&state, "beta"),
+            vec!["beta".to_string()]
+        );
     }
 
     // ------------------------------------------------------------------

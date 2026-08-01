@@ -11,7 +11,7 @@ use crate::config::{
     ConnectionConfig, ConnectionKind, DEFAULT_ONEKEY_PASSWORD_EXPECT, EncryptedValue,
     FocusedTabAppearance, Keybindings, OneKey, OneKeyStep, PersistedConfig, PersistedConnection,
     PersistedConnectionKind, PersistedOneKey, PersistedOneKeyStep, PersistedSshAuth,
-    PersistedSshConfig, SidebarPreferences, SshAuth, SshConfig,
+    PersistedSshConfig, SidebarPreferences, SkinSettings, SshAuth, SshConfig,
 };
 use rusterm_crypto::{KeyringStore, decrypt_data, encrypt_data};
 
@@ -253,6 +253,7 @@ impl ConfigManager {
             suggestion_count: existing.suggestion_count,
             sidebar: existing.sidebar,
             keybindings: existing.keybindings,
+            skin: existing.skin,
         };
 
         let json =
@@ -283,6 +284,7 @@ impl ConfigManager {
             suggestion_count: existing.suggestion_count,
             sidebar: existing.sidebar,
             keybindings: existing.keybindings,
+            skin: existing.skin,
         };
 
         let json =
@@ -320,6 +322,7 @@ impl ConfigManager {
             suggestion_count: existing.suggestion_count,
             sidebar: existing.sidebar,
             keybindings: existing.keybindings,
+            skin: existing.skin,
         };
 
         let json =
@@ -353,6 +356,39 @@ impl ConfigManager {
             suggestion_count: existing.suggestion_count,
             sidebar: existing.sidebar,
             keybindings: keybindings.clone().normalized(),
+            skin: existing.skin,
+        };
+        let json =
+            serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
+        let temp_path = self.config_path.with_extension("json.tmp");
+        fs::write(&temp_path, &json).context("Failed to write config file")?;
+        fs::rename(&temp_path, &self.config_path).context("Failed to rename temp config file")?;
+        Ok(())
+    }
+
+    /// Load the selected UI skin and normalize custom color values before they
+    /// are interpolated into inline application styles.
+    pub fn load_skin_settings(&self) -> SkinSettings {
+        self.read_persisted().skin.normalized()
+    }
+
+    /// Persist the application-chrome skin while preserving encrypted
+    /// connections, OneKeys, and every other setting.
+    pub fn save_skin_settings(&self, skin: &SkinSettings) -> Result<()> {
+        let existing = self.read_persisted();
+        let persisted = PersistedConfig {
+            version: CONFIG_VERSION,
+            connections: existing.connections,
+            onekeys: existing.onekeys,
+            master_password_hash: self.master_password_hash.clone(),
+            restore_disabled: existing.restore_disabled,
+            confirm_close_on_exit: existing.confirm_close_on_exit,
+            focused_tab_appearance: existing.focused_tab_appearance,
+            suggestion_enabled: existing.suggestion_enabled,
+            suggestion_count: existing.suggestion_count,
+            sidebar: existing.sidebar,
+            keybindings: existing.keybindings,
+            skin: skin.clone().normalized(),
         };
         let json =
             serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
@@ -392,6 +428,7 @@ impl ConfigManager {
             suggestion_count: count,
             sidebar: existing.sidebar,
             keybindings: existing.keybindings,
+            skin: existing.skin,
         };
 
         let json =
@@ -425,6 +462,7 @@ impl ConfigManager {
             suggestion_count: existing.suggestion_count,
             sidebar: sidebar.clone().normalized(),
             keybindings: existing.keybindings,
+            skin: existing.skin,
         };
 
         let json =
@@ -498,6 +536,7 @@ impl ConfigManager {
             suggestion_count: existing.suggestion_count,
             sidebar: existing.sidebar,
             keybindings: existing.keybindings,
+            skin: existing.skin,
         };
 
         let json =
@@ -525,6 +564,7 @@ impl ConfigManager {
                 suggestion_count: 3,
                 sidebar: SidebarPreferences::default(),
                 keybindings: Keybindings::default(),
+                skin: SkinSettings::default(),
             };
         }
         fs::read_to_string(&self.config_path)
@@ -542,6 +582,7 @@ impl ConfigManager {
                 suggestion_count: 3,
                 sidebar: SidebarPreferences::default(),
                 keybindings: Keybindings::default(),
+                skin: SkinSettings::default(),
             })
     }
 
@@ -563,6 +604,7 @@ impl ConfigManager {
             suggestion_count: existing.suggestion_count,
             sidebar: existing.sidebar,
             keybindings: existing.keybindings,
+            skin: existing.skin,
         };
 
         let json =
@@ -767,7 +809,8 @@ mod tests {
     use super::*;
     use crate::config::{
         ConnectionGroup, ConnectionKind, KeyChord, Keybindings, OneKey, OneKeyStep, SerialConfig,
-        SidebarPreferences, SshAuth, SshConfig, TcpConfig, TelnetConfig, default_host_key_policy,
+        SidebarPreferences, SkinKind, SkinPalette, SkinSettings, SshAuth, SshConfig, TcpConfig,
+        TelnetConfig, default_host_key_policy,
     };
 
     fn test_config_manager() -> (ConfigManager, tempfile::TempDir) {
@@ -825,6 +868,28 @@ mod tests {
             .unwrap();
 
         assert_eq!(cm.load_keybindings(), keybindings);
+    }
+
+    #[test]
+    fn skin_roundtrips_and_survives_other_saves() {
+        let (cm, _dir) = test_config_manager();
+        let skin = SkinSettings {
+            kind: SkinKind::Custom,
+            custom: SkinPalette {
+                background: "#102030".to_string(),
+                accent: "#4080c0".to_string(),
+                ..SkinPalette::default()
+            },
+        };
+
+        cm.save_skin_settings(&skin).unwrap();
+        assert_eq!(cm.load_skin_settings(), skin);
+
+        cm.save_connections(&[]).unwrap();
+        cm.save_onekeys(&[]).unwrap();
+        cm.save_suggestion_settings(false, 10).unwrap();
+
+        assert_eq!(cm.load_skin_settings(), skin);
     }
 
     #[test]

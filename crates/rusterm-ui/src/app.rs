@@ -8,7 +8,7 @@ use tokio::sync::mpsc;
 
 use rusterm_core::config::{
     ConnectionConfig, ConnectionGroup, ConnectionKind, KeybindingAction, Keybindings, OneKey,
-    OneKeyStep, ShellConfig, SidebarPreferences, SshAuth, SshConfig,
+    OneKeyStep, ShellConfig, SidebarPreferences, SkinSettings, SshAuth, SshConfig,
 };
 use rusterm_core::config_manager::ConfigManager;
 use rusterm_core::event::SessionEvent;
@@ -30,6 +30,7 @@ use crate::components::TerminalView;
 use crate::components::connection_dialog::NewConnectionForm;
 use crate::keybindings::action_for_event;
 use crate::layout::{PaneLayout, SplitAxis, SplitDirection};
+use crate::skin::css_variables;
 use crate::state::{
     AppState, Modal, OneKeyMatch, OneKeyPopupState, OneKeySubmissionFeedback,
     PendingDangerousCommand, SessionConnectionState, SessionTab, TabDropOutcome, TerminalEntry,
@@ -37,9 +38,9 @@ use crate::state::{
     close_workspace, distribute_sessions_across_panes, execute_tab_drop_on_pane,
     execute_tab_drop_on_pane_at, focus_pane_for_layout, focused_pane_session,
     move_floating_pane_for_active, move_session_to_leftmost, prepare_split_for_sidebar_drop,
-    prepare_split_for_sidebar_drop_at, push_workspace_tab, resize_layout_split, set_active_tab,
-    set_pane_session_for_layout, source_pane_for_copy, toggle_comparison_mode, toggle_pane_zoom,
-    toggle_split_mode,
+    prepare_split_for_sidebar_drop_at, push_workspace_tab, resize_layout_split,
+    scroll_sync_targets, set_active_tab, set_pane_session_for_layout, source_pane_for_copy,
+    toggle_comparison_mode, toggle_pane_zoom, toggle_split_mode,
 };
 
 fn save_config(state: &Signal<AppState>) {
@@ -257,6 +258,48 @@ fn is_arrow_key_seq(data: &[u8]) -> bool {
         }
     }
     false
+}
+
+/// Scroll the source pane locally, or every comparison pane when comparison
+/// mode is enabled, and refresh each affected terminal view.
+fn scroll_terminal_sessions(
+    mut state: Signal<AppState>,
+    source_session_id: &str,
+    rows: usize,
+    scroll_up: bool,
+) {
+    let (targets, terminals) = {
+        let app_state = state.read();
+        (
+            scroll_sync_targets(&app_state, source_session_id),
+            app_state.terminals.clone(),
+        )
+    };
+
+    let renders = targets
+        .into_iter()
+        .filter_map(|session_id| {
+            let handle = terminals.get(&session_id)?;
+            let render_output = if scroll_up {
+                handle.lock().scroll_up(rows)
+            } else {
+                handle.lock().scroll_down(rows)
+            };
+            Some((session_id, render_output))
+        })
+        .collect::<Vec<_>>();
+
+    let mut app_state = state.write();
+    for (session_id, render_output) in renders {
+        if let Some(tab) = app_state
+            .sessions
+            .iter_mut()
+            .find(|tab| tab.id == session_id)
+        {
+            tab.render_output = render_output;
+            tab.version += 1;
+        }
+    }
 }
 
 /// Render a single TerminalView for the session identified by `session_id`.
@@ -776,26 +819,10 @@ fn render_terminal_pane(
                         }
                     },
                     on_scroll_up: move |rows: usize| {
-                        let terminals = state_for_cmd.read().terminals.clone();
-                        if let Some(handle) = terminals.get(&sid_for_scroll_up) {
-                            let render_result = handle.lock().scroll_up(rows);
-                            let mut s = state_for_cmd.write();
-                            if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == sid_for_scroll_up) {
-                                tab.render_output = render_result;
-                                tab.version += 1;
-                            }
-                        }
+                        scroll_terminal_sessions(state, &sid_for_scroll_up, rows, true);
                     },
                     on_scroll_down: move |rows: usize| {
-                        let terminals = state_for_cmd.read().terminals.clone();
-                        if let Some(handle) = terminals.get(&sid_for_scroll_down) {
-                            let render_result = handle.lock().scroll_down(rows);
-                            let mut s = state_for_cmd.write();
-                            if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == sid_for_scroll_down) {
-                                tab.render_output = render_result;
-                                tab.version += 1;
-                            }
-                        }
+                        scroll_terminal_sessions(state, &sid_for_scroll_down, rows, false);
                     },
                     on_scroll_to_bottom: move |_: ()| {
                         let terminals = state_for_cmd.read().terminals.clone();
@@ -9176,6 +9203,7 @@ pub fn App() -> Element {
                                 s.suggestion_enabled = sug_enabled;
                                 s.suggestion_count = sug_count;
                                 s.keybindings = cm.load_keybindings();
+                                s.skin = cm.load_skin_settings();
                                 s.config_manager = Some(cm);
                                 s.sidebar_preferences = sidebar_preferences;
                                 s.connections = connections;
@@ -9245,15 +9273,19 @@ pub fn App() -> Element {
         UnlockState::Unlocked => {}
     }
 
+    let skin_style = css_variables(&state.read().skin);
+
     rsx! {
         div {
             id: "main",
             style: "
+                {skin_style}
                 display: flex;
                 height: 100%;
                 width: 100%;
                 overflow: hidden;
-                background: #1a1b26;
+                background: var(--skin-bg);
+                color: var(--skin-text);
                 font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
             ",
             tabindex: "0",
@@ -9686,9 +9718,9 @@ pub fn App() -> Element {
                                 style: format!(
                                     "position: fixed; left: {ghost_x}px; top: {ghost_y}px; \
                                      pointer-events: none; z-index: 9999; \
-                                     background: #24283b; border: 1px solid #7aa2f7; \
+                                     background: var(--skin-surface); border: 1px solid var(--skin-accent); \
                                      padding: 4px 8px; border-radius: 4px; \
-                                     font-size: 12px; color: #c0caf5; \
+                                     font-size: 12px; color: var(--skin-text); \
                                      box-shadow: 0 2px 8px rgba(0,0,0,0.4); \
                                      user-select: none; -webkit-user-select: none;",
                                     ghost_x = ghost_x,
@@ -9720,13 +9752,13 @@ pub fn App() -> Element {
                 div {
                     style: "
                         height: 24px;
-                        background: #1a1b26;
-                        border-top: 1px solid #2a2b3d;
+                        background: var(--skin-bg);
+                        border-top: 1px solid var(--skin-border);
                         display: flex;
                         align-items: center;
                         padding: 0 12px;
                         font-size: 11px;
-                        color: #565f89;
+                        color: var(--skin-text-muted);
                         gap: 12px;
                     ",
                     span { "RusTerm v0.1.0" }
@@ -10046,6 +10078,7 @@ pub fn App() -> Element {
                 suggestion_enabled: state.read().suggestion_enabled,
                 suggestion_count: state.read().suggestion_count,
                 keybindings: state.read().keybindings.clone(),
+                skin: state.read().skin.clone(),
                 on_close: move |_| modal.set(Modal::None),
                 on_save: move |appearance: rusterm_core::FocusedTabAppearance| {
                     let appearance = appearance.normalized();
@@ -10065,6 +10098,15 @@ pub fn App() -> Element {
                         }
                     }
                     state.write().keybindings = keybindings;
+                },
+                on_save_skin: move |skin: SkinSettings| {
+                    let skin = skin.normalized();
+                    if let Some(cm) = state.read().config_manager.clone() {
+                        if let Err(e) = cm.save_skin_settings(&skin) {
+                            tracing::error!("Failed to save skin settings: {}", e);
+                        }
+                    }
+                    state.write().skin = skin;
                 },
                 on_save_suggestions: move |(enabled, count): (bool, u8)| {
                     if let Some(cm) = state.read().config_manager.clone() {
