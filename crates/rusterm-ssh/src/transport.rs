@@ -134,7 +134,7 @@ async fn connect_tcp(
 }
 
 fn validate_host(host: &str, stage: &'static str) -> Result<(), TransportError> {
-    if host.is_empty() || host.bytes().any(|byte| byte.is_ascii_control()) {
+    if host.is_empty() || host.bytes().any(|byte| byte.is_ascii_whitespace()) {
         return Err(TransportError::new(stage, "invalid host"));
     }
     Ok(())

@@ -8173,12 +8173,9 @@ fn build_ssh_auth(form: &NewConnectionForm) -> SshAuth {
     }
 }
 
-/// Rebuild a `ConnectionConfig` from an edit-dialog form, preserving the
-/// original id and any fields the dialog doesn't expose (tags and, for SSH,
-/// proxy_jump / keepalive_interval). For non-SSH kinds the whole `kind`
-/// is preserved as-is — the dialog only edits SSH-specific fields, so a Shell /
-/// Serial / Telnet / TCP connection keeps its config and just gets its name /
-/// onekey updated.
+/// Convert the proxy fields into a per-connection proxy configuration.
+/// Unknown proxy types mean direct connection; known types use their conventional
+/// port when the form leaves the port empty or contains an invalid value.
 fn build_proxy_config(form: &NewConnectionForm) -> Option<ProxyConfig> {
     let (kind, default_port) = match form.proxy_type.as_str() {
         "http" => (ProxyKind::Http, 8080),
@@ -8196,6 +8193,9 @@ fn build_proxy_config(form: &NewConnectionForm) -> Option<ProxyConfig> {
     })
 }
 
+/// Rebuild a `ConnectionConfig` from an edit-dialog form, preserving the
+/// original id and fields the dialog doesn't expose (`tags`, `proxy_jump`, and
+/// `keepalive_interval`). For non-SSH kinds, preserve the whole protocol config.
 fn rebuild_connection(original: &ConnectionConfig, form: &NewConnectionForm) -> ConnectionConfig {
     let kind = match &original.kind {
         ConnectionKind::Ssh(ssh) => {

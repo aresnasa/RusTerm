@@ -691,8 +691,8 @@ pub fn ConnectionDialog(
                             if let Some(ref c) = editing {
                                 // Edit mode: preserve the id so the existing
                                 // entry is replaced. Non-form fields (tags,
-                                // proxy_jump, keepalive_interval, and the
-                                // whole kind for non-SSH) are preserved by
+                                // proxy_jump, keepalive_interval, and the whole
+                                // kind for non-SSH) are preserved by
                                 // `rebuild_connection` in app.rs.
                                 on_edit.call((c.id.clone(), form()));
                             } else {
