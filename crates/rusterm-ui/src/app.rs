@@ -53,8 +53,9 @@ use crate::state::{
     focused_pane_session, move_floating_pane_for_active, move_session_to_leftmost,
     prepare_split_for_sidebar_drop, prepare_split_for_sidebar_drop_at, push_workspace_tab,
     resize_layout_split, rollback_pending_exit, scroll_sync_targets, set_active_tab,
-    set_pane_session_for_layout, source_pane_for_copy, toggle_comparison_mode, toggle_pane_zoom,
-    toggle_split_mode, track_terminal_input, tracked_terminal_command,
+    set_pane_session_for_layout, source_pane_for_copy, suppress_comparison_diff_warning,
+    toggle_comparison_mode, toggle_pane_zoom, toggle_split_mode, track_terminal_input,
+    tracked_terminal_command,
 };
 use crate::transfers::{FileEndpoint, TransferJob, TransferRequest};
 
@@ -4066,13 +4067,18 @@ fn multi_pane_container(
             })
             .collect();
         let confirmed = snapshot.comparison_diff_confirmed;
+        let warning_enabled = snapshot.comparison_diff_warning_enabled;
         drop(snapshot);
 
         if pane_texts.len() > 1 {
             let diffs = crate::comparison::compute_comparison_diffs(&pane_texts);
             let summary = crate::comparison::diff_summary(&diffs);
 
-            if summary.exceeds_threshold() && !confirmed {
+            if crate::comparison::should_warn_for_large_diff(
+                &summary,
+                warning_enabled,
+                confirmed,
+            ) {
                 // Too many differences — warn the user before highlighting.
                 // Don't apply highlights yet (set diffs to None so
                 // TerminalView doesn't render diff backgrounds).
@@ -10084,6 +10090,8 @@ pub fn App() -> Element {
                                 // attempt loading `session_state.enc`.
                                 s.restore_disabled = cm.load_restore_disabled();
                                 s.confirm_close_on_exit = cm.load_confirm_close_on_exit();
+                                s.comparison_diff_warning_enabled =
+                                    cm.load_comparison_diff_warning_enabled();
                                 s.focused_tab_appearance = cm.load_focused_tab_appearance();
                                 let (sug_enabled, sug_count) = cm.load_suggestion_settings();
                                 s.suggestion_enabled = sug_enabled;
@@ -10978,6 +10986,7 @@ pub fn App() -> Element {
                 appearance: state.read().focused_tab_appearance.clone(),
                 suggestion_enabled: state.read().suggestion_enabled,
                 suggestion_count: state.read().suggestion_count,
+                comparison_diff_warning_enabled: state.read().comparison_diff_warning_enabled,
                 keybindings: state.read().keybindings.clone(),
                 skin: state.read().skin.clone(),
                 on_close: move |_| modal.set(Modal::None),
@@ -11008,6 +11017,26 @@ pub fn App() -> Element {
                         }
                     }
                     state.write().skin = skin;
+                },
+                on_save_comparison_diff_warning: move |enabled: bool| {
+                    if let Some(cm) = state.read().config_manager.clone() {
+                        if let Err(e) = cm.save_comparison_diff_warning_enabled(enabled) {
+                            tracing::error!(
+                                "Failed to save comparison diff warning setting: {}",
+                                e
+                            );
+                        }
+                    }
+                    let mut s = state.write();
+                    let was_enabled = s.comparison_diff_warning_enabled;
+                    s.comparison_diff_warning_enabled = enabled;
+                    if enabled && !was_enabled {
+                        // Re-enabling applies immediately to an active comparison.
+                        s.comparison_diff_confirmed = false;
+                    } else if !enabled {
+                        // Disabling must never leave a stale warning modal open.
+                        s.comparison_diff_warning = None;
+                    }
                 },
                 on_save_suggestions: move |(enabled, count): (bool, u8)| {
                     if let Some(cm) = state.read().config_manager.clone() {
@@ -11423,6 +11452,22 @@ pub fn App() -> Element {
                                 toggle_comparison_mode(&mut s);
                             },
                             "取消"
+                        }
+                        button {
+                            style: "padding:8px 20px;background:transparent;border:1px solid #e0af68;border-radius:4px;color:#e0af68;font-size:13px;cursor:pointer;",
+                            onclick: move |_| {
+                                // Disable future prompts and approve this diff now.
+                                if let Some(cm) = state.read().config_manager.clone() {
+                                    if let Err(e) = cm.save_comparison_diff_warning_enabled(false) {
+                                        tracing::error!(
+                                            "Failed to disable comparison diff warning: {}",
+                                            e
+                                        );
+                                    }
+                                }
+                                suppress_comparison_diff_warning(&mut state.write());
+                            },
+                            "不再提示"
                         }
                         button {
                             style: "padding:8px 20px;background:#7aa2f7;border:1px solid #7aa2f7;border-radius:4px;color:#1a1b26;font-size:13px;font-weight:600;cursor:pointer;",
