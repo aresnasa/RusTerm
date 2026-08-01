@@ -26,11 +26,9 @@ fn SkinColorField(label: &'static str, value: String, on_change: EventHandler<St
     }
 }
 
-/// Settings dialog: appearance + suggestion preferences.
-///
-/// The dialog manages two independent groups of settings via separate
-/// `on_save_*` callbacks so the caller can persist each to its own
-/// `ConfigManager::save_*` method. Both callbacks fire on "Save".
+/// Settings dialog for appearance, suggestions, comparison warnings, keyboard
+/// shortcuts, and application skin. Each `on_save_*` callback lets the caller
+/// persist its setting group through the matching `ConfigManager` method.
 #[component]
 pub fn SettingsDialog(
     appearance: FocusedTabAppearance,
@@ -299,6 +297,33 @@ pub fn SettingsDialog(
                     }
                 }
 
+                // ── Comparison preferences ──────────────────────────────────
+                h3 {
+                    style: "margin: 24px 0 6px; font-size: 16px;",
+                    "Comparison mode"
+                }
+                p {
+                    style: "margin: 0 0 12px; color: var(--settings-text-muted); font-size: 12px; line-height: 1.5;",
+                    "Control the warning shown before highlighting a comparison where more than half of the visible rows differ."
+                }
+                div {
+                    style: "display: flex; align-items: center; justify-content: space-between; gap: 16px;",
+                    label { style: "font-size: 12px; color: var(--settings-text);", "Large diff warning" }
+                    div {
+                        style: "display: flex; align-items: center; gap: 8px;",
+                        input {
+                            r#type: "checkbox",
+                            checked: "{comparison_warning_enabled()}",
+                            style: "width: 16px; height: 16px; cursor: pointer; accent-color: var(--settings-accent);",
+                            onchange: move |e| comparison_warning_enabled.set(e.checked()),
+                        }
+                        span {
+                            style: "font-size: 11px; color: var(--settings-text-muted);",
+                            {comparison_warning_enabled().then_some("ON").unwrap_or("OFF")}
+                        }
+                    }
+                }
+
                 h3 {
                     style: "margin: 24px 0 6px; font-size: 16px;",
                     "Keyboard shortcuts"
@@ -401,6 +426,7 @@ pub fn SettingsDialog(
                             draft.set(FocusedTabAppearance::default());
                             sug_enabled.set(true);
                             sug_count.set(3);
+                            comparison_warning_enabled.set(true);
                             keybinding_draft.set(Keybindings::default());
                             skin_draft.set(SkinSettings::default());
                             capturing_keybinding.set(None);
@@ -420,6 +446,7 @@ pub fn SettingsDialog(
                             onclick: move |_| {
                                 on_save.call(draft().normalized());
                                 on_save_suggestions.call((sug_enabled(), sug_count()));
+                                on_save_comparison_diff_warning.call(comparison_warning_enabled());
                                 on_save_keybindings.call(keybinding_draft().normalized());
                                 on_save_skin.call(skin_draft().normalized());
                             },
