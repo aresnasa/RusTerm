@@ -41,6 +41,45 @@ return (async () => {
       await sleep(80);
       return button;
     };
+    const clickText = async (selector, text) => {
+      const element = await waitFor(
+        () =>
+          [...document.querySelectorAll(selector)].find(
+            (entry) => entry.textContent.trim() === text,
+          ),
+        `${selector} text not found: ${text}`,
+      );
+      element.click();
+      await sleep(80);
+      return element;
+    };
+    const parseColor = (value) => {
+      const channels = value.match(/[\d.]+/g)?.map(Number);
+      if (!channels || channels.length < 3)
+        throw new Error(`unable to parse computed color: ${value}`);
+      return {
+        red: channels[0],
+        green: channels[1],
+        blue: channels[2],
+        alpha: channels[3] ?? 1,
+      };
+    };
+    const luminance = ({ red, green, blue }) => {
+      const linear = [red, green, blue].map((channel) => {
+        const normalized = channel / 255;
+        return normalized <= 0.04045
+          ? normalized / 12.92
+          : ((normalized + 0.055) / 1.055) ** 2.4;
+      });
+      return 0.2126 * linear[0] + 0.7152 * linear[1] + 0.0722 * linear[2];
+    };
+    const contrastRatio = (foreground, background) => {
+      const foregroundLuminance = luminance(parseColor(foreground));
+      const backgroundLuminance = luminance(parseColor(background));
+      const lighter = Math.max(foregroundLuminance, backgroundLuminance);
+      const darker = Math.min(foregroundLuminance, backgroundLuminance);
+      return (lighter + 0.05) / (darker + 0.05);
+    };
     const clickTitle = async (title) => {
       const element = await waitFor(
         () => document.querySelector(`[title="${title}"]`),
@@ -146,6 +185,80 @@ return (async () => {
       "workspace did not render after unlock",
     );
     await sleep(750);
+
+    stage = "settings-readable-with-low-contrast-skin";
+    await clickText("span", "Settings");
+    await waitFor(
+      () => document.querySelector('[data-rusterm-settings-panel="true"]'),
+      "settings panel did not open",
+    );
+    await clickButton("Custom");
+    for (const [label, value] of [
+      ["Background", "#080808"],
+      ["Surface", "#101010"],
+      ["Text", "#101010"],
+      ["Muted text", "#101010"],
+    ]) {
+      fill(`[data-rusterm-skin-color="${label}"] input`, value);
+    }
+    await clickButton("Save");
+    await waitFor(
+      () => !document.querySelector('[data-rusterm-settings-overlay="true"]'),
+      "settings panel did not close after saving custom skin",
+    );
+    await clickText("span", "Settings");
+    const settingsPanel = await waitFor(
+      () => document.querySelector('[data-rusterm-settings-panel="true"]'),
+      "settings panel did not reopen with custom skin",
+    );
+    const settingsOverlay = document.querySelector(
+      '[data-rusterm-settings-overlay="true"]',
+    );
+    const overlayStyle = getComputedStyle(settingsOverlay);
+    const panelStyle = getComputedStyle(settingsPanel);
+    if (parseColor(overlayStyle.backgroundColor).alpha < 0.75)
+      throw new Error(
+        `settings overlay is too transparent: ${overlayStyle.backgroundColor}`,
+      );
+    if (parseColor(panelStyle.backgroundColor).alpha < 0.98)
+      throw new Error(
+        `settings panel is not opaque: ${panelStyle.backgroundColor}`,
+      );
+    if (Number.parseInt(overlayStyle.zIndex, 10) < 1000)
+      throw new Error(`settings overlay z-index is too low: ${overlayStyle.zIndex}`);
+    if (overlayStyle.pointerEvents === "none")
+      throw new Error("settings overlay does not block workspace interaction");
+    const heading = settingsPanel.querySelector("h3");
+    const bodyCopy = settingsPanel.querySelector("p");
+    const fieldLabel = [...settingsPanel.querySelectorAll("label")].find(
+      (label) => label.textContent.trim() === "Outline width",
+    );
+    for (const [element, name] of [
+      [heading, "heading"],
+      [bodyCopy, "body copy"],
+      [fieldLabel, "field label"],
+    ]) {
+      const ratio = contrastRatio(
+        getComputedStyle(element).color,
+        panelStyle.backgroundColor,
+      );
+      if (ratio < 4.5)
+        throw new Error(`settings ${name} contrast is ${ratio.toFixed(2)}:1`);
+    }
+    const overlayRect = settingsOverlay.getBoundingClientRect();
+    const cornerTarget = document.elementFromPoint(
+      overlayRect.left + 4,
+      overlayRect.top + 4,
+    );
+    if (!cornerTarget?.closest('[data-rusterm-settings-overlay="true"]'))
+      throw new Error("settings overlay does not cover the workspace hit target");
+    await clickButton("Reset default");
+    await clickButton("Save");
+    await waitFor(
+      () => !document.querySelector('[data-rusterm-settings-overlay="true"]'),
+      "settings panel did not close after restoring defaults",
+    );
+
     stage = "ensure-docks";
     await ensureZone("left", "Show or hide the left connection/file dock");
     await ensureZone("right", "Show or hide Sessions and History");
