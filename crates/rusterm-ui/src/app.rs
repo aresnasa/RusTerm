@@ -142,6 +142,32 @@ const LOGIN_SCRIPT_EXPECT_TIMEOUT_SECS: u64 = 30;
 /// on a pathologically slow machine (VTE parsing is ~500 MB/s on the bench).
 const MAX_OUTPUT_BATCH_BYTES: usize = 1 * 1024 * 1024;
 
+/// Hard ceiling on the amount of un-processed output buffered per session
+/// inside the unbounded MPSC channel before we start dropping data.
+///
+/// The terminal scrollback is bounded at 10 000 lines (trimmed on every push),
+/// so the terminal grid itself never grows without limit. The real OOM risk
+/// is the *channel* between the reader task (SSH/PTY) and the UI event loop:
+/// `tokio::sync::mpsc::unbounded_channel` has no backpressure, so if the
+/// producer outruns the consumer for an extended period (e.g. `tree` on a
+/// directory with millions of entries pours out hundreds of MB before the
+/// UI can render it all) the channel grows without limit and eventually OOMs.
+///
+/// When the backlog for a session exceeds this ceiling, [`drain_output_batch`]
+/// drops the surplus `Output` events for that session — keeping only the most
+/// recent `MAX_BACKLOG_BYTES` of data (the tail, which is what the user cares
+/// about: the end of `tree`/`ls` output, the final prompt, exit codes) and
+/// discarding the oldest flood data. This mirrors how hardware terminals
+/// handle overrun: you can only display what fits, and it's better to show the
+/// tail than to crash. Dropped bytes are logged once per drop event.
+///
+/// 8 MiB is generous: the consumer processes ~1 MiB per tick at ~500 MB/s
+/// (≈2 ms), so on a 60 Hz loop it keeps up with ~60 MiB/s of sustained output.
+/// A backlog only accrues when the producer exceeds that for many ticks, and
+/// 8 MiB gives enough headroom that short bursts (a few MiB over a tick) are
+/// never dropped — only sustained floods are.
+const MAX_BACKLOG_BYTES: usize = 8 * 1024 * 1024;
+
 /// Drains all immediately-available `SessionEvent::Output` events for
 /// `session_id` from `rx`, concatenating their payloads into `batch` (which
 /// already holds the first event's data). Stops when:
@@ -153,9 +179,26 @@ const MAX_OUTPUT_BATCH_BYTES: usize = 1 * 1024 * 1024;
 /// The peeked non-batch event (if any) is returned so the caller can process
 /// it on the next loop iteration instead of dropping it.
 ///
-/// This is the core of the output-coalescing optimisation: turning N tiny
-/// `process_and_render` calls into one, which keeps the event loop ahead of the
-/// producer and prevents the unbounded channel from growing without limit.
+/// ## Backlog overflow protection (OOM guard)
+///
+/// If the batch hits the [`MAX_OUTPUT_BATCH_BYTES`] cap (meaning there's a
+/// backlog), we additionally drain the remaining same-session `Output` events
+/// from the channel into a bounded tail buffer. If the total backlog exceeds
+/// [`MAX_BACKLOG_BYTES`], the oldest surplus is dropped and only the most
+/// recent `MAX_BACKLOG_BYTES` are returned to the caller as a pending
+/// `Output` event — so the outer loop re-enters with the tail as the seed and
+/// processes it on the next tick. This keeps the channel's memory footprint
+/// bounded even when a command like `tree`/`ls` on a huge tree floods the
+/// reader far faster than the UI can render. The terminal already caps
+/// scrollback at 10 000 lines, so the dropped bytes are content the user
+/// couldn't have scrolled to anyway.
+///
+/// Non-`Output` events and `Output` for other sessions are preserved — they're
+/// returned as the pending event so the outer loop processes them normally. If
+/// both a kept-tail `Output` and a non-`Output` event are pending, the
+/// non-`Output` event wins (connection-lifecycle events are higher priority);
+/// the kept tail is folded into the caller's `batch` in that case so it isn't
+/// lost.
 fn drain_output_batch(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
     session_id: &str,
@@ -171,7 +214,136 @@ fn drain_output_batch(
             other => return other.ok(),
         }
     }
-    None
+
+    // Batch is full → there's a backlog. Drain + shed surplus output to keep
+    // the channel's memory footprint bounded (see `MAX_BACKLOG_BYTES`).
+    shed_backlog_overflow(rx, session_id, batch)
+}
+
+/// Drop queued `Output` events for `session_id` that exceed the
+/// [`MAX_BACKLOG_BYTES`] ceiling, so the unbounded channel can't grow without
+/// limit during a sustained output flood.
+///
+/// Called by [`drain_output_batch`] once the per-tick processing batch is full.
+/// We drain same-session `Output` events into a **bounded tail buffer**
+/// (`VecDeque` of chunks). As long as the running total stays under
+/// [`MAX_BACKLOG_BYTES`] we keep everything. The moment the total would exceed
+/// the ceiling, we drop the oldest chunks from the front of the deque to make
+/// room — so the deque always holds the most recent `MAX_BACKLOG_BYTES` of
+/// data (the tail). At the end:
+///
+///   - If we never exceeded the ceiling (small backlog), the drained data is
+///     returned as a single pending `Output` event so the outer loop re-enters
+///     `drain_output_batch` with it as the seed — it gets processed on the next
+///     tick. Nothing is dropped.
+///   - If we exceeded the ceiling (flood), the kept tail is returned as a
+///     pending `Output` event (same path), and the dropped oldest surplus is
+///     logged once.
+///   - If a non-`Output` or different-session event is encountered, it's
+///     returned as the pending event instead. When this happens alongside a
+///     kept tail, the tail is folded into `batch` (the caller's buffer) so it
+///     isn't lost — `batch` grows past the 1 MiB processing cap by at most
+///     `MAX_BACKLOG_BYTES`, which is acceptable because it's processed in the
+///     same tick and then freed.
+///
+/// `tokio::sync::mpsc::UnboundedReceiver` has no `peek` and the receiver end
+/// exposes no sender, so we can't put data back into the channel once
+/// consumed — hence the return-as-pending-event + fold-into-batch strategy.
+fn shed_backlog_overflow(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
+    session_id: &str,
+    batch: &mut Vec<u8>,
+) -> Option<SessionEvent> {
+    // Bounded tail buffer: holds the most recent `MAX_BACKLOG_BYTES` of
+    // same-session Output. Older chunks are evicted from the front as new ones
+    // arrive, so the deque never holds more than the ceiling worth of data.
+    let mut tail: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
+    let mut tail_total: usize = 0;
+    let mut dropped_bytes: usize = 0;
+    // Initialised in the loop's `other =>` branch (which always fires because
+    // `try_recv` eventually returns `Empty`/`Disconnected`). The `#[allow]`
+    // silences a false-positive `unused_assignments` warning from the
+    // compiler's flow analysis.
+    #[allow(unused_assignments)]
+    let mut pending_other: Option<SessionEvent> = None;
+
+    loop {
+        match rx.try_recv() {
+            Ok(SessionEvent::Output(id, data)) if id == session_id => {
+                let chunk_len = data.len();
+                // Evict oldest chunks from the front until the new chunk fits
+                // under the ceiling. This is O(k) in the number of evicted
+                // chunks — independent of the total backlog, so it stays cheap
+                // even for very large floods.
+                while tail_total + chunk_len > MAX_BACKLOG_BYTES && !tail.is_empty() {
+                    if let Some(evicted) = tail.pop_front() {
+                        tail_total -= evicted.len();
+                        dropped_bytes += evicted.len();
+                    }
+                }
+                // If the single chunk itself is larger than the ceiling (rare:
+                // a single SSH read returning >8 MiB), keep only its tail.
+                if chunk_len > MAX_BACKLOG_BYTES {
+                    let keep_from = chunk_len - MAX_BACKLOG_BYTES;
+                    dropped_bytes += keep_from;
+                    tail.clear();
+                    tail.push_back(data[keep_from..].to_vec());
+                    tail_total = MAX_BACKLOG_BYTES;
+                } else {
+                    tail_total += chunk_len;
+                    tail.push_back(data);
+                }
+            }
+            other => {
+                pending_other = other.ok();
+                break;
+            }
+        }
+    }
+
+    if dropped_bytes > 0 {
+        tracing::warn!(
+            "Output backlog overflow for session {} (dropped {} bytes, kept {} bytes) \
+             — terminal output was arriving faster than it could be rendered; \
+             oldest surplus discarded to prevent OOM",
+            &session_id[..session_id.len().min(8)],
+            dropped_bytes,
+            tail_total,
+        );
+    }
+
+    // Fold the kept tail into the caller's `batch` or return it as a pending
+    // event. If there's a non-Output event pending, we can only return one
+    // value — so fold the tail into `batch` (the caller processes whatever is
+    // in `batch` this tick) and return the non-Output event. Otherwise return
+    // the tail as a pending Output event for the next drain iteration.
+    if tail.is_empty() {
+        return pending_other;
+    }
+
+    match pending_other {
+        Some(non_output) => {
+            // Fold the kept tail into `batch` so it's processed this tick (the
+            // caller already has 1 MiB in `batch`; adding up to 8 MiB more is
+            // fine — VTE at ~500 MB/s chews through 9 MiB in ~18 ms).
+            for chunk in tail {
+                batch.extend_from_slice(&chunk);
+            }
+            Some(non_output)
+        }
+        None => {
+            // Return the kept tail as a single pending Output event. The outer
+            // loop re-enters with it as the seed `data`, so drain_output_batch
+            // processes it on the next tick. This avoids growing `batch` past
+            // the 1 MiB processing cap in the common (no non-Output event)
+            // case.
+            let mut combined: Vec<u8> = Vec::with_capacity(tail_total);
+            for chunk in tail {
+                combined.extend_from_slice(&chunk);
+            }
+            Some(SessionEvent::Output(session_id.to_string(), combined))
+        }
+    }
 }
 
 #[cfg(test)]
@@ -263,6 +435,12 @@ mod drain_output_batch_tests {
     /// message mid-flight), the batch can overshoot by at most one chunk.
     /// This is the memory-safety ceiling that prevents a single coalesced
     /// `process` call from ingesting an unbounded amount of data.
+    ///
+    /// When the batch cap is hit, `drain_output_batch` additionally drains the
+    /// remaining same-session backlog via `shed_backlog_overflow`. As long as
+    /// the total backlog is under `MAX_BACKLOG_BYTES` nothing is dropped — the
+    /// remaining data is returned as a pending `Output` event so the caller's
+    /// outer loop feeds it back into the next drain iteration.
     #[test]
     fn caps_batch_at_max_bytes() {
         let (tx, mut rx) = mpsc::unbounded_channel::<SessionEvent>();
@@ -290,11 +468,141 @@ mod drain_output_batch_tests {
             batch.len() > MAX_OUTPUT_BATCH_BYTES,
             "batch should have consumed at least one full chunk past the cap boundary"
         );
-        // There's still data in the channel — the next drain_output_batch call
-        // (on the next loop iteration) will pick it up.
+        // The remaining backlog (under MAX_BACKLOG_BYTES) is returned as a
+        // pending Output event — the outer loop re-enters drain_output_batch
+        // with it as the seed. Nothing is dropped.
+        match pending {
+            Some(SessionEvent::Output(id, data)) => {
+                assert_eq!(id, "s1");
+                // 50 chunks × 100_000 = 5_000_000 total. The batch consumed
+                // roughly MAX_OUTPUT_BATCH_BYTES worth, so the pending tail
+                // holds the remainder.
+                let expected_min = 5_000_000 - (MAX_OUTPUT_BATCH_BYTES + chunk.len());
+                assert!(
+                    data.len() >= expected_min,
+                    "pending tail {} should be at least the total ({}) minus the batch cap ({})",
+                    data.len(),
+                    5_000_000,
+                    MAX_OUTPUT_BATCH_BYTES + chunk.len(),
+                );
+                assert!(
+                    data.len() <= 5_000_000,
+                    "pending tail {} should not exceed the total queued (5_000_000)",
+                    data.len(),
+                );
+            }
+            other => panic!("expected pending Output for s1, got {other:?}"),
+        }
+        // The channel should now be empty — shed_backlog_overflow drained it.
         assert!(
-            pending.is_none(),
-            "pending should be None when we stopped due to the byte cap, not a non-Output event"
+            rx.try_recv().is_err(),
+            "channel should be empty after drain"
+        );
+    }
+
+    /// When the backlog exceeds `MAX_BACKLOG_BYTES`, the oldest surplus is
+    /// dropped and only the most recent `MAX_BACKLOG_BYTES` are kept. This is
+    /// the OOM guard: the unbounded channel can't grow without limit during a
+    /// sustained output flood (e.g. `tree` on a directory with millions of
+    /// entries).
+    #[test]
+    fn sheds_oldest_when_backlog_exceeds_ceiling() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<SessionEvent>();
+        // Push far more than MAX_BACKLOG_BYTES worth of data. Each chunk is
+        // tagged with a unique byte so we can verify the *tail* is kept.
+        // Total: 40 chunks × 500_000 = 20_000_000 bytes (> MAX_BACKLOG_BYTES).
+        let chunk_size = 500_000;
+        let num_chunks = 40;
+        for i in 0..num_chunks {
+            let mut chunk = vec![i as u8; chunk_size];
+            // The last byte of each chunk is its index so we can identify
+            // which chunks survived the shed.
+            if let Some(last) = chunk.last_mut() {
+                *last = i as u8;
+            }
+            tx.send(SessionEvent::Output("s1".into(), chunk)).unwrap();
+        }
+
+        let mut batch = Vec::new();
+        let pending = drain_output_batch(&mut rx, "s1", &mut batch);
+
+        // Batch should have consumed roughly MAX_OUTPUT_BATCH_BYTES.
+        assert!(
+            batch.len() > MAX_OUTPUT_BATCH_BYTES,
+            "batch should be at the processing cap"
+        );
+
+        // The pending event holds the kept tail (at most MAX_BACKLOG_BYTES).
+        let pending_data = match pending {
+            Some(SessionEvent::Output(id, data)) => {
+                assert_eq!(id, "s1");
+                data
+            }
+            other => panic!("expected pending Output, got {other:?}"),
+        };
+        assert!(
+            pending_data.len() <= MAX_BACKLOG_BYTES,
+            "kept tail {} must not exceed MAX_BACKLOG_BYTES ({})",
+            pending_data.len(),
+            MAX_BACKLOG_BYTES,
+        );
+        // We should have dropped a substantial amount (20 MB total, kept ≤ 8 MB).
+        let total_queued = num_chunks * chunk_size;
+        let dropped = total_queued - batch.len() - pending_data.len();
+        assert!(
+            dropped > 0,
+            "should have dropped data (total={}, batch={}, tail={})",
+            total_queued,
+            batch.len(),
+            pending_data.len(),
+        );
+        // The kept tail should contain the most recent chunks. The last byte
+        // of the pending data should be from one of the last chunks (index
+        // close to num_chunks - 1).
+        if let Some(&last_byte) = pending_data.last() {
+            assert!(
+                last_byte as usize >= num_chunks - 4,
+                "kept tail should end with a recent chunk (last byte={}, expected ≥ {})",
+                last_byte,
+                num_chunks - 4,
+            );
+        }
+        // Channel should be empty after the shed.
+        assert!(rx.try_recv().is_err(), "channel should be empty after shed");
+    }
+
+    /// A non-`Output` event arriving behind a backlog is preserved: it's
+    /// returned as the pending event, and the kept tail is folded into the
+    /// caller's `batch` so it isn't lost.
+    #[test]
+    fn preserves_non_output_event_during_backlog() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<SessionEvent>();
+        // Push enough to fill the batch + a small backlog.
+        let chunk = vec![b'x'; 100_000];
+        for _ in 0..20 {
+            tx.send(SessionEvent::Output("s1".into(), chunk.clone()))
+                .unwrap();
+        }
+        // Then a Disconnected event.
+        tx.send(SessionEvent::Disconnected("s1".into(), "bye".into()))
+            .unwrap();
+
+        let mut batch = Vec::new();
+        let pending = drain_output_batch(&mut rx, "s1", &mut batch);
+
+        // The Disconnected event must be returned as pending.
+        match pending {
+            Some(SessionEvent::Disconnected(id, reason)) => {
+                assert_eq!(id, "s1");
+                assert_eq!(reason, "bye");
+            }
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
+        // The batch should include the kept tail (folded in because the
+        // pending slot was taken by the non-Output event).
+        assert!(
+            batch.len() > MAX_OUTPUT_BATCH_BYTES,
+            "batch should contain the processing cap + folded tail"
         );
     }
 }
@@ -11117,6 +11425,41 @@ fn save_layout_snapshot(state: &Signal<AppState>) {
     }
 }
 
+/// Synchronously encrypt + persist the current session state to
+/// `session_state.enc`.
+///
+/// This is the close-path counterpart to the 30 s periodic save loop. Without
+/// it, the only saved snapshot is whatever the timer last wrote (up to 30 s
+/// stale), and if the user closes the app within the first 30 s of a fresh
+/// launch the file never gets written at all — so on the next launch there is
+/// nothing to restore and the restore dialog never appears. Calling this on
+/// every exit path guarantees the final session arrangement (tabs, cwds,
+/// command-history tails, terminal sizes) is persisted.
+///
+/// Best-effort: failures (no master key, encrypt/write error) are logged but
+/// never block the exit. No-op when `restore_disabled` is set or there are no
+/// sessions — mirrors the gating in `AppState::save_session_state`.
+fn save_session_state_snapshot(state: &Signal<AppState>) {
+    let s = state.read();
+    if s.restore_disabled {
+        return;
+    }
+    if s.sessions.is_empty() {
+        return;
+    }
+    let Some(cm) = s.config_manager.as_ref() else {
+        return;
+    };
+    let master_key = cm.master_key();
+    // Build the snapshot while holding the read lock, then release before the
+    // CPU-bound encrypt+write (same pattern as the periodic save loop).
+    let snapshot = s.build_session_state(s.theme_name());
+    drop(s);
+    if let Err(e) = snapshot.save(&master_key) {
+        tracing::warn!("Failed to save session state on exit: {}", e);
+    }
+}
+
 /// Schedule a `cd '<cwd>'\n` send to the session's input sender after a
 /// delay that's long enough for the shell to be ready (we piggyback on the
 /// existing 400ms shell-integration injection delay, then add a bit more
@@ -12384,11 +12727,13 @@ pub fn App() -> Element {
         // (which runs right after this handler in the same event-loop tick)
         // actually destroys the window and exits the app.
         if !s.confirm_close_on_exit {
-            // Best-effort layout save before exit so the user's last pane
-            // arrangement isn't lost between the last 30s periodic save and
-            // the actual exit. `save()` is synchronous + atomic, so it
-            // completes before `handle_close_requested` destroys the window.
+            // Best-effort save before exit so the user's last pane
+            // arrangement AND session state aren't lost between the last 30s
+            // periodic save and the actual exit. Both are synchronous + atomic,
+            // so they complete before `handle_close_requested` destroys the
+            // window.
             save_layout_snapshot(&state_for_close);
+            save_session_state_snapshot(&state_for_close);
             desktop_for_close.set_close_behavior(WindowCloseBehaviour::WindowCloses);
             return;
         }
@@ -14280,9 +14625,12 @@ pub fn App() -> Element {
                         state.write().confirm_close_on_exit = false;
                     }
                     state.write().close_dialog_visible = false;
-                    // Best-effort layout save before exit (see the fast-close
-                    // path above for rationale).
+                    // Best-effort save before exit (see the fast-close
+                    // path above for rationale). Both the layout snapshot
+                    // and the session state are persisted so the next launch
+                    // can restore tabs + cwds + command history.
                     save_layout_snapshot(&state);
+                    save_session_state_snapshot(&state);
                     // Flip the close behaviour to WindowCloses and call
                     // window.close() so handle_close_requested actually destroys
                     // the window + exits the app (since this is the last window).
