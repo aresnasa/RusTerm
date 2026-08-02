@@ -6087,10 +6087,10 @@ fn onekey_step_label(step: &OneKeyStep) -> String {
         return step.label.trim().to_string();
     }
     match credential_kind(&step.expect) {
-        Some(CredentialKind::Password) => "Password".to_string(),
-        Some(CredentialKind::Token) => "Token".to_string(),
-        Some(CredentialKind::Username) => "Username".to_string(),
-        None => "Credential".to_string(),
+        Some(CredentialKind::Password) => crate::i18n::t("onekey.credential_password"),
+        Some(CredentialKind::Token) => crate::i18n::t("onekey.credential_token"),
+        Some(CredentialKind::Username) => crate::i18n::t("onekey.credential_username"),
+        None => crate::i18n::t("onekey.credential"),
     }
 }
 
@@ -9458,7 +9458,8 @@ fn start_serial_connection(
                 }
             }
             Ok(Err(e)) => {
-                let msg = format!("\r\nSerial open failed: {}\r\n", e);
+                let failed = crate::i18n::tf("session.serial_open_failed", &[("error", &e)]);
+                let msg = format!("\r\n{failed}\r\n");
                 let terminals = state.read().terminals.clone();
                 if let Some(handle) = terminals.get(&tab_id) {
                     let render_result = handle.lock().process_and_render(msg.as_bytes());
@@ -9585,7 +9586,8 @@ fn start_telnet_connection(
                 }
             }
             Err(e) => {
-                let msg = format!("\r\nTelnet connect failed: {}\r\n", e);
+                let failed = crate::i18n::tf("session.telnet_connect_failed", &[("error", &e)]);
+                let msg = format!("\r\n{failed}\r\n");
                 let terminals = state.read().terminals.clone();
                 if let Some(handle) = terminals.get(&tab_id) {
                     let render_result = handle.lock().process_and_render(msg.as_bytes());

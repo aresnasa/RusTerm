@@ -305,10 +305,9 @@ impl RelayExecutor for AppRelayExecutor {
                 let Some(credential) = sudo_credentials().get(&credential_key, Instant::now())
                 else {
                     let _ = handle.disconnect().await;
-                    return Err(ExecutorError::ElevationRequired(
-                        "No reusable sudo authorization is available for this host. Run sudo once in its RusTerm session with OneKey enabled, then retry."
-                            .to_string(),
-                    ));
+                    return Err(ExecutorError::ElevationRequired(crate::i18n::t(
+                        "relay.sudo_authorization_unavailable",
+                    )));
                 };
                 let stdin = Zeroizing::new(format!("{}\n", credential.as_str()));
                 let password_command = sudo_command(command, true);
@@ -319,10 +318,9 @@ impl RelayExecutor for AppRelayExecutor {
                 if sudo_authorization_failed(&second) {
                     sudo_credentials().clear_key(&credential_key);
                     let _ = handle.disconnect().await;
-                    return Err(ExecutorError::ElevationRequired(
-                        "The reusable sudo credential was rejected or sudo policy denied this command. Re-authorize sudo in the target RusTerm session."
-                            .to_string(),
-                    ));
+                    return Err(ExecutorError::ElevationRequired(crate::i18n::t(
+                        "relay.sudo_authorization_rejected",
+                    )));
                 }
                 second
             }
@@ -440,7 +438,10 @@ pub fn start_relay(
             Ok(())
         }
         Ok(Err(e)) => Err(format!("{e:#}")),
-        Err(e) => Err(format!("relay start timed out or runtime is wedged: {e}")),
+        Err(e) => Err(crate::i18n::tf(
+            "relay.start_timeout_or_runtime_wedged",
+            &[("error", &e)],
+        )),
     }
 }
 
