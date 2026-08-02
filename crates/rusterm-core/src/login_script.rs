@@ -45,7 +45,11 @@ pub struct LoginScriptError {
 
 impl std::fmt::Display for LoginScriptError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "line {}: {} (in {:?})", self.line, self.reason, self.text)
+        write!(
+            f,
+            "line {}: {} (in {:?})",
+            self.line, self.reason, self.text
+        )
     }
 }
 
@@ -66,13 +70,11 @@ pub fn parse_login_script(script: &str) -> Result<Vec<LoginStep>, LoginScriptErr
             continue;
         }
 
-        steps.push(
-            parse_step(line).map_err(|reason| LoginScriptError {
-                line: line_no,
-                text: line.to_string(),
-                reason,
-            })?,
-        );
+        steps.push(parse_step(line).map_err(|reason| LoginScriptError {
+            line: line_no,
+            text: line.to_string(),
+            reason,
+        })?);
     }
     Ok(steps)
 }
@@ -117,9 +119,7 @@ fn parse_step(line: &str) -> Result<LoginStep, String> {
             } else {
                 rest.parse::<u64>()
                     .map(|ms| LoginStep::Delay { ms })
-                    .map_err(|_| {
-                        format!("invalid delay {rest:?}: expected integer milliseconds")
-                    })
+                    .map_err(|_| format!("invalid delay {rest:?}: expected integer milliseconds"))
             }
         }
         other => Err(format!("unknown keyword {other:?}")),
@@ -145,7 +145,7 @@ mod tests {
     }
 
     #[test]
-    fn expect_parses_regex_as_the_rest_of_the_line()
+    fn expect_parses_regex_as_the_rest_of_the_line() {
         let steps = parse_login_script("expect Password:").unwrap();
         assert_eq!(
             steps,
