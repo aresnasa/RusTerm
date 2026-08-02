@@ -20,6 +20,7 @@ pub fn OneKeyPopup(
     on_save: EventHandler<()>,
     on_dismiss: EventHandler<()>,
 ) -> Element {
+    let _lang = crate::i18n::LANGUAGE();
     let rejected = matches!(
         submission_feedback,
         Some(OneKeySubmissionFeedback::Rejected { .. })
@@ -64,8 +65,8 @@ pub fn OneKeyPopup(
 
             button {
                 r#type: "button",
-                aria_label: "Cancel credential popup",
-                title: "Cancel credential popup (Escape)",
+                aria_label: crate::i18n::t("onekey.popup.cancel"),
+                title: crate::i18n::t("onekey.popup.cancel_tooltip"),
                 style: "position:absolute;right:6px;top:4px;z-index:1;border:0;background:transparent;color:#9aa5ce;font:inherit;font-size:14px;font-weight:700;cursor:pointer;padding:0 5px;",
                 onpointerdown: move |e| {
                     e.prevent_default();
@@ -85,7 +86,7 @@ pub fn OneKeyPopup(
             if rejected {
                 div {
                     style: "padding:6px 12px;color:#f7768e;background:rgba(247,118,142,0.08);border-bottom:1px solid #2a2b3d;font-size:11px;",
-                    "Credential was sent, but the remote requested it again. Verify the saved value."
+                    { crate::i18n::t("onekey.popup.rejected") }
                 }
             }
 
@@ -95,25 +96,38 @@ pub fn OneKeyPopup(
                     let bg = if is_sel { "#283457" } else { "transparent" };
                     let fg = if is_sel { "#c0caf5" } else { "#a9b1d6" };
                     let border_left = if is_sel { "border-left:2px solid #9ece6a;" } else { "border-left:2px solid transparent;" };
-                    let label = if m.label.trim().is_empty() { "Credential" } else { m.label.trim() };
-                    let label_lower = label.to_lowercase();
-                    let (badge, badge_color, badge_title) = if label_lower.contains("password")
-                        || label_lower.contains("passwd")
-                        || label_lower.contains("secret")
-                        || label_lower.contains("passphrase")
-                        || label_lower.contains("pwd")
-                    {
-                        ("P", "#f7768e", "Password / secret")
-                    } else if label_lower.contains("token") || label_lower.contains("otp") {
-                        ("T", "#e0af68", "Token / OTP")
-                    } else {
-                        ("U", "#9ece6a", "Username / account")
+                    let raw_label = m.label.trim();
+                    let label = match raw_label {
+                        "" | "Credential" => crate::i18n::t("onekey.credential"),
+                        "Password" => crate::i18n::t("onekey.credential_password"),
+                        "Token" => crate::i18n::t("onekey.credential_token"),
+                        "Username" => crate::i18n::t("onekey.credential_username"),
+                        _ => raw_label.to_string(),
                     };
+                    let credential_hint = format!("{} {}", raw_label, m.matched_expect).to_lowercase();
+                    let (credential_key, badge_color) = if credential_hint.contains("password")
+                        || credential_hint.contains("passwd")
+                        || credential_hint.contains("secret")
+                        || credential_hint.contains("passphrase")
+                        || credential_hint.contains("pwd")
+                    {
+                        ("onekey.credential_password", "#f7768e")
+                    } else if credential_hint.contains("token") || credential_hint.contains("otp") {
+                        ("onekey.credential_token", "#e0af68")
+                    } else {
+                        ("onekey.credential_username", "#9ece6a")
+                    };
+                    let badge_title = crate::i18n::t(credential_key);
+                    let badge = badge_title.chars().next().unwrap_or('?');
+                    let use_title = crate::i18n::tf(
+                        "onekey.popup.use_credential",
+                        &[("name", &m.name), ("label", &label)],
+                    );
                     rsx! {
                         div {
                             key: "{i}",
                             style: "display:flex;align-items:center;padding:5px 32px 5px 12px;{border_left}background:{bg};color:{fg};cursor:pointer;overflow:hidden;",
-                            title: "Use {m.name} · {label} (Enter or Tab)",
+                            title: "{use_title}",
                             onmouseenter: move |_| on_highlight.call(i),
                             onclick: move |_| on_select.call(i),
                             span {
@@ -133,7 +147,7 @@ pub fn OneKeyPopup(
             div {
                 style: "display:flex;align-items:center;padding:4px 12px;border-top:1px solid #2a2b3d;color:#9aa5ce;cursor:pointer;",
                 onclick: move |_| on_save.call(()),
-                span { style: "flex:1;", "Save In OneKeys" }
+                span { style: "flex:1;", { crate::i18n::t("onekey.popup.save") } }
                 span { style: "color:#7aa2f7;", "+" }
             }
             div { style: "display:none;", onclick: move |_| on_dismiss.call(()), "" }

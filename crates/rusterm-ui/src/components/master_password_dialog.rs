@@ -9,6 +9,7 @@ pub fn MasterPasswordDialog(
     on_unlock: EventHandler<String>,
     on_clear_error: EventHandler<()>,
 ) -> Element {
+    let _lang = crate::i18n::LANGUAGE();
     let mut password = use_signal(String::new);
     let mut confirm = use_signal(String::new);
     let mut loading = use_signal(|| false);
@@ -16,14 +17,14 @@ pub fn MasterPasswordDialog(
 
     let is_first_run = mode == UnlockState::FirstRun;
     let title = if is_first_run {
-        "Create Master Password"
+        crate::i18n::t("master_password.create_title")
     } else {
-        "Unlock RusTerm"
+        crate::i18n::t("master_password.unlock_title")
     };
     let subtitle = if is_first_run {
-        "Set a master password to protect your connection credentials."
+        crate::i18n::t("master_password.create_subtitle")
     } else {
-        "Enter your master password to decrypt your connections."
+        crate::i18n::t("master_password.unlock_subtitle")
     };
 
     // If an error appears, clear the loading state so the user can retry
@@ -36,7 +37,11 @@ pub fn MasterPasswordDialog(
     let passwords_match = !is_first_run || password() == confirm();
     let can_submit = !password().is_empty() && passwords_match && !loading();
     let pw_input_type = if show_password() { "text" } else { "password" };
-    let toggle_label = if show_password() { "Hide" } else { "Show" };
+    let toggle_label = if show_password() {
+        crate::i18n::t("common.hide")
+    } else {
+        crate::i18n::t("common.show")
+    };
 
     rsx! {
         div {
@@ -78,7 +83,7 @@ pub fn MasterPasswordDialog(
                         style: "display: flex; flex-direction: column; gap: 4px;",
                         label {
                             style: "font-size: 12px; color: #9aa5ce; font-weight: 500;",
-                            "Master Password"
+                            { crate::i18n::t("master_password.label") }
                         }
                         div {
                             style: "display: flex; gap: 6px;",
@@ -95,7 +100,7 @@ pub fn MasterPasswordDialog(
                                     box-sizing: border-box;
                                 ",
                                 r#type: "{pw_input_type}",
-                                placeholder: "Enter password",
+                                placeholder: crate::i18n::t("master_password.enter_placeholder"),
                                 autofocus: true,
                                 value: "{password}",
                                 oninput: move |e| {
@@ -121,7 +126,7 @@ pub fn MasterPasswordDialog(
                                     min-width: 56px;
                                 ",
                                 r#type: "button",
-                                title: "Show / hide password",
+                                title: crate::i18n::t("master_password.toggle_visibility"),
                                 onclick: move |_| show_password.set(!show_password()),
                                 "{toggle_label}"
                             }
@@ -133,7 +138,7 @@ pub fn MasterPasswordDialog(
                             style: "display: flex; flex-direction: column; gap: 4px;",
                             label {
                                 style: "font-size: 12px; color: #9aa5ce; font-weight: 500;",
-                                "Confirm Password"
+                                { crate::i18n::t("master_password.confirm_label") }
                             }
                             input {
                                 style: "
@@ -148,7 +153,7 @@ pub fn MasterPasswordDialog(
                                     box-sizing: border-box;
                                 ",
                                 r#type: "{pw_input_type}",
-                                placeholder: "Confirm password",
+                                placeholder: crate::i18n::t("master_password.confirm_placeholder"),
                                 value: "{confirm}",
                                 oninput: move |e| {
                                     confirm.set(e.value());
@@ -164,7 +169,7 @@ pub fn MasterPasswordDialog(
                             if !passwords_match && !confirm().is_empty() {
                                 p {
                                     style: "color: #f7768e; font-size: 12px; margin: 0;",
-                                    "Passwords do not match"
+                                    { crate::i18n::t("master_password.mismatch") }
                                 }
                             }
                         }
@@ -191,18 +196,18 @@ pub fn MasterPasswordDialog(
                             }
                         },
                         if loading() {
-                            "Verifying..."
+                            { crate::i18n::t("master_password.verifying") }
                         } else if is_first_run {
-                            "Create & Unlock"
+                            { crate::i18n::t("master_password.create_and_unlock") }
                         } else {
-                            "Unlock"
+                            { crate::i18n::t("master_password.unlock") }
                         }
                     }
 
                     if is_first_run {
                         p {
                             style: "font-size: 11px; color: #9aa5ce; margin: 0; text-align: center; line-height: 1.4;",
-                            "Your master password cannot be recovered if lost.\nIt protects all saved connection credentials."
+                            { crate::i18n::t("master_password.recovery_warning") }
                         }
                     }
                 }

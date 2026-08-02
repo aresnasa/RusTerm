@@ -321,11 +321,11 @@ pub fn SettingsDialog(
                 // ── Suggestion preferences ──────────────────────────────────
                 h3 {
                     style: "margin: 24px 0 6px; font-size: 16px;",
-                    "Command suggestions"
+                    { crate::i18n::t("settings.suggestions") }
                 }
                 p {
                     style: "margin: 0 0 16px; color: var(--settings-text-muted); font-size: 12px; line-height: 1.5;",
-                    "Inline fish-style suggestions based on your command history."
+                    { crate::i18n::t("settings.suggestions_help") }
                 }
 
                 div {
@@ -334,7 +334,7 @@ pub fn SettingsDialog(
                     // Enable / disable toggle
                     div {
                         style: "display: flex; align-items: center; justify-content: space-between; gap: 16px;",
-                        label { style: "font-size: 12px; color: var(--settings-text);", "Enable suggestions" }
+                        label { style: "font-size: 12px; color: var(--settings-text);", { crate::i18n::t("settings.enable_suggestions") } }
                         div {
                             style: "display: flex; align-items: center; gap: 8px;",
                             input {
@@ -345,7 +345,7 @@ pub fn SettingsDialog(
                             }
                             span {
                                 style: "font-size: 11px; color: var(--settings-text-muted);",
-                                {sug_enabled().then_some("ON").unwrap_or("OFF")}
+                                {if sug_enabled() { crate::i18n::t("settings.on") } else { crate::i18n::t("settings.off") }}
                             }
                         }
                     }
@@ -353,7 +353,7 @@ pub fn SettingsDialog(
                     // Suggestion count selector (3 / 5 / 10)
                     div {
                         style: "display: flex; align-items: center; justify-content: space-between; gap: 16px;",
-                        label { style: "font-size: 12px; color: var(--settings-text);", "Max suggestions shown" }
+                        label { style: "font-size: 12px; color: var(--settings-text);", { crate::i18n::t("settings.suggestion_count") } }
                         div {
                             style: "display: flex; gap: 6px;",
                             for &count in &[3u8, 5, 10] {
@@ -380,14 +380,14 @@ pub fn SettingsDialog(
                     div {
                         style: "font-size: 11px; color: var(--settings-text-muted); line-height: 1.5;",
                         {
-                            let c = sug_count();
-                            let desc = match c {
-                                3 => "3 — compact popup, minimal screen coverage",
-                                5 => "5 — balanced view of recent commands",
-                                10 => "10 — extensive history at a glance",
-                                _ => "compact popup, minimal screen coverage",
+                            let count = sug_count();
+                            let desc = match count {
+                                3 => crate::i18n::t("settings.suggestion_count_compact"),
+                                5 => crate::i18n::t("settings.suggestion_count_balanced"),
+                                10 => crate::i18n::t("settings.suggestion_count_extensive"),
+                                _ => crate::i18n::t("settings.suggestion_count_compact"),
                             };
-                            rsx! { "{desc}" }
+                            rsx! { "{count} — {desc}" }
                         }
                     }
                 }
@@ -395,15 +395,15 @@ pub fn SettingsDialog(
                 // ── Comparison preferences ──────────────────────────────────
                 h3 {
                     style: "margin: 24px 0 6px; font-size: 16px;",
-                    "Comparison mode"
+                    { crate::i18n::t("settings.comparison") }
                 }
                 p {
                     style: "margin: 0 0 12px; color: var(--settings-text-muted); font-size: 12px; line-height: 1.5;",
-                    "Control the warning shown before highlighting a comparison where more than half of the visible rows differ."
+                    { crate::i18n::t("settings.comparison_help") }
                 }
                 div {
                     style: "display: flex; align-items: center; justify-content: space-between; gap: 16px;",
-                    label { style: "font-size: 12px; color: var(--settings-text);", "Large diff warning" }
+                    label { style: "font-size: 12px; color: var(--settings-text);", { crate::i18n::t("settings.comparison_diff_warning") } }
                     div {
                         style: "display: flex; align-items: center; gap: 8px;",
                         input {
@@ -414,7 +414,7 @@ pub fn SettingsDialog(
                         }
                         span {
                             style: "font-size: 11px; color: var(--settings-text-muted);",
-                            {comparison_warning_enabled().then_some("ON").unwrap_or("OFF")}
+                            {if comparison_warning_enabled() { crate::i18n::t("settings.on") } else { crate::i18n::t("settings.off") }}
                         }
                     }
                 }
@@ -422,17 +422,17 @@ pub fn SettingsDialog(
                 // ── Usage habits (privacy) ────────────────────────────────
                 h3 {
                     style: "margin: 24px 0 6px; font-size: 16px;",
-                    "Usage habits & privacy / 使用习惯与隐私"
+                    { crate::i18n::t("settings.usage_habits") }
                 }
                 p {
                     style: "margin: 0 0 12px; color: var(--settings-text-muted); font-size: 12px; line-height: 1.5;",
-                    "Opt in to local command-habit learning. Data stays on this machine in a local DuckDB file unless you explicitly export it below."
+                    { crate::i18n::t("settings.usage_habits_help") }
                 }
                 div {
                     style: "display: flex; align-items: center; justify-content: space-between; gap: 16px;",
                     label {
                         style: "font-size: 12px; color: var(--settings-text);",
-                        "Collect usage habits / 收集使用习惯"
+                        { crate::i18n::t("settings.collect_usage_habits") }
                     }
                     div {
                         style: "display: flex; align-items: center; gap: 8px;",
@@ -444,23 +444,23 @@ pub fn SettingsDialog(
                         }
                         span {
                             style: "font-size: 11px; color: var(--settings-text-muted);",
-                            {usage_habits().then_some("ON").unwrap_or("OFF")}
+                            {if usage_habits() { crate::i18n::t("settings.on") } else { crate::i18n::t("settings.off") }}
                         }
                     }
                 }
                 div {
                     style: "background: var(--settings-bg); border: 1px solid var(--settings-border); border-radius: 6px; padding: 12px; margin-top: 8px; font-size: 11px; color: var(--settings-text-muted); line-height: 1.6;",
-                    div { style: "color: var(--settings-text); font-weight: 600; margin-bottom: 6px;", "What is collected / 收集内容" }
-                    div { "• Command name + first-token category (git, docker, kubectl, …)" }
-                    div { "• Success / failure counts and per-hour activity distribution" }
-                    div { "• Typo → correction pairs that you accept (e.g. dockre → docker)" }
-                    div { "• Number of distinct hosts (hostnames are NOT stored)" }
-                    div { style: "color: var(--settings-text); font-weight: 600; margin: 10px 0 6px;", "Never collected / 绝不收集" }
-                    div { "• Passwords, passphrases, private keys, API tokens, bearer tokens" }
-                    div { "• OneKey credential values or expect-matched secret responses" }
-                    div { "• Environment variable values, remote command output, session content" }
-                    div { "• Full command arguments when a credential flag is detected (the whole line is dropped or the value redacted to ***)" }
-                    div { style: "margin-top: 10px; color: var(--settings-text-muted);", "Secret material is filtered by a dedicated sanitizer before anything reaches the local DuckDB store. Turning this off stops all future collection; existing local data is retained until you clear it." }
+                    div { style: "color: var(--settings-text); font-weight: 600; margin-bottom: 6px;", { crate::i18n::t("settings.what_is_collected") } }
+                    div { { crate::i18n::t("settings.collected_command_category") } }
+                    div { { crate::i18n::t("settings.collected_activity_counts") } }
+                    div { { crate::i18n::t("settings.collected_corrections") } }
+                    div { { crate::i18n::t("settings.collected_host_count") } }
+                    div { style: "color: var(--settings-text); font-weight: 600; margin: 10px 0 6px;", { crate::i18n::t("settings.never_collected") } }
+                    div { { crate::i18n::t("settings.never_collected_credentials") } }
+                    div { { crate::i18n::t("settings.never_collected_onekey") } }
+                    div { { crate::i18n::t("settings.never_collected_session_data") } }
+                    div { { crate::i18n::t("settings.never_collected_sensitive_arguments") } }
+                    div { style: "margin-top: 10px; color: var(--settings-text-muted);", { crate::i18n::t("settings.privacy_sanitizer_help") } }
                 }
                 div {
                     style: "display: flex; gap: 8px; margin-top: 10px;",
@@ -468,38 +468,42 @@ pub fn SettingsDialog(
                         style: "background: var(--settings-bg); border: 1px solid var(--settings-border-strong); color: var(--settings-text); border-radius: 4px; padding: 6px 12px; cursor: pointer; font-size: 11px;",
                         disabled: "{!usage_habits()}",
                         onclick: move |_| on_export_usage_habits.call(()),
-                        "Export privacy-safe report (JSON)"
+                        { crate::i18n::t("settings.export_report") }
+                        " (JSON)"
                     }
                 }
                 div {
                     style: "font-size: 10px; color: var(--settings-text-muted); margin-top: 6px; line-height: 1.5;",
-                    "Export writes an aggregated, sanitized JSON file (no raw commands, no hostnames, no timestamps beyond the report generation time) to your downloads directory. Upload to GitHub Gist or object storage is a manual next step — paste the token into your uploader of choice; RusTerm never transmits anything automatically."
+                    { crate::i18n::t("settings.export_report_help") }
                 }
 
                 h3 {
                     style: "margin: 24px 0 6px; font-size: 16px;",
-                    "Keyboard shortcuts"
+                    { crate::i18n::t("settings.keybindings") }
                 }
                 p {
                     style: "margin: 0 0 12px; color: var(--settings-text-muted); font-size: 12px; line-height: 1.5;",
-                    "Click a shortcut, then press a new combination. Application shortcuts require Cmd/Ctrl + Shift so standard terminal controls remain available."
+                    { crate::i18n::t("settings.keybindings_help") }
                 }
                 div {
                     style: "display: flex; flex-direction: column; gap: 8px;",
                     for action in KeybindingAction::ALL {
                         {
-                            let action_label = action.label();
+                            let action_key = keybinding_action_key(action);
+                            let action_label = crate::i18n::t(action_key);
                             let is_capturing = capturing_keybinding() == Some(action);
                             let chord_label = if is_capturing {
-                                "Press shortcut…".to_string()
+                                crate::i18n::t("settings.keybinding_press_shortcut")
+                            } else if let Some(chord) = keybinding_draft().chord(action) {
+                                format_key_chord(Some(chord))
                             } else {
-                                format_key_chord(keybinding_draft().chord(action))
+                                crate::i18n::t("settings.keybinding_disabled")
                             };
                             let button_border = if is_capturing { "var(--settings-accent)" } else { "var(--settings-border-strong)" };
                             let button_bg = if is_capturing { "var(--settings-surface-hover)" } else { "var(--settings-bg)" };
                             rsx! {
                                 div {
-                                    key: "keybinding-{action_label}",
+                                    key: "keybinding-{action_key}",
                                     style: "display: flex; align-items: center; justify-content: space-between; gap: 12px;",
                                     span { style: "font-size: 12px; color: var(--settings-text);", "{action_label}" }
                                     div { style: "display: flex; align-items: center; gap: 6px;",
@@ -529,18 +533,16 @@ pub fn SettingsDialog(
                                                 };
                                                 if !chord.is_safe_application_shortcut() {
                                                     keybinding_error.set(Some(
-                                                        "Use Cmd/Ctrl + Shift plus a key to keep terminal controls safe."
-                                                            .to_string(),
+                                                        KeybindingValidationError::UnsafeShortcut,
                                                     ));
                                                     return;
                                                 }
                                                 if let Some(conflict) = keybinding_draft()
                                                     .conflicting_action(action, &chord)
                                                 {
-                                                    keybinding_error.set(Some(format!(
-                                                        "Already used by {}.",
-                                                        conflict.label()
-                                                    )));
+                                                    keybinding_error.set(Some(
+                                                        KeybindingValidationError::Conflict(conflict),
+                                                    ));
                                                     return;
                                                 }
                                                 keybinding_draft.write().set_chord(action, Some(chord));
@@ -558,7 +560,7 @@ pub fn SettingsDialog(
                                                 }
                                                 keybinding_error.set(None);
                                             },
-                                            "Disable"
+                                            { crate::i18n::t("settings.keybinding_disable") }
                                         }
                                     }
                                 }
@@ -566,7 +568,7 @@ pub fn SettingsDialog(
                         }
                     }
                     if let Some(error) = keybinding_error() {
-                        div { style: "font-size: 11px; color: var(--settings-danger); margin-top: 2px;", "{error}" }
+                        div { style: "font-size: 11px; color: var(--settings-danger); margin-top: 2px;", { keybinding_error_text(error) } }
                     }
                 }
 
@@ -585,14 +587,14 @@ pub fn SettingsDialog(
                             capturing_keybinding.set(None);
                             keybinding_error.set(None);
                         },
-                        "Reset default"
+                        { crate::i18n::t("settings.reset_default") }
                     }
                     div {
                         style: "display: flex; gap: 8px;",
                         button {
                             style: "background: transparent; border: 1px solid var(--settings-border); color: var(--settings-text); border-radius: 4px; padding: 8px 16px; cursor: pointer; font-size: 13px;",
                             onclick: move |_| on_close.call(()),
-                            "Cancel"
+                            { crate::i18n::t("common.cancel") }
                         }
                         button {
                             style: "background: var(--settings-accent); border: none; color: var(--settings-bg); border-radius: 4px; padding: 8px 16px; cursor: pointer; font-size: 13px; font-weight: 600;",
@@ -604,7 +606,7 @@ pub fn SettingsDialog(
                                 on_save_skin.call(skin_draft().normalized());
                                 on_save_usage_habits.call(usage_habits());
                             },
-                            "Save"
+                            { crate::i18n::t("common.save") }
                         }
                     }
                 }

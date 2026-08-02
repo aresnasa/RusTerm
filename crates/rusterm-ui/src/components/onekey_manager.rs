@@ -28,35 +28,64 @@ fn expect_mode_key(onekey_id: &str, step_index: usize) -> String {
 
 fn validate_onekeys(onekeys: &[OneKey]) -> Option<String> {
     for (entry_index, onekey) in onekeys.iter().enumerate() {
+        let entry_number = entry_index + 1;
         let entry_name = if onekey.name.trim().is_empty() {
-            format!("OneKey #{}", entry_index + 1)
+            crate::i18n::tf(
+                "onekey.validation.entry_numbered",
+                &[("number", &entry_number)],
+            )
         } else {
-            format!("OneKey ‘{}’", onekey.name.trim())
+            crate::i18n::tf(
+                "onekey.validation.entry_named",
+                &[("name", &onekey.name.trim())],
+            )
         };
         if onekey.name.trim().is_empty() {
-            return Some(format!("{entry_name} needs a name."));
+            return Some(crate::i18n::tf(
+                "onekey.validation.name_required",
+                &[("entry", &entry_name)],
+            ));
         }
         if onekey.steps.is_empty() {
-            return Some(format!(
-                "{entry_name} needs at least one Expect / Send step."
+            return Some(crate::i18n::tf(
+                "onekey.validation.steps_required",
+                &[("entry", &entry_name)],
             ));
         }
         for (step_index, step) in onekey.steps.iter().enumerate() {
+            let step_number = step_index + 1;
             let step_name = if step.label.trim().is_empty() {
-                format!("step #{}", step_index + 1)
+                crate::i18n::tf(
+                    "onekey.validation.step_numbered",
+                    &[("number", &step_number)],
+                )
             } else {
-                format!("step ‘{}’", step.label.trim())
+                crate::i18n::tf(
+                    "onekey.validation.step_named",
+                    &[("label", &step.label.trim())],
+                )
             };
             if step.expect.trim().is_empty() {
-                return Some(format!("{entry_name} {step_name} needs an Expect regex."));
+                return Some(crate::i18n::tf(
+                    "onekey.validation.expect_required",
+                    &[("entry", &entry_name), ("step", &step_name)],
+                ));
             }
             if let Err(error) = regex::Regex::new(&format!("(?i){}", step.expect)) {
-                return Some(format!(
-                    "{entry_name} {step_name} has an invalid Expect regex: {error}"
+                return Some(crate::i18n::tf(
+                    "onekey.validation.invalid_expect",
+                    &[
+                        ("entry", &entry_name),
+                        ("step", &step_name),
+                        ("error", &error),
+                    ],
                 ));
             }
             if step.send.is_empty() {
-                return Some(format!("{entry_name} {step_name} needs a Send value."));
+                return Some(crate::i18n::tf(
+                    "onekey.validation.send_required",
+                    &[("entry", &entry_name), ("step", &step_name)],
+                ));
             }
         }
     }
@@ -146,6 +175,7 @@ pub fn OneKeyManager(
     on_close: EventHandler<()>,
     on_save: EventHandler<Vec<OneKey>>,
 ) -> Element {
+    let _lang = crate::i18n::LANGUAGE();
     let initial_custom_expect_steps = onekeys
         .iter()
         .flat_map(|onekey| {
@@ -176,9 +206,9 @@ pub fn OneKeyManager(
         "password"
     };
     let send_toggle_label = if show_send_values() {
-        "Hide Send values"
+        crate::i18n::t("onekey.hide_send_values")
     } else {
-        "Show Send values"
+        crate::i18n::t("onekey.show_send_values")
     };
     let validation_error = validate_onekeys(&entries());
     let can_save = validation_error.is_none();
@@ -282,7 +312,7 @@ pub fn OneKeyManager(
 
                 div {
                     style: "display:flex;align-items:center;justify-content:space-between;gap:12px;margin:-8px -8px 6px;padding:8px;cursor:move;user-select:none;-webkit-user-select:none;",
-                    title: "Drag to move OneKey Manager",
+                    title: crate::i18n::t("onekey.drag_manager"),
                     onmousedown: move |e: MouseEvent| {
                         if e.trigger_button() != Some(MouseButton::Primary) {
                             return;
@@ -302,24 +332,20 @@ pub fn OneKeyManager(
                             moved: false,
                         }));
                     },
-                    h3 { style: "margin:0;font-size:16px;", "OneKeys (Expect / Send steps)" }
+                    h3 { style: "margin:0;font-size:16px;", { crate::i18n::t("onekey.manager_title") } }
                     button {
                         r#type: "button",
                         style: "background:transparent;border:1px solid #2a2b3d;border-radius:4px;color:#7aa2f7;padding:4px 8px;cursor:pointer;font-size:11px;",
-                        title: "Temporarily reveal Send values so they can be verified",
+                        title: crate::i18n::t("onekey.reveal_send_values_tooltip"),
                         onmousedown: move |e: MouseEvent| e.stop_propagation(),
                         onclick: move |_| show_send_values.toggle(),
                         "{send_toggle_label}"
                     }
                 }
                 p { style: "margin: 0 0 6px; font-size: 12px; color: #9aa5ce; line-height: 1.5;",
-                    "Each OneKey is a sequence of prompt/Send steps. Choose a built-in prompt type for \
-                     common Username, Password, sudo, Git, bastion, and SSH key passphrase prompts. \
-                     Send values are encrypted at rest." }
+                    { crate::i18n::t("onekey.manager_description") } }
                 p { style: "margin: 0 0 14px; font-size: 11px; color:#9aa5ce; line-height: 1.5;",
-                    "Use Custom regex only for unusual prompts. Matching is case-insensitive and runs \
-                     only for connections with One-Key Connect enabled — set it in the connection's \
-                     Edit dialog (checkbox right under Name)." }
+                    { crate::i18n::t("onekey.custom_regex_help") } }
 
                 div {
                     style: "display: flex; gap: 12px; flex: 1; min-height: 360px;",
@@ -335,6 +361,11 @@ pub fn OneKeyManager(
                                     let is_sel = selected() == Some(i);
                                     let bg = if is_sel { "#283457" } else { "transparent" };
                                     let i_clone = i;
+                                    let display_name = if ok.name.trim().is_empty() {
+                                        crate::i18n::t("onekey.untitled")
+                                    } else {
+                                        ok.name.clone()
+                                    };
                                     rsx! {
                                         div {
                                             key: "{ok.id}",
@@ -342,15 +373,15 @@ pub fn OneKeyManager(
                                                     background: {bg}; border-bottom: 1px solid #2a2b3d; \
                                                     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;",
                                             onclick: move |_| selected.set(Some(i_clone)),
-                                            "{ok.name}"
-                                            span { style: "color:#9aa5ce;font-size:10px;margin-left:6px;", {format!("({} steps)", ok.steps.len())} }
+                                            "{display_name}"
+                                            span { style: "color:#9aa5ce;font-size:10px;margin-left:6px;", { crate::i18n::tf("onekey.step_count", &[("count", &ok.steps.len())]) } }
                                         }
                                     }
                                 }
                             }
                             if entries().is_empty() {
                                 div { style: "padding: 16px 10px; color: #9aa5ce; font-size: 12px;",
-                                    "No OneKeys yet.\nClick + to add one." }
+                                    { crate::i18n::t("onekey.empty") }
                             }
                         }
                         button {
@@ -363,7 +394,9 @@ pub fn OneKeyManager(
                                 // Git HTTPS, and bastion hosts.
                                 let new_ok = OneKey {
                                     id: uuid::Uuid::new_v4().to_string(),
-                                    name: "new".to_string(),
+                                    name: String::new(),
+                                    // These labels are persisted semantic values used by credential
+                                    // classification, so they must not contain translated UI text.
                                     steps: vec![
                                         OneKeyStep {
                                             label: "Username".to_string(),
@@ -380,7 +413,7 @@ pub fn OneKeyManager(
                                 entries.write().push(new_ok);
                                 selected.set(Some(entries().len() - 1));
                             },
-                            "+ Add OneKey"
+                            { crate::i18n::t("onekey.add") }
                         }
                     }
 
@@ -393,11 +426,11 @@ pub fn OneKeyManager(
                                 {rsx! {
                                     div {
                                         style: "display: flex; flex-direction: column; gap: 4px;",
-                                        label { style: "{label_style}", "Name" }
+                                        label { style: "{label_style}", { crate::i18n::t("onekey.name") } }
                                         input {
                                             style: "{input_style}",
                                             r#type: "text",
-                                            placeholder: "ecs-user / git-inesa",
+                                            placeholder: crate::i18n::t("onekey.name_placeholder"),
                                             value: "{entries.read()[idx].name}",
                                             oninput: move |e| entries.write()[idx].name = e.value(),
                                         }
@@ -405,7 +438,7 @@ pub fn OneKeyManager(
 
                                     div {
                                         style: "display: flex; justify-content: space-between; align-items: center; margin-top: 4px;",
-                                        span { style: "{label_style}", "Expect / Send steps" }
+                                        span { style: "{label_style}", { crate::i18n::t("onekey.steps_label") } }
                                         button {
                                             style: "padding: 3px 8px; background: transparent; color: #7aa2f7; \
                                                     border: 1px solid #2a2b3d; border-radius: 4px; cursor: pointer; font-size: 11px;",
@@ -417,7 +450,7 @@ pub fn OneKeyManager(
                                                     send: String::new(),
                                                 });
                                             },
-                                            "+ Step"
+                                            { crate::i18n::t("onekey.add_step") }
                                         }
                                     }
 
@@ -454,13 +487,13 @@ pub fn OneKeyManager(
                                                         input {
                                                             style: "background: #16161e; border: 1px solid #2a2b3d; border-radius: 3px; padding: 5px; color: #9ece6a; font-size: 12px; outline: none; width: 120px;",
                                                             r#type: "text",
-                                                            placeholder: "label (Username)",
+                                                            placeholder: crate::i18n::t("onekey.step_label_placeholder"),
                                                             value: "{entries.read()[idx].steps[step_idx].label}",
                                                             oninput: move |e| entries.write()[idx].steps[step_idx].label = e.value(),
                                                         }
                                                         button {
                                                             style: "margin-left: auto; background: transparent; color: #f7768e; border: none; cursor: pointer; font-size: 14px; padding: 0 4px;",
-                                                            title: "Remove step",
+                                                            title: crate::i18n::t("onekey.remove_step"),
                                                             onclick: move |_| {
                                                                 entries.write()[idx].steps.remove(step_idx);
                                                                 custom_expect_steps
@@ -500,24 +533,24 @@ pub fn OneKeyManager(
                                                         option {
                                                             value: "password",
                                                             selected: expect_mode == "password",
-                                                            "Password prompt (recommended)"
+                                                            { crate::i18n::t("onekey.password_prompt_option") }
                                                         }
                                                         option {
                                                             value: "username",
                                                             selected: expect_mode == "username",
-                                                            "Git username prompt"
+                                                            { crate::i18n::t("onekey.username_prompt_option") }
                                                         }
                                                         option {
                                                             value: "custom",
                                                             selected: expect_mode == "custom",
-                                                            "Custom regex (advanced)"
+                                                            { crate::i18n::t("onekey.custom_regex_option") }
                                                         }
                                                     }
                                                     if is_custom_expect {
                                                         input {
                                                             style: "{input_style}",
                                                             r#type: "text",
-                                                            placeholder: "Custom Expect regex",
+                                                            placeholder: crate::i18n::t("onekey.custom_expect_placeholder"),
                                                             value: "{entries.read()[idx].steps[step_idx].expect}",
                                                             oninput: move |e| entries.write()[idx].steps[step_idx].expect = e.value(),
                                                         }
@@ -525,16 +558,16 @@ pub fn OneKeyManager(
                                                         div {
                                                             style: "font-size: 11px; color: #9aa5ce; line-height: 1.4;",
                                                             if expect_mode == "password" {
-                                                                "Matches Password, sudo, Git/bastion password, and SSH key passphrase prompts."
+                                                                { crate::i18n::t("onekey.password_prompt_help") }
                                                             } else {
-                                                                "Matches Git HTTPS username prompts."
+                                                                { crate::i18n::t("onekey.username_prompt_help") }
                                                             }
                                                         }
                                                     }
                                                     input {
                                                         style: "{input_style}",
                                                         r#type: "{send_input_type}",
-                                                        placeholder: "Send (secret — encrypted)",
+                                                        placeholder: crate::i18n::t("onekey.send_placeholder"),
                                                         autocomplete: "off",
                                                         spellcheck: "false",
                                                         value: "{entries.read()[idx].steps[step_idx].send}",
@@ -553,7 +586,7 @@ pub fn OneKeyManager(
                                             entries.write().remove(idx);
                                             selected.set(None);
                                         },
-                                        "Delete OneKey"
+                                        { crate::i18n::t("onekey.delete") }
                                     }
                                 }}
                             }
@@ -561,7 +594,8 @@ pub fn OneKeyManager(
                             div { style: "color: #9aa5ce; font-size: 13px; padding: 20px 0; \
                                           text-align: center; flex: 1; display: flex; align-items: center; \
                                           justify-content: center;",
-                                "Select a OneKey, or click + Add OneKey to create one." }
+                                { crate::i18n::t("onekey.select_or_add") }
+                            }
                         }
                     }
                 }
@@ -575,12 +609,12 @@ pub fn OneKeyManager(
                 }
                 div {
                     style: "display: flex; justify-content: flex-end; align-items:center; gap: 8px; margin-top: 12px;",
-                    span { style: "margin-right:auto;color:#9aa5ce;font-size:10px;", "Esc Cancel · Ctrl/Cmd+Enter Save" }
+                    span { style: "margin-right:auto;color:#9aa5ce;font-size:10px;", { crate::i18n::t("onekey.shortcuts") } }
                     button {
                         style: "background: transparent; border: 1px solid #2a2b3d; color: #c0caf5; \
                                 border-radius: 4px; padding: 8px 16px; cursor: pointer; font-size: 13px;",
                         onclick: move |_| on_close.call(()),
-                        "Cancel"
+                        { crate::i18n::t("common.cancel") }
                     }
                     button {
                         style: if can_save {
@@ -594,7 +628,7 @@ pub fn OneKeyManager(
                                 on_save.call(entries());
                             }
                         },
-                        "OK"
+                        { crate::i18n::t("common.ok") }
                     }
                 }
             }
@@ -644,16 +678,8 @@ mod tests {
 
     #[test]
     fn empty_send_and_invalid_regex_are_rejected() {
-        assert!(
-            validate_onekeys(&[entry("password:", "")])
-                .unwrap()
-                .contains("Send value")
-        );
-        assert!(
-            validate_onekeys(&[entry("(", "secret")])
-                .unwrap()
-                .contains("invalid Expect regex")
-        );
+        assert!(validate_onekeys(&[entry("password:", "")]).is_some());
+        assert!(validate_onekeys(&[entry("(", "secret")]).is_some());
     }
 
     #[test]

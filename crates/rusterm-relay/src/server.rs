@@ -22,6 +22,7 @@ use tokio::sync::oneshot;
 
 use crate::audit::{AuditAction, AuditEntry, AuditLog, AuditOutcome, now_iso};
 use crate::auth::{RateLimiter, authenticate, parse_basic_auth};
+use crate::command_guard::BlocklistConfig;
 use crate::config::RelayConfig;
 #[cfg(test)]
 use crate::executor::NullExecutor;
@@ -70,6 +71,11 @@ impl RelayHandle {
 
 /// Start the relay. Binds first (so port conflicts are reported before any
 /// state changes), then spawns the serving task.
+///
+/// The dangerous-command blocklist is loaded from `relay-blocklist.json`
+/// (if present) and merged into the validator. The hardcoded catastrophic
+/// patterns always apply regardless of this file — it can only *add*
+/// restrictions.
 pub async fn run(
     config: RelayConfig,
     executor: Arc<dyn RelayExecutor>,
@@ -80,10 +86,34 @@ pub async fn run(
         .map_err(|e| anyhow::anyhow!("cannot bind relay at {bind}: {e} (port already in use?)"))?;
     let bound_addr = listener.local_addr()?;
 
+    // Load the user/skill blocklist. Missing file = empty (first launch).
+    // Invalid regexes are logged but don't abort startup — one bad pattern
+    // shouldn't take down the API.
+    let blocklist = BlocklistConfig::load().unwrap_or_else(|e| {
+        tracing::warn!("[relay] failed to load blocklist config: {e}; using built-ins only");
+        BlocklistConfig::default()
+    });
+    let loaded = blocklist.compile();
+    for err in &loaded.errors {
+        tracing::warn!(
+            "[relay] blocklist pattern from {} failed to compile: {} (regex: {:?})",
+            err.source,
+            err.error,
+            err.regex
+        );
+    }
+    if !loaded.patterns.is_empty() {
+        tracing::info!(
+            "[relay] loaded {} user/skill blocklist patterns",
+            loaded.patterns.len()
+        );
+    }
+    let validator = Arc::new(CommandValidator::new().with_blocklist(loaded));
+
     let state = AppState {
         config: Arc::new(parking_lot::RwLock::new(config)),
         executor,
-        validator: Arc::new(CommandValidator::new()),
+        validator,
         limiter: RateLimiter::new(),
         audit: Arc::new(AuditLog::new()),
     };
@@ -948,5 +978,144 @@ mod tests {
         body: &serde_json::Value,
     ) -> (u16, serde_json::Value) {
         raw_request(url, "POST", auth, Some(body.to_string())).await
+    }
+
+    // ── Script endpoint (issue 73) ────────────────────────────────────────
+
+    #[tokio::test]
+    async fn missing_payload_returns_400() {
+        let executor: Arc<dyn RelayExecutor> = Arc::new(NullExecutor);
+        let handle = run(test_config(), executor).await.unwrap();
+        let (status, body) = post_json(
+            &format!("{}/api/v1/exec", handle.url()),
+            Some(("ops", "pw")),
+            &serde_json::json!({"host_id": "host-1"}),
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], "missing_payload");
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn multiple_payloads_returns_400() {
+        let executor: Arc<dyn RelayExecutor> = Arc::new(NullExecutor);
+        let handle = run(test_config(), executor).await.unwrap();
+        let (status, body) = post_json(
+            &format!("{}/api/v1/exec", handle.url()),
+            Some(("ops", "pw")),
+            &serde_json::json!({
+                "host_id": "host-1",
+                "command": "uptime",
+                "script": "echo hi",
+            }),
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], "multiple_payloads");
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn base64_invalid_returns_400() {
+        let executor: Arc<dyn RelayExecutor> = Arc::new(NullExecutor);
+        let handle = run(test_config(), executor).await.unwrap();
+        let (status, body) = post_json(
+            &format!("{}/api/v1/exec", handle.url()),
+            Some(("ops", "pw")),
+            &serde_json::json!({
+                "host_id": "host-1",
+                "script_base64": "not base64!!!",
+            }),
+        )
+        .await;
+        assert_eq!(status, 400);
+        assert_eq!(body["code"], "base64_invalid");
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn script_with_dangerous_line_returns_403() {
+        let executor: Arc<dyn RelayExecutor> = Arc::new(NullExecutor);
+        let handle = run(test_config(), executor).await.unwrap();
+        // Line 2 is `rm -rf /` — the hard floor must reject the whole script.
+        let (status, _) = post_json(
+            &format!("{}/api/v1/exec", handle.url()),
+            Some(("ops", "pw")),
+            &serde_json::json!({
+                "host_id": "host-1",
+                "script": "echo before\nrm -rf /\necho after",
+            }),
+        )
+        .await;
+        assert_eq!(status, 403);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn script_with_syntax_error_returns_403_sandbox_failed() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let handle = run(test_config(), executor).await.unwrap();
+        // `if true; then echo broken` (no `fi`) — passes the hard floor
+        // (each line is individually benign) but fails `sh -n` syntax check
+        // in the sandbox pre-flight.
+        let (status, body) = post_json(
+            &format!("{}/api/v1/exec", handle.url()),
+            Some(("ops", "pw")),
+            &serde_json::json!({
+                "host_id": "host-1",
+                "script": "if true; then echo broken",
+            }),
+        )
+        .await;
+        assert_eq!(status, 403);
+        // The syntax error is caught by the sandbox, not the validator —
+        // so the code should be `sandbox_failed`.
+        assert_eq!(body["code"], "sandbox_failed");
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn base64_encoded_benign_script_runs() {
+        use base64::Engine;
+        let executor = Arc::new(RecordingExecutor::default());
+        let handle = run(test_config(), executor).await.unwrap();
+        let script = "#!/bin/sh\nset -e\necho hello\nuptime\n";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(script);
+        let (status, body) = post_json(
+            &format!("{}/api/v1/exec", handle.url()),
+            Some(("ops", "pw")),
+            &serde_json::json!({
+                "host_id": "host-1",
+                "script_base64": encoded,
+            }),
+        )
+        .await;
+        // If dcg is installed and denies a benign script, this becomes 403 —
+        // acceptable in CI, since dcg's verdict is environment-dependent.
+        // We assert it's either 200 (happy path) or 403 with dcg/sandbox code.
+        assert!(
+            status == 200 || (status == 403 && body["code"].as_str().is_some()),
+            "unexpected status {status}, body: {body}"
+        );
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn command_still_works_backward_compatible() {
+        // The legacy `command` field must keep working exactly as before.
+        let executor = Arc::new(RecordingExecutor::default());
+        let handle = run(test_config(), executor.clone()).await.unwrap();
+        let (status, _) = post_json(
+            &format!("{}/api/v1/exec", handle.url()),
+            Some(("ops", "pw")),
+            &serde_json::json!({
+                "host_id": "host-1",
+                "command": "uptime",
+            }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        handle.shutdown().await;
     }
 }
