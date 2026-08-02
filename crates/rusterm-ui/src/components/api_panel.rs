@@ -125,6 +125,10 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
             .api-field{{display:flex;flex-direction:column;gap:3px;margin-bottom:8px;}}
             .api-field > span{{font-size:11px;color:#9aa5ce;}}
             .api-input{{padding:5px 7px;border:1px solid #2a2b3d;border-radius:4px;background:#1a1b26;color:#c0caf5;font-size:12px;outline:none;box-sizing:border-box;width:100%;}}
+            .api-command-field{{padding:8px;border:1px solid rgba(224,175,104,.55);border-radius:5px;background:rgba(224,175,104,.08);}}
+            .api-command-field > span{{color:#e0af68;font-weight:600;}}
+            .api-command-field .api-input{{border-color:#e0af68;box-shadow:0 0 0 1px rgba(224,175,104,.18);}}
+            .api-command-edit-hint{{font-size:11px;color:#e0af68;line-height:1.4;}}
             .api-row{{display:flex;align-items:center;gap:8px;margin-bottom:8px;}}
             .api-btn{{border:1px solid #2a2b3d;border-radius:4px;background:#1a1b26;color:#c0caf5;font-size:11px;padding:4px 10px;cursor:pointer;}}
             .api-btn:hover{{border-color:#7aa2f7;color:#7aa2f7;}}
@@ -363,8 +367,11 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
                             }
                         }
                     }
-                    div { class: "api-field",
+                    div { class: "api-field api-command-field",
                         span { { crate::i18n::t("api.command") } }
+                        div { class: "api-command-edit-hint",
+                            { crate::i18n::t("api.command_edit_hint") }
+                        }
                         input {
                             class: "api-input",
                             value: "{curl_command}",
@@ -461,6 +468,8 @@ if [ -z \"${{RUSTERM_API_PASSWORD+x}}\" ]; then\n\
   printf '\\n' >&2\n\
   export RUSTERM_API_PASSWORD\n\
 fi\n\n\
+# EDIT REMOTE COMMAND BELOW / 在下方修改远程命令\n\
+# Change the JSON \"command\" value / 请替换 JSON 中的 \"command\" 值\n\
 curl -X POST \"${{RUSTERM_API_URL}}/api/v1/exec\" \\\n  -u \"${{RUSTERM_API_USER}}:${{RUSTERM_API_PASSWORD}}\" \\\n  -H 'Content-Type: application/json' \\\n  -d {body}",
         url = shell_quote(url.trim_end_matches('/')),
         user = shell_quote(default_user),
@@ -513,6 +522,25 @@ mod tests {
         assert!(
             curl.contains("elevated\":true"),
             "missing elevation flag: {curl}"
+        );
+    }
+
+    #[test]
+    fn curl_marks_the_remote_command_edit_location() {
+        let curl = gen_curl(
+            "http://127.0.0.1:8080",
+            "alice",
+            &Some("prod-web".to_string()),
+            "docker ps",
+            true,
+        );
+        assert!(
+            curl.contains("# EDIT REMOTE COMMAND BELOW / 在下方修改远程命令"),
+            "missing command edit marker: {curl}"
+        );
+        assert!(
+            curl.contains("command\":\"docker ps\""),
+            "the editable command should remain in the JSON body: {curl}"
         );
     }
 

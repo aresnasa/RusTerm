@@ -290,6 +290,10 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
             "复制的脚本会导出已配置的用户名，并在每个 shell 中仅询问一次 API 密码；密码不会写入 shell 历史。",
         ),
         "api.command" => ("Command", "命令"),
+        "api.command_edit_hint" => (
+            "↓ Edit the remote command here. The curl script updates automatically.",
+            "↓ 在这里输入要执行的远程命令；curl 脚本会自动更新。",
+        ),
         "api.elevated" => ("Run with reusable sudo authorization", "复用 sudo 授权执行"),
         "api.session" => ("Session", "会话"),
         "api.copy" => ("Copy", "复制"),
