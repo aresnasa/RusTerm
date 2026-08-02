@@ -215,6 +215,17 @@ fn SendCompletionPopup(
                 max-height:240px;
                 overflow-y:auto;
             ",
+            // Prevent default on pointer/mouse down so the textarea keeps
+            // focus while the user clicks a suggestion — mirrors the
+            // SuggestionPopup / OneKeyPopup pattern.
+            onpointerdown: move |e: Event<PointerData>| {
+                e.prevent_default();
+                e.stop_propagation();
+            },
+            onmousedown: move |e: Event<MouseData>| {
+                e.prevent_default();
+                e.stop_propagation();
+            },
             for (i, cmd) in suggestions.iter().enumerate() {
                 {
                     let is_sel = i == current;
