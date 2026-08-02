@@ -267,6 +267,11 @@ pub struct AppState {
     /// popup once the grace period elapses.
     #[serde(skip)]
     pub onekey_submission_cooldown: HashMap<String, (String, std::time::Instant)>,
+    /// Fresh remote output received after a submission, accumulated across PTY
+    /// chunks. This distinguishes a genuinely re-emitted (possibly fragmented)
+    /// prompt from residual text already present in the terminal model.
+    #[serde(skip)]
+    pub onekey_output_since_submission: HashMap<String, String>,
     /// (session_id, skip-reason) pairs already reported at info level, so a
     /// repeated OneKey gate skip (e.g. `disabled_for_session` on every output
     /// chunk) logs exactly once per session instead of spamming — while never
@@ -714,6 +719,7 @@ impl Default for AppState {
             onekey_popups: HashMap::new(),
             onekey_submission_feedback: HashMap::new(),
             onekey_submission_cooldown: HashMap::new(),
+            onekey_output_since_submission: HashMap::new(),
             onekey_skip_logged: HashSet::new(),
             session_configs: HashMap::new(),
             session_connection_states: HashMap::new(),
@@ -2452,6 +2458,7 @@ pub fn close_session(
     state.onekey_popups.remove(id);
     state.onekey_submission_feedback.remove(id);
     state.onekey_submission_cooldown.remove(id);
+    state.onekey_output_since_submission.remove(id);
     state.onekey_preference_attempts.remove(id);
     state
         .onekey_skip_logged
@@ -2622,6 +2629,7 @@ pub fn close_workspace(
         state.onekey_popups.remove(sid);
         state.onekey_submission_feedback.remove(sid);
         state.onekey_submission_cooldown.remove(sid);
+        state.onekey_output_since_submission.remove(sid);
         state.onekey_preference_attempts.remove(sid);
         state
             .onekey_skip_logged

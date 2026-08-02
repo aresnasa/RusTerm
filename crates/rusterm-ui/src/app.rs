@@ -2402,6 +2402,8 @@ fn render_terminal_pane(
                                             std::time::Instant::now(),
                                         ),
                                     );
+                                    app.onekey_output_since_submission
+                                        .insert(sid_for_ok_sel.clone(), String::new());
                                     if let Some(preference) = selection.preference.clone() {
                                         remember_onekey_preference(&mut app, preference.clone());
                                         app.onekey_preference_attempts.insert(
@@ -2428,6 +2430,7 @@ fn render_terminal_pane(
                                 let mut app = state_for_cmd.write();
                                 app.onekey_submission_feedback.remove(&sid_for_ok_sel);
                                 app.onekey_submission_cooldown.remove(&sid_for_ok_sel);
+                                app.onekey_output_since_submission.remove(&sid_for_ok_sel);
                                 tracing::warn!(
                                     "[ONEKEY-SELECT] session={} input channel closed",
                                     sid_short
@@ -2437,6 +2440,7 @@ fn render_terminal_pane(
                                 let mut app = state_for_cmd.write();
                                 app.onekey_submission_feedback.remove(&sid_for_ok_sel);
                                 app.onekey_submission_cooldown.remove(&sid_for_ok_sel);
+                                app.onekey_output_since_submission.remove(&sid_for_ok_sel);
                                 tracing::warn!(
                                     "[ONEKEY-SELECT] session={} input sender missing",
                                     sid_short
@@ -2508,6 +2512,7 @@ fn render_terminal_pane(
                         app.onekey_popups.remove(&sid_for_ok_save);
                         app.onekey_submission_feedback.remove(&sid_for_ok_save);
                         app.onekey_submission_cooldown.remove(&sid_for_ok_save);
+                        app.onekey_output_since_submission.remove(&sid_for_ok_save);
                     },
                     on_onekey_dismiss: move |_: ()| {
                         dismiss_onekey_popup(
@@ -6123,6 +6128,8 @@ fn dismiss_onekey_popup(
         state.onekey_popups.remove(session_id);
         state.onekey_submission_feedback.remove(session_id);
         state.onekey_submission_cooldown.remove(session_id);
+        state.onekey_output_since_submission.remove(session_id);
+        state.onekey_preference_attempts.remove(session_id);
     }
     should_hide
 }
@@ -6131,6 +6138,7 @@ fn clear_onekey_session_runtime(state: &mut AppState, session_id: &str) {
     state.onekey_popups.remove(session_id);
     state.onekey_submission_feedback.remove(session_id);
     state.onekey_submission_cooldown.remove(session_id);
+    state.onekey_output_since_submission.remove(session_id);
     state.onekey_preference_attempts.remove(session_id);
 }
 
@@ -6143,6 +6151,7 @@ fn note_manual_input_after_onekey_submission(
     if !state.onekey_preference_attempts.contains_key(session_id) {
         state.onekey_submission_feedback.remove(session_id);
         state.onekey_submission_cooldown.remove(session_id);
+        state.onekey_output_since_submission.remove(session_id);
         return;
     }
     let submitted_command = data.contains(&b'\r')
@@ -6152,6 +6161,7 @@ fn note_manual_input_after_onekey_submission(
         state.onekey_preference_attempts.remove(session_id);
         state.onekey_submission_feedback.remove(session_id);
         state.onekey_submission_cooldown.remove(session_id);
+        state.onekey_output_since_submission.remove(session_id);
     }
 }
 
@@ -6303,6 +6313,20 @@ const ONEKEY_SKIP_ALT_SCREEN: OneKeySkip =
 const ONEKEY_SKIP_NO_MATCH: OneKeySkip = "no_match";
 const ONEKEY_SKIP_COOLDOWN: OneKeySkip = "submission_cooldown";
 
+fn note_onekey_output_after_submission(state: &mut AppState, session_id: &str, data: &[u8]) {
+    if !state.onekey_submission_cooldown.contains_key(session_id) {
+        return;
+    }
+    let output = state
+        .onekey_output_since_submission
+        .entry(session_id.to_string())
+        .or_default();
+    if output.len().saturating_add(data.len()) > 4096 {
+        output.clear();
+    }
+    output.push_str(&String::from_utf8_lossy(data));
+}
+
 fn onekey_popup_for_output(
     state: &AppState,
     session_id: &str,
@@ -6355,8 +6379,12 @@ fn onekey_popup_for_output(
             // retry carries the prompt again in the fresh output chunk and must
             // bypass cooldown so the remembered credential is invalidated now,
             // even if the remote rejects it in under three seconds.
-            let raw = strip_ansi(&String::from_utf8_lossy(data));
-            let fresh_line = raw
+            let fresh_output = state
+                .onekey_output_since_submission
+                .get(session_id)
+                .map(|output| strip_ansi(output))
+                .unwrap_or_default();
+            let fresh_line = fresh_output
                 .lines()
                 .rev()
                 .find(|line| !line.trim().is_empty())
@@ -6511,6 +6539,8 @@ fn note_onekey_prompt_after_submission(
             // A different matching prompt is the next step of a multi-step
             // exchange, not a rejection of the previous credential.
             state.onekey_submission_feedback.remove(session_id);
+            state.onekey_submission_cooldown.remove(session_id);
+            state.onekey_output_since_submission.remove(session_id);
             state.onekey_preference_attempts.remove(session_id);
             false
         }
@@ -6545,6 +6575,8 @@ fn apply_onekey_popup(
 
     let repeated_prompt = note_onekey_prompt_after_submission(state, session_id, &popup);
     if repeated_prompt {
+        state.onekey_submission_cooldown.remove(session_id);
+        state.onekey_output_since_submission.remove(session_id);
         if let Some(attempt) = state.onekey_preference_attempts.remove(session_id) {
             if forget_onekey_preference(state, &attempt.preference) {
                 tracing::info!(
@@ -6588,6 +6620,9 @@ fn apply_onekey_popup(
                 session_id.to_string(),
                 (candidate.matched_expect.clone(), std::time::Instant::now()),
             );
+            state
+                .onekey_output_since_submission
+                .insert(session_id.to_string(), String::new());
             state.onekey_preference_attempts.insert(
                 session_id.to_string(),
                 OneKeyPreferenceAttempt {
@@ -6632,6 +6667,7 @@ fn check_onekey_match_with_senders_in_state(
     session_id: &str,
     data: &[u8],
 ) {
+    note_onekey_output_after_submission(state, session_id, data);
     if let Ok(popup) = onekey_popup_for_output(state, session_id, data) {
         apply_onekey_popup(state, senders, session_id, popup);
     }
@@ -6708,6 +6744,7 @@ fn check_onekey_match(
     session_id: &str,
     data: &[u8],
 ) {
+    note_onekey_output_after_submission(&mut state.write(), session_id, data);
     // Decide from a read snapshot first so the read guard is released before
     // we take the write guard below.
     let (outcome, onekeys_count) = {
@@ -7525,8 +7562,15 @@ mod session_startup_tests {
         check_onekey_match_with_senders_in_state(&mut state, &senders, session_id, prompt);
         assert_eq!(receiver.try_recv().unwrap(), b"preferred-secret\r");
         // A fresh repeated prompt is a real rejection even inside the residual
-        // text cooldown; no later output is required to reopen the chooser.
-        check_onekey_match_with_senders_in_state(&mut state, &senders, session_id, prompt);
+        // text cooldown and when PTY/network chunking splits the prompt.
+        check_onekey_match_with_senders_in_state(
+            &mut state,
+            &senders,
+            session_id,
+            b"[sudo: authenticate] Pass",
+        );
+        assert!(!state.onekey_popups.contains_key(session_id));
+        check_onekey_match_with_senders_in_state(&mut state, &senders, session_id, b"word: ");
 
         assert!(state.onekey_preferences.is_empty());
         assert!(state.onekey_preference_attempts.get(session_id).is_none());
@@ -9396,6 +9440,7 @@ fn start_ssh_connection(
                             s.onekey_popups.remove(&id);
                             s.onekey_submission_feedback.remove(&id);
                             s.onekey_submission_cooldown.remove(&id);
+                            s.onekey_output_since_submission.remove(&id);
                             s.onekey_preference_attempts.remove(&id);
                             if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
                                 // Keep disconnect feedback exclusively in session
@@ -9891,6 +9936,7 @@ fn start_shell_connection(
                             s.onekey_popups.remove(&id);
                             s.onekey_submission_feedback.remove(&id);
                             s.onekey_submission_cooldown.remove(&id);
+                            s.onekey_output_since_submission.remove(&id);
                             s.onekey_preference_attempts.remove(&id);
                             if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
                                 // Keep disconnect feedback exclusively in session
@@ -11418,6 +11464,7 @@ fn reconnect_session(
         s.onekey_popups.remove(&tab_id);
         s.onekey_submission_feedback.remove(&tab_id);
         s.onekey_submission_cooldown.remove(&tab_id);
+        s.onekey_output_since_submission.remove(&tab_id);
         s.onekey_preference_attempts.remove(&tab_id);
         s.pending_exit_check.remove(&tab_id);
     }
