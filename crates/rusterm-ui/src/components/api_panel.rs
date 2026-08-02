@@ -141,6 +141,7 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
             .api-status.idle{{background:#24283b;color:#9aa5ce;}}
             .api-account{{border:1px solid #2a2b3d;border-radius:4px;padding:6px 8px;margin-bottom:5px;background:#1a1b26;}}
             .api-code{{font-family:'JetBrains Mono','Fira Code',ui-monospace,monospace;font-size:11px;background:#16161e;border:1px solid #2a2b3d;border-radius:4px;padding:8px 10px;color:#9ece6a;white-space:pre-wrap;word-break:break-all;}}
+            .api-command-highlight{{display:inline;padding:1px 3px;border-radius:3px;background:#e0af68;color:#16161e;font-weight:700;box-shadow:0 0 0 1px rgba(255,158,100,.75),0 0 8px rgba(224,175,104,.45);}}
             .api-hint{{font-size:11px;color:#9aa5ce;line-height:1.5;margin:4px 0 8px;}}
         "# }
 
@@ -389,8 +390,26 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
                         { crate::i18n::t("api.elevated") }
                     }
 
-                    div { class: "api-code",
-                        { gen_curl(&url, &default_user, &selected_session(), &curl_command(), curl_elevated()) }
+                    {
+                        let preview = gen_curl_preview(
+                            &url,
+                            &default_user,
+                            &selected_session(),
+                            &curl_command(),
+                            curl_elevated(),
+                        );
+                        let CurlPreviewParts {
+                            before_command,
+                            command,
+                            after_command,
+                        } = preview;
+                        rsx! {
+                            div { class: "api-code",
+                                {before_command}
+                                span { class: "api-command-highlight", {command} }
+                                {after_command}
+                            }
+                        }
                     }
                     div { class: "api-row", style: "margin-top:8px;",
                         button {
@@ -439,16 +458,29 @@ POST {url}/api/v1/parse-curl   # parse a pasted curl into JSON",
     }
 }
 
-/// Build a ready-to-run shell snippet. API credentials are exported once and
-/// reused by curl; the password is read with terminal echo disabled instead of
-/// being copied into the clipboard or shell history.
-fn gen_curl(
+#[derive(Debug, PartialEq, Eq)]
+struct CurlPreviewParts {
+    before_command: String,
+    command: String,
+    after_command: String,
+}
+
+impl CurlPreviewParts {
+    fn into_script(self) -> String {
+        self.before_command + &self.command + &self.after_command
+    }
+}
+
+/// Build the shell snippet as three text fragments so the JSON `command` value
+/// can be styled independently without injecting HTML or matching duplicate
+/// command text elsewhere in the script.
+fn gen_curl_preview(
     url: &str,
     default_user: &str,
     session: &Option<String>,
     command: &str,
     elevated: bool,
-) -> String {
+) -> CurlPreviewParts {
     let host = session.clone().unwrap_or_else(|| "HOST".to_string());
     let body = serde_json::json!({
         "host_id": host,
@@ -456,9 +488,26 @@ fn gen_curl(
         "elevated": elevated,
     })
     .to_string();
-    let shell_quote = |value: &str| format!("'{}'", value.replace('\'', "'\"'\"'"));
-    format!(
-        "export RUSTERM_API_URL={url}\n\
+    let command_json = serde_json::to_string(command).expect("strings always serialize to JSON");
+    let command_key = "\"command\":";
+    let value_start = body
+        .find(command_key)
+        .map(|start| start + command_key.len())
+        .expect("generated JSON body always contains the command field");
+    let value_end = value_start + command_json.len();
+
+    // Keep the JSON quotes outside the highlighted fragment. Escaping each
+    // fragment independently is equivalent to escaping the concatenated body,
+    // including commands containing apostrophes.
+    let body_before_command = &body[..value_start + 1];
+    let body_command = &command_json[1..command_json.len() - 1];
+    let body_after_command = &body[value_end - 1..];
+    let shell_escape = |value: &str| value.replace('\'', "'\"'\"'");
+    let shell_quote = |value: &str| format!("'{}'", shell_escape(value));
+
+    CurlPreviewParts {
+        before_command: format!(
+            "export RUSTERM_API_URL={url}\n\
 export RUSTERM_API_USER={user}\n\
 if [ -z \"${{RUSTERM_API_PASSWORD+x}}\" ]; then\n\
   printf 'RusTerm API password: ' >&2\n\
@@ -470,11 +519,27 @@ if [ -z \"${{RUSTERM_API_PASSWORD+x}}\" ]; then\n\
 fi\n\n\
 # EDIT REMOTE COMMAND BELOW / 在下方修改远程命令\n\
 # Change the JSON \"command\" value / 请替换 JSON 中的 \"command\" 值\n\
-curl -X POST \"${{RUSTERM_API_URL}}/api/v1/exec\" \\\n  -u \"${{RUSTERM_API_USER}}:${{RUSTERM_API_PASSWORD}}\" \\\n  -H 'Content-Type: application/json' \\\n  -d {body}",
-        url = shell_quote(url.trim_end_matches('/')),
-        user = shell_quote(default_user),
-        body = shell_quote(&body),
-    )
+curl -X POST \"${{RUSTERM_API_URL}}/api/v1/exec\" \\\n  -u \"${{RUSTERM_API_USER}}:${{RUSTERM_API_PASSWORD}}\" \\\n  -H 'Content-Type: application/json' \\\n  -d '{body_before_command}",
+            url = shell_quote(url.trim_end_matches('/')),
+            user = shell_quote(default_user),
+            body_before_command = shell_escape(body_before_command),
+        ),
+        command: shell_escape(body_command),
+        after_command: format!("{}'", shell_escape(body_after_command)),
+    }
+}
+
+/// Build a ready-to-run shell snippet. API credentials are exported once and
+/// reused by curl; the password is read with terminal echo disabled instead of
+/// being copied into the clipboard or shell history.
+fn gen_curl(
+    url: &str,
+    default_user: &str,
+    session: &Option<String>,
+    command: &str,
+    elevated: bool,
+) -> String {
+    gen_curl_preview(url, default_user, session, command, elevated).into_script()
 }
 
 #[cfg(test)]
@@ -560,6 +625,56 @@ mod tests {
         assert!(
             curl.contains(r#"command":"echo \"hi\" \\n""#),
             "bad escape: {curl}"
+        );
+    }
+
+    #[test]
+    fn curl_preview_highlights_only_the_json_command_value() {
+        let preview = gen_curl_preview(
+            "http://repeat.example",
+            "repeat",
+            &Some("repeat".to_string()),
+            "repeat",
+            true,
+        );
+        let marked = format!(
+            "{}<mark>{}</mark>{}",
+            preview.before_command, preview.command, preview.after_command
+        );
+
+        assert_eq!(marked.matches("<mark>").count(), 1);
+        assert!(
+            marked.contains(r#""command":"<mark>repeat</mark>""#),
+            "highlight must wrap only the command field value: {marked}"
+        );
+    }
+
+    #[test]
+    fn curl_preview_highlight_preserves_json_and_shell_escaping() {
+        let preview = gen_curl_preview(
+            "http://x",
+            "u",
+            &Some("h".to_string()),
+            r#"echo "hi" 'there' \n"#,
+            false,
+        );
+
+        assert_eq!(preview.command, r#"echo \"hi\" '"'"'there'"'"' \\n"#);
+        let script = preview.into_script();
+        assert!(
+            script.contains(r#"command":"echo \"hi\" '"'"'there'"'"' \\n""#),
+            "highlight fragments must concatenate into the escaped shell script: {script}"
+        );
+    }
+
+    #[test]
+    fn curl_preview_handles_an_empty_command() {
+        let preview = gen_curl_preview("http://x", "u", &Some("h".to_string()), "", false);
+
+        assert!(preview.command.is_empty());
+        assert!(
+            preview.into_script().contains(r#""command":"""#),
+            "empty command must remain valid JSON"
         );
     }
 

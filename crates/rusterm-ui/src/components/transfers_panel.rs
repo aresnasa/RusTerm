@@ -9,6 +9,7 @@ pub fn TransfersPanel(
     on_retry: EventHandler<String>,
     on_clear_finished: EventHandler<()>,
 ) -> Element {
+    let _lang = crate::i18n::LANGUAGE();
     let has_finished = jobs.iter().any(|job| job.status.is_finished());
 
     rsx! {
@@ -37,14 +38,18 @@ pub fn TransfersPanel(
                 style: "display:flex;align-items:center;justify-content:space-between;gap:12px;padding:9px 12px;border-bottom:1px solid var(--skin-border);",
                 div {
                     style: "font-size:12px;font-weight:600;",
-                    "Transfers"
+                    { crate::i18n::t("transfers.tab_title") }
                 }
                 button {
                     class: "transfers-panel-button",
                     disabled: !has_finished,
-                    title: if has_finished { "Remove completed, failed, and cancelled transfers" } else { "No finished transfers" },
+                    title: if has_finished {
+                        crate::i18n::t("transfers.clear_finished_hint")
+                    } else {
+                        crate::i18n::t("transfers.no_finished_hint")
+                    },
                     onclick: move |_| on_clear_finished.call(()),
-                    "Clear finished"
+                    { crate::i18n::t("transfers.clear_finished") }
                 }
             }
 
@@ -53,7 +58,7 @@ pub fn TransfersPanel(
                 if jobs.is_empty() {
                     div {
                         style: "display:flex;height:100%;min-height:120px;align-items:center;justify-content:center;padding:24px;text-align:center;color:var(--skin-text-muted);font-size:12px;line-height:1.6;box-sizing:border-box;",
-                        "No file transfers yet.\nUploads and downloads will appear here."
+                        { crate::i18n::t("transfers.empty_state") }
                     }
                 } else {
                     for job in jobs {
@@ -65,9 +70,9 @@ pub fn TransfersPanel(
                             let destination = endpoint_label(&job.destination);
                             let status_text = status(&job.status);
                             let direction = match job.direction() {
-                                Some(TransferDirection::Upload) => "↑ Upload",
-                                Some(TransferDirection::Download) => "↓ Download",
-                                None => "↔ Transfer",
+                                Some(TransferDirection::Upload) => crate::i18n::t("transfers.direction_upload"),
+                                Some(TransferDirection::Download) => crate::i18n::t("transfers.direction_download"),
+                                None => crate::i18n::t("transfers.direction_transfer"),
                             };
                             let can_cancel = matches!(
                                 job.status,
@@ -114,13 +119,13 @@ pub fn TransfersPanel(
                                             }
                                             div {
                                                 style: "margin-top:5px;color:var(--skin-text-muted);font:10px ui-monospace,SFMono-Regular,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;",
-                                                title: "Source: {source}",
-                                                "From: {source}"
+                                                title: crate::i18n::tf("transfers.source_title", &[("source", &source)]),
+                                                { crate::i18n::tf("transfers.from", &[("source", &source)]) }
                                             }
                                             div {
                                                 style: "margin-top:2px;color:var(--skin-text-muted);font:10px ui-monospace,SFMono-Regular,Menlo,monospace;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;",
-                                                title: "Destination: {destination}",
-                                                "To: {destination}"
+                                                title: crate::i18n::tf("transfers.destination_title", &[("destination", &destination)]),
+                                                { crate::i18n::tf("transfers.to", &[("destination", &destination)]) }
                                             }
                                         }
 
@@ -128,13 +133,13 @@ pub fn TransfersPanel(
                                             button {
                                                 class: "transfers-panel-button",
                                                 onclick: move |_| on_cancel.call(id.clone()),
-                                                "Cancel"
+                                                { crate::i18n::t("common.cancel") }
                                             }
                                         } else if can_retry {
                                             button {
                                                 class: "transfers-panel-button",
                                                 onclick: move |_| on_retry.call(id.clone()),
-                                                "Retry"
+                                                { crate::i18n::t("common.retry") }
                                             }
                                         }
                                     }
@@ -183,8 +188,12 @@ fn format_bytes(bytes: u64) -> String {
 
 fn endpoint_label(endpoint: &FileEndpoint) -> String {
     match endpoint {
-        FileEndpoint::Local(path) => format!("Local · {}", path.display()),
-        FileEndpoint::Remote(path) => format!("Remote · {path}"),
+        FileEndpoint::Local(path) => {
+            crate::i18n::tf("transfers.endpoint_local", &[("path", &path.display())])
+        }
+        FileEndpoint::Remote(path) => {
+            crate::i18n::tf("transfers.endpoint_remote", &[("path", path)])
+        }
     }
 }
 
@@ -198,17 +207,22 @@ fn file_name(endpoint: &FileEndpoint) -> String {
             .filter(|name| !name.is_empty()),
     };
 
-    name.unwrap_or("Unnamed file").to_string()
+    name.map(str::to_owned)
+        .unwrap_or_else(|| crate::i18n::t("transfers.unnamed_file"))
 }
 
 fn status(transfer_status: &TransferStatus) -> String {
     match transfer_status {
-        TransferStatus::Queued => "Queued".to_string(),
-        TransferStatus::Running => "Running".to_string(),
-        TransferStatus::Succeeded => "Completed".to_string(),
-        TransferStatus::Failed(reason) if reason.is_empty() => "Failed".to_string(),
-        TransferStatus::Failed(reason) => format!("Failed: {reason}"),
-        TransferStatus::Cancelled => "Cancelled".to_string(),
+        TransferStatus::Queued => crate::i18n::t("transfers.status_queued"),
+        TransferStatus::Running => crate::i18n::t("transfers.status_running"),
+        TransferStatus::Succeeded => crate::i18n::t("transfers.status_completed"),
+        TransferStatus::Failed(reason) if reason.is_empty() => {
+            crate::i18n::t("transfers.status_failed")
+        }
+        TransferStatus::Failed(reason) => {
+            crate::i18n::tf("transfers.status_failed_reason", &[("reason", reason)])
+        }
+        TransferStatus::Cancelled => crate::i18n::t("transfers.status_cancelled"),
     }
 }
 
@@ -232,11 +246,11 @@ mod tests {
     fn endpoint_label_identifies_local_and_remote_paths() {
         assert_eq!(
             endpoint_label(&FileEndpoint::Local(PathBuf::from("/tmp/report.txt"))),
-            "Local · /tmp/report.txt"
+            crate::i18n::tf("transfers.endpoint_local", &[("path", &"/tmp/report.txt")])
         );
         assert_eq!(
             endpoint_label(&FileEndpoint::Remote("/srv/report.txt".to_string())),
-            "Remote · /srv/report.txt"
+            crate::i18n::tf("transfers.endpoint_remote", &[("path", &"/srv/report.txt")])
         );
     }
 
@@ -258,20 +272,36 @@ mod tests {
         );
         assert_eq!(
             file_name(&FileEndpoint::Local(PathBuf::from("/"))),
-            "Unnamed file"
+            crate::i18n::t("transfers.unnamed_file")
         );
     }
 
     #[test]
     fn status_covers_every_transfer_state_and_preserves_failure_reason() {
-        assert_eq!(status(&TransferStatus::Queued), "Queued");
-        assert_eq!(status(&TransferStatus::Running), "Running");
-        assert_eq!(status(&TransferStatus::Succeeded), "Completed");
         assert_eq!(
-            status(&TransferStatus::Failed("connection lost".to_string())),
-            "Failed: connection lost"
+            status(&TransferStatus::Queued),
+            crate::i18n::t("transfers.status_queued")
         );
-        assert_eq!(status(&TransferStatus::Failed(String::new())), "Failed");
-        assert_eq!(status(&TransferStatus::Cancelled), "Cancelled");
+        assert_eq!(
+            status(&TransferStatus::Running),
+            crate::i18n::t("transfers.status_running")
+        );
+        assert_eq!(
+            status(&TransferStatus::Succeeded),
+            crate::i18n::t("transfers.status_completed")
+        );
+        let reason = "connection lost".to_string();
+        assert_eq!(
+            status(&TransferStatus::Failed(reason.clone())),
+            crate::i18n::tf("transfers.status_failed_reason", &[("reason", &reason)])
+        );
+        assert_eq!(
+            status(&TransferStatus::Failed(String::new())),
+            crate::i18n::t("transfers.status_failed")
+        );
+        assert_eq!(
+            status(&TransferStatus::Cancelled),
+            crate::i18n::t("transfers.status_cancelled")
+        );
     }
 }
