@@ -47,9 +47,7 @@ fn start_history_request(
 
     if query.current_session_only && query.session_id.is_none() {
         loading.set(false);
-        error.set(Some(
-            "No focused or active session is available for this filter.".to_string(),
-        ));
+        error.set(Some(crate::i18n::t("history.no_focused_session")));
         return;
     }
 
@@ -88,8 +86,9 @@ fn start_history_request(
                 error.set(None);
             }
             Err(query_error) => {
-                error.set(Some(format!(
-                    "Unable to load command history: {query_error}"
+                error.set(Some(crate::i18n::tf(
+                    "history.load_error",
+                    &[("error", &query_error)],
                 )));
             }
         }
@@ -97,11 +96,23 @@ fn start_history_request(
     });
 }
 
-fn connection_status(state: SessionConnectionState) -> (&'static str, &'static str, &'static str) {
+fn connection_status(state: SessionConnectionState) -> (&'static str, String, &'static str) {
     match state {
-        SessionConnectionState::Connected => ("●", "Connected", "var(--skin-success)"),
-        SessionConnectionState::Disconnected => ("○", "Disconnected", "var(--skin-danger)"),
-        SessionConnectionState::Reconnecting => ("◌", "Reconnecting", "var(--skin-warning)"),
+        SessionConnectionState::Connected => (
+            "●",
+            crate::i18n::t("sessions.status_connected"),
+            "var(--skin-success)",
+        ),
+        SessionConnectionState::Disconnected => (
+            "○",
+            crate::i18n::t("sessions.status_disconnected"),
+            "var(--skin-danger)",
+        ),
+        SessionConnectionState::Reconnecting => (
+            "◌",
+            crate::i18n::t("sessions.status_reconnecting"),
+            "var(--skin-warning)",
+        ),
     }
 }
 
@@ -128,6 +139,7 @@ pub fn RightToolPanel(
     on_run_history: EventHandler<String>,
     on_close: EventHandler<()>,
 ) -> Element {
+    let _lang = crate::i18n::LANGUAGE();
     let mut search = use_signal(String::new);
     let mut current_session_only = use_signal(|| false);
     let history_entries = use_signal(Vec::<HistoryEntry>::new);
@@ -217,16 +229,16 @@ pub fn RightToolPanel(
                 button {
                     class: if active_tab == RightPanelTab::Sessions { "right-tool-tab active" } else { "right-tool-tab" },
                     onclick: move |_| on_tab_change.call(RightPanelTab::Sessions),
-                    "Sessions"
+                    { crate::i18n::t("sessions.title") }
                 }
                 button {
                     class: if active_tab == RightPanelTab::History { "right-tool-tab active" } else { "right-tool-tab" },
                     onclick: move |_| on_tab_change.call(RightPanelTab::History),
-                    "History"
+                    { crate::i18n::t("history.title") }
                 }
                 button {
                     style: "margin-left:auto;margin-right:5px;border:0;background:transparent;color:var(--skin-text-muted);cursor:pointer;padding:4px 7px;font-size:14px;",
-                    title: "Hide right panel",
+                    title: crate::i18n::t("dock.hide_right"),
                     onclick: move |_| on_close.call(()),
                     "×"
                 }
@@ -236,14 +248,14 @@ pub fn RightToolPanel(
             if active_tab == RightPanelTab::Sessions {
                 div {
                     style: "padding:7px 9px;font-size:10px;color:var(--skin-text-muted);border-bottom:1px solid var(--skin-border);",
-                    "OPEN SESSIONS · {session_count}"
+                    { crate::i18n::tf("sessions.open_count", &[("count", &session_count)]) }
                 }
                 div {
                     style: "flex:1;overflow:auto;padding:1px 0 4px;",
                     if session_tree.is_empty() {
                         div {
                             style: "padding:20px;text-align:center;color:var(--skin-text-muted);font-size:12px;",
-                            "No open workspaces"
+                            { crate::i18n::t("sessions.no_open_workspaces") }
                         }
                     }
                     for (workspace_index, workspace) in session_tree.into_iter().enumerate() {
@@ -269,10 +281,10 @@ pub fn RightToolPanel(
                                     span {
                                         style: "min-width:0;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;",
                                         title: "{workspace.tab_id}",
-                                        "Workspace {workspace_index + 1} · {workspace_label}"
+                                        { crate::i18n::tf("sessions.workspace_label", &[("index", &(workspace_index + 1)), ("label", &workspace_label)]) }
                                     }
                                     if workspace.is_active {
-                                        span { class: "right-tool-badge active", "ACTIVE" }
+                                        span { class: "right-tool-badge active", { crate::i18n::t("common.active") } }
                                     }
                                 }
                                 for pane in workspace.panes {
@@ -281,9 +293,9 @@ pub fn RightToolPanel(
                                         class: "right-tool-pane",
                                         div {
                                             class: "right-tool-pane-header",
-                                            span { "Pane {pane.index + 1}" }
+                                            span { { crate::i18n::tf("sessions.pane_label", &[("index", &(pane.index + 1))]) } }
                                             if pane.is_focused {
-                                                span { class: "right-tool-badge focused", "FOCUSED" }
+                                                span { class: "right-tool-badge focused", { crate::i18n::t("common.focused") } }
                                             }
                                         }
                                         if let Some(session) = pane.session {
@@ -293,7 +305,7 @@ pub fn RightToolPanel(
                                             rsx! {
                                                 div {
                                                     class: if session.is_active { "right-tool-session-row active" } else { "right-tool-session-row" },
-                                                    title: "Select {session.name}",
+                                                    title: crate::i18n::tf("sessions.select", &[("name", &session.name)]),
                                                     onclick: move |_| on_select_session.call(session_id.clone()),
                                                     span {
                                                         style: "flex:0 0 auto;color:{connection_color};font-size:10px;",
@@ -305,7 +317,7 @@ pub fn RightToolPanel(
                                                         "{session.name}"
                                                     }
                                                     if session.is_active {
-                                                        span { class: "right-tool-badge active", "ACTIVE" }
+                                                        span { class: "right-tool-badge active", { crate::i18n::t("common.active") } }
                                                     }
                                                     span { style: "flex:0 0 auto;color:var(--skin-text-muted);font-size:9px;", "{session_kind}" }
                                                     span {
@@ -317,7 +329,7 @@ pub fn RightToolPanel(
                                         } else {
                                             div {
                                                 style: "padding:5px 8px 7px 29px;color:var(--skin-text-muted);font-size:11px;font-style:italic;",
-                                                "Empty pane"
+                                                { crate::i18n::t("sessions.empty_pane") }
                                             }
                                         }
                                     }
@@ -331,7 +343,7 @@ pub fn RightToolPanel(
                     style: "padding:7px;border-bottom:1px solid var(--skin-border);display:flex;flex-direction:column;gap:7px;",
                     input {
                         style: "width:100%;box-sizing:border-box;background:var(--skin-surface);border:1px solid var(--skin-border);border-radius:4px;padding:6px 8px;color:var(--skin-text);font-size:11px;outline:none;",
-                        placeholder: "Search command history (contains)...",
+                        placeholder: crate::i18n::t("history.search_placeholder"),
                         value: "{search}",
                         oninput: move |event| search.set(event.value()),
                     }
@@ -346,16 +358,16 @@ pub fn RightToolPanel(
                         span {
                             style: "min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;",
                             if let Some(name) = current_session_name {
-                                "Current focused/active session only · {name}"
+                                { crate::i18n::tf("history.current_session_only_named", &[("name", &name)]) }
                             } else {
-                                "Current focused/active session only"
+                                { crate::i18n::t("history.current_session_only") }
                             }
                         }
                     }
                 }
                 div {
                     style: "padding:6px 9px;font-size:10px;color:var(--skin-text-muted);border-bottom:1px solid var(--skin-border);",
-                    "Persistent history · newest first · double-click to run"
+                    { crate::i18n::t("history.description") }
                 }
                 div {
                     style: "flex:1;overflow:auto;padding:4px;",
@@ -368,12 +380,12 @@ pub fn RightToolPanel(
                     if entries_snapshot.is_empty() && loading_snapshot {
                         div {
                             style: "padding:20px;text-align:center;color:var(--skin-text-muted);font-size:12px;",
-                            "Loading history…"
+                            { crate::i18n::t("history.loading") }
                         }
                     } else if entries_snapshot.is_empty() && error_snapshot.is_none() {
                         div {
                             style: "padding:20px;text-align:center;color:var(--skin-text-muted);font-size:12px;",
-                            "No matching persistent history"
+                            { crate::i18n::t("history.no_matches") }
                         }
                     }
                     for entry in entries_snapshot {
@@ -385,7 +397,7 @@ pub fn RightToolPanel(
                             div {
                                 key: "{entry.id}",
                                 class: "right-tool-history-row",
-                                title: "Double-click to run",
+                                title: crate::i18n::t("history.double_click_to_run"),
                                 ondoubleclick: move |_| on_run_history.call(command_to_run.clone()),
                                 code {
                                     style: "width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--skin-text);font-size:11px;",
@@ -394,11 +406,11 @@ pub fn RightToolPanel(
                                 }
                                 div {
                                     class: "right-tool-history-meta",
-                                    span { class: "right-tool-history-meta-item", style: "flex:0 1 auto;", title: "Host: {hostname}", "host {hostname}" }
+                                    span { class: "right-tool-history-meta-item", style: "flex:0 1 auto;", title: crate::i18n::tf("history.host_tooltip", &[("hostname", &hostname)]), { crate::i18n::tf("history.host_meta", &[("hostname", &hostname)]) } }
                                     span { "·" }
-                                    span { class: "right-tool-history-meta-item", style: "flex:1 1 auto;", title: "Cwd: {cwd}", "cwd {cwd}" }
+                                    span { class: "right-tool-history-meta-item", style: "flex:1 1 auto;", title: crate::i18n::tf("history.cwd_tooltip", &[("cwd", &cwd)]), { crate::i18n::tf("history.cwd_meta", &[("cwd", &cwd)]) } }
                                     span { "·" }
-                                    span { class: "right-tool-history-meta-item", style: "flex:0 0 auto;", title: "Time: {entry.created_at}", "{time}" }
+                                    span { class: "right-tool-history-meta-item", style: "flex:0 0 auto;", title: crate::i18n::tf("history.time_tooltip", &[("time", &entry.created_at)]), "{time}" }
                                 }
                             }
                         }}
@@ -406,7 +418,7 @@ pub fn RightToolPanel(
                     if loading_snapshot && !history_entries.read().is_empty() {
                         div {
                             style: "padding:9px;text-align:center;color:var(--skin-text-muted);font-size:11px;",
-                            "Loading more…"
+                            { crate::i18n::t("history.loading_more") }
                         }
                     } else if cursor_snapshot.is_some() {
                         button {
@@ -427,7 +439,7 @@ pub fn RightToolPanel(
                                     request_epoch,
                                 );
                             },
-                            "Load more"
+                            { crate::i18n::t("history.load_more") }
                         }
                     }
                 }

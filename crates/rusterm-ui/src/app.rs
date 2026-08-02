@@ -497,7 +497,10 @@ fn render_workspace_dock_panel(
                     if let Some(connection) = connection {
                         state.write().connections.push(ConnectionConfig {
                             id: uuid::Uuid::new_v4().to_string(),
-                            name: format!("{} (copy)", connection.name),
+                            name: crate::i18n::tf(
+                                "connection.copy_name",
+                                &[("name", &connection.name)],
+                            ),
                             kind: connection.kind,
                             group: connection.group,
                             tags: connection.tags,
@@ -605,13 +608,13 @@ fn render_workspace_dock_panel(
                 let options = available_send_targets(&app);
                 let selected = selected_send_target_ids(&app);
                 let label = match selected.as_slice() {
-                    [] => "None".to_string(),
+                    [] => crate::i18n::t("send.no_target"),
                     [session_id] => options
                         .iter()
                         .find(|target| &target.session_id == session_id)
                         .map(|target| target.label.clone())
-                        .unwrap_or_else(|| "Connected session".to_string()),
-                    _ => format!("{} sessions", selected.len()),
+                        .unwrap_or_else(|| crate::i18n::t("send.connected_session")),
+                    _ => crate::i18n::tf("send.n_sessions", &[("n", &selected.len())]),
                 };
                 (options, selected, label)
             };
@@ -1046,14 +1049,16 @@ async fn run_transfer_job(
             .get(&job.session)
             .cloned()
             .ok_or_else(|| {
-                rusterm_ssh::SftpError::Connection("SSH session is not connected".to_string())
+                rusterm_ssh::SftpError::Connection(crate::i18n::t(
+                    "transfer.ssh_session_not_connected",
+                ))
             })?;
         let opened = ssh_session.open_sftp().await?;
         let mut app = state.write();
         if !app.ssh_sessions.contains_key(&job.session) {
-            return Err(rusterm_ssh::SftpError::ConnectionLost(
-                "SSH session disconnected while SFTP was opening".to_string(),
-            ));
+            return Err(rusterm_ssh::SftpError::ConnectionLost(crate::i18n::t(
+                "transfer.ssh_disconnected_while_opening_sftp",
+            )));
         }
         app.sftp_clients
             .entry(job.session.clone())
@@ -1079,9 +1084,9 @@ async fn run_transfer_job(
             .download_with_progress(remote.clone(), local, cancellation, on_progress)
             .await
             .map(|result| result.bytes_transferred),
-        _ => Err(rusterm_ssh::SftpError::InvalidPath(
-            "transfer endpoints must be one local and one remote path".to_string(),
-        )),
+        _ => Err(rusterm_ssh::SftpError::InvalidPath(crate::i18n::t(
+            "transfer.local_remote_endpoints_required",
+        ))),
     }
 }
 
@@ -1309,12 +1314,17 @@ fn layout_display_label(state: &AppState) -> String {
         .and_then(|id| state.layouts.get(id))
         .map(|l| l.panes.len())
         .unwrap_or(1);
-    let noun = if pane_count == 1 { "pane" } else { "panes" };
-    if !state.split_mode_enabled && pane_count > 1 {
-        format!("Layout: {pane_count} {noun} (tab-tiled)")
+    let noun = if pane_count == 1 {
+        crate::i18n::t("layout.pane")
     } else {
-        format!("Layout: {pane_count} {noun}")
-    }
+        crate::i18n::t("layout.panes")
+    };
+    let key = if !state.split_mode_enabled && pane_count > 1 {
+        "layout.summary_tab_tiled"
+    } else {
+        "layout.summary"
+    };
+    crate::i18n::tf(key, &[("count", &pane_count), ("panes", &noun)])
 }
 
 /// Detect whether a byte sequence sent to the PTY is an arrow-key
@@ -2426,18 +2436,27 @@ fn render_terminal_pane(
                                 line.trim().to_string()
                             };
                             let label = match credential_kind(&expect) {
-                                Some(CredentialKind::Password) => "Password",
-                                Some(CredentialKind::Token) => "Token",
-                                Some(CredentialKind::Username) => "Username",
-                                None => "Credential",
+                                Some(CredentialKind::Password) => {
+                                    crate::i18n::t("onekey.credential_password")
+                                }
+                                Some(CredentialKind::Token) => {
+                                    crate::i18n::t("onekey.credential_token")
+                                }
+                                Some(CredentialKind::Username) => {
+                                    crate::i18n::t("onekey.credential_username")
+                                }
+                                None => crate::i18n::t("onekey.credential"),
                             };
                             OneKey {
                                 id: uuid::Uuid::new_v4().to_string(),
                                 // Never use `send` as a display name: it may be a
                                 // password and popup labels are intentionally visible.
-                                name: format!("Saved {label}"),
+                                name: crate::i18n::tf(
+                                    "onekey.saved_credential",
+                                    &[("credential", &label)],
+                                ),
                                 steps: vec![OneKeyStep {
-                                    label: label.to_string(),
+                                    label,
                                     expect,
                                     send: send.clone(),
                                 }],
@@ -5166,11 +5185,12 @@ fn multi_pane_container(
                 let diff_info = state.read().comparison_diffs.as_ref()
                     .map(|diffs| crate::comparison::diff_summary(diffs));
                 let badge_text = match &diff_info {
-                    Some(s) if s.diff_rows > 0 => {
-                        format!("⚠ Comparison · {} diff", s.diff_rows)
-                    }
-                    Some(_) => "⚠ Comparison · identical".to_string(),
-                    None => "⚠ Comparison mode ON".to_string(),
+                    Some(s) if s.diff_rows > 0 => crate::i18n::tf(
+                        "layout.comparison_diff_rows",
+                        &[("count", &s.diff_rows)],
+                    ),
+                    Some(_) => crate::i18n::t("layout.comparison_identical"),
+                    None => crate::i18n::t("layout.comparison_on"),
                 };
                 rsx! {
                     div {
@@ -5526,7 +5546,6 @@ fn multi_pane_container(
                         span {
                             class: "pane-accent-strip",
                             style: "width: 4px; align-self: stretch; flex-shrink: 0; background: {accent_color}; margin-right: 7px; box-shadow: 0 0 4px {accent_color};",
-                            title: "session-type-accent",
                         }
                         span {
                             class: "pane-drag-handle",
@@ -5822,7 +5841,7 @@ fn render_col_splitters(
                         tracing::info!("[LAYOUT] local left/right split shrunk");
                     }
                 },
-                title: "Drag to resize local left/right split",
+                title: crate::i18n::t("layout.resize_left_right_split"),
             }
         }
     }
@@ -5880,7 +5899,7 @@ fn render_row_splitters(
                         tracing::info!("[LAYOUT] local top/bottom split shrunk");
                     }
                 },
-                title: "Drag to resize local top/bottom split",
+                title: crate::i18n::t("layout.resize_top_bottom_split"),
             }
         }
     }
@@ -8630,7 +8649,9 @@ fn start_ssh_connection(
                     .write()
                     .session_connection_states
                     .insert(tab_id.clone(), SessionConnectionState::Disconnected);
-                let msg = format!("Connection failed: {}\r\nPress Enter to reconnect.\r\n", e);
+                let failed = crate::i18n::tf("session.connection_failed", &[("error", &e)]);
+                let reconnect = crate::i18n::t("session.press_enter_to_reconnect");
+                let msg = format!("{failed}\r\n{reconnect}\r\n");
                 let terminals = state.read().terminals.clone();
                 if let Some(handle) = terminals.get(&tab_id) {
                     let render_result = handle.lock().process_and_render(msg.as_bytes());
@@ -9118,7 +9139,9 @@ fn start_shell_connection(
                 .write()
                 .session_connection_states
                 .insert(tab_id.clone(), SessionConnectionState::Disconnected);
-            let msg = format!("Shell failed: {}\r\nPress Enter to reconnect.\r\n", e);
+            let failed = crate::i18n::tf("session.shell_failed", &[("error", &e)]);
+            let reconnect = crate::i18n::t("session.press_enter_to_reconnect");
+            let msg = format!("{failed}\r\n{reconnect}\r\n");
             let terminals = state.read().terminals.clone();
             if let Some(handle) = terminals.get(&tab_id) {
                 let render_result = handle.lock().process_and_render(msg.as_bytes());
@@ -9277,7 +9300,11 @@ fn create_local_shell_session(state: &mut Signal<AppState>, embedded: bool) -> S
         working_dir: None,
     };
     create_terminal(session_id.clone(), state);
-    let name = if embedded { "Bottom Shell" } else { "Local" };
+    let name = if embedded {
+        crate::i18n::t("shell.bottom_session_name")
+    } else {
+        crate::i18n::t("shell.local_session_name")
+    };
     {
         let mut app = state.write();
         app.session_configs.insert(
@@ -10043,7 +10070,7 @@ fn open_connection(
             assigned
         }
         ConnectionKind::Shell(shell_config) => {
-            let msg = format!("\r\nStarting shell...\r\n");
+            let msg = format!("\r\n{}\r\n", crate::i18n::t("session.starting_shell"));
             let render_output = {
                 let terminals = state.read().terminals.clone();
                 if let Some(handle) = terminals.get(&tab_id) {
@@ -10073,7 +10100,10 @@ fn open_connection(
             assigned
         }
         _ => {
-            let msg = format!("\r\nConnection type not yet supported\r\n");
+            let msg = format!(
+                "\r\n{}\r\n",
+                crate::i18n::t("session.connection_type_not_supported"),
+            );
             let terminals = state.read().terminals.clone();
             if let Some(handle) = terminals.get(&tab_id) {
                 let render_result = handle.lock().process_and_render(msg.as_bytes());
@@ -10155,7 +10185,8 @@ fn reconnect_session(
     {
         let terminals = state.read().terminals.clone();
         if let Some(handle) = terminals.get(&tab_id) {
-            let render_result = handle.lock().process_and_render(b"\r\nReconnecting...\r\n");
+            let msg = format!("\r\n{}\r\n", crate::i18n::t("session.reconnecting"));
+            let render_result = handle.lock().process_and_render(msg.as_bytes());
             let mut s = state.write();
             if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == tab_id) {
                 tab.render_output = render_result;
@@ -11180,9 +11211,9 @@ pub fn App() -> Element {
                             }
                             Err(e) => {
                                 let msg = if e.to_string().contains("Invalid") {
-                                    "Invalid master password".to_string()
+                                    crate::i18n::t("master_password.invalid")
                                 } else {
-                                    format!("Error: {}", e)
+                                    crate::i18n::tf("master_password.error", &[("error", &e)])
                                 };
                                 state.write().master_password_error = Some(msg);
                             }
@@ -11462,7 +11493,7 @@ pub fn App() -> Element {
                                     color: #9aa5ce;
                                     font-size: 14px;
                                 ",
-                                "Welcome to RusTerm — Press + New to create a connection"
+                                { crate::i18n::t("welcome.create_connection") }
                             }
                         },
                         (Some(sid), false) => {
@@ -11653,9 +11684,9 @@ pub fn App() -> Element {
                                     .map(|s| format!(" | tmux: {}", s))
                                     .unwrap_or_default();
                                 let log_status = if state.read().session_logs.contains_key(&sid) {
-                                    " | LOG"
+                                    format!(" | {}", crate::i18n::t("status.logging"))
                                 } else {
-                                    ""
+                                    String::new()
                                 };
                                 format!("{}{}{}{}",
                                     t.name,
@@ -11759,14 +11790,14 @@ pub fn App() -> Element {
                             } else {
                                 "cursor:pointer;color:var(--skin-text-muted);border:1px solid var(--skin-border);border-radius:3px;padding:1px 5px;"
                             },
-                            title: "Show or hide the left connection/file dock",
+                            title: crate::i18n::t("status.toggle_left_dock"),
                             onclick: move |_| {
                                 update_workspace_preferences(state, |preferences| {
                                     let visible = preferences.dock_layout.left.visible;
                                     preferences.set_zone_visible(DockZone::Left, !visible);
                                 });
                             },
-                            "Left"
+                            { crate::i18n::t("status.left") }
                         }
                         span {
                             style: if state.read().workspace_preferences.bottom_visible {
@@ -11774,14 +11805,14 @@ pub fn App() -> Element {
                             } else {
                                 "cursor:pointer;color:var(--skin-text-muted);border:1px solid var(--skin-border);border-radius:3px;padding:1px 5px;"
                             },
-                            title: "Show or hide Send, Shell, and Transfers",
+                            title: crate::i18n::t("status.toggle_bottom_dock"),
                             onclick: move |_| {
                                 update_workspace_preferences(state, |preferences| {
                                     let visible = preferences.dock_layout.bottom.visible;
                                     preferences.set_zone_visible(DockZone::Bottom, !visible);
                                 });
                             },
-                            "Bottom"
+                            { crate::i18n::t("status.bottom") }
                         }
                         span {
                             style: if state.read().workspace_preferences.right_visible {
@@ -11789,14 +11820,14 @@ pub fn App() -> Element {
                             } else {
                                 "cursor:pointer;color:var(--skin-text-muted);border:1px solid var(--skin-border);border-radius:3px;padding:1px 5px;"
                             },
-                            title: "Show or hide Sessions and History",
+                            title: crate::i18n::t("status.toggle_right_dock"),
                             onclick: move |_| {
                                 update_workspace_preferences(state, |preferences| {
                                     let visible = preferences.dock_layout.right.visible;
                                     preferences.set_zone_visible(DockZone::Right, !visible);
                                 });
                             },
-                            "Right"
+                            { crate::i18n::t("status.right") }
                         }
 
                         // --- Multi-pane layout controls ---
@@ -11814,7 +11845,7 @@ pub fn App() -> Element {
                         // or "Layout: 1 pane" when no multi-pane layout exists.
                         span {
                             style: "color: #7aa2f7; font-size: 11px; user-select: none; opacity: 0.85;",
-                            title: "Number of panes in the active tab's layout",
+                            title: crate::i18n::t("layout.pane_count_tooltip"),
                             { layout_display_label(&state.read()) }
                         }
                         // "Split" button — toggles the split-pane mode.
@@ -11866,8 +11897,8 @@ pub fn App() -> Element {
                                 );
                                 restore_focus_to_active_session(state, 100);
                             },
-                            title: "Split — toggle multi-pane layout on/off (off = tab tiling)",
-                            "⊕ Split"
+                            title: crate::i18n::t("layout.split_tooltip"),
+                            { crate::i18n::t("layout.split") }
                         }
                         // "Distribute" button — toggles the split-pane mode AND
                         // distributes all open sessions across the panes when
@@ -11922,8 +11953,8 @@ pub fn App() -> Element {
                                 }
                                 restore_focus_to_active_session(state, 100);
                             },
-                            title: "Distribute — toggle split + fill panes with all sessions (off = tab tiling)",
-                            "⇶ Distribute"
+                            title: crate::i18n::t("layout.distribute_tooltip"),
+                            { crate::i18n::t("layout.distribute") }
                         }
                         span {
                             class: if state.read().layouts.get(&state.read().active_tab.clone().unwrap_or_default())
@@ -11936,12 +11967,12 @@ pub fn App() -> Element {
                                 let on = toggle_comparison_mode(&mut state.write());
                                 tracing::info!("[LAYOUT] comparison mode toggled: {:?}", on);
                             },
-                            title: "Toggle comparison mode (sync scroll + broadcast input)",
+                            title: crate::i18n::t("layout.compare_tooltip"),
                             span {
                                 class: "compare-btn-icon",
                                 "⇄"
                             }
-                            "Compare"
+                            { crate::i18n::t("layout.compare") }
                         }
                         span {
                             style: "cursor: pointer; color: #7aa2f7; font-size: 11px; user-select: none;",
@@ -11955,51 +11986,54 @@ pub fn App() -> Element {
                                     tracing::info!("[LAYOUT] zoom toggle for {}: applied={}", sid, toggled);
                                 }
                             },
-                            title: "Toggle fullscreen (zoom) on the active pane",
+                            title: crate::i18n::t("layout.zoom_tooltip"),
                             "⤢"
                         }
                         span {
                             style: "cursor: pointer; color: #9aa5ce;",
-                            "Sessions: {state.read().sessions.len()}"
+                            { crate::i18n::tf(
+                                "status.sessions",
+                                &[("count", &state.read().sessions.len())],
+                            ) }
                         }
                         span {
                             style: "color:var(--skin-warning);font-size:10px;letter-spacing:0.5px;border:1px solid var(--skin-warning);border-radius:3px;padding:0 4px;cursor:default;",
-                            "LLM OPT-IN"
+                            { crate::i18n::t("status.llm_opt_in") }
                         }
                         span {
                             style: "cursor:pointer;color:var(--skin-accent);",
                             onclick: move |_| {
                                 request_ai_suggestions(state, modal, ai_suggestions, ai_status);
                             },
-                            "AI"
+                            { crate::i18n::t("status.ai") }
                         }
                         span {
                             style: "cursor: pointer; color: #7aa2f7;",
                             onclick: move |_| modal.set(Modal::OneKeyManager),
-                            "OneKeys"
+                            { crate::i18n::t("status.onekeys") }
                         }
                         span {
                             style: "cursor: pointer; color: #7aa2f7;",
                             onclick: move |_| modal.set(Modal::Settings),
-                            "Settings"
+                            { crate::i18n::t("settings.title") }
                         }
                         span {
                             style: "cursor: pointer; color: #7aa2f7;",
-                            title: "Manage SSH tunnels (local forward & SOCKS5 proxy)",
+                            title: crate::i18n::t("status.tunnels_tooltip"),
                             onclick: move |_| modal.set(Modal::Tunnels),
-                            "Tunnels"
+                            { crate::i18n::t("status.tunnels") }
                         }
                         span {
                             style: "cursor: pointer; color: #7aa2f7;",
-                            title: "Manage the REST API relay (BasicAuth, command relay)",
+                            title: crate::i18n::t("status.relay_tooltip"),
                             onclick: move |_| modal.set(Modal::Relay),
-                            "Relay"
+                            { crate::i18n::t("status.relay") }
                         }
                         span {
                             style: "cursor: pointer; color: #9ece6a;",
                             onclick: move |_| open_local_terminal(state, input_senders),
-                            title: "Open a local shell (zsh/bash)",
-                            "Local"
+                            title: crate::i18n::t("status.local_tooltip"),
+                            { crate::i18n::t("status.local") }
                         }
                     }
                 }
@@ -12239,7 +12273,11 @@ pub fn App() -> Element {
                 let render_output = {
                     let terminals = state.read().terminals.clone();
                     if let Some(handle) = terminals.get(&tab_id) {
-                        let msg = format!("\r\nConnecting to {}...\r\n", config.name);
+                        let connecting = crate::i18n::tf(
+                            "session.connecting_to",
+                            &[("name", &config.name)],
+                        );
+                        let msg = format!("\r\n{connecting}\r\n");
                         handle.lock().process_and_render(msg.as_bytes())
                     } else {
                         Default::default()
@@ -12348,17 +12386,23 @@ pub fn App() -> Element {
                         width: 380px;
                         color: #c0caf5;
                     ",
-                    h3 { style: "margin: 0 0 8px; font-size: 15px;", "Delete connection?" }
+                    h3 {
+                        style: "margin: 0 0 8px; font-size: 15px;",
+                        { crate::i18n::t("connection.delete_title") }
+                    }
                     p {
                         style: "margin: 0 0 20px; font-size: 13px; color: #c0caf5; line-height: 1.5;",
-                        "This will remove \"{target.name}\" from your saved connections. The encrypted config (including any stored password) will be erased from disk. This cannot be undone."
+                        { crate::i18n::tf(
+                            "connection.delete_body",
+                            &[("name", &target.name)],
+                        ) }
                     }
                     div {
                         style: "display: flex; justify-content: flex-end; gap: 8px;",
                         button {
                             style: "background: transparent; border: 1px solid #2a2b3d; color: #c0caf5; border-radius: 4px; padding: 8px 16px; cursor: pointer; font-size: 13px;",
                             onclick: move |_| delete_target.set(None),
-                            "Cancel"
+                            { crate::i18n::t("common.cancel") }
                         }
                         button {
                             style: "background: #f7768e; border: none; color: #1a1b26; border-radius: 4px; padding: 8px 16px; cursor: pointer; font-size: 13px; font-weight: 600;",
@@ -12379,7 +12423,7 @@ pub fn App() -> Element {
                                 }
                                 delete_target.set(None);
                             },
-                            "Delete"
+                            { crate::i18n::t("common.delete") }
                         }
                     }
                 }

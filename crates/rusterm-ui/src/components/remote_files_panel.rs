@@ -465,7 +465,7 @@ pub fn RemoteFilesPanel(
                                     path_draft.set(path);
                                     action_error.set(None);
                                 }
-                                Err(error) => action_error.set(Some(error.to_string())),
+                                Err(key) => action_error.set(Some(crate::i18n::t(key))),
                             }
                         }
                     },
@@ -480,10 +480,10 @@ pub fn RemoteFilesPanel(
                                 path_draft.set(path);
                                 action_error.set(None);
                             }
-                            Err(error) => action_error.set(Some(error.to_string())),
+                            Err(key) => action_error.set(Some(crate::i18n::t(key))),
                         }
                     },
-                    "Go"
+                    { crate::i18n::t("remote_files.go") }
                 }
             }
 
@@ -497,7 +497,7 @@ pub fn RemoteFilesPanel(
                         action_error.set(None);
                         pending_dialog.set(Some(PendingDialog::CreateDirectory));
                     },
-                    "New folder"
+                    { crate::i18n::t("remote_files.new_folder") }
                 }
                 button {
                     class: "remote-files-button",
@@ -509,7 +509,7 @@ pub fn RemoteFilesPanel(
                             pending_dialog.set(Some(PendingDialog::Rename(entry)));
                         }
                     },
-                    "Rename"
+                    { crate::i18n::t("remote_files.rename") }
                 }
                 button {
                     class: "remote-files-button",
@@ -519,7 +519,7 @@ pub fn RemoteFilesPanel(
                             pending_dialog.set(Some(PendingDialog::Delete(entry)));
                         }
                     },
-                    "Delete"
+                    { crate::i18n::t("common.delete") }
                 }
                 button {
                     class: "remote-files-button",
@@ -529,11 +529,11 @@ pub fn RemoteFilesPanel(
                         let remote_directory = current_path.peek().clone();
                         action_busy.set(true);
                         action_error.set(None);
-                        status.set(Some("Choosing a local file…".to_string()));
+                        status.set(Some(crate::i18n::t("remote_files.choosing_local_file")));
                         spawn(async move {
                             let Some(file) = rfd::AsyncFileDialog::new().pick_file().await else {
                                 action_busy.set(false);
-                                status.set(Some("Upload cancelled".to_string()));
+                                status.set(Some(crate::i18n::t("remote_files.upload_cancelled")));
                                 return;
                             };
                             let local_path = file.path().to_path_buf();
@@ -543,7 +543,7 @@ pub fn RemoteFilesPanel(
                                 .map(str::to_owned)
                             else {
                                 action_busy.set(false);
-                                action_error.set(Some("Selected file has no valid UTF-8 name".to_string()));
+                                action_error.set(Some(crate::i18n::t("remote_files.invalid_utf8_filename")));
                                 status.set(None);
                                 return;
                             };
@@ -551,13 +551,16 @@ pub fn RemoteFilesPanel(
                                 Ok(metadata) if metadata.is_file() => metadata,
                                 Ok(_) => {
                                     action_busy.set(false);
-                                    action_error.set(Some("Please select a regular local file".to_string()));
+                                    action_error.set(Some(crate::i18n::t("remote_files.select_regular_file")));
                                     status.set(None);
                                     return;
                                 }
                                 Err(error) => {
                                     action_busy.set(false);
-                                    action_error.set(Some(format!("Unable to read local file metadata: {error}")));
+                                    action_error.set(Some(crate::i18n::tf(
+                                                                            "remote_files.read_local_metadata_failed",
+                                                                            &[("error", &error)],
+                                                                        )));
                                     status.set(None);
                                     return;
                                 }
@@ -569,11 +572,14 @@ pub fn RemoteFilesPanel(
                                 total: metadata.len(),
                             });
                             action_busy.set(false);
-                            status.set(Some(format!("Upload queued: {file_name}")));
+                            status.set(Some(crate::i18n::tf(
+                                                            "remote_files.upload_queued",
+                                                            &[("name", &file_name)],
+                                                        )));
                             refresh_epoch.set(refresh_epoch().wrapping_add(1));
                         });
                     },
-                    "Upload"
+                    { crate::i18n::t("remote_files.upload") }
                 }
                 button {
                     class: "remote-files-button",
@@ -586,7 +592,9 @@ pub fn RemoteFilesPanel(
                         }
                         action_busy.set(true);
                         action_error.set(None);
-                        status.set(Some("Choosing download destination…".to_string()));
+                        status.set(Some(crate::i18n::t(
+                                                    "remote_files.choosing_download_destination",
+                                                )));
                         spawn(async move {
                             let Some(destination) = rfd::AsyncFileDialog::new()
                                 .set_file_name(&entry.name)
@@ -594,7 +602,7 @@ pub fn RemoteFilesPanel(
                                 .await
                             else {
                                 action_busy.set(false);
-                                status.set(Some("Download cancelled".to_string()));
+                                status.set(Some(crate::i18n::t("remote_files.download_cancelled")));
                                 return;
                             };
                             let local_path: PathBuf = destination.path().to_path_buf();
@@ -605,16 +613,19 @@ pub fn RemoteFilesPanel(
                                 total: entry.metadata.size.unwrap_or(0),
                             });
                             action_busy.set(false);
-                            status.set(Some(format!("Download queued: {}", entry.name)));
+                            status.set(Some(crate::i18n::tf(
+                                                            "remote_files.download_queued",
+                                                            &[("name", &entry.name)],
+                                                        )));
                             refresh_epoch.set(refresh_epoch().wrapping_add(1));
                         });
                     },
-                    "Download"
+                    { crate::i18n::t("remote_files.download") }
                 }
             }
 
             if loading() {
-                div { style: "padding:6px 8px;border-bottom:1px solid var(--skin-border);font-size:10px;color:var(--skin-accent);", "Loading remote directory…" }
+                div { style: "padding:6px 8px;border-bottom:1px solid var(--skin-border);font-size:10px;color:var(--skin-accent);", { crate::i18n::t("remote_files.loading") } }
             }
             if let Some(error) = load_error() {
                 div { style: "padding:6px 8px;border-bottom:1px solid var(--skin-border);font-size:10px;color:var(--skin-danger);overflow-wrap:anywhere;", "{error}" }
@@ -630,10 +641,10 @@ pub fn RemoteFilesPanel(
                 if !has_session {
                     div {
                         style: "padding:22px 14px;text-align:center;color:var(--skin-text-muted);font-size:12px;line-height:1.5;",
-                        "Connect an SSH session to browse remote files."
+                        { crate::i18n::t("remote_files.connect_ssh_hint") }
                     }
                 } else if !loading() && load_error().is_none() && entries().is_empty() {
-                    div { style: "padding:20px;text-align:center;color:var(--skin-text-muted);font-size:12px;", "This directory is empty" }
+                    div { style: "padding:20px;text-align:center;color:var(--skin-text-muted);font-size:12px;", { crate::i18n::t("remote_files.empty_directory") } }
                 } else {
                     for entry in entries() {
                         {let entry_key = entry.path.clone();
@@ -651,7 +662,7 @@ pub fn RemoteFilesPanel(
                             div {
                                 key: "{entry_key}",
                                 class: if is_selected { "remote-files-row selected" } else { "remote-files-row" },
-                                title: if is_directory { "Double-click to open directory" } else { "{kind}" },
+                                title: if is_directory { crate::i18n::t("remote_files.open_directory_hint") } else { kind },
                                 onclick: move |_| selected_entry.set(Some(entry_for_click.clone())),
                                 ondoubleclick: move |_| {
                                     if is_directory {
@@ -681,18 +692,27 @@ pub fn RemoteFilesPanel(
             if let Some(dialog) = pending_dialog() {
                 {let is_delete = matches!(dialog, PendingDialog::Delete(_));
                 let dialog_title = match &dialog {
-                    PendingDialog::CreateDirectory => "Create remote directory",
-                    PendingDialog::Rename(_) => "Rename remote entry",
-                    PendingDialog::Delete(_) => "Confirm remote deletion",
+                    PendingDialog::CreateDirectory => crate::i18n::t("remote_files.dialog_create_title"),
+                    PendingDialog::Rename(_) => crate::i18n::t("remote_files.dialog_rename_title"),
+                    PendingDialog::Delete(_) => crate::i18n::t("remote_files.dialog_delete_title"),
                 };
                 let delete_message = match &dialog {
                     PendingDialog::Delete(entry) if entry.metadata.file_type == RemoteFileType::Directory => {
-                        format!("Delete empty directory ‘{}’? Non-empty directories are never deleted recursively.", entry.name)
+                        crate::i18n::tf(
+                            "remote_files.delete_directory_confirmation",
+                            &[("name", &entry.name)],
+                        )
                     }
                     PendingDialog::Delete(entry) if entry.metadata.file_type == RemoteFileType::Symlink => {
-                        format!("Delete symbolic link ‘{}’? Its target will not be followed or deleted.", entry.name)
+                        crate::i18n::tf(
+                            "remote_files.delete_symlink_confirmation",
+                            &[("name", &entry.name)],
+                        )
                     }
-                    PendingDialog::Delete(entry) => format!("Delete remote file ‘{}’?", entry.name),
+                    PendingDialog::Delete(entry) => crate::i18n::tf(
+                                            "remote_files.delete_file_confirmation",
+                                            &[("name", &entry.name)],
+                                        ),
                     _ => String::new(),
                 };
                 let dialog_for_submit = dialog.clone();
@@ -718,7 +738,7 @@ pub fn RemoteFilesPanel(
                                 button {
                                     class: "remote-files-button",
                                     onclick: move |_| pending_dialog.set(None),
-                                    "Cancel"
+                                    { crate::i18n::t("common.cancel") }
                                 }
                                 button {
                                     class: "remote-files-button",
@@ -735,22 +755,25 @@ pub fn RemoteFilesPanel(
                                             PendingDialog::CreateDirectory => {
                                                 let name = match validate_entry_name(&input) {
                                                     Ok(name) => name.to_string(),
-                                                    Err(error) => {
-                                                        action_error.set(Some(error.to_string()));
+                                                    Err(key) => {
+                                                        action_error.set(Some(crate::i18n::t(key)));
                                                         return;
                                                     }
                                                 };
                                                 let path = posix_join(&directory, &name);
                                                 (
                                                     Box::pin(create_remote_directory(state, session_id, path)),
-                                                    format!("Created directory: {name}"),
+                                                    crate::i18n::tf(
+                                                        "remote_files.created_directory",
+                                                        &[("name", &name)],
+                                                    ),
                                                 )
                                             }
                                             PendingDialog::Rename(entry) => {
                                                 let name = match validate_entry_name(&input) {
                                                     Ok(name) => name.to_string(),
-                                                    Err(error) => {
-                                                        action_error.set(Some(error.to_string()));
+                                                    Err(key) => {
+                                                        action_error.set(Some(crate::i18n::t(key)));
                                                         return;
                                                     }
                                                 };
@@ -761,21 +784,27 @@ pub fn RemoteFilesPanel(
                                                 let new_path = posix_join(&directory, &name);
                                                 (
                                                     Box::pin(rename_remote_entry(state, session_id, entry.path, new_path)),
-                                                    format!("Renamed to: {name}"),
+                                                    crate::i18n::tf(
+                                                        "remote_files.renamed_to",
+                                                        &[("name", &name)],
+                                                    ),
                                                 )
                                             }
                                             PendingDialog::Delete(entry) => {
                                                 let name = entry.name.clone();
                                                 (
                                                     Box::pin(delete_remote_entry(state, session_id, entry)),
-                                                    format!("Deleted: {name}"),
+                                                    crate::i18n::tf(
+                                                        "remote_files.deleted",
+                                                        &[("name", &name)],
+                                                    ),
                                                 )
                                             }
                                         };
                                         pending_dialog.set(None);
                                         action_busy.set(true);
                                         action_error.set(None);
-                                        status.set(Some("Applying remote operation…".to_string()));
+                                        status.set(Some(crate::i18n::t("remote_files.applying_operation")));
                                         spawn(async move {
                                             match future.await {
                                                 Ok(()) => {
@@ -791,7 +820,11 @@ pub fn RemoteFilesPanel(
                                             action_busy.set(false);
                                         });
                                     },
-                                    if is_delete { "Delete" } else { "Apply" }
+                                    if is_delete {
+                                                                            { crate::i18n::t("common.delete") }
+                                                                        } else {
+                                                                            { crate::i18n::t("remote_files.apply") }
+                                                                        }
                                 }
                             }
                         }
@@ -824,7 +857,7 @@ pub fn RemoteFilesPanel(
             div {
                 class: if resize_drag().is_some() { "remote-files-resize-handle active" } else { "remote-files-resize-handle" },
                 style: "position:absolute;left:-3px;top:0;width:6px;height:100%;z-index:80;cursor:col-resize;background:transparent;transition:background .1s;",
-                title: "Drag to resize remote files panel",
+                title: crate::i18n::t("remote_files.resize_hint"),
                 onmousedown: move |event: MouseEvent| {
                     if event.trigger_button() == Some(MouseButton::Primary) {
                         event.prevent_default();

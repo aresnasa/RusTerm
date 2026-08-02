@@ -70,3 +70,6 @@
   -H 'Content-Type: application/json' \
   -d '{"host_id":"bidbot-prod","command":"docker ps"}'
 {"exit_code":null,"stdout":"","stderr":"permission denied while trying to connect to the docker API at unix:///var/run/docker.sock\n","timed_out":false,"duration_ms":865}权限不足，改造一下，然后改造一下复制命令，这里可以先根据用户配置的账号和密码做 export 申明，然后再输出 curl 命令，做运行时的命令，这样更加方便，改造下
+69. 继续改造API 模式，支持流式处理，添加相关支持，能让模型通过流式聊天交互式的修复问题，接入当前主流的模型，可以集成一个模型网关到 API 中支持切换不同的模型来协助排查问题。
+70. 继续优化录入 ssh 的逻辑支持解析xuchao@jump.zs.shaipower.online -p 22类似这种格式的解析并录入配置，配置自动填充，默认没有配置端口则根据 ssh 或者 telnet 来自动配置，还要添加串口的支持，强化相关代码
+71.

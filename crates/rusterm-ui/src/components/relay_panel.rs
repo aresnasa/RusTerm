@@ -10,6 +10,7 @@ use crate::components::{Icon, IconName};
 
 #[component]
 pub fn RelayPanel(state: Signal<crate::state::AppState>, on_close: EventHandler<()>) -> Element {
+    let _lang = crate::i18n::LANGUAGE();
     let mut config = use_signal(|| state.read().relay_config.clone());
     let mut running = use_signal(|| state.read().relay_runtime.is_running());
     let mut started_url = use_signal(|| {
@@ -59,27 +60,30 @@ pub fn RelayPanel(state: Signal<crate::state::AppState>, on_close: EventHandler<
         div { class: "relay-overlay", onclick: move |_| on_close.call(()),
             div { class: "relay-card", onclick: move |e| e.stop_propagation(),
                 div { class: "relay-head",
-                    span { style: "font-size:16px;font-weight:600;", "REST API Relay" }
-                    button { class: "relay-btn", onclick: move |_| on_close.call(()), "Close" }
+                    span { style: "font-size:16px;font-weight:600;", { crate::i18n::t("api.title") } }
+                    button { class: "relay-btn", onclick: move |_| on_close.call(()), { crate::i18n::t("common.close") } }
                 }
 
                 div { class: "relay-body",
                     // ── status ──────────────────────────────────────────
                     if running() {
                         div { class: "relay-status ok",
-                            "Running at {started_url().clone().unwrap_or_default()}"
+                            { crate::i18n::tf(
+                                                            "api.status_running",
+                                                            &[("url", &started_url().clone().unwrap_or_default())],
+                                                        ) }
                         }
                     } else {
                         div { class: "relay-status", style: "background:#24283b;color:#9aa5ce;",
-                            "Stopped"
+                            { crate::i18n::t("api.status_stopped") }
                         }
                     }
                     if !status_msg().is_empty() {
-                        div { class: "relay-status err", "{status_msg()}" }
+                        div { class: "relay-status err", { crate::i18n::t(&status_msg()) } }
                     }
 
                     // ── server settings ─────────────────────────────────
-                    div { class: "relay-sect", "Server" }
+                    div { class: "relay-sect", { crate::i18n::t("relay.server") } }
 
                     div { class: "relay-row",
                         label {
@@ -91,11 +95,11 @@ pub fn RelayPanel(state: Signal<crate::state::AppState>, on_close: EventHandler<
                                     config.write().enabled = e.checked();
                                 },
                             }
-                            "Enable relay on startup"
+                            { crate::i18n::t("api.enable_on_startup") }
                         }
                     }
                     div { class: "relay-row",
-                        span { style: "width:80px;", "Bind addr" }
+                        span { style: "width:80px;", { crate::i18n::t("api.bind_addr") } }
                         input {
                             class: "relay-input",
                             style: "width:110px;",
@@ -104,11 +108,14 @@ pub fn RelayPanel(state: Signal<crate::state::AppState>, on_close: EventHandler<
                                 if let Ok(ip) = e.value().parse::<std::net::IpAddr>() {
                                     config.write().bind_addr = ip;
                                 } else {
-                                    status_msg.set(format!("Invalid bind addr: {}", e.value()));
+                                    status_msg.set(crate::i18n::tf(
+                                                                            "relay.invalid_bind_addr",
+                                                                            &[("value", &e.value())],
+                                                                        ));
                                 }
                             },
                         }
-                        span { "Port" }
+                        span { { crate::i18n::t("api.port") } }
                         input {
                             class: "relay-input",
                             style: "width:70px;",
@@ -118,7 +125,10 @@ pub fn RelayPanel(state: Signal<crate::state::AppState>, on_close: EventHandler<
                                     config.write().port = p;
                                     status_msg.set(String::new());
                                 } else {
-                                    status_msg.set(format!("Invalid port: {}", e.value()));
+                                    status_msg.set(crate::i18n::tf(
+                                                                            "api.invalid_port",
+                                                                            &[("value", &e.value())],
+                                                                        ));
                                 }
                             },
                         }
@@ -126,12 +136,12 @@ pub fn RelayPanel(state: Signal<crate::state::AppState>, on_close: EventHandler<
 
                     if config.read().binds_publicly() && !confirm_public_bind() {
                         div { class: "relay-status err",
-                            "Binding to a non-loopback address exposes the API on the network. Confirm you understand the risk."
+                            { crate::i18n::t("relay.public_bind_warning") }
                         }
                         button {
                             class: "relay-btn warn",
                             onclick: move |_| confirm_public_bind.set(true),
-                            "I understand — allow public bind"
+                            { crate::i18n::t("relay.confirm_public_bind") }
                         }
                     }
 
@@ -152,7 +162,7 @@ pub fn RelayPanel(state: Signal<crate::state::AppState>, on_close: EventHandler<
                                     crate::relay_tunnel::stop_relay(runtime);
                                     running.set(false);
                                 },
-                                "Stop"
+                                { crate::i18n::t("api.stop") }
                             }
                         } else {
                             button {
@@ -162,11 +172,11 @@ pub fn RelayPanel(state: Signal<crate::state::AppState>, on_close: EventHandler<
                                     // the user's mental model of "current".
                                     let cfg = config();
                                     if cfg.binds_publicly() && !confirm_public_bind() {
-                                        status_msg.set("Confirm public bind before starting".into());
+                                        status_msg.set("relay.confirm_public_bind_before_start".into());
                                         return;
                                     }
                                     if cfg.accounts.is_empty() {
-                                        status_msg.set("Add at least one account before starting".into());
+                                        status_msg.set("relay.account_required_before_start".into());
                                         return;
                                     }
                                     if let Err(e) = cfg.save() {
@@ -192,7 +202,7 @@ pub fn RelayPanel(state: Signal<crate::state::AppState>, on_close: EventHandler<
                                         Err(e) => status_msg.set(e),
                                     }
                                 },
-                                "Start"
+                                { crate::i18n::t("api.start") }
                             }
                         }
                         button {
@@ -204,15 +214,15 @@ pub fn RelayPanel(state: Signal<crate::state::AppState>, on_close: EventHandler<
                                     status_msg.set(e.to_string());
                                 } else {
                                     state.write().relay_config = cfg;
-                                    status_msg.set("Saved to relay.json".into());
+                                    status_msg.set("api.saved".into());
                                 }
                             },
-                            "Save config"
+                            { crate::i18n::t("relay.save_config") }
                         }
                     }
 
                     // ── accounts ────────────────────────────────────────
-                    div { class: "relay-sect", "Accounts (BasicAuth)" }
+                    div { class: "relay-sect", { crate::i18n::t("api.accounts") } }
                     for account in config.read().accounts.iter().cloned() {
                         {
                             let username = account.username.clone();
@@ -222,7 +232,7 @@ pub fn RelayPanel(state: Signal<crate::state::AppState>, on_close: EventHandler<
                                     div { style: "display:flex;align-items:center;justify-content:space-between;",
                                         span { style: "font-weight:600;", "{username}" }
                                         if account.readonly {
-                                            span { style: "font-size:10px;color:#7aa2f7;", "read-only" }
+                                            span { style: "font-size:10px;color:#7aa2f7;", { crate::i18n::t("api.readonly") } }
                                         }
                                         button {
                                             class: "relay-btn",
@@ -239,16 +249,16 @@ pub fn RelayPanel(state: Signal<crate::state::AppState>, on_close: EventHandler<
                                             account.allowed_hosts.join(", ")
                                         };
                                         let commands_text = if account.allowed_commands.is_empty() {
-                                            "* (validated)".to_string()
+                                            crate::i18n::t("relay.all_commands_validated")
                                         } else {
                                             account.allowed_commands.join(", ")
                                         };
                                         rsx! {
                                             div { style: "font-size:10px;color:#9aa5ce;margin-top:3px;",
-                                                "hosts: {hosts_text}"
+                                                { crate::i18n::tf("relay.hosts", &[("hosts", &hosts_text)]) }
                                             }
                                             div { style: "font-size:10px;color:#9aa5ce;",
-                                                "commands: {commands_text}"
+                                                { crate::i18n::tf("relay.commands", &[("commands", &commands_text)]) }
                                             }
                                         }
                                     }
@@ -257,9 +267,9 @@ pub fn RelayPanel(state: Signal<crate::state::AppState>, on_close: EventHandler<
                         }
                     }
 
-                    div { class: "relay-sect", "Add account" }
+                    div { class: "relay-sect", { crate::i18n::t("relay.add_account") } }
                     div { class: "relay-field",
-                        span { "Username" }
+                        span { { crate::i18n::t("api.username") } }
                         input {
                             class: "relay-input",
                             value: "{new_username()}",
@@ -267,7 +277,7 @@ pub fn RelayPanel(state: Signal<crate::state::AppState>, on_close: EventHandler<
                         }
                     }
                     div { class: "relay-field",
-                        span { "Password (stored only as Argon2id hash)" }
+                        span { { crate::i18n::t("relay.password_hash_note") } }
                         input {
                             class: "relay-input",
                             r#type: "password",
@@ -276,7 +286,7 @@ pub fn RelayPanel(state: Signal<crate::state::AppState>, on_close: EventHandler<
                         }
                     }
                     div { class: "relay-field",
-                        span { "Allowed hosts (comma-separated ids/names, empty = all)" }
+                        span { { crate::i18n::t("relay.allowed_hosts_help") } }
                         input {
                             class: "relay-input",
                             placeholder: "prod-web-1, ci-runner",
@@ -285,7 +295,7 @@ pub fn RelayPanel(state: Signal<crate::state::AppState>, on_close: EventHandler<
                         }
                     }
                     div { class: "relay-field",
-                        span { "Allowed commands (comma-separated regex, empty = all non-dangerous)" }
+                        span { { crate::i18n::t("relay.allowed_commands_help") } }
                         input {
                             class: "relay-input",
                             placeholder: r"^docker\s+(ps|logs)",
@@ -299,11 +309,11 @@ pub fn RelayPanel(state: Signal<crate::state::AppState>, on_close: EventHandler<
                             checked: new_readonly(),
                             onchange: move |e| new_readonly.set(e.checked()),
                         }
-                        "Read-only (reject any mutating command)"
+                        { crate::i18n::t("relay.readonly_help") }
                     }
 
                     if !account_error().is_empty() {
-                        div { class: "relay-status err", "{account_error()}" }
+                        div { class: "relay-status err", { crate::i18n::t(&account_error()) } }
                     }
 
                     button {
@@ -312,17 +322,20 @@ pub fn RelayPanel(state: Signal<crate::state::AppState>, on_close: EventHandler<
                             let username = new_username().trim().to_string();
                             let password = new_password();
                             if username.is_empty() {
-                                account_error.set("Username is required".into());
+                                account_error.set("relay.username_required".into());
                                 return;
                             }
                             if password.is_empty() {
-                                account_error.set("Password is required".into());
+                                account_error.set("relay.password_required".into());
                                 return;
                             }
                             let password_hash = match hash_password(&password) {
                                 Ok(h) => h,
                                 Err(e) => {
-                                    account_error.set(format!("hashing failed: {e}"));
+                                    account_error.set(crate::i18n::tf(
+                                                                            "relay.hashing_failed",
+                                                                            &[("error", &e)],
+                                                                        ));
                                     return;
                                 }
                             };
@@ -331,9 +344,13 @@ pub fn RelayPanel(state: Signal<crate::state::AppState>, on_close: EventHandler<
                             match rusterm_relay::compile_allowlist(&allowed_commands_raw) {
                                 Ok(_) => {}
                                 Err(errors) => {
-                                    account_error.set(format!(
-                                        "Invalid regex(es) at index: {:?}",
+                                    let indices = format!(
+                                        "{:?}",
                                         errors.iter().map(|(i, _)| *i).collect::<Vec<_>>()
+                                    );
+                                    account_error.set(crate::i18n::tf(
+                                        "relay.invalid_regex_indices",
+                                        &[("indices", &indices)],
                                     ));
                                     return;
                                 }
@@ -361,14 +378,17 @@ pub fn RelayPanel(state: Signal<crate::state::AppState>, on_close: EventHandler<
                                 new_allowed_commands.set(String::new());
                             }
                         },
-                        "Add / update account"
+                        { crate::i18n::t("relay.add_update_account") }
                     }
                 }
 
                 div { style: "padding:10px 16px;border-top:1px solid #2a2b3d;font-size:10px;color:#9aa5ce;",
                     {
                         let audit_dir = rusterm_core::logging::log_dir().display().to_string();
-                        format!("Audit log: {audit_dir}/relay-audit.jsonl — every auth failure and command execution is recorded.")
+                        crate::i18n::tf(
+                                                    "relay.audit_log",
+                                                    &[("path", &format!("{audit_dir}/relay-audit.jsonl"))],
+                                                )
                     }
                 }
             }

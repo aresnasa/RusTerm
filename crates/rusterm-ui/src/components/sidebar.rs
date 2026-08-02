@@ -8,13 +8,13 @@ use rusterm_core::config::{
 
 use super::icon::{Icon, IconName};
 
-fn kind_label(kind: &ConnectionKind) -> &'static str {
+fn kind_label(kind: &ConnectionKind) -> String {
     match kind {
-        ConnectionKind::Ssh(_) => "SSH",
-        ConnectionKind::Serial(_) => "Serial",
-        ConnectionKind::Telnet(_) => "Telnet",
-        ConnectionKind::Shell(_) => "Shell",
-        ConnectionKind::Tcp(_) => "TCP",
+        ConnectionKind::Ssh(_) => crate::i18n::t("connections.kind_ssh"),
+        ConnectionKind::Serial(_) => crate::i18n::t("connections.kind_serial"),
+        ConnectionKind::Telnet(_) => crate::i18n::t("connections.kind_telnet"),
+        ConnectionKind::Shell(_) => crate::i18n::t("connections.kind_shell"),
+        ConnectionKind::Tcp(_) => crate::i18n::t("connections.kind_tcp"),
     }
 }
 
@@ -97,6 +97,7 @@ pub fn Sidebar(
     on_delete: EventHandler<String>,
     on_drag_start: EventHandler<(ConnectionConfig, String, f64, f64)>,
 ) -> Element {
+    let _lang = crate::i18n::LANGUAGE();
     let mut search = use_signal(String::new);
     let mut show_hidden = use_signal(|| false);
     let mut creating_group = use_signal(|| false);
@@ -154,9 +155,9 @@ pub fn Sidebar(
         )
     };
     let hidden_button_title = if show_hidden() {
-        "Hide hidden connections again"
+        crate::i18n::t("connections.hide_hidden_again")
     } else {
-        "Show hidden connections"
+        crate::i18n::t("connections.show_hidden")
     };
     let hidden_button_color = if show_hidden() {
         "var(--skin-accent)"
@@ -196,13 +197,13 @@ pub fn Sidebar(
                 style: "padding:10px 10px 8px;display:flex;align-items:center;gap:8px;min-width:0;flex-wrap:nowrap;",
                 span {
                     style: "flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600;font-size:14px;letter-spacing:.3px;",
-                    "Connections"
+                    { crate::i18n::t("connections.title") }
                 }
                 div {
                     style: "display:flex;flex:0 0 auto;flex-wrap:nowrap;gap:5px;white-space:nowrap;",
                     button {
                         class: "sidebar-icon-button",
-                        title: "Open local file manager",
+                        title: crate::i18n::t("remote_files.open_local_manager"),
                         onclick: move |_| on_show_files.call(()),
                         Icon { name: IconName::FolderOpen, size: 15 }
                     }
@@ -218,21 +219,21 @@ pub fn Sidebar(
                     }
                     button {
                         class: "sidebar-icon-button",
-                        title: "Create connection group",
+                        title: crate::i18n::t("connections.create_group"),
                         onclick: move |_| creating_group.set(!creating_group()),
                         Icon { name: IconName::Folder, size: 15 }
                         Icon { name: IconName::Plus, size: 10 }
                     }
                     button {
                         class: "sidebar-icon-button",
-                        title: "Configure OneKeys",
+                        title: crate::i18n::t("connections.configure_onekeys"),
                         onclick: move |_| on_onekey.call(()),
                         Icon { name: IconName::Key, size: 15 }
                     }
                     button {
                         class: "sidebar-icon-button",
                         style: "background:var(--skin-accent);color:var(--skin-bg);border-color:var(--skin-accent);",
-                        title: "Create connection",
+                        title: crate::i18n::t("connections.create"),
                         onclick: move |_| on_new.call(()),
                         Icon { name: IconName::Plus, size: 16 }
                     }
@@ -245,7 +246,7 @@ pub fn Sidebar(
                     input {
                         style: "min-width:0;flex:1;background:var(--skin-surface);border:1px solid var(--skin-border-strong);border-radius:4px;padding:6px 8px;color:var(--skin-text);font-size:12px;outline:none;",
                         r#type: "text",
-                        placeholder: "Group name",
+                        placeholder: crate::i18n::t("connections.group_name_placeholder"),
                         value: "{new_group_name}",
                         autofocus: true,
                         oninput: move |event| new_group_name.set(event.value()),
@@ -266,7 +267,7 @@ pub fn Sidebar(
                     }
                     button {
                         class: "sidebar-icon-button",
-                        title: "Add group",
+                        title: crate::i18n::t("connections.add_group"),
                         onclick: move |_| {
                             if let Some(updated) = create_group(&prefs_for_create_click, &new_group_name()) {
                                 on_preferences_change.call(updated);
@@ -288,7 +289,7 @@ pub fn Sidebar(
                 input {
                     style: "width:100%;background:var(--skin-surface);border:1px solid var(--skin-border);border-radius:4px;padding:6px 8px 6px 28px;color:var(--skin-text);font-size:12px;box-sizing:border-box;outline:none;",
                     r#type: "text",
-                    placeholder: "Search connections...",
+                    placeholder: crate::i18n::t("connections.search_placeholder"),
                     value: "{search}",
                     oninput: move |event| search.set(event.value()),
                 }
@@ -319,7 +320,7 @@ pub fn Sidebar(
                     div {
                         style: "padding:5px 8px 3px;font-size:11px;color:var(--skin-text-muted);font-weight:600;text-transform:uppercase;letter-spacing:.5px;display:flex;align-items:center;gap:6px;",
                         Icon { name: IconName::FolderOpen, size: 14 }
-                        "Ungrouped ({ungrouped.len()})"
+                        { crate::i18n::tf("connections.ungrouped_count", &[("count", &ungrouped.len())]) }
                     }
                     for connection in ungrouped {
                         ConnItem {
@@ -339,11 +340,11 @@ pub fn Sidebar(
                     div {
                         style: "padding:24px 12px;text-align:center;color:var(--skin-text-muted);font-size:12px;white-space:pre-line;",
                         if !search_lower.is_empty() {
-                            "No matching connections."
+                            { crate::i18n::t("connections.no_matches") }
                         } else if hidden_count > 0 && !show_hidden() {
-                            "All connections are hidden.\nUse the eye button to restore them."
+                            { crate::i18n::t("connections.all_hidden_hint") }
                         } else {
-                            "No connections yet.\nUse + to create one."
+                            { crate::i18n::t("connections.empty_hint") }
                         }
                     }
                 }
@@ -379,7 +380,7 @@ pub fn Sidebar(
             div {
                 class: if resize_drag().is_some() { "sidebar-resize-handle active" } else { "sidebar-resize-handle" },
                 style: "position:absolute;right:-3px;top:0;width:6px;height:100%;z-index:80;cursor:col-resize;background:transparent;transition:background .1s;",
-                title: "Drag to resize connection sidebar",
+                title: crate::i18n::t("connections.resize_sidebar"),
                 onmousedown: move |event: MouseEvent| {
                     if event.trigger_button() == Some(MouseButton::Primary) {
                         event.prevent_default();
@@ -423,7 +424,7 @@ pub fn Sidebar(
                         context_menu.set(None);
                     },
                     Icon { name: IconName::Connect, size: 14 }
-                    "Connect"
+                    { crate::i18n::t("connections.connect") }
                 }
                 div {
                     class: "ctx-item",
@@ -432,7 +433,7 @@ pub fn Sidebar(
                         context_menu.set(None);
                     },
                     Icon { name: IconName::Plus, size: 14 }
-                    "Copy connection"
+                    { crate::i18n::t("connections.copy") }
                 }
                 div {
                     class: "ctx-item",
@@ -441,7 +442,7 @@ pub fn Sidebar(
                         context_menu.set(None);
                     },
                     Icon { name: IconName::Edit, size: 14 }
-                    "Edit…"
+                    { crate::i18n::t("connections.edit") }
                 }
                 div {
                     class: "ctx-item",
@@ -466,14 +467,14 @@ pub fn Sidebar(
                         size: 14,
                     }
                     if context_menu().as_ref().is_some_and(|(id, _, _)| hidden_ids_for_menu.iter().any(|hidden| hidden == id)) {
-                        "Show in sidebar"
+                        { crate::i18n::t("connections.show_in_sidebar") }
                     } else {
-                        "Hide from sidebar"
+                        { crate::i18n::t("connections.hide_from_sidebar") }
                     }
                 }
 
                 div { style: "height:1px;background:var(--skin-border-strong);margin:4px 0;" }
-                div { class: "ctx-label", "Move to group" }
+                div { class: "ctx-label", { crate::i18n::t("connections.move_to_group") } }
                 div {
                     class: "ctx-item",
                     onclick: move |_| {
@@ -481,7 +482,7 @@ pub fn Sidebar(
                         context_menu.set(None);
                     },
                     Icon { name: IconName::FolderOpen, size: 14 }
-                    "Ungrouped"
+                    { crate::i18n::t("connections.ungrouped") }
                 }
                 for group in groups_for_menu {
                     div {
@@ -505,7 +506,7 @@ pub fn Sidebar(
                         context_menu.set(None);
                     },
                     Icon { name: IconName::Delete, size: 14 }
-                    "Delete"
+                    { crate::i18n::t("common.delete") }
                 }
             }
         }
@@ -528,6 +529,7 @@ fn ConnectionGroupSection(
     on_drag_start: EventHandler<(ConnectionConfig, String, f64, f64)>,
     mut context_menu: Signal<Option<(String, f64, f64)>>,
 ) -> Element {
+    let _lang = crate::i18n::LANGUAGE();
     let group_id = group.id.clone();
     let group_id_for_delete = group.id.clone();
     let preferences_for_toggle = preferences.clone();
@@ -550,7 +552,7 @@ fn ConnectionGroupSection(
             span { style: "flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;", "{group.name} ({connections.len()})" }
             span {
                 class: "conn-row-action",
-                title: "Delete group and move its connections to Ungrouped",
+                title: crate::i18n::t("connections.delete_group_hint"),
                 onclick: move |event: MouseEvent| {
                     event.stop_propagation();
                     on_group_delete.call(group_id_for_delete.clone());
@@ -585,7 +587,9 @@ fn ConnItem(
     on_drag_start: EventHandler<(ConnectionConfig, String, f64, f64)>,
     mut context_menu: Signal<Option<(String, f64, f64)>>,
 ) -> Element {
+    let _lang = crate::i18n::LANGUAGE();
     let color = kind_color(&conn.kind);
+    let connection_kind = kind_label(&conn.kind);
     let icon = kind_icon(&conn.kind);
     let id = conn.id.clone();
     let id_for_ctx = conn.id.clone();
@@ -599,7 +603,7 @@ fn ConnItem(
         div {
             class: "conn-item",
             style: "padding:6px 9px;margin:1px 4px;border-radius:4px;cursor:pointer;font-size:12px;display:flex;align-items:center;gap:7px;background:transparent;opacity:{row_opacity};transition:background .1s,opacity .1s;",
-            title: "{kind_label(&conn.kind)} · {conn.name}",
+            title: "{connection_kind} · {conn.name}",
             onclick: move |_| on_connect.call(id.clone()),
             onmousedown: move |event: MouseEvent| {
                 if event.trigger_button() == Some(MouseButton::Primary) {
@@ -618,13 +622,13 @@ fn ConnItem(
                 span { style: "display:inline-flex;color:var(--skin-text-muted);", Icon { name: IconName::EyeOff, size: 12 } }
             }
             if conn.onekey {
-                span { style: "display:inline-flex;color:var(--skin-success);", title: "OneKey enabled", Icon { name: IconName::Key, size: 12 } }
+                span { style: "display:inline-flex;color:var(--skin-success);", title: crate::i18n::t("connections.onekey_enabled"), Icon { name: IconName::Key, size: 12 } }
             }
             span {
                 class: "conn-icons",
                 span {
                     class: "conn-row-action",
-                    title: "Edit connection",
+                    title: crate::i18n::t("connections.edit"),
                     onclick: move |event: MouseEvent| {
                         event.stop_propagation();
                         on_edit.call(id_for_edit.clone());
@@ -633,7 +637,7 @@ fn ConnItem(
                 }
                 span {
                     class: "conn-row-action",
-                    title: "Delete connection",
+                    title: crate::i18n::t("connections.delete"),
                     onclick: move |event: MouseEvent| {
                         event.stop_propagation();
                         on_delete.call(id_for_delete.clone());

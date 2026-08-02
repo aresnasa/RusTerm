@@ -189,11 +189,15 @@ pub fn ConnectionDialog(
 
     let is_editing = editing.is_some();
     let title = if is_editing {
-        "Edit SSH Connection"
+        crate::i18n::t("connection.edit_title")
     } else {
-        "New SSH Connection"
+        crate::i18n::t("connection.new_title")
     };
-    let submit_label = if is_editing { "Save" } else { "Connect" };
+    let submit_label = if is_editing {
+        crate::i18n::t("common.save")
+    } else {
+        crate::i18n::t("connection.connect")
+    };
     // Diagnostic: log every render where the dialog is visible. We need to
     // know whether app.rs passed `editing` for the session the user thinks
     // they're editing. If logs say `editing=none` while the user states they
@@ -259,11 +263,11 @@ pub fn ConnectionDialog(
                     // Name
                     div {
                         style: "display: flex; flex-direction: column; gap: 4px;",
-                        label { style: "font-size: 12px; color: #9aa5ce;", "Name" }
+                        label { style: "font-size: 12px; color: #9aa5ce;", { crate::i18n::t("connection.name") } }
                         input {
                             style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                             r#type: "text",
-                            placeholder: "My Server",
+                            placeholder: crate::i18n::t("connection.name_placeholder"),
                             value: "{form().name}",
                             oninput: move |e| form.write().name = e.value(),
                         }
@@ -272,7 +276,7 @@ pub fn ConnectionDialog(
                     // Group
                     div {
                         style: "display: flex; flex-direction: column; gap: 4px;",
-                        label { style: "font-size: 12px; color: #9aa5ce;", "Group" }
+                        label { style: "font-size: 12px; color: #9aa5ce;", { crate::i18n::t("connection.group") } }
                         select {
                             style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                             value: "{form().group_id.as_deref().unwrap_or_default()}",
@@ -280,7 +284,7 @@ pub fn ConnectionDialog(
                                 let value = e.value();
                                 form.write().group_id = (!value.is_empty()).then_some(value);
                             },
-                            option { value: "", "Ungrouped" }
+                            option { value: "", { crate::i18n::t("connections.ungrouped") } }
                             for group in groups.iter() {
                                 option {
                                     value: "{group.id}",
@@ -326,9 +330,9 @@ pub fn ConnectionDialog(
                         }
                         div {
                             style: "display: flex; flex-direction: column; gap: 2px;",
-                            label { style: "font-size: 12px; color: #9ece6a; cursor: pointer; pointer-events: none;", "One-Key Connect" }
+                            label { style: "font-size: 12px; color: #9ece6a; cursor: pointer; pointer-events: none;", { crate::i18n::t("connection.onekey_connect") } }
                             span { style: "font-size: 11px; color: #9aa5ce; line-height: 1.4; pointer-events: none;",
-                                "Auto-suggest a matching OneKey credential when this host asks for a password." }
+                                { crate::i18n::t("connection.onekey_hint") } }
                         }
                     }
 
@@ -339,7 +343,7 @@ pub fn ConnectionDialog(
                         style: "display: flex; flex-direction: column; gap: 4px; margin-top: 8px;",
                         label {
                             style: "font-size: 12px; color: #9aa5ce;",
-                            "Login script (optional, expect/send DSL)"
+                            { crate::i18n::t("connection.login_script_label") }
                         }
                         textarea {
                             style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 12px; font-family: 'JetBrains Mono', monospace; outline: none; min-height: 80px; resize: vertical;",
@@ -352,7 +356,7 @@ delay 250",
                         }
                         span {
                             style: "font-size: 10px; color: #9aa5ce; line-height: 1.4;",
-                            "Lines: expect <regex> | send <text> | send_onekey <name> | delay <ms>. Credentials are resolved from your unlocked OneKey library — never paste passwords here."
+                            { crate::i18n::t("connection.login_script_help") }
                         }
                     }
 
@@ -361,7 +365,7 @@ delay 250",
                         style: "display: flex; gap: 8px;",
                         div {
                             style: "flex: 3; display: flex; flex-direction: column; gap: 4px;",
-                            label { style: "font-size: 12px; color: #9aa5ce;", "Host" }
+                            label { style: "font-size: 12px; color: #9aa5ce;", { crate::i18n::t("connection.host") } }
                             input {
                                 style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                                 r#type: "text",
@@ -447,7 +451,7 @@ delay 250",
                         }
                         div {
                             style: "flex: 1; display: flex; flex-direction: column; gap: 4px;",
-                            label { style: "font-size: 12px; color: #9aa5ce;", "Port" }
+                            label { style: "font-size: 12px; color: #9aa5ce;", { crate::i18n::t("connection.port") } }
                             input {
                                 style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                                 r#type: "text",
@@ -461,7 +465,7 @@ delay 250",
                     // Username
                     div {
                         style: "display: flex; flex-direction: column; gap: 4px;",
-                        label { style: "font-size: 12px; color: #9aa5ce;", "Username" }
+                        label { style: "font-size: 12px; color: #9aa5ce;", { crate::i18n::t("connection.username") } }
                         input {
                             style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                             r#type: "text",
@@ -474,7 +478,7 @@ delay 250",
                     // Auth Type selector
                     div {
                         style: "display: flex; flex-direction: column; gap: 4px;",
-                        label { style: "font-size: 12px; color: #9aa5ce;", "Authentication" }
+                        label { style: "font-size: 12px; color: #9aa5ce;", { crate::i18n::t("connection.authentication") } }
                         div {
                             style: "display: flex; gap: 4px;",
 
@@ -485,7 +489,7 @@ delay 250",
                                     "flex: 1; padding: 6px 12px; background: transparent; color: #c0caf5; border: 1px solid #2a2b3d; border-radius: 4px; font-size: 12px; cursor: pointer;"
                                 },
                                 onclick: move |_| form.write().auth_type = "password".to_string(),
-                                "Password"
+                                { crate::i18n::t("connection.password") }
                             }
                             button {
                                 style: if is_key {
@@ -494,7 +498,7 @@ delay 250",
                                     "flex: 1; padding: 6px 12px; background: transparent; color: #c0caf5; border: 1px solid #2a2b3d; border-radius: 4px; font-size: 12px; cursor: pointer;"
                                 },
                                 onclick: move |_| form.write().auth_type = "key".to_string(),
-                                "Key"
+                                { crate::i18n::t("connection.key") }
                             }
                             button {
                                 style: if is_agent {
@@ -503,7 +507,7 @@ delay 250",
                                     "flex: 1; padding: 6px 12px; background: transparent; color: #c0caf5; border: 1px solid #2a2b3d; border-radius: 4px; font-size: 12px; cursor: pointer;"
                                 },
                                 onclick: move |_| form.write().auth_type = "agent".to_string(),
-                                "Agent"
+                                { crate::i18n::t("connection.agent") }
                             }
                         }
                     }
@@ -512,11 +516,15 @@ delay 250",
                     {is_password.then(|| rsx! {
                         div {
                             style: "display: flex; flex-direction: column; gap: 4px;",
-                            label { style: "font-size: 12px; color: #9aa5ce;", "Password" }
+                            label { style: "font-size: 12px; color: #9aa5ce;", { crate::i18n::t("connection.password") } }
                             input {
                                 style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                                 r#type: "password",
-                                placeholder: if password_hint { "Leave blank to keep current password" } else { "Enter password" },
+                                placeholder: if password_hint {
+                                    crate::i18n::t("connection.password_keep_placeholder")
+                                } else {
+                                    crate::i18n::t("connection.password_placeholder")
+                                },
                                 value: "{form().password}",
                                 oninput: move |e| form.write().password = e.value(),
                             }
@@ -530,7 +538,7 @@ delay 250",
 
                             div {
                                 style: "display: flex; flex-direction: column; gap: 4px;",
-                                label { style: "font-size: 12px; color: #9aa5ce;", "Private Key Path" }
+                                label { style: "font-size: 12px; color: #9aa5ce;", { crate::i18n::t("connection.private_key_path") } }
                                 input {
                                     style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                                     r#type: "text",
@@ -568,11 +576,11 @@ delay 250",
 
                             div {
                                 style: "display: flex; flex-direction: column; gap: 4px;",
-                                label { style: "font-size: 12px; color: #9aa5ce;", "Passphrase (optional)" }
+                                label { style: "font-size: 12px; color: #9aa5ce;", { crate::i18n::t("connection.passphrase_optional") } }
                                 input {
                                     style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                                     r#type: "password",
-                                    placeholder: "Leave blank if no passphrase",
+                                    placeholder: crate::i18n::t("connection.passphrase_placeholder"),
                                     value: "{form().passphrase}",
                                     oninput: move |e| form.write().passphrase = e.value(),
                                 }
@@ -584,7 +592,7 @@ delay 250",
                     {is_agent.then(|| rsx! {
                         div {
                             style: "font-size: 12px; color: #9aa5ce; padding: 8px; background: #1a1b26; border-radius: 4px; border: 1px solid #2a2b3d;",
-                            "Will use SSH agent (ssh-agent) for authentication."
+                            { crate::i18n::t("connection.agent_hint") }
                         }
                     })}
 
@@ -595,7 +603,7 @@ delay 250",
                             style: "display: flex; flex-direction: column; gap: 8px; padding: 10px; background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px;",
                             div {
                                 style: "display: flex; flex-direction: column; gap: 4px;",
-                                label { style: "font-size: 12px; color: #9aa5ce;", "Proxy" }
+                                label { style: "font-size: 12px; color: #9aa5ce;", { crate::i18n::t("connection.proxy") } }
                                 select {
                                     style: "background: #16161e; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                                     value: "{form().proxy_type}",
@@ -619,7 +627,7 @@ delay 250",
                                         }
                                         current.proxy_type = next;
                                     },
-                                    option { value: "none", "None (direct)" }
+                                    option { value: "none", { crate::i18n::t("connection.proxy_direct") } }
                                     option { value: "http", "HTTP CONNECT" }
                                     option { value: "https", "HTTPS CONNECT" }
                                     option { value: "socks5", "SOCKS5" }
@@ -631,7 +639,7 @@ delay 250",
                                     style: "display: flex; gap: 8px;",
                                     div {
                                         style: "flex: 3; display: flex; flex-direction: column; gap: 4px;",
-                                        label { style: "font-size: 12px; color: #9aa5ce;", "Proxy Host" }
+                                        label { style: "font-size: 12px; color: #9aa5ce;", { crate::i18n::t("connection.proxy_host") } }
                                         input {
                                             style: "background: #16161e; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                                             r#type: "text",
@@ -642,7 +650,7 @@ delay 250",
                                     }
                                     div {
                                         style: "flex: 1; display: flex; flex-direction: column; gap: 4px;",
-                                        label { style: "font-size: 12px; color: #9aa5ce;", "Port" }
+                                        label { style: "font-size: 12px; color: #9aa5ce;", { crate::i18n::t("connection.port") } }
                                         input {
                                             style: "background: #16161e; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                                             r#type: "text",
@@ -656,7 +664,7 @@ delay 250",
                                     style: "display: flex; gap: 8px;",
                                     div {
                                         style: "flex: 1; display: flex; flex-direction: column; gap: 4px;",
-                                        label { style: "font-size: 12px; color: #9aa5ce;", "Proxy Username (optional)" }
+                                        label { style: "font-size: 12px; color: #9aa5ce;", { crate::i18n::t("connection.proxy_username_optional") } }
                                         input {
                                             style: "background: #16161e; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                                             r#type: "text",
@@ -666,7 +674,7 @@ delay 250",
                                     }
                                     div {
                                         style: "flex: 1; display: flex; flex-direction: column; gap: 4px;",
-                                        label { style: "font-size: 12px; color: #9aa5ce;", "Proxy Password (optional)" }
+                                        label { style: "font-size: 12px; color: #9aa5ce;", { crate::i18n::t("connection.proxy_password_optional") } }
                                         input {
                                             style: "background: #16161e; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                                             r#type: "password",
@@ -677,7 +685,7 @@ delay 250",
                                 }
                                 div {
                                     style: "font-size: 11px; color: #9aa5ce; line-height: 1.4;",
-                                    "Authentication requires both username and password. HTTPS secures the connection to the proxy before CONNECT."
+                                    { crate::i18n::t("connection.proxy_help") }
                                 }
                             })}
                         }
@@ -686,7 +694,7 @@ delay 250",
                     // Terminal Type selector
                     div {
                         style: "display: flex; flex-direction: column; gap: 4px;",
-                        label { style: "font-size: 12px; color: #9aa5ce;", "Terminal Type" }
+                        label { style: "font-size: 12px; color: #9aa5ce;", { crate::i18n::t("connection.terminal_type") } }
                         select {
                             style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                             value: "{form().terminal_type}",
@@ -708,7 +716,7 @@ delay 250",
                     button {
                         style: "background: transparent; border: 1px solid #2a2b3d; color: #c0caf5; border-radius: 4px; padding: 8px 16px; cursor: pointer; font-size: 13px;",
                         onclick: move |_| on_close.call(()),
-                        "Cancel"
+                        { crate::i18n::t("common.cancel") }
                     }
                     button {
                         style: "background: #7aa2f7; border: none; color: #1a1b26; border-radius: 4px; padding: 8px 16px; cursor: pointer; font-size: 13px; font-weight: 600;",

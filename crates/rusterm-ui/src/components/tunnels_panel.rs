@@ -58,6 +58,7 @@ impl TunnelForm {
 
 #[component]
 pub fn TunnelsPanel(state: Signal<crate::state::AppState>, on_close: EventHandler<()>) -> Element {
+    let _lang = crate::i18n::LANGUAGE();
     let manager: Option<Arc<TunnelManager>> = state.read().tunnel_manager.clone();
     let mut snapshots = use_signal(Vec::<TunnelSnapshot>::new);
     let mut form = use_signal(TunnelForm::default);
@@ -90,8 +91,8 @@ pub fn TunnelsPanel(state: Signal<crate::state::AppState>, on_close: EventHandle
         return rsx! {
             div { class: "tunnels-overlay",
                 div { class: "tunnels-card",
-                    p { "Tunnel manager is not initialized (unlock the app first)." }
-                    button { onclick: move |_| on_close.call(()), "Close" }
+                    p { { crate::i18n::t("tunnels.manager_uninitialized") } }
+                    button { onclick: move |_| on_close.call(()), { crate::i18n::t("common.close") } }
                 }
             }
         };
@@ -146,7 +147,7 @@ pub fn TunnelsPanel(state: Signal<crate::state::AppState>, on_close: EventHandle
         div { class: "tunnels-overlay", onclick: move |_| on_close.call(()),
             div { class: "tunnels-card", onclick: move |e| e.stop_propagation(),
                 div { class: "tunnels-head",
-                    span { style: "font-size:16px;font-weight:600;", "SSH Tunnels" }
+                    span { style: "font-size:16px;font-weight:600;", { crate::i18n::t("tunnels.title") } }
                     button {
                         class: "tunnel-btn",
                         onclick: move |_| {
@@ -163,7 +164,7 @@ pub fn TunnelsPanel(state: Signal<crate::state::AppState>, on_close: EventHandle
                             }
                             form.set(f);
                         },
-                        "+ New tunnel"
+                        { crate::i18n::t("tunnels.new_tunnel_button") }
                     }
                 }
 
@@ -172,7 +173,7 @@ pub fn TunnelsPanel(state: Signal<crate::state::AppState>, on_close: EventHandle
                     div { class: "tunnels-list",
                         if snapshots().is_empty() {
                             div { style: "padding:32px;text-align:center;color:#9aa5ce;font-size:12px;",
-                                "No tunnels yet. Create one to forward a local port through SSH."
+                                { crate::i18n::t("tunnels.empty") }
                             }
                         } else {
                             for snap in snapshots().iter() {
@@ -204,13 +205,13 @@ pub fn TunnelsPanel(state: Signal<crate::state::AppState>, on_close: EventHandle
                                                 button {
                                                     class: "tunnel-btn",
                                                     onclick: move |_| { mgr_stop.stop(&id_stop).ok(); },
-                                                    "Stop"
+                                                    { crate::i18n::t("tunnels.stop") }
                                                 }
                                             } else {
                                                 button {
                                                     class: "tunnel-btn",
                                                     onclick: move |_| { mgr_start.start(&id_start).ok(); },
-                                                    "Start"
+                                                    { crate::i18n::t("tunnels.start") }
                                                 }
                                             }
                                             button {
@@ -220,7 +221,7 @@ pub fn TunnelsPanel(state: Signal<crate::state::AppState>, on_close: EventHandle
                                                     editing.set(true);
                                                     form_error.set(String::new());
                                                 },
-                                                "Edit"
+                                                { crate::i18n::t("tunnels.edit") }
                                             }
                                             button {
                                                 class: "tunnel-btn danger",
@@ -238,18 +239,22 @@ pub fn TunnelsPanel(state: Signal<crate::state::AppState>, on_close: EventHandle
                     if editing() {
                         div { class: "tunnels-editor",
                             div { style: "font-size:12px;font-weight:600;margin-bottom:10px;",
-                                if form().id.is_empty() { "New tunnel" } else { "Edit tunnel" }
+                                if form().id.is_empty() {
+                                                                    { crate::i18n::t("tunnels.new_tunnel") }
+                                                                } else {
+                                                                    { crate::i18n::t("tunnels.edit_tunnel") }
+                                                                }
                             }
 
                             div { class: "tunnel-field",
-                                span { "Name" }
+                                span { { crate::i18n::t("tunnels.name") } }
                                 input {
                                     value: "{form().name}",
                                     oninput: move |e| form.write().name = e.value(),
                                 }
                             }
                             div { class: "tunnel-field",
-                                span { "SSH connection" }
+                                span { { crate::i18n::t("tunnels.ssh_connection") } }
                                 select {
                                     value: "{form().connection_id}",
                                     onchange: move |e| form.write().connection_id = e.value(),
@@ -259,17 +264,17 @@ pub fn TunnelsPanel(state: Signal<crate::state::AppState>, on_close: EventHandle
                                 }
                             }
                             div { class: "tunnel-field",
-                                span { "Type" }
+                                span { { crate::i18n::t("tunnels.type") } }
                                 select {
                                     value: "{form().kind}",
                                     onchange: move |e| form.write().kind = e.value(),
-                                    option { value: "local", "Local forward (ssh -L)" }
-                                    option { value: "socks", "Dynamic SOCKS5 proxy (ssh -D)" }
+                                    option { value: "local", { crate::i18n::t("tunnels.type_local_forward") } }
+                                    option { value: "socks", { crate::i18n::t("tunnels.type_dynamic_socks") } }
                                 }
                             }
                             if form().kind == "local" {
                                 div { class: "tunnel-field",
-                                    span { "Remote host : port" }
+                                    span { { crate::i18n::t("tunnels.remote_host_port") } }
                                     div { style: "display:flex;gap:6px;",
                                         input {
                                             style: "flex:1;",
@@ -287,7 +292,7 @@ pub fn TunnelsPanel(state: Signal<crate::state::AppState>, on_close: EventHandle
                                 }
                             }
                             div { class: "tunnel-field",
-                                span { "Listen : port" }
+                                span { { crate::i18n::t("tunnels.listen_addr_port") } }
                                 div { style: "display:flex;gap:6px;",
                                     input {
                                         style: "flex:1;",
@@ -318,10 +323,14 @@ pub fn TunnelsPanel(state: Signal<crate::state::AppState>, on_close: EventHandle
                                             port_hints.set(Vec::new());
                                         }
                                     },
-                                    if port_free() { "Check port" } else { "Port busy — suggest free ports" }
+                                    if port_free() {
+                                                                            { crate::i18n::t("tunnels.check_port") }
+                                                                        } else {
+                                                                            { crate::i18n::t("tunnels.suggest_free_ports") }
+                                                                        }
                                 }
                                 if !port_free() {
-                                    div { class: "tunnel-error", "Port is in use." }
+                                    div { class: "tunnel-error", { crate::i18n::t("tunnels.port_in_use") } }
                                     if !port_hints().is_empty() {
                                         div { class: "tunnel-hints",
                                             for port in port_hints().clone() {
@@ -345,7 +354,7 @@ pub fn TunnelsPanel(state: Signal<crate::state::AppState>, on_close: EventHandle
                                     checked: form().auto_start,
                                     onchange: move |e| form.write().auto_start = e.checked(),
                                 }
-                                "Auto-start on app launch"
+                                { crate::i18n::t("tunnels.auto_start") }
                             }
                             label { class: "tunnel-check",
                                 input {
@@ -353,11 +362,11 @@ pub fn TunnelsPanel(state: Signal<crate::state::AppState>, on_close: EventHandle
                                     checked: form().auto_reconnect,
                                     onchange: move |e| form.write().auto_reconnect = e.checked(),
                                 }
-                                "Auto-reconnect with backoff"
+                                { crate::i18n::t("tunnels.auto_reconnect") }
                             }
 
                             if !form_error().is_empty() {
-                                div { class: "tunnel-error", "{form_error()}" }
+                                div { class: "tunnel-error", { crate::i18n::t(&form_error()) } }
                             }
 
                             div { style: "display:flex;gap:8px;margin-top:6px;",
@@ -376,7 +385,7 @@ pub fn TunnelsPanel(state: Signal<crate::state::AppState>, on_close: EventHandle
                                             Err(e) => form_error.set(e),
                                         }
                                     },
-                                    "Save & start"
+                                    { crate::i18n::t("tunnels.save_and_start") }
                                 }
                                 button {
                                     class: "tunnel-btn",
@@ -385,7 +394,7 @@ pub fn TunnelsPanel(state: Signal<crate::state::AppState>, on_close: EventHandle
                                         form_error.set(String::new());
                                         form.set(TunnelForm::default());
                                     },
-                                    "Cancel"
+                                    { crate::i18n::t("common.cancel") }
                                 }
                             }
                         }
@@ -393,7 +402,7 @@ pub fn TunnelsPanel(state: Signal<crate::state::AppState>, on_close: EventHandle
                 }
 
                 div { style: "display:flex;justify-content:flex-end;padding:8px 16px;border-top:1px solid #2a2b3d;",
-                    button { class: "tunnel-btn", onclick: move |_| on_close.call(()), "Close" }
+                    button { class: "tunnel-btn", onclick: move |_| on_close.call(()), { crate::i18n::t("common.close") } }
                 }
             }
         }
@@ -402,15 +411,19 @@ pub fn TunnelsPanel(state: Signal<crate::state::AppState>, on_close: EventHandle
 
 fn describe_state(state: &TunnelState) -> (&'static str, String) {
     match state {
-        TunnelState::Stopped => ("red", "Stopped".to_string()),
-        TunnelState::Connecting { attempt } => {
-            ("yellow", format!("Connecting (attempt {attempt})"))
-        }
+        TunnelState::Stopped => ("red", crate::i18n::t("tunnels.state_stopped")),
+        TunnelState::Connecting { attempt } => (
+            "yellow",
+            crate::i18n::tf("tunnels.state_connecting", &[("attempt", attempt)]),
+        ),
         TunnelState::Active { since_epoch_secs } => {
             let up_secs = (chrono::Utc::now().timestamp() - since_epoch_secs).max(0);
             (
                 "green",
-                format!("Active {}m {}s", up_secs / 60, up_secs % 60),
+                crate::i18n::tf(
+                    "tunnels.state_active",
+                    &[("minutes", &(up_secs / 60)), ("seconds", &(up_secs % 60))],
+                ),
             )
         }
         TunnelState::Reconnecting {
@@ -419,12 +432,19 @@ fn describe_state(state: &TunnelState) -> (&'static str, String) {
             last_error,
         } => (
             "yellow",
-            format!(
-                "Reconnecting attempt {attempt} in {}ms ({})",
-                next_retry_ms, last_error
+            crate::i18n::tf(
+                "tunnels.state_reconnecting",
+                &[
+                    ("attempt", attempt),
+                    ("delay_ms", next_retry_ms),
+                    ("error", last_error),
+                ],
             ),
         ),
-        TunnelState::Failed(msg) => ("red", format!("Failed: {msg}")),
+        TunnelState::Failed(msg) => (
+            "red",
+            crate::i18n::tf("tunnels.state_failed", &[("error", msg)]),
+        ),
     }
 }
 
@@ -439,39 +459,41 @@ fn describe_kind(kind: &TunnelKind) -> &'static str {
 /// Validate + assemble a `TunnelConfig` from the form strings.
 fn build_config(form: &TunnelForm) -> Result<TunnelConfig, String> {
     if form.name.trim().is_empty() {
-        return Err("Name is required".into());
+        return Err("tunnels.name_required".into());
     }
     if form.connection_id.is_empty() {
-        return Err("Pick an SSH connection".into());
+        return Err("tunnels.connection_required".into());
     }
     let listen_addr: IpAddr = form
         .listen_addr
         .parse()
-        .map_err(|_| "Listen address must be a valid IP".to_string())?;
+        .map_err(|_| "tunnels.invalid_listen_address".to_string())?;
     let listen_port: u16 = form
         .listen_port
         .parse()
-        .map_err(|_| "Listen port must be 1-65535".to_string())?;
+        .map_err(|_| "tunnels.invalid_listen_port".to_string())?;
     if listen_port == 0 {
-        return Err("Listen port cannot be 0".into());
+        return Err("tunnels.listen_port_zero".into());
     }
     let kind = match form.kind.as_str() {
         "local" => {
             let remote_host = form.remote_host.trim();
             if remote_host.is_empty() {
-                return Err("Remote host is required for local forward".into());
+                return Err("tunnels.remote_host_required".into());
             }
             let remote_port: u16 = form
                 .remote_port
                 .parse()
-                .map_err(|_| "Remote port must be 1-65535".to_string())?;
+                .map_err(|_| "tunnels.invalid_remote_port".to_string())?;
             TunnelKind::LocalForward {
                 remote_host: remote_host.to_string(),
                 remote_port,
             }
         }
         "socks" => TunnelKind::DynamicSocks,
-        other => return Err(format!("unknown kind {other}")),
+        other => {
+            return Err(crate::i18n::tf("tunnels.unknown_kind", &[("kind", &other)]));
+        }
     };
 
     let id = if form.id.is_empty() {

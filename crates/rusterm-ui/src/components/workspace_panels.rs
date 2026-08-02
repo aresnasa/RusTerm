@@ -120,7 +120,7 @@ pub fn BottomToolPanel(
                 if !embedded {
                 button {
                     style: "margin-right:5px;border:0;background:transparent;color:var(--skin-text-muted);cursor:pointer;padding:4px 7px;font-size:14px;",
-                    title: "Hide bottom panel",
+                    title: crate::i18n::t("dock.hide_bottom"),
                     onclick: move |_| on_close.call(()),
                     "×"
                 }
@@ -137,7 +137,7 @@ pub fn BottomToolPanel(
                     div {
                         style: "display:flex;align-items:center;flex-wrap:wrap;gap:6px;padding:7px;border-bottom:1px solid var(--skin-border);",
                         span { style: "color:var(--skin-text);font-size:11px;font-weight:600;", { crate::i18n::t("send.targets") } }
-                        span { style: "margin-left:auto;color:var(--skin-text-muted);font-size:10px;", "{selected_target_count}/{target_count} selected" }
+                        span { style: "margin-left:auto;color:var(--skin-text-muted);font-size:10px;", { crate::i18n::tf("send.selected_count", &[("selected", &selected_target_count), ("total", &target_count)]) } }
                         button {
                             class: "send-target-action",
                             disabled: !has_available_targets,
