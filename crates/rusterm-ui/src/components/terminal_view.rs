@@ -1414,16 +1414,23 @@ pub fn TerminalView(
             if matches!(key, Key::Enter) {
                 let matches = search_matches();
                 if !matches.is_empty() {
-                    let next = (search_match_index() + 1) % matches.len();
+                    let current = search_match_index().min(matches.len() - 1);
+                    let next = if shift {
+                        current.checked_sub(1).unwrap_or(matches.len() - 1)
+                    } else {
+                        (current + 1) % matches.len()
+                    };
                     search_match_index.set(next);
                 }
                 return;
             }
             if matches!(key, Key::Escape) {
                 search_visible.set(false);
-                search_query.set(String::new());
-                search_matches.set(Vec::new());
-                search_match_index.set(0);
+                if !search_highlight_pinned() {
+                    search_query.set(String::new());
+                    search_matches.set(Vec::new());
+                    search_match_index.set(0);
+                }
                 return;
             }
             return;
