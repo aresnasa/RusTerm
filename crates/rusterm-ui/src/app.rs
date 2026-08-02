@@ -4,15 +4,16 @@ use std::sync::Arc;
 use dioxus::html::input_data::MouseButton;
 use dioxus::prelude::*;
 use parking_lot::Mutex;
+use sha2::{Digest, Sha256};
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use rusterm_core::LoginStep;
 use rusterm_core::config::{
     BottomPanelTab, ConnectionConfig, ConnectionGroup, ConnectionKind, DockZone, KeybindingAction,
-    Keybindings, OneKey, OneKeyStep, PanelId, ProxyConfig, ProxyKind, RightPanelTab, SerialConfig,
-    ShellConfig, SidebarPreferences, SkinSettings, SshAuth, SshConfig, TelnetConfig,
-    WorkspacePreferences,
+    Keybindings, OneKey, OneKeyPreference, OneKeyStep, PanelId, ProxyConfig, ProxyKind,
+    RightPanelTab, SerialConfig, ShellConfig, SidebarPreferences, SkinSettings, SshAuth, SshConfig,
+    TelnetConfig, WorkspacePreferences,
 };
 use rusterm_core::config_manager::ConfigManager;
 use rusterm_core::event::SessionEvent;
@@ -49,13 +50,13 @@ use crate::keybindings::action_for_event;
 use crate::layout::{PaneLayout, SplitAxis, SplitDirection};
 use crate::skin::css_variables;
 use crate::state::{
-    AppState, CommandStatus, Modal, OneKeyMatch, OneKeyPopupState, OneKeySubmissionFeedback,
-    PendingCommandPayload, PendingDangerousCommand, SessionConnectionState, SessionTab,
-    TabDropOutcome, TerminalEntry, UnlockState, activate_session, append_pane_to_active,
-    available_send_targets, begin_floating_pane_move, clear_terminal_command_lines, close_pane,
-    close_session, close_workspace, command_send_targets, distribute_sessions_across_panes,
-    enqueue_pending_exit, execute_tab_drop_on_pane, execute_tab_drop_on_pane_at,
-    focus_pane_for_layout, focused_pane_session, invert_send_targets,
+    AppState, CommandStatus, Modal, OneKeyMatch, OneKeyPopupState, OneKeyPreferenceAttempt,
+    OneKeySubmissionFeedback, PendingCommandPayload, PendingDangerousCommand,
+    SessionConnectionState, SessionTab, TabDropOutcome, TerminalEntry, UnlockState,
+    activate_session, append_pane_to_active, available_send_targets, begin_floating_pane_move,
+    clear_terminal_command_lines, close_pane, close_session, close_workspace, command_send_targets,
+    distribute_sessions_across_panes, enqueue_pending_exit, execute_tab_drop_on_pane,
+    execute_tab_drop_on_pane_at, focus_pane_for_layout, focused_pane_session, invert_send_targets,
     move_floating_pane_for_active, move_session_to_leftmost, prepare_split_for_sidebar_drop,
     prepare_split_for_sidebar_drop_at, push_workspace_tab, resize_layout_split,
     rollback_pending_exit, scroll_sync_targets, select_all_send_targets, selected_send_target_ids,
@@ -5939,18 +5940,39 @@ fn is_sudo_password_prompt(text: &str) -> bool {
         && credential_kind(&plain) == Some(CredentialKind::Password)
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OneKeySelection {
+    credential: String,
+    matched_expect: String,
+    /// Present only for a multi-match popup with a stable saved connection.
+    preference: Option<OneKeyPreference>,
+}
+
 /// Atomically resolve and remove one popup selection. Removing the popup in the
 /// same operation means duplicate click/keyboard callbacks cannot submit twice.
 fn take_onekey_selection(
     popups: &mut HashMap<String, OneKeyPopupState>,
     session_id: &str,
     index: usize,
-) -> Option<(String, String)> {
+) -> Option<OneKeySelection> {
     let selection = popups.get(session_id).and_then(|popup| {
-        popup
-            .matches
-            .get(index)
-            .map(|entry| (entry.send.clone(), entry.matched_expect.clone()))
+        popup.matches.get(index).map(|entry| {
+            let preference = (popup.matches.len() > 1)
+                .then(|| {
+                    Some(OneKeyPreference {
+                        connection_id: popup.connection_id.clone()?,
+                        prompt_fingerprint: popup.prompt_fingerprint.clone()?,
+                        onekey_id: entry.onekey_id.clone(),
+                        step_index: entry.step_index,
+                    })
+                })
+                .flatten();
+            OneKeySelection {
+                credential: entry.send.clone(),
+                matched_expect: entry.matched_expect.clone(),
+                preference,
+            }
+        })
     });
     if selection.is_some()
         && popups
@@ -6099,11 +6121,11 @@ fn onekey_step_label(step: &OneKeyStep) -> String {
 /// label/expect has the same credential kind as the prompt. This prevents a
 /// broad Username rule placed first from supplying a username at a Password
 /// prompt. Configuration order remains the fallback for unclassified prompts.
-fn first_matching_step<'a>(ok: &'a OneKey, line: &str) -> Option<&'a OneKeyStep> {
+fn matching_step_with_index<'a>(ok: &'a OneKey, line: &str) -> Option<(usize, &'a OneKeyStep)> {
     let prompt_kind = credential_kind(line);
     let mut first_match = None;
 
-    for step in &ok.steps {
+    for (step_index, step) in ok.steps.iter().enumerate() {
         let pattern = format!("(?i){}", step.expect);
         let Ok(re) = regex::Regex::new(&pattern) else {
             continue;
@@ -6112,16 +6134,29 @@ fn first_matching_step<'a>(ok: &'a OneKey, line: &str) -> Option<&'a OneKeyStep>
             continue;
         }
 
-        first_match.get_or_insert(step);
+        first_match.get_or_insert((step_index, step));
         if let Some(prompt_kind) = prompt_kind {
             let step_kind = credential_kind(&format!("{} {}", step.label, step.expect));
             if step_kind == Some(prompt_kind) {
-                return Some(step);
+                return Some((step_index, step));
             }
         }
     }
 
     first_match
+}
+
+fn first_matching_step<'a>(ok: &'a OneKey, line: &str) -> Option<&'a OneKeyStep> {
+    matching_step_with_index(ok, line).map(|(_, step)| step)
+}
+
+fn onekey_prompt_fingerprint(prompt: &str) -> String {
+    let normalized = strip_ansi(prompt)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .to_lowercase();
+    format!("{:x}", Sha256::digest(normalized.as_bytes()))
 }
 
 fn onekey_prompt_text(state: &AppState, session_id: &str, data: &[u8]) -> String {
