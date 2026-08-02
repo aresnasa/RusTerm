@@ -285,10 +285,19 @@ pub mod disabled {
         ) -> anyhow::Result<()> {
             Ok(())
         }
-        pub fn command_corrections_for(
+        pub fn command_corrections_for(&self, _typo: &str) -> Result<Vec<LearnedCorrection>> {
+            Ok(Vec::new())
+        }
+
+        /// Feature-off stub: DuckDB is not compiled in, so there are no
+        /// frequency rankings. Returning an empty vec keeps call sites
+        /// (Send panel completion, terminal suggestion pipeline) working
+        /// without `#[cfg]` guards.
+        pub fn command_rankings_by_prefix(
             &self,
-            _typo: &str,
-        ) -> anyhow::Result<Vec<LearnedCorrection>> {
+            _prefix: &str,
+            _limit: u32,
+        ) -> Result<Vec<rusterm_analytics::CommandRanking>> {
             Ok(Vec::new())
         }
     }
