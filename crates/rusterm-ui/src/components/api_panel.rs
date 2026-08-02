@@ -709,10 +709,10 @@ fn gen_curl_preview_for_language(
     let first_body = request_body(first_host);
     // Locate the payload value inside the JSON so we can highlight it. The
     // field name differs per mode; find whichever key is present.
-    let (field_key, field_value) = match payload {
-        CurlPayload::Command(v) => ("\"command":", v),
-        CurlPayload::Script(v) => ("\"script":", v),
-        CurlPayload::ScriptBase64(v) => ("\"script_base64":", v),
+    let (field_key, field_value): (&'static str, &str) = match payload {
+        CurlPayload::Command(v) => (r#""command":"#, v),
+        CurlPayload::Script(v) => (r#""script":"#, v),
+        CurlPayload::ScriptBase64(v) => (r#""script_base64":"#, v),
     };
     let field_json = serde_json::to_string(field_value).expect("strings always serialize to JSON");
     let value_start = first_body
