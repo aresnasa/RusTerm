@@ -2,8 +2,8 @@ use dioxus::prelude::*;
 
 use rusterm_core::config::{ConnectionConfig, ConnectionGroup, ConnectionKind, ProxyKind, SshAuth};
 use rusterm_ssh::{
-    SshHostSuggestion, default_ssh_config_path, list_identity_files, list_ssh_config_hosts,
-    lookup_host,
+    HostSpec, Protocol, SshHostSuggestion, default_ssh_config_path, list_identity_files,
+    list_ssh_config_hosts, lookup_host, parse_host_input,
 };
 
 #[derive(Debug, Clone, Default)]
@@ -27,6 +27,34 @@ pub struct NewConnectionForm {
     /// Raw login-script DSL text (expect/send/send_onekey/delay lines).
     /// Empty string means "no script". Only meaningful for SSH/Shell kinds.
     pub login_script: String,
+
+    // ── quick-entry / protocol switching ───────────────────────────────
+    /// Free-text the user types in the "quick entry" box at the top of the
+    /// dialog (e.g. `xuchao@jump.zs.shaipower.online -p 22`). Empty when the
+    /// user fills fields individually below.
+    pub quick_input: String,
+    /// Last parse-error message from the quick-entry box, shown inline so
+    /// the user knows why nothing auto-filled. Empty when the last parse
+    /// was successful (or the box is empty).
+    pub quick_error: String,
+    /// Active protocol tab. One of `"ssh"`, `"telnet"`, `"serial"`.
+    /// Drives which fields are visible and which `ConnectionKind` the form
+    /// builds on submit.
+    pub protocol: String,
+
+    // ── serial-specific fields (only used when protocol == "serial") ────
+    /// Device path, e.g. `/dev/ttyUSB0` (Linux/macOS) or `COM3` (Windows).
+    pub serial_port: String,
+    /// Baud rate as a string so the input is unconstrained; parsed on save.
+    pub baud_rate: String,
+    /// One of `"5"|"6"|"7"|"8"`.
+    pub data_bits: String,
+    /// One of `"none"|"odd"|"even"`.
+    pub parity: String,
+    /// One of `"1"|"2"`.
+    pub stop_bits: String,
+    /// One of `"none"|"software"|"hardware"`.
+    pub flow_control: String,
 }
 
 const TERMINAL_TYPES: &[&str] = &[
@@ -47,16 +75,65 @@ fn default_form() -> NewConnectionForm {
         terminal_type: "xterm-256color".to_string(),
         proxy_type: "none".to_string(),
         port: "22".to_string(),
+        protocol: "ssh".to_string(),
+        baud_rate: "115200".to_string(),
+        data_bits: "8".to_string(),
+        parity: "none".to_string(),
+        stop_bits: "1".to_string(),
+        flow_control: "none".to_string(),
         ..Default::default()
     }
 }
 
+/// Apply the quick-entry parse result to the form. Updates host/port/username
+/// and switches the protocol tab when the parsed protocol differs from the
+/// current one. Clears `quick_error` on success.
+fn apply_host_spec(spec: &HostSpec, form: &mut NewConnectionForm) {
+    if let Some(user) = &spec.user {
+        if !user.is_empty() {
+            form.username = user.clone();
+        }
+    }
+    form.host = spec.host.clone();
+    // Always fill the port — `resolved_port` falls back to the protocol
+    // default (ssh=22, telnet=23) when the user didn't specify one, which is
+    // exactly the "auto-fill the default port" behavior the requirement
+    // asks for.
+    form.port = spec.resolved_port().to_string();
+    let new_protocol = match spec.protocol {
+        Protocol::Ssh => "ssh",
+        Protocol::Telnet => "telnet",
+    };
+    if form.protocol != new_protocol {
+        form.protocol = new_protocol.to_string();
+    }
+    form.quick_error.clear();
+}
+
+/// Convenience: the conventional default port for a protocol string used in
+/// the UI dropdown ("ssh" | "telnet" | "serial"). Serial returns 0 (the
+/// port field is hidden for serial connections — the dropdown swap hides it
+/// visually, and 0 is the sentinel `parse().unwrap_or(0)` falls back to).
+fn default_port_for_protocol(protocol: &str) -> &'static str {
+    match protocol {
+        "telnet" => "23",
+        "serial" => "0",
+        _ => "22",
+    }
+}
+
 /// Build a form pre-filled from an existing connection so the edit dialog
-/// shows the saved values. Only SSH connections populate the host/port/auth
-/// fields; non-SSH kinds only carry name + onekey (the SSH-specific inputs are
-/// left at defaults and, on save, the original `kind` is preserved unchanged
-/// — see `app::rebuild_connection`).
+/// shows the saved values. SSH/Telnet/Serial each populate their own
+/// fields; on save, `rebuild_connection` reconstructs the matching
+/// `ConnectionKind` from the form. The `protocol` field is seeded from the
+/// connection kind so the dialog opens on the right tab.
 fn form_from_connection(c: &ConnectionConfig) -> NewConnectionForm {
+    let mut base = default_form();
+    base.name = c.name.clone();
+    base.group_id = c.group.clone();
+    base.onekey = c.onekey;
+    base.login_script = c.login_script.clone().unwrap_or_default();
+
     match &c.kind {
         ConnectionKind::Ssh(ssh) => {
             let (auth_type, password, key_path, passphrase) = match &ssh.auth {
@@ -100,35 +177,43 @@ fn form_from_connection(c: &ConnectionConfig) -> NewConnectionForm {
                         String::new(),
                     )
                 });
-            NewConnectionForm {
-                name: c.name.clone(),
-                host: ssh.host.clone(),
-                port: ssh.port.to_string(),
-                username: ssh.username.clone(),
-                auth_type: auth_type.to_string(),
-                password,
-                key_path,
-                passphrase,
-                terminal_type: ssh.terminal_type.clone(),
-                proxy_type,
-                proxy_host,
-                proxy_port,
-                proxy_username,
-                proxy_password,
-                group_id: c.group.clone(),
-                onekey: c.onekey,
-                login_script: c.login_script.clone().unwrap_or_default(),
-            }
+            base.protocol = "ssh".to_string();
+            base.host = ssh.host.clone();
+            base.port = ssh.port.to_string();
+            base.username = ssh.username.clone();
+            base.auth_type = auth_type.to_string();
+            base.password = password;
+            base.key_path = key_path;
+            base.passphrase = passphrase;
+            base.terminal_type = ssh.terminal_type.clone();
+            base.proxy_type = proxy_type;
+            base.proxy_host = proxy_host;
+            base.proxy_port = proxy_port;
+            base.proxy_username = proxy_username;
+            base.proxy_password = proxy_password;
+            base
         }
-        // Non-SSH connections can still be renamed / onekey-toggled; the SSH
-        // fields are irrelevant and ignored on save (kind is preserved).
-        _ => NewConnectionForm {
-            name: c.name.clone(),
-            group_id: c.group.clone(),
-            onekey: c.onekey,
-            login_script: String::new(),
-            ..default_form()
-        },
+        ConnectionKind::Telnet(telnet) => {
+            base.protocol = "telnet".to_string();
+            base.host = telnet.host.clone();
+            base.port = telnet.port.to_string();
+            // Telnet has no username field in the config; leave whatever the
+            // user typed in a previous session, but typically empty.
+            base
+        }
+        ConnectionKind::Serial(serial) => {
+            base.protocol = "serial".to_string();
+            base.serial_port = serial.port.clone();
+            base.baud_rate = serial.baud_rate.to_string();
+            base.data_bits = serial.data_bits.to_string();
+            base.parity = serial.parity.clone();
+            base.stop_bits = serial.stop_bits.to_string();
+            base.flow_control = serial.flow_control.clone();
+            base
+        }
+        // Shell / Tcp don't have a dedicated form tab; keep name + onekey
+        // + login_script only. Kind is preserved on save by `rebuild_connection`.
+        _ => base,
     }
 }
 
@@ -222,15 +307,30 @@ pub fn ConnectionDialog(
         "socks5" => "1080",
         _ => "8080",
     };
-    let show_proxy_settings = editing
-        .as_ref()
-        .map(|connection| matches!(connection.kind, ConnectionKind::Ssh(_)))
-        .unwrap_or(true);
+    // Protocol tab drives which fields are visible. In edit mode we still
+    // show all SSH fields when the underlying kind is SSH (preserving the
+    // existing behavior); for non-SSH kinds we honor the form's protocol so
+    // the user can switch tabs and see the right inputs.
+    let protocol = form().protocol.clone();
+    let is_ssh = protocol == "ssh";
+    let is_telnet = protocol == "telnet";
+    let is_serial = protocol == "serial";
+    let show_proxy_settings = is_ssh
+        && editing
+            .as_ref()
+            .map(|connection| matches!(connection.kind, ConnectionKind::Ssh(_)))
+            .unwrap_or(true);
 
     // In edit mode, the password field is shown empty (we never echo the
     // stored password back into the DOM for security). A small hint tells the
     // user that leaving it blank keeps the existing password.
     let password_hint = is_editing && is_password;
+
+    // Available serial ports (system enumeration). Loaded once on mount;
+    // `serialport::available_ports` is a cheap syscall that returns a Vec,
+    // never panics. The user can still type a path not in the list.
+    let serial_port_suggestions: Signal<Vec<String>> =
+        use_signal(rusterm_proto::list_available_ports);
 
     rsx! {
         div {
@@ -259,6 +359,120 @@ pub fn ConnectionDialog(
 
                 div {
                     style: "display: flex; flex-direction: column; gap: 12px;",
+
+                    // ── Quick entry ────────────────────────────────────────
+                    // Single input box at the top that parses `user@host -p 22`
+                    // (and variants) and auto-fills the host/port/username/
+                    // protocol fields below. Only shown for SSH/Telnet (serial
+                    // doesn't have a `user@host` form).
+                    {(is_ssh || is_telnet).then(|| rsx! {
+                        div {
+                            style: "display: flex; flex-direction: column; gap: 4px; padding: 10px; background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px;",
+                            label {
+                                style: "font-size: 12px; color: #9ece6a;",
+                                { crate::i18n::t("connection.quick_entry_label") }
+                            }
+                            div {
+                                style: "display: flex; gap: 6px;",
+                                input {
+                                    style: "flex: 1; background: #16161e; border: 1px solid #2a2b3d; border-radius: 4px; padding: 6px 8px; color: #c0caf5; font-size: 12px; font-family: 'JetBrains Mono', monospace; outline: none;",
+                                    r#type: "text",
+                                    placeholder: "xuchao@jump.zs.shaipower.online -p 22",
+                                    value: "{form().quick_input}",
+                                    oninput: move |e| {
+                                        let v = e.value();
+                                        let mut f = form.write();
+                                        f.quick_input = v.clone();
+                                        // Live-parse: update fields as the user
+                                        // types so the form below reflects the
+                                        // parsed result in real time. Errors
+                                        // are shown inline but do NOT clear
+                                        // previously-filled fields.
+                                        if v.trim().is_empty() {
+                                            f.quick_error.clear();
+                                        } else {
+                                            match parse_host_input(&v) {
+                                                Ok(spec) => apply_host_spec(&spec, &mut f),
+                                                Err(err) => f.quick_error = err.to_string(),
+                                            }
+                                        }
+                                    },
+                                    // Enter: parse + jump focus to the next
+                                    // field (password/key). We don't auto-submit
+                                    // because the user may still want to fill
+                                    // auth details.
+                                    onkeydown: move |e: KeyboardEvent| {
+                                        if e.key() == Key::Enter {
+                                            e.prevent_default();
+                                        }
+                                    },
+                                }
+                            }
+                            // Inline parse-error hint. Empty when the last
+                            // parse succeeded (or the box is empty).
+                            {(!form().quick_error.is_empty()).then(|| rsx! {
+                                span {
+                                    style: "font-size: 11px; color: #f7768e; margin-top: 2px;",
+                                    { form().quick_error.clone() }
+                                }
+                            })}
+                            span {
+                                style: "font-size: 10px; color: #9aa5ce; line-height: 1.4; margin-top: 2px;",
+                                { crate::i18n::t("connection.quick_entry_help") }
+                            }
+                        }
+                    })}
+
+                    // ── Protocol selector ──────────────────────────────────
+                    // Three tabs: SSH / Telnet / Serial. Switching updates
+                    // `form.protocol` and swaps the default port (ssh=22,
+                    // telnet=23) when the user hasn't typed a custom port.
+                    div {
+                        style: "display: flex; gap: 4px;",
+                        button {
+                            style: if is_ssh {
+                                "flex: 1; padding: 6px 12px; background: #7aa2f7; color: #1a1b26; border: 1px solid #7aa2f7; border-radius: 4px; font-size: 12px; font-weight: 600; cursor: pointer;"
+                            } else {
+                                "flex: 1; padding: 6px 12px; background: transparent; color: #c0caf5; border: 1px solid #2a2b3d; border-radius: 4px; font-size: 12px; cursor: pointer;"
+                            },
+                            onclick: move |_| {
+                                let mut f = form.write();
+                                let prev_default = default_port_for_protocol(&f.protocol);
+                                f.protocol = "ssh".to_string();
+                                if f.port.is_empty() || f.port == prev_default {
+                                    f.port = default_port_for_protocol("ssh").to_string();
+                                }
+                            },
+                            "SSH"
+                        }
+                        button {
+                            style: if is_telnet {
+                                "flex: 1; padding: 6px 12px; background: #ff9e64; color: #1a1b26; border: 1px solid #ff9e64; border-radius: 4px; font-size: 12px; font-weight: 600; cursor: pointer;"
+                            } else {
+                                "flex: 1; padding: 6px 12px; background: transparent; color: #c0caf5; border: 1px solid #2a2b3d; border-radius: 4px; font-size: 12px; cursor: pointer;"
+                            },
+                            onclick: move |_| {
+                                let mut f = form.write();
+                                let prev_default = default_port_for_protocol(&f.protocol);
+                                f.protocol = "telnet".to_string();
+                                if f.port.is_empty() || f.port == prev_default {
+                                    f.port = default_port_for_protocol("telnet").to_string();
+                                }
+                            },
+                            "Telnet"
+                        }
+                        button {
+                            style: if is_serial {
+                                "flex: 1; padding: 6px 12px; background: #e0af68; color: #1a1b26; border: 1px solid #e0af68; border-radius: 4px; font-size: 12px; font-weight: 600; cursor: pointer;"
+                            } else {
+                                "flex: 1; padding: 6px 12px; background: transparent; color: #c0caf5; border: 1px solid #2a2b3d; border-radius: 4px; font-size: 12px; cursor: pointer;"
+                            },
+                            onclick: move |_| {
+                                form.write().protocol = "serial".to_string();
+                            },
+                            "Serial"
+                        }
+                    }
 
                     // Name
                     div {
@@ -360,108 +574,203 @@ delay 250",
                         }
                     }
 
-                    // Host + Port
-                    div {
-                        style: "display: flex; gap: 8px;",
+                    // Host + Port (shown for both SSH and Telnet — both are
+                    // host-based protocols; Serial has its own device-picker
+                    // section below).
+                    {(is_ssh || is_telnet).then(|| rsx! {
                         div {
-                            style: "flex: 3; display: flex; flex-direction: column; gap: 4px;",
-                            label { style: "font-size: 12px; color: #9aa5ce;", { crate::i18n::t("connection.host") } }
-                            input {
-                                style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
-                                r#type: "text",
-                                placeholder: "192.168.1.1",
-                                // `list` attribute links this input to the
-                                // `<datalist id=\"ssh-host-list\">` below, enabling
-                                // the browser's native autocomplete dropdown.
-                                list: "ssh-host-list",
-                                value: "{form().host}",
-                                oninput: move |e| form.write().host = e.value(),
-                                // Auto-fill from `~/.ssh/config` when the user
-                                // picks (or types a complete match for) a
-                                // configured host alias. `onchange` fires on
-                                // blur or when the user selects a datalist
-                                // suggestion — NOT on every keystroke, so we
-                                // don't interrupt typing.
-                                onchange: move |e| {
-                                    let alias = e.value();
-                                    if let Some(resolved) = lookup_host(&alias, None) {
-                                        let mut f = form.write();
-                                        // Only overwrite fields that the
-                                        // config actually specifies — leave
-                                        // user-typed values alone for fields
-                                        // the config doesn't set.
-                                        // `lookup_host` returns resolved
-                                        // values for user/port/identity_file
-                                        // (with sane defaults when the
-                                        // config doesn't set them), so we
-                                        // always fill those.
-                                        f.host = resolved.host;
-                                        f.port = resolved.port.to_string();
-                                        f.username = resolved.user;
-                                        if let Some(id_path) = resolved.identity_file {
-                                            f.key_path = id_path;
-                                            f.auth_type = "key".to_string();
-                                        } else {
-                                            // No IdentityFile in the config —
-                                            // fall back to agent auth (the
-                                            // OpenSSH convention when no
-                                            // IdentityFile is specified).
-                                            f.auth_type = "agent".to_string();
+                            style: "display: flex; gap: 8px;",
+                            div {
+                                style: "flex: 3; display: flex; flex-direction: column; gap: 4px;",
+                                label { style: "font-size: 12px; color: #9aa5ce;", { crate::i18n::t("connection.host") } }
+                                input {
+                                    style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
+                                    r#type: "text",
+                                    placeholder: "192.168.1.1",
+                                    list: "ssh-host-list",
+                                    value: "{form().host}",
+                                    oninput: move |e| form.write().host = e.value(),
+                                    onchange: move |e| {
+                                        let alias = e.value();
+                                        if let Some(resolved) = lookup_host(&alias, None) {
+                                            let mut f = form.write();
+                                            f.host = resolved.host;
+                                            f.port = resolved.port.to_string();
+                                            f.username = resolved.user;
+                                            if let Some(id_path) = resolved.identity_file {
+                                                f.key_path = id_path;
+                                                f.auth_type = "key".to_string();
+                                            } else {
+                                                f.auth_type = "agent".to_string();
+                                            }
+                                        }
+                                    },
+                                }
+                                {(ssh_config_path_display().is_some() && !host_suggestions().is_empty() && is_ssh).then(|| {
+                                    let host_count = host_suggestions().len();
+                                    let ssh_path = ssh_config_path_display().as_deref().unwrap_or("~/.ssh/config").to_string();
+                                    rsx! {
+                                        div {
+                                            style: "font-size: 11px; color: #9aa5ce; margin-top: 2px;",
+                                            { crate::i18n::tf("connection.ssh_hosts_hint", &[("count", &host_count), ("path", &ssh_path)]) }
                                         }
                                     }
-                                },
-                            }
-                            // Path hint: tells the user where the suggestions
-                            // come from (so they know to edit `~/.ssh/config`
-                            // if a host is missing). Only shown when the
-                            // config file exists / is readable.
-                            {(ssh_config_path_display().is_some() && !host_suggestions().is_empty()).then(|| {
-                                let host_count = host_suggestions().len();
-                                let ssh_path = ssh_config_path_display().as_deref().unwrap_or("~/.ssh/config").to_string();
-                                rsx! {
-                                    div {
-                                        style: "font-size: 11px; color: #9aa5ce; margin-top: 2px;",
-                                        { crate::i18n::tf("connection.ssh_hosts_hint", &[("count", &host_count), ("path", &ssh_path)]) }
-                                    }
-                                }
-                            })}
-                            // Datalist of host aliases from `~/.ssh/config`.
-                            // The browser renders these as a native dropdown
-                            // under the input as the user types. We include
-                            // both the alias AND the resolved hostname (if
-                            // set) as the value, so the user can see what
-                            // they're picking. The `value` attribute is what
-                            // gets filled into the input on selection; the
-                            // text content is what's shown in the dropdown.
-                            datalist {
-                                id: "ssh-host-list",
-                                for suggestion in host_suggestions().iter() {
-                                    option {
-                                        // `value` is what gets filled into
-                                        // the input on selection. We use
-                                        // the alias (not the resolved
-                                        // hostname) because the user wants
-                                        // to type/pick the alias, and the
-                                        // `onchange` handler resolves it
-                                        // via `lookup_host`.
-                                        value: "{suggestion.alias}",
+                                })}
+                                datalist {
+                                    id: "ssh-host-list",
+                                    for suggestion in host_suggestions().iter() {
+                                        option {
+                                            value: "{suggestion.alias}",
+                                        }
                                     }
                                 }
                             }
-                        }
-                        div {
-                            style: "flex: 1; display: flex; flex-direction: column; gap: 4px;",
-                            label { style: "font-size: 12px; color: #9aa5ce;", { crate::i18n::t("connection.port") } }
-                            input {
-                                style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
-                                r#type: "text",
-                                placeholder: "22",
-                                value: "{form().port}",
-                                oninput: move |e| form.write().port = e.value(),
+                            div {
+                                style: "flex: 1; display: flex; flex-direction: column; gap: 4px;",
+                                label { style: "font-size: 12px; color: #9aa5ce;", { crate::i18n::t("connection.port") } }
+                                input {
+                                    style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
+                                    r#type: "text",
+                                    placeholder: "22",
+                                    value: "{form().port}",
+                                    oninput: move |e| form.write().port = e.value(),
+                                }
                             }
                         }
-                    }
+                    })}
 
+                    // Serial-specific fields (device path + line settings).
+                    // Only shown when the Serial tab is active.
+                    {is_serial.then(|| rsx! {
+                        div {
+                            style: "display: flex; flex-direction: column; gap: 12px;",
+
+                            // Device path with system-enumerated dropdown.
+                            div {
+                                style: "display: flex; flex-direction: column; gap: 4px;",
+                                label { style: "font-size: 12px; color: #9aa5ce;", { crate::i18n::t("connection.serial_device") } }
+                                input {
+                                    style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
+                                    r#type: "text",
+                                    placeholder: "/dev/ttyUSB0",
+                                    list: "serial-port-list",
+                                    value: "{form().serial_port}",
+                                    oninput: move |e| form.write().serial_port = e.value(),
+                                }
+                                {(!serial_port_suggestions().is_empty()).then(|| {
+                                    let count = serial_port_suggestions().len();
+                                    rsx! {
+                                        div {
+                                            style: "font-size: 11px; color: #9aa5ce; margin-top: 2px;",
+                                            { crate::i18n::tf("connection.serial_ports_hint", &[("count", &count)]) }
+                                        }
+                                    }
+                                })}
+                                datalist {
+                                    id: "serial-port-list",
+                                    for name in serial_port_suggestions().iter() {
+                                        option {
+                                            value: "{name}",
+                                        }
+                                    }
+                                }
+                            }
+
+                            // Baud rate + data bits + parity + stop bits + flow control
+                            div {
+                                style: "display: flex; gap: 8px;",
+                                div {
+                                    style: "flex: 2; display: flex; flex-direction: column; gap: 4px;",
+                                    label { style: "font-size: 12px; color: #9aa5ce;", { crate::i18n::t("connection.baud_rate") } }
+                                    select {
+                                        style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
+                                        value: "{form().baud_rate}",
+                                        onchange: move |e| form.write().baud_rate = e.value(),
+                                        for rate in &["9600", "19200", "38400", "57600", "115200", "230400", "460800", "921600"] {
+                                            option {
+                                                value: "{rate}",
+                                                selected: form().baud_rate == *rate,
+                                                "{rate}"
+                                            }
+                                        }
+                                    }
+                                }
+                                div {
+                                    style: "flex: 1; display: flex; flex-direction: column; gap: 4px;",
+                                    label { style: "font-size: 12px; color: #9aa5ce;", { crate::i18n::t("connection.data_bits") } }
+                                    select {
+                                        style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
+                                        value: "{form().data_bits}",
+                                        onchange: move |e| form.write().data_bits = e.value(),
+                                        for bits in &["5", "6", "7", "8"] {
+                                            option {
+                                                value: "{bits}",
+                                                selected: form().data_bits == *bits,
+                                                "{bits}"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+
+                            div {
+                                style: "display: flex; gap: 8px;",
+                                div {
+                                    style: "flex: 1; display: flex; flex-direction: column; gap: 4px;",
+                                    label { style: "font-size: 12px; color: #9aa5ce;", { crate::i18n::t("connection.parity") } }
+                                    select {
+                                        style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
+                                        value: "{form().parity}",
+                                        onchange: move |e| form.write().parity = e.value(),
+                                        for p in &[("none", "None"), ("odd", "Odd"), ("even", "Even")] {
+                                            option {
+                                                value: "{p.0}",
+                                                selected: form().parity == p.0,
+                                                "{p.1}"
+                                            }
+                                        }
+                                    }
+                                }
+                                div {
+                                    style: "flex: 1; display: flex; flex-direction: column; gap: 4px;",
+                                    label { style: "font-size: 12px; color: #9aa5ce;", { crate::i18n::t("connection.stop_bits") } }
+                                    select {
+                                        style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
+                                        value: "{form().stop_bits}",
+                                        onchange: move |e| form.write().stop_bits = e.value(),
+                                        for s in &["1", "2"] {
+                                            option {
+                                                value: "{s}",
+                                                selected: form().stop_bits == *s,
+                                                "{s}"
+                                            }
+                                        }
+                                    }
+                                }
+                                div {
+                                    style: "flex: 1; display: flex; flex-direction: column; gap: 4px;",
+                                    label { style: "font-size: 12px; color: #9aa5ce;", { crate::i18n::t("connection.flow_control") } }
+                                    select {
+                                        style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
+                                        value: "{form().flow_control}",
+                                        onchange: move |e| form.write().flow_control = e.value(),
+                                        for fc in &[("none", "None"), ("software", "XON/XOFF"), ("hardware", "RTS/CTS")] {
+                                            option {
+                                                value: "{fc.0}",
+                                                selected: form().flow_control == fc.0,
+                                                "{fc.1}"
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    })}
+
+                    // SSH-only fields (Username / Auth / Proxy / Terminal Type).
+                    // Telnet connections don't carry username/auth/terminal in
+                    // `TelnetConfig`; Serial has its own block above.
+                    {is_ssh.then(|| rsx! {
                     // Username
                     div {
                         style: "display: flex; flex-direction: column; gap: 4px;",
@@ -543,17 +852,10 @@ delay 250",
                                     style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                                     r#type: "text",
                                     placeholder: "~/.ssh/id_rsa",
-                                    // Link to the identity-file datalist
-                                    // below — the browser will offer the
-                                    // `~/.ssh/id_*` files it found as the
-                                    // user types.
                                     list: "ssh-identity-list",
                                     value: "{form().key_path}",
                                     oninput: move |e| form.write().key_path = e.value(),
                                 }
-                                // Hint showing how many identity files were
-                                // found in `~/.ssh/` (so the user knows the
-                                // dropdown is populated).
                                 {(!identity_suggestions().is_empty()).then(|| {
                                     let identity_count = identity_suggestions().len();
                                     rsx! {
@@ -563,7 +865,6 @@ delay 250",
                                         }
                                     }
                                 })}
-                                // Datalist of identity files from `~/.ssh/`.
                                 datalist {
                                     id: "ssh-identity-list",
                                     for path in identity_suggestions().iter() {
@@ -708,6 +1009,7 @@ delay 250",
                             }
                         }
                     }
+                    })}
 
                 }
 

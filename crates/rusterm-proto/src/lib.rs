@@ -1,9 +1,9 @@
 pub mod serial;
-pub mod telnet;
-pub mod tcp;
 pub mod shell;
+pub mod tcp;
+pub mod telnet;
 
-pub use serial::SerialConnection;
-pub use telnet::TelnetConnection;
-pub use tcp::TcpConnection;
+pub use serial::{SerialConnection, list_available_ports};
 pub use shell::ShellConnection;
+pub use tcp::TcpConnection;
+pub use telnet::TelnetConnection;
