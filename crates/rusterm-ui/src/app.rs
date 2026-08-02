@@ -7728,14 +7728,12 @@ fn start_ssh_connection(
                                         // exit_code=Some(0) so search_history's HAVING
                                         // clause treats it as a known-good command).
                                         if let Some((cmd, db_id)) = popped {
-                                            let learned_typo = s
-                                                    .last_failed_command_by_session
-                                                    .remove(&id)
-                                                    .and_then(|(failed, failed_at)| {
-                                                        (failed_at.elapsed() <= std::time::Duration::from_secs(120)
-                                                            && crate::command_correction::is_likely_correction(&failed, &cmd))
-                                                            .then_some(failed)
-                                                    });
+                                            let learned_typo =
+                                                crate::command_correction::take_correction_for_success(
+                                                    &mut s.last_failed_command_by_session,
+                                                    &id,
+                                                    &cmd,
+                                                );
                                             let hostname = s
                                                 .sessions
                                                 .iter()
@@ -7787,9 +7785,10 @@ fn start_ssh_connection(
                                         // entry once `mark_command_failed` commits
                                         // (the DB HAVING then takes over).
                                         if let Some((cmd, _db_id)) = popped {
-                                            s.last_failed_command_by_session.insert(
-                                                id.clone(),
-                                                (cmd.clone(), std::time::Instant::now()),
+                                            crate::command_correction::remember_failed_command(
+                                                &mut s.last_failed_command_by_session,
+                                                &id,
+                                                &cmd,
                                             );
                                             if let Some(tab) =
                                                 s.sessions.iter_mut().find(|t| t.id == id)
@@ -8259,14 +8258,12 @@ fn start_shell_connection(
                                         // exit_code=Some(0) so search_history's HAVING
                                         // clause treats it as a known-good command).
                                         if let Some((cmd, db_id)) = popped {
-                                            let learned_typo = s
-                                                    .last_failed_command_by_session
-                                                    .remove(&id)
-                                                    .and_then(|(failed, failed_at)| {
-                                                        (failed_at.elapsed() <= std::time::Duration::from_secs(120)
-                                                            && crate::command_correction::is_likely_correction(&failed, &cmd))
-                                                            .then_some(failed)
-                                                    });
+                                            let learned_typo =
+                                                crate::command_correction::take_correction_for_success(
+                                                    &mut s.last_failed_command_by_session,
+                                                    &id,
+                                                    &cmd,
+                                                );
                                             let hostname = s
                                                 .sessions
                                                 .iter()
@@ -8300,9 +8297,10 @@ fn start_shell_connection(
                                         // The spawn removes the entry once the DB
                                         // write commits.
                                         if let Some((cmd, _db_id)) = popped {
-                                            s.last_failed_command_by_session.insert(
-                                                id.clone(),
-                                                (cmd.clone(), std::time::Instant::now()),
+                                            crate::command_correction::remember_failed_command(
+                                                &mut s.last_failed_command_by_session,
+                                                &id,
+                                                &cmd,
                                             );
                                             if let Some(tab) =
                                                 s.sessions.iter_mut().find(|t| t.id == id)
