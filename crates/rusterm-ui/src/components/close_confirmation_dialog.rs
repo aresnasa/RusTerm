@@ -78,7 +78,7 @@ pub fn CloseConfirmationDialog(
                         { crate::i18n::t("close_confirm.title") }
                     }
                     p {
-                        style: "margin: 0; font-size: 13px; color: #565f89;",
+                        style: "margin: 0; font-size: 13px; color: #9aa5ce;",
                         { crate::i18n::t("close_confirm.closing_last_window") }
                     }
                 }

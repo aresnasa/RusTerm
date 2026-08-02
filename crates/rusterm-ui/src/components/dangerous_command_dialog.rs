@@ -54,7 +54,7 @@ pub fn DangerousCommandDialog(
                         { crate::i18n::t("danger.title") }
                     }
                     p {
-                        style: "margin: 0; font-size: 12px; color: #565f89;",
+                        style: "margin: 0; font-size: 12px; color: #9aa5ce;",
                         { crate::i18n::t("danger.body") }
                     }
                 }

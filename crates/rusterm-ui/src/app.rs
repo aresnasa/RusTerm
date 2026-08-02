@@ -4259,7 +4259,7 @@ fn empty_pane_title_actions(
         }
         None => rsx! {
             button {
-                style: "height: 18px; min-width: 24px; padding: 0 6px; border: 1px solid #2a2b3d; border-radius: 3px; background: #1f2335; color: #414868; cursor: not-allowed; font-size: 12px; line-height: 16px;",
+                style: "height: 18px; min-width: 24px; padding: 0 6px; border: 1px solid #2a2b3d; border-radius: 3px; background: #1f2335; color: #9aa5ce; cursor: not-allowed; font-size: 12px; line-height: 16px;",
                 title: crate::i18n::t("layout.no_focused_to_clone"),
                 disabled: true,
                 "⧉"
@@ -5474,8 +5474,8 @@ fn multi_pane_container(
                                     align-items: center; justify-content: center;
                                     gap: 8px;
                                     background: linear-gradient(180deg, #16161e 0%, #1a1b26 100%);
-                                    border: 1px dashed #414868;
-                                    color: #565f89;
+                                    border: 1px dashed #7d89b3;
+                                    color: #9aa5ce;
                                     font-size: 12px;
                                     user-select: none;
                                     -webkit-user-select: none;
@@ -5483,7 +5483,7 @@ fn multi_pane_container(
                                     text-align: center;
                                 ",
                                 div {
-                                    style: "font-size: 22px; color: #414868; line-height: 1; margin-bottom: 4px;",
+                                    style: "font-size: 22px; color: #9aa5ce; line-height: 1; margin-bottom: 4px;",
                                     "⊡"
                                 }
                                 div {
@@ -5491,7 +5491,7 @@ fn multi_pane_container(
                                     { crate::i18n::t("layout.empty_pane") }
                                 }
                                 div {
-                                    style: "color: #565f89; font-size: 11px; line-height: 1.5;",
+                                    style: "color: #9aa5ce; font-size: 11px; line-height: 1.5;",
                                     { crate::i18n::t("layout.empty_pane_clone_hint") }
                                     br {}
                                     { crate::i18n::t("layout.drop_new_session") }
@@ -11223,7 +11223,7 @@ pub fn App() -> Element {
                                     display: flex;
                                     justify-content: center;
                                     align-items: center;
-                                    color: #565f89;
+                                    color: #9aa5ce;
                                     font-size: 14px;
                                 ",
                                 "Welcome to RusTerm — Press + New to create a connection"
@@ -11602,7 +11602,7 @@ pub fn App() -> Element {
                             style: if state.read().split_mode_enabled {
                                 "cursor: pointer; color: #9ece6a; font-size: 11px; user-select: none; border: 1px solid #9ece6a; border-radius: 3px; padding: 1px 6px; line-height: 16px; background: rgba(158,206,106,0.15);"
                             } else {
-                                "cursor: pointer; color: #565f89; font-size: 11px; user-select: none; border: 1px solid #414868; border-radius: 3px; padding: 1px 6px; line-height: 16px;"
+                                "cursor: pointer; color: #9aa5ce; font-size: 11px; user-select: none; border: 1px solid #414868; border-radius: 3px; padding: 1px 6px; line-height: 16px;"
                             },
                             onclick: move |_| {
                                 let _on = toggle_split_mode(&mut state.write());
@@ -11649,7 +11649,7 @@ pub fn App() -> Element {
                             style: if state.read().split_mode_enabled {
                                 "cursor: pointer; color: #bb9af7; font-size: 11px; user-select: none; border: 1px solid #bb9af7; border-radius: 3px; padding: 1px 6px; line-height: 16px; background: rgba(187,154,247,0.15);"
                             } else {
-                                "cursor: pointer; color: #565f89; font-size: 11px; user-select: none; border: 1px solid #414868; border-radius: 3px; padding: 1px 6px; line-height: 16px;"
+                                "cursor: pointer; color: #9aa5ce; font-size: 11px; user-select: none; border: 1px solid #414868; border-radius: 3px; padding: 1px 6px; line-height: 16px;"
                             },
                             onclick: move |_| {
                                 // Toggle behaviour matching the Split button:
@@ -11723,7 +11723,7 @@ pub fn App() -> Element {
                             "⤢"
                         }
                         span {
-                            style: "cursor: pointer; color: #565f89;",
+                            style: "cursor: pointer; color: #9aa5ce;",
                             "Sessions: {state.read().sessions.len()}"
                         }
                         span {

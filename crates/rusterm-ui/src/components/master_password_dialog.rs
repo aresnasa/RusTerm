@@ -66,7 +66,7 @@ pub fn MasterPasswordDialog(
                         "{title}"
                     }
                     p {
-                        style: "margin: 0; font-size: 13px; color: #565f89; line-height: 1.5;",
+                        style: "margin: 0; font-size: 13px; color: #9aa5ce; line-height: 1.5;",
                         "{subtitle}"
                     }
                 }
@@ -77,7 +77,7 @@ pub fn MasterPasswordDialog(
                     div {
                         style: "display: flex; flex-direction: column; gap: 4px;",
                         label {
-                            style: "font-size: 12px; color: #565f89; font-weight: 500;",
+                            style: "font-size: 12px; color: #9aa5ce; font-weight: 500;",
                             "Master Password"
                         }
                         div {
@@ -115,7 +115,7 @@ pub fn MasterPasswordDialog(
                                     border: 1px solid #2a2b3d;
                                     border-radius: 4px;
                                     padding: 0 12px;
-                                    color: #565f89;
+                                    color: #9aa5ce;
                                     cursor: pointer;
                                     font-size: 12px;
                                     min-width: 56px;
@@ -132,7 +132,7 @@ pub fn MasterPasswordDialog(
                         div {
                             style: "display: flex; flex-direction: column; gap: 4px;",
                             label {
-                                style: "font-size: 12px; color: #565f89; font-weight: 500;",
+                                style: "font-size: 12px; color: #9aa5ce; font-weight: 500;",
                                 "Confirm Password"
                             }
                             input {
@@ -181,7 +181,7 @@ pub fn MasterPasswordDialog(
                         style: if can_submit {
                             "background: #7aa2f7; border: none; color: #1a1b26; border-radius: 4px; padding: 10px; cursor: pointer; font-size: 14px; font-weight: 600; width: 100%;"
                         } else {
-                            "background: #2a2b3d; border: none; color: #565f89; border-radius: 4px; padding: 10px; cursor: not-allowed; font-size: 14px; width: 100%;"
+                            "background: #2a2b3d; border: none; color: #9aa5ce; border-radius: 4px; padding: 10px; cursor: not-allowed; font-size: 14px; width: 100%;"
                         },
                         disabled: !can_submit,
                         onclick: move |_| {
@@ -201,7 +201,7 @@ pub fn MasterPasswordDialog(
 
                     if is_first_run {
                         p {
-                            style: "font-size: 11px; color: #565f89; margin: 0; text-align: center; line-height: 1.4;",
+                            style: "font-size: 11px; color: #9aa5ce; margin: 0; text-align: center; line-height: 1.4;",
                             "Your master password cannot be recovered if lost.\nIt protects all saved connection credentials."
                         }
                     }

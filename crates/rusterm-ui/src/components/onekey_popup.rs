@@ -66,7 +66,7 @@ pub fn OneKeyPopup(
                 r#type: "button",
                 aria_label: "Cancel credential popup",
                 title: "Cancel credential popup (Escape)",
-                style: "position:absolute;right:6px;top:4px;z-index:1;border:0;background:transparent;color:#565f89;font:inherit;font-size:14px;font-weight:700;cursor:pointer;padding:0 5px;",
+                style: "position:absolute;right:6px;top:4px;z-index:1;border:0;background:transparent;color:#9aa5ce;font:inherit;font-size:14px;font-weight:700;cursor:pointer;padding:0 5px;",
                 onpointerdown: move |e| {
                     e.prevent_default();
                     e.stop_propagation();
@@ -119,7 +119,7 @@ pub fn OneKeyPopup(
                             span {
                                 style: "display:flex;flex:1;min-width:0;align-items:baseline;gap:8px;",
                                 span { style: "overflow:hidden;text-overflow:ellipsis;white-space:nowrap;", "{m.name}" }
-                                span { style: "color:#565f89;font-size:11px;white-space:nowrap;", "{label}" }
+                                span { style: "color:#9aa5ce;font-size:11px;white-space:nowrap;", "{label}" }
                             }
                             span {
                                 style: "color:{badge_color};font-size:10px;margin-left:8px;font-weight:700;border:1px solid {badge_color};border-radius:3px;padding:0 4px;",
@@ -131,7 +131,7 @@ pub fn OneKeyPopup(
                 }
             }
             div {
-                style: "display:flex;align-items:center;padding:4px 12px;border-top:1px solid #2a2b3d;color:#565f89;cursor:pointer;",
+                style: "display:flex;align-items:center;padding:4px 12px;border-top:1px solid #2a2b3d;color:#9aa5ce;cursor:pointer;",
                 onclick: move |_| on_save.call(()),
                 span { style: "flex:1;", "Save In OneKeys" }
                 span { style: "color:#7aa2f7;", "+" }

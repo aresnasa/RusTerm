@@ -259,7 +259,7 @@ pub fn ConnectionDialog(
                     // Name
                     div {
                         style: "display: flex; flex-direction: column; gap: 4px;",
-                        label { style: "font-size: 12px; color: #565f89;", "Name" }
+                        label { style: "font-size: 12px; color: #9aa5ce;", "Name" }
                         input {
                             style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                             r#type: "text",
@@ -272,7 +272,7 @@ pub fn ConnectionDialog(
                     // Group
                     div {
                         style: "display: flex; flex-direction: column; gap: 4px;",
-                        label { style: "font-size: 12px; color: #565f89;", "Group" }
+                        label { style: "font-size: 12px; color: #9aa5ce;", "Group" }
                         select {
                             style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                             value: "{form().group_id.as_deref().unwrap_or_default()}",
@@ -327,7 +327,7 @@ pub fn ConnectionDialog(
                         div {
                             style: "display: flex; flex-direction: column; gap: 2px;",
                             label { style: "font-size: 12px; color: #9ece6a; cursor: pointer; pointer-events: none;", "One-Key Connect" }
-                            span { style: "font-size: 11px; color: #565f89; line-height: 1.4; pointer-events: none;",
+                            span { style: "font-size: 11px; color: #9aa5ce; line-height: 1.4; pointer-events: none;",
                                 "Auto-suggest a matching OneKey credential when this host asks for a password." }
                         }
                     }
@@ -338,7 +338,7 @@ pub fn ConnectionDialog(
                     div {
                         style: "display: flex; flex-direction: column; gap: 4px; margin-top: 8px;",
                         label {
-                            style: "font-size: 12px; color: #565f89;",
+                            style: "font-size: 12px; color: #9aa5ce;",
                             "Login script (optional, expect/send DSL)"
                         }
                         textarea {
@@ -351,7 +351,7 @@ delay 250",
                             oninput: move |e| form.write().login_script = e.value(),
                         }
                         span {
-                            style: "font-size: 10px; color: #565f89; line-height: 1.4;",
+                            style: "font-size: 10px; color: #9aa5ce; line-height: 1.4;",
                             "Lines: expect <regex> | send <text> | send_onekey <name> | delay <ms>. Credentials are resolved from your unlocked OneKey library — never paste passwords here."
                         }
                     }
@@ -361,7 +361,7 @@ delay 250",
                         style: "display: flex; gap: 8px;",
                         div {
                             style: "flex: 3; display: flex; flex-direction: column; gap: 4px;",
-                            label { style: "font-size: 12px; color: #565f89;", "Host" }
+                            label { style: "font-size: 12px; color: #9aa5ce;", "Host" }
                             input {
                                 style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                                 r#type: "text",
@@ -416,7 +416,7 @@ delay 250",
                                 let ssh_path = ssh_config_path_display().as_deref().unwrap_or("~/.ssh/config").to_string();
                                 rsx! {
                                     div {
-                                        style: "font-size: 11px; color: #565f89; margin-top: 2px;",
+                                        style: "font-size: 11px; color: #9aa5ce; margin-top: 2px;",
                                         { crate::i18n::tf("connection.ssh_hosts_hint", &[("count", &host_count), ("path", &ssh_path)]) }
                                     }
                                 }
@@ -447,7 +447,7 @@ delay 250",
                         }
                         div {
                             style: "flex: 1; display: flex; flex-direction: column; gap: 4px;",
-                            label { style: "font-size: 12px; color: #565f89;", "Port" }
+                            label { style: "font-size: 12px; color: #9aa5ce;", "Port" }
                             input {
                                 style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                                 r#type: "text",
@@ -461,7 +461,7 @@ delay 250",
                     // Username
                     div {
                         style: "display: flex; flex-direction: column; gap: 4px;",
-                        label { style: "font-size: 12px; color: #565f89;", "Username" }
+                        label { style: "font-size: 12px; color: #9aa5ce;", "Username" }
                         input {
                             style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                             r#type: "text",
@@ -474,7 +474,7 @@ delay 250",
                     // Auth Type selector
                     div {
                         style: "display: flex; flex-direction: column; gap: 4px;",
-                        label { style: "font-size: 12px; color: #565f89;", "Authentication" }
+                        label { style: "font-size: 12px; color: #9aa5ce;", "Authentication" }
                         div {
                             style: "display: flex; gap: 4px;",
 
@@ -512,7 +512,7 @@ delay 250",
                     {is_password.then(|| rsx! {
                         div {
                             style: "display: flex; flex-direction: column; gap: 4px;",
-                            label { style: "font-size: 12px; color: #565f89;", "Password" }
+                            label { style: "font-size: 12px; color: #9aa5ce;", "Password" }
                             input {
                                 style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                                 r#type: "password",
@@ -530,7 +530,7 @@ delay 250",
 
                             div {
                                 style: "display: flex; flex-direction: column; gap: 4px;",
-                                label { style: "font-size: 12px; color: #565f89;", "Private Key Path" }
+                                label { style: "font-size: 12px; color: #9aa5ce;", "Private Key Path" }
                                 input {
                                     style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                                     r#type: "text",
@@ -550,7 +550,7 @@ delay 250",
                                     let identity_count = identity_suggestions().len();
                                     rsx! {
                                         div {
-                                            style: "font-size: 11px; color: #565f89; margin-top: 2px;",
+                                            style: "font-size: 11px; color: #9aa5ce; margin-top: 2px;",
                                             { crate::i18n::tf("connection.identity_files_hint", &[("count", &identity_count)]) }
                                         }
                                     }
@@ -568,7 +568,7 @@ delay 250",
 
                             div {
                                 style: "display: flex; flex-direction: column; gap: 4px;",
-                                label { style: "font-size: 12px; color: #565f89;", "Passphrase (optional)" }
+                                label { style: "font-size: 12px; color: #9aa5ce;", "Passphrase (optional)" }
                                 input {
                                     style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                                     r#type: "password",
@@ -583,7 +583,7 @@ delay 250",
                     // Agent hint
                     {is_agent.then(|| rsx! {
                         div {
-                            style: "font-size: 12px; color: #565f89; padding: 8px; background: #1a1b26; border-radius: 4px; border: 1px solid #2a2b3d;",
+                            style: "font-size: 12px; color: #9aa5ce; padding: 8px; background: #1a1b26; border-radius: 4px; border: 1px solid #2a2b3d;",
                             "Will use SSH agent (ssh-agent) for authentication."
                         }
                     })}
@@ -595,7 +595,7 @@ delay 250",
                             style: "display: flex; flex-direction: column; gap: 8px; padding: 10px; background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px;",
                             div {
                                 style: "display: flex; flex-direction: column; gap: 4px;",
-                                label { style: "font-size: 12px; color: #565f89;", "Proxy" }
+                                label { style: "font-size: 12px; color: #9aa5ce;", "Proxy" }
                                 select {
                                     style: "background: #16161e; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                                     value: "{form().proxy_type}",
@@ -631,7 +631,7 @@ delay 250",
                                     style: "display: flex; gap: 8px;",
                                     div {
                                         style: "flex: 3; display: flex; flex-direction: column; gap: 4px;",
-                                        label { style: "font-size: 12px; color: #565f89;", "Proxy Host" }
+                                        label { style: "font-size: 12px; color: #9aa5ce;", "Proxy Host" }
                                         input {
                                             style: "background: #16161e; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                                             r#type: "text",
@@ -642,7 +642,7 @@ delay 250",
                                     }
                                     div {
                                         style: "flex: 1; display: flex; flex-direction: column; gap: 4px;",
-                                        label { style: "font-size: 12px; color: #565f89;", "Port" }
+                                        label { style: "font-size: 12px; color: #9aa5ce;", "Port" }
                                         input {
                                             style: "background: #16161e; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                                             r#type: "text",
@@ -656,7 +656,7 @@ delay 250",
                                     style: "display: flex; gap: 8px;",
                                     div {
                                         style: "flex: 1; display: flex; flex-direction: column; gap: 4px;",
-                                        label { style: "font-size: 12px; color: #565f89;", "Proxy Username (optional)" }
+                                        label { style: "font-size: 12px; color: #9aa5ce;", "Proxy Username (optional)" }
                                         input {
                                             style: "background: #16161e; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                                             r#type: "text",
@@ -666,7 +666,7 @@ delay 250",
                                     }
                                     div {
                                         style: "flex: 1; display: flex; flex-direction: column; gap: 4px;",
-                                        label { style: "font-size: 12px; color: #565f89;", "Proxy Password (optional)" }
+                                        label { style: "font-size: 12px; color: #9aa5ce;", "Proxy Password (optional)" }
                                         input {
                                             style: "background: #16161e; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                                             r#type: "password",
@@ -676,7 +676,7 @@ delay 250",
                                     }
                                 }
                                 div {
-                                    style: "font-size: 11px; color: #565f89; line-height: 1.4;",
+                                    style: "font-size: 11px; color: #9aa5ce; line-height: 1.4;",
                                     "Authentication requires both username and password. HTTPS secures the connection to the proxy before CONNECT."
                                 }
                             })}
@@ -686,7 +686,7 @@ delay 250",
                     // Terminal Type selector
                     div {
                         style: "display: flex; flex-direction: column; gap: 4px;",
-                        label { style: "font-size: 12px; color: #565f89;", "Terminal Type" }
+                        label { style: "font-size: 12px; color: #9aa5ce;", "Terminal Type" }
                         select {
                             style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 13px; outline: none;",
                             value: "{form().terminal_type}",

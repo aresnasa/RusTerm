@@ -123,7 +123,7 @@ pub fn SuggestionPopup(
                     //   - selected item : bright green (always visible)
                     //   - non-selected   : muted gray, brightens on row hover
                     //     via the `.sug-row:hover .sug-del` CSS rule emitted below.
-                    let del_color = if is_selected { "#9ece6a" } else { "#565f89" };
+                    let del_color = if is_selected { "#9ece6a" } else { "#9aa5ce" };
                     rsx! {
                         div {
                             key: "{cmd}",
@@ -196,7 +196,7 @@ pub fn SuggestionPopup(
                     justify-content:flex-end;
                     padding:2px 12px;
                     border-top:1px solid #2a2b3d;
-                    color:#565f89;
+                    color:#9aa5ce;
                     font-size:11px;
                     background:#1a1b26;
                 ",

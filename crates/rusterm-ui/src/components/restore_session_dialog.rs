@@ -53,7 +53,7 @@ pub fn RestoreSessionDialog(
                         { crate::i18n::t("restore.title") }
                     }
                     p {
-                        style: "margin: 0; font-size: 13px; color: #565f89; line-height: 1.5;",
+                        style: "margin: 0; font-size: 13px; color: #9aa5ce; line-height: 1.5;",
                         { crate::i18n::tf("restore.detected", &[("session_count", &session_count), ("saved_at", &saved_at)]) }
                     }
                 }
@@ -78,7 +78,7 @@ pub fn RestoreSessionDialog(
                         { crate::i18n::t("restore.no_history_run") }
                     }
                     p {
-                        style: "margin: 0; color: #565f89; font-size: 12px;",
+                        style: "margin: 0; color: #9aa5ce; font-size: 12px;",
                         { crate::i18n::t("restore.skip_hint") }
                     }
                 }
@@ -127,7 +127,7 @@ pub fn RestoreSessionDialog(
                         style: "
                             width: 100%;
                             background: transparent;
-                            color: #565f89;
+                            color: #9aa5ce;
                             border: none;
                             border-radius: 4px;
                             padding: 8px;

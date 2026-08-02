@@ -169,7 +169,7 @@ pub fn OneKeyManager(
     let input_style = "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; \
                        padding: 7px; color: #c0caf5; font-size: 13px; outline: none; width: 100%; \
                        box-sizing: border-box;";
-    let label_style = "font-size: 11px; color: #565f89;";
+    let label_style = "font-size: 11px; color: #9aa5ce;";
     let send_input_type = if show_send_values() {
         "text"
     } else {
@@ -312,11 +312,11 @@ pub fn OneKeyManager(
                         "{send_toggle_label}"
                     }
                 }
-                p { style: "margin: 0 0 6px; font-size: 12px; color: #565f89; line-height: 1.5;",
+                p { style: "margin: 0 0 6px; font-size: 12px; color: #9aa5ce; line-height: 1.5;",
                     "Each OneKey is a sequence of prompt/Send steps. Choose a built-in prompt type for \
                      common Username, Password, sudo, Git, bastion, and SSH key passphrase prompts. \
                      Send values are encrypted at rest." }
-                p { style: "margin: 0 0 14px; font-size: 11px; color: #414868; line-height: 1.5;",
+                p { style: "margin: 0 0 14px; font-size: 11px; color:#9aa5ce; line-height: 1.5;",
                     "Use Custom regex only for unusual prompts. Matching is case-insensitive and runs \
                      only for connections with One-Key Connect enabled — set it in the connection's \
                      Edit dialog (checkbox right under Name)." }
@@ -343,13 +343,13 @@ pub fn OneKeyManager(
                                                     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;",
                                             onclick: move |_| selected.set(Some(i_clone)),
                                             "{ok.name}"
-                                            span { style: "color:#565f89;font-size:10px;margin-left:6px;", {format!("({} steps)", ok.steps.len())} }
+                                            span { style: "color:#9aa5ce;font-size:10px;margin-left:6px;", {format!("({} steps)", ok.steps.len())} }
                                         }
                                     }
                                 }
                             }
                             if entries().is_empty() {
-                                div { style: "padding: 16px 10px; color: #565f89; font-size: 12px;",
+                                div { style: "padding: 16px 10px; color: #9aa5ce; font-size: 12px;",
                                     "No OneKeys yet.\nClick + to add one." }
                             }
                         }
@@ -523,7 +523,7 @@ pub fn OneKeyManager(
                                                         }
                                                     } else {
                                                         div {
-                                                            style: "font-size: 11px; color: #565f89; line-height: 1.4;",
+                                                            style: "font-size: 11px; color: #9aa5ce; line-height: 1.4;",
                                                             if expect_mode == "password" {
                                                                 "Matches Password, sudo, Git/bastion password, and SSH key passphrase prompts."
                                                             } else {
@@ -558,7 +558,7 @@ pub fn OneKeyManager(
                                 }}
                             }
                         } else {
-                            div { style: "color: #565f89; font-size: 13px; padding: 20px 0; \
+                            div { style: "color: #9aa5ce; font-size: 13px; padding: 20px 0; \
                                           text-align: center; flex: 1; display: flex; align-items: center; \
                                           justify-content: center;",
                                 "Select a OneKey, or click + Add OneKey to create one." }
@@ -575,7 +575,7 @@ pub fn OneKeyManager(
                 }
                 div {
                     style: "display: flex; justify-content: flex-end; align-items:center; gap: 8px; margin-top: 12px;",
-                    span { style: "margin-right:auto;color:#414868;font-size:10px;", "Esc Cancel · Ctrl/Cmd+Enter Save" }
+                    span { style: "margin-right:auto;color:#9aa5ce;font-size:10px;", "Esc Cancel · Ctrl/Cmd+Enter Save" }
                     button {
                         style: "background: transparent; border: 1px solid #2a2b3d; color: #c0caf5; \
                                 border-radius: 4px; padding: 8px 16px; cursor: pointer; font-size: 13px;",
@@ -586,7 +586,7 @@ pub fn OneKeyManager(
                         style: if can_save {
                             "background:#7aa2f7;border:none;color:#1a1b26;border-radius:4px;padding:8px 16px;cursor:pointer;font-size:13px;font-weight:600;"
                         } else {
-                            "background:#2a2b3d;border:none;color:#565f89;border-radius:4px;padding:8px 16px;cursor:not-allowed;font-size:13px;"
+                            "background:#2a2b3d;border:none;color:#9aa5ce;border-radius:4px;padding:8px 16px;cursor:not-allowed;font-size:13px;"
                         },
                         disabled: !can_save,
                         onclick: move |_| {
