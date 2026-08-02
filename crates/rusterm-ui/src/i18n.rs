@@ -99,7 +99,13 @@ pub fn set_language(lang: Language) {
 /// from a plain atomic so this works from any thread / test / helper without
 /// a Dioxus runtime.
 pub fn t(key: &str) -> String {
-    translate(key, current_language())
+    t_for(key, current_language())
+}
+
+/// Resolve a translation key for an explicit language. This is useful for
+/// deterministic helpers and tests that must not mutate the global language.
+pub(crate) fn t_for(key: &str, language: Language) -> String {
+    translate(key, language)
         .map(str::to_owned)
         .unwrap_or_else(|| key.to_owned())
 }
@@ -296,6 +302,14 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         ),
         "api.elevated" => ("Run with reusable sudo authorization", "复用 sudo 授权执行"),
         "api.session" => ("Session", "会话"),
+        "api.sessions" => ("Sessions", "会话"),
+        "api.selected_count" => ("{count} selected", "已选择 {count} 个"),
+        "api.select_all" => ("All", "全选"),
+        "api.clear_selection" => ("Clear", "清空"),
+        "api.select_session_hint" => (
+            "Select at least one session to generate a curl script.",
+            "请至少选择一个会话以生成 curl 脚本。",
+        ),
         "api.copy" => ("Copy", "复制"),
         "api.copied" => ("Copied!", "已复制！"),
         "api.no_sessions" => (
@@ -650,11 +664,15 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
             "GET  {url}/api/v1/health      # liveness, no auth\nGET  {url}/api/v1/hosts        # list hosts (BasicAuth)\nPOST {url}/api/v1/exec         # { host_id, command, elevated?, timeout_ms? }\nPOST {url}/api/v1/parse-curl   # parse a pasted curl into JSON",
             "GET  {url}/api/v1/health      # 存活检查，无需鉴权\nGET  {url}/api/v1/hosts        # 列出主机（BasicAuth）\nPOST {url}/api/v1/exec         # { host_id, command, elevated?, timeout_ms? }\nPOST {url}/api/v1/parse-curl   # 将粘贴的 curl 解析为 JSON",
         ),
-        "api.password_prompt" => ("printf \"API password: \"", "printf \"API 密码：\""),
-        "api.command_marker_title" => ("Remote command", "远程命令"),
+        "api.password_prompt" => ("RusTerm API password: ", "RusTerm API 密码："),
+        "api.command_marker_title" => ("EDIT REMOTE COMMAND BELOW", "在下方修改远程命令"),
         "api.command_marker_help" => (
-            "Edit the command between the markers; the curl script updates automatically.",
-            "编辑标记之间的命令；curl 脚本会自动更新。",
+            "Change the JSON \"command\" value",
+            "请替换 JSON 中的 \"command\" 值",
+        ),
+        "api.request_failed" => (
+            "One or more RusTerm API requests failed (last status: %s).",
+            "一个或多个 RusTerm API 请求失败（最后状态：%s）。",
         ),
 
         // ── common / connection / sidebar additions ───────────────────

@@ -28,6 +28,7 @@
 
 pub mod audit;
 pub mod auth;
+pub mod command_guard;
 pub mod config;
 pub mod curl;
 pub mod executor;
@@ -36,6 +37,10 @@ pub mod validator;
 
 pub use audit::{AuditAction, AuditEntry, AuditLog, AuditOutcome};
 pub use auth::{RateLimiter, authenticate, parse_basic_auth};
+pub use command_guard::{
+    BlocklistConfig, BlocklistLoadError, BlocklistPattern, CompiledPattern,
+    LoadedBlocklist, SkillBlocklist, BLOCKLIST_CONFIG_FILE,
+};
 pub use config::{DEFAULT_PORT, RelayAccount, RelayConfig, hash_password, verify_password};
 pub use curl::{CurlParseError, ParsedCurl, parse_curl};
 pub use executor::{ExecOutcome, ExecutorError, HostInfo, NullExecutor, RelayExecutor};

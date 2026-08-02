@@ -5,12 +5,12 @@
 //!   1. Toggle / configure the relay (bind addr, port, accounts) without
 //!      opening a modal.
 //!   2. Auto-generate ready-to-paste `curl` commands that execute a chosen
-//!      command on a chosen connected SSH session through the relay, using
+//!      command on one or more connected SSH sessions through the relay, using
 //!      HTTP BasicAuth through exported runtime environment variables.
 //!
-//! The generated curl targets `POST /api/v1/exec` with a JSON body of
+//! Each generated curl targets `POST /api/v1/exec` with a JSON body of
 //! `{ "host_id": "<id-or-name>", "command": "<cmd>", "elevated": <bool> }`,
-//! matching the relay's [`ExecRequest`](rusterm_relay::server) schema.
+//! preserving the relay's single-host request, authorization, and audit semantics.
 
 use dioxus::prelude::*;
 use rusterm_relay::{RelayAccount, hash_password};
@@ -97,15 +97,24 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
             })
             .collect()
     };
-    // Default the selected session to the first available; keep the last
-    // selection if still valid.
-    let mut selected_session = use_signal(|| sessions.first().map(|(id, _)| id.clone()));
-    if selected_session()
-        .as_ref()
-        .is_some_and(|s| !sessions.iter().any(|(id, _)| id == s))
-    {
-        selected_session.set(sessions.first().map(|(id, _)| id.clone()));
+    // Default to one target while allowing any number of connected sessions.
+    // Drop stale IDs when a selected session disconnects.
+    let mut selected_sessions = use_signal(|| {
+        sessions
+            .first()
+            .map(|(id, _)| vec![id.clone()])
+            .unwrap_or_default()
+    });
+    let current_selection = selected_sessions();
+    let valid_selection: Vec<String> = current_selection
+        .iter()
+        .filter(|selected| sessions.iter().any(|(id, _)| id == *selected))
+        .cloned()
+        .collect();
+    if valid_selection != current_selection {
+        selected_sessions.set(valid_selection);
     }
+    let all_session_ids: Vec<String> = sessions.iter().map(|(id, _)| id.clone()).collect();
 
     let default_user = config
         .read()
@@ -125,6 +134,13 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
             .api-field{{display:flex;flex-direction:column;gap:3px;margin-bottom:8px;}}
             .api-field > span{{font-size:11px;color:#9aa5ce;}}
             .api-input{{padding:5px 7px;border:1px solid #2a2b3d;border-radius:4px;background:#1a1b26;color:#c0caf5;font-size:12px;outline:none;box-sizing:border-box;width:100%;}}
+            .api-session-picker{{flex:1;min-width:0;border:1px solid #2a2b3d;border-radius:5px;background:#16161e;overflow:hidden;}}
+            .api-session-toolbar{{display:flex;align-items:center;justify-content:space-between;gap:8px;padding:5px 7px;border-bottom:1px solid #2a2b3d;color:#9aa5ce;font-size:11px;}}
+            .api-session-actions{{display:flex;gap:4px;}}
+            .api-session-list{{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));max-height:128px;overflow-y:auto;padding:4px;gap:2px;}}
+            .api-session-option{{display:flex;align-items:center;gap:7px;min-width:0;padding:5px 6px;border-radius:4px;cursor:pointer;}}
+            .api-session-option:hover{{background:#24283b;}}
+            .api-session-option span{{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}}
             .api-command-field{{padding:8px;border:1px solid rgba(224,175,104,.55);border-radius:5px;background:rgba(224,175,104,.08);}}
             .api-command-field > span{{color:#e0af68;font-weight:600;}}
             .api-command-field .api-input{{border-color:#e0af68;box-shadow:0 0 0 1px rgba(224,175,104,.18);}}
@@ -134,6 +150,7 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
             .api-btn:hover{{border-color:#7aa2f7;color:#7aa2f7;}}
             .api-btn.primary{{background:#7aa2f7;color:#1a1b26;border:1px solid #7aa2f7;font-weight:600;}}
             .api-btn.primary:hover{{color:#1a1b26;opacity:.9;}}
+            .api-btn:disabled{{cursor:not-allowed;opacity:.45;}}
             .api-btn.danger:hover{{border-color:#f7768e;color:#f7768e;}}
             .api-status{{font-size:11px;padding:5px 9px;border-radius:4px;margin-bottom:8px;}}
             .api-status.ok{{background:rgba(76,175,80,.12);color:#9ece6a;}}
@@ -356,17 +373,62 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
                 if sessions.is_empty() {
                     div { class: "api-hint", style: "color:#e0af68;", { crate::i18n::t("api.no_sessions") } }
                 } else {
-                    div { class: "api-row",
-                        span { style: "width:64px;font-size:11px;color:#9aa5ce;", { crate::i18n::t("api.session") } }
-                        select {
-                            class: "api-input",
-                            style: "flex:1;",
-                            value: "{selected_session().clone().unwrap_or_default()}",
-                            onchange: move |e| selected_session.set(if e.value().is_empty() { None } else { Some(e.value()) }),
-                            for (id, label) in sessions.iter() {
-                                option { value: "{id}", "{label}" }
+                    div { class: "api-row", style: "align-items:flex-start;",
+                        span { style: "width:64px;padding-top:7px;font-size:11px;color:#9aa5ce;", { crate::i18n::t("api.sessions") } }
+                        div { class: "api-session-picker",
+                            div { class: "api-session-toolbar",
+                                span {
+                                    { crate::i18n::tf(
+                                        "api.selected_count",
+                                        &[("count", &selected_sessions().len().to_string())],
+                                    ) }
+                                }
+                                div { class: "api-session-actions",
+                                    button {
+                                        class: "api-btn",
+                                        r#type: "button",
+                                        onclick: move |_| selected_sessions.set(all_session_ids.clone()),
+                                        { crate::i18n::t("api.select_all") }
+                                    }
+                                    button {
+                                        class: "api-btn",
+                                        r#type: "button",
+                                        onclick: move |_| selected_sessions.set(Vec::new()),
+                                        { crate::i18n::t("api.clear_selection") }
+                                    }
+                                }
+                            }
+                            div { class: "api-session-list",
+                                for (id, label) in sessions.iter() {
+                                    {
+                                        let id_for_toggle = id.clone();
+                                        let checked = selected_sessions().contains(id);
+                                        rsx! {
+                                            label { class: "api-session-option", key: "{id}", title: "{label}",
+                                                input {
+                                                    r#type: "checkbox",
+                                                    checked,
+                                                    onchange: move |e| {
+                                                        let mut selected = selected_sessions.write();
+                                                        if e.checked() {
+                                                            if !selected.contains(&id_for_toggle) {
+                                                                selected.push(id_for_toggle.clone());
+                                                            }
+                                                        } else {
+                                                            selected.retain(|id| id != &id_for_toggle);
+                                                        }
+                                                    },
+                                                }
+                                                span { "{label}" }
+                                            }
+                                        }
+                                    }
+                                }
                             }
                         }
+                    }
+                    if selected_sessions().is_empty() {
+                        div { class: "api-hint", style: "color:#e0af68;", { crate::i18n::t("api.select_session_hint") } }
                     }
                     div { class: "api-field api-command-field",
                         span { { crate::i18n::t("api.command") } }
@@ -394,7 +456,7 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
                         let preview = gen_curl_preview(
                             &url,
                             &default_user,
-                            &selected_session(),
+                            &selected_sessions(),
                             &curl_command(),
                             curl_elevated(),
                         );
@@ -414,13 +476,14 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
                     div { class: "api-row", style: "margin-top:8px;",
                         button {
                             class: "api-btn primary",
+                            disabled: selected_sessions().is_empty(),
                             // Clone into the move closure so `url` itself isn't
                             // moved out of the render scope.
                             onclick: move |_| {
                                 let curl = gen_curl(
                                     &url_for_copy,
                                     &default_user,
-                                    &selected_session(),
+                                    &selected_sessions(),
                                     &curl_command(),
                                     curl_elevated(),
                                 );
@@ -440,14 +503,11 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
                 }
 
                 // ── Endpoint reference ───────────────────────────────────
-                div { class: "api-sect", "Endpoints" }
+                div { class: "api-sect", { crate::i18n::t("api.endpoints") } }
                 {
-                    let endpoints = format!(
-"GET  {url}/api/v1/health      # liveness, no auth
-GET  {url}/api/v1/hosts        # list hosts (BasicAuth)
-POST {url}/api/v1/exec         # {{ host_id, command, elevated?, timeout_ms? }}
-POST {url}/api/v1/parse-curl   # parse a pasted curl into JSON",
-                        url = url.clone(),
+                    let endpoints = crate::i18n::tf(
+                        "api.endpoint_reference",
+                        &[("url", &url)],
                     );
                     rsx! {
                         div { class: "api-code", "{endpoints}" }
@@ -477,20 +537,60 @@ impl CurlPreviewParts {
 fn gen_curl_preview(
     url: &str,
     default_user: &str,
-    session: &Option<String>,
+    sessions: &[String],
     command: &str,
     elevated: bool,
 ) -> CurlPreviewParts {
-    let host = session.clone().unwrap_or_else(|| "HOST".to_string());
-    let body = serde_json::json!({
-        "host_id": host,
-        "command": command,
-        "elevated": elevated,
-    })
-    .to_string();
+    gen_curl_preview_for_language(
+        url,
+        default_user,
+        sessions,
+        command,
+        elevated,
+        crate::i18n::current_language(),
+    )
+}
+
+fn gen_curl_preview_for_language(
+    url: &str,
+    default_user: &str,
+    sessions: &[String],
+    command: &str,
+    elevated: bool,
+    language: crate::i18n::Language,
+) -> CurlPreviewParts {
+    let hosts = if sessions.is_empty() {
+        vec!["HOST".to_string()]
+    } else {
+        sessions.to_vec()
+    };
+    let shell_escape = |value: &str| value.replace('\'', "'\"'\"'");
+    let shell_quote = |value: &str| format!("'{}'", shell_escape(value));
+    let password_prompt = shell_escape(&crate::i18n::t_for("api.password_prompt", language));
+    let command_marker_title = crate::i18n::t_for("api.command_marker_title", language);
+    let command_marker_help = crate::i18n::t_for("api.command_marker_help", language);
+    let request_failed = shell_escape(&crate::i18n::t_for("api.request_failed", language));
+    let request_body = |host: &str| {
+        serde_json::json!({
+            "host_id": host,
+            "command": command,
+            "elevated": elevated,
+        })
+        .to_string()
+    };
+    let invocation = |host: &str, body: &str| {
+        format!(
+            "rusterm_exec {} '{}' || RUSTERM_FAILED=$?\n",
+            shell_quote(host),
+            shell_escape(body),
+        )
+    };
+
+    let first_host = &hosts[0];
+    let first_body = request_body(first_host);
     let command_json = serde_json::to_string(command).expect("strings always serialize to JSON");
     let command_key = "\"command\":";
-    let value_start = body
+    let value_start = first_body
         .find(command_key)
         .map(|start| start + command_key.len())
         .expect("generated JSON body always contains the command field");
@@ -499,33 +599,67 @@ fn gen_curl_preview(
     // Keep the JSON quotes outside the highlighted fragment. Escaping each
     // fragment independently is equivalent to escaping the concatenated body,
     // including commands containing apostrophes.
-    let body_before_command = &body[..value_start + 1];
+    let body_before_command = &first_body[..value_start + 1];
     let body_command = &command_json[1..command_json.len() - 1];
-    let body_after_command = &body[value_end - 1..];
-    let shell_escape = |value: &str| value.replace('\'', "'\"'\"'");
-    let shell_quote = |value: &str| format!("'{}'", shell_escape(value));
+    let body_after_command = &first_body[value_end - 1..];
+
+    let mut after_command = format!(
+        "{}' || RUSTERM_FAILED=$?\n",
+        shell_escape(body_after_command)
+    );
+    for host in hosts.iter().skip(1) {
+        after_command.push_str(&invocation(host, &request_body(host)));
+    }
+    after_command.push_str(&format!(
+        "\nif [ \"$RUSTERM_FAILED\" -ne 0 ]; then\n\
+  printf '\\n{request_failed}\\n' \"$RUSTERM_FAILED\" >&2\n\
+fi\n"
+    ));
 
     CurlPreviewParts {
         before_command: format!(
             "export RUSTERM_API_URL={url}\n\
 export RUSTERM_API_USER={user}\n\
 if [ -z \"${{RUSTERM_API_PASSWORD+x}}\" ]; then\n\
-  printf 'RusTerm API password: ' >&2\n\
+  printf '{password_prompt}' >&2\n\
+  RUSTERM_STTY=$(stty -g)\n\
+  trap 'stty \"$RUSTERM_STTY\"' 0 1 2 15\n\
   stty -echo\n\
   IFS= read -r RUSTERM_API_PASSWORD\n\
-  stty echo\n\
+  stty \"$RUSTERM_STTY\"\n\
+  trap - 0 1 2 15\n\
   printf '\\n' >&2\n\
   export RUSTERM_API_PASSWORD\n\
 fi\n\n\
-# EDIT REMOTE COMMAND BELOW / 在下方修改远程命令\n\
-# Change the JSON \"command\" value / 请替换 JSON 中的 \"command\" 值\n\
-curl -X POST \"${{RUSTERM_API_URL}}/api/v1/exec\" \\\n  -u \"${{RUSTERM_API_USER}}:${{RUSTERM_API_PASSWORD}}\" \\\n  -H 'Content-Type: application/json' \\\n  -d '{body_before_command}",
+rusterm_pretty_json() {{\n\
+  if command -v jq >/dev/null 2>&1; then\n\
+    jq .\n\
+  elif command -v python3 >/dev/null 2>&1; then\n\
+    python3 -m json.tool\n\
+  else\n\
+    cat\n\
+  fi\n\
+}}\n\n\
+rusterm_exec() {{\n\
+  RUSTERM_TARGET=$1\n\
+  RUSTERM_BODY=$2\n\
+  printf '\\n==> %s\\n' \"$RUSTERM_TARGET\"\n\
+  RUSTERM_RESPONSE=$(curl --silent --show-error --fail-with-body \\\n    --connect-timeout 10 --max-time 120 \\\n    --request POST \"${{RUSTERM_API_URL}}/api/v1/exec\" \\\n    --user \"${{RUSTERM_API_USER}}:${{RUSTERM_API_PASSWORD}}\" \\\n    --header 'Accept: application/json' \\\n    --header 'Content-Type: application/json' \\\n    --data \"$RUSTERM_BODY\")\n\
+  RUSTERM_STATUS=$?\n\
+  printf '%s\\n' \"$RUSTERM_RESPONSE\" | rusterm_pretty_json\n\
+  return \"$RUSTERM_STATUS\"\n\
+}}\n\n\
+RUSTERM_FAILED=0\n\
+# {command_marker_title}\n\
+# {command_marker_help}\n\
+rusterm_exec {host} '{body_before_command}",
             url = shell_quote(url.trim_end_matches('/')),
             user = shell_quote(default_user),
+            host = shell_quote(first_host),
             body_before_command = shell_escape(body_before_command),
         ),
         command: shell_escape(body_command),
-        after_command: format!("{}'", shell_escape(body_after_command)),
+        after_command,
     }
 }
 
@@ -535,11 +669,11 @@ curl -X POST \"${{RUSTERM_API_URL}}/api/v1/exec\" \\\n  -u \"${{RUSTERM_API_USER
 fn gen_curl(
     url: &str,
     default_user: &str,
-    session: &Option<String>,
+    sessions: &[String],
     command: &str,
     elevated: bool,
 ) -> String {
-    gen_curl_preview(url, default_user, session, command, elevated).into_script()
+    gen_curl_preview(url, default_user, sessions, command, elevated).into_script()
 }
 
 #[cfg(test)]
@@ -565,7 +699,7 @@ mod tests {
             "missing configured user export: {curl}"
         );
         assert!(
-            curl.contains("-u \"${RUSTERM_API_USER}:${RUSTERM_API_PASSWORD}\""),
+            curl.contains("--user \"${RUSTERM_API_USER}:${RUSTERM_API_PASSWORD}\""),
             "missing environment-based basic-auth: {curl}"
         );
         assert!(
@@ -591,22 +725,64 @@ mod tests {
     }
 
     #[test]
-    fn curl_marks_the_remote_command_edit_location() {
+    fn curl_generates_one_pretty_request_per_selected_session() {
         let curl = gen_curl(
             "http://127.0.0.1:8080",
             "alice",
-            &["prod-web".to_string()],
+            &["host-a".to_string(), "host-b".to_string()],
+            "uptime",
+            false,
+        );
+
+        assert_eq!(curl.matches("rusterm_exec '").count(), 2, "{curl}");
+        assert!(curl.contains(r#"host_id":"host-a"#), "{curl}");
+        assert!(curl.contains(r#"host_id":"host-b"#), "{curl}");
+        assert!(curl.contains("command -v jq"), "{curl}");
+        assert!(curl.contains("python3 -m json.tool"), "{curl}");
+        assert!(
+            curl.contains("--silent --show-error --fail-with-body"),
+            "{curl}"
+        );
+        assert!(
+            curl.contains("--connect-timeout 10 --max-time 120"),
+            "{curl}"
+        );
+    }
+
+    #[test]
+    fn curl_script_copy_follows_the_requested_language() {
+        let sessions = ["prod-web".to_string()];
+        let english = gen_curl_preview_for_language(
+            "http://127.0.0.1:8080",
+            "alice",
+            &sessions,
             "docker ps",
             true,
-        );
-        assert!(
-            curl.contains("# EDIT REMOTE COMMAND BELOW / 在下方修改远程命令"),
-            "missing command edit marker: {curl}"
-        );
-        assert!(
-            curl.contains("command\":\"docker ps\""),
-            "the editable command should remain in the JSON body: {curl}"
-        );
+            crate::i18n::Language::En,
+        )
+        .into_script();
+        let chinese = gen_curl_preview_for_language(
+            "http://127.0.0.1:8080",
+            "alice",
+            &sessions,
+            "docker ps",
+            true,
+            crate::i18n::Language::Zh,
+        )
+        .into_script();
+
+        assert!(english.contains("# EDIT REMOTE COMMAND BELOW"), "{english}");
+        assert!(english.contains("RusTerm API password: "), "{english}");
+        assert!(!english.contains("在下方修改远程命令"), "{english}");
+        assert!(chinese.contains("# 在下方修改远程命令"), "{chinese}");
+        assert!(chinese.contains("RusTerm API 密码："), "{chinese}");
+        assert!(!chinese.contains("EDIT REMOTE COMMAND BELOW"), "{chinese}");
+        for script in [english, chinese] {
+            assert!(
+                script.contains("command\":\"docker ps\""),
+                "the editable command should remain in the JSON body: {script}"
+            );
+        }
     }
 
     #[test]
