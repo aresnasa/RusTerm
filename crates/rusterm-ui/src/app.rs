@@ -752,6 +752,95 @@ fn render_workspace_dock_zone(
     }
 }
 
+fn suggestion_acceptance_input(
+    current: &str,
+    suggestion: &str,
+    is_correction: bool,
+    replace_line: bool,
+) -> Vec<u8> {
+    let current_chars = current.chars().count();
+    let prefix: String = suggestion.chars().take(current_chars).collect();
+    if prefix.chars().count() != current_chars {
+        return Vec::new();
+    }
+
+    if replace_line
+        || is_correction
+        || (prefix != current && prefix.to_lowercase() == current.to_lowercase())
+    {
+        return crate::command_correction::replacement_input(current, suggestion);
+    }
+
+    if prefix == current {
+        return suggestion[prefix.len()..].as_bytes().to_vec();
+    }
+
+    Vec::new()
+}
+
+fn history_completion_candidates(
+    query: &str,
+    commands: impl IntoIterator<Item = String>,
+    limit: usize,
+) -> Vec<String> {
+    let query = query.to_lowercase();
+    let mut seen = std::collections::HashSet::new();
+    commands
+        .into_iter()
+        .filter(|command| !command.trim().is_empty())
+        .filter(|command| query.is_empty() || command.to_lowercase().contains(&query))
+        .filter(|command| seen.insert(command.to_lowercase()))
+        .take(limit)
+        .collect()
+}
+
+fn dispatch_terminal_input_bytes_in_state(
+    state: &mut AppState,
+    input_senders: &HashMap<String, mpsc::UnboundedSender<Vec<u8>>>,
+    source_session_id: &str,
+    targets: &[String],
+    data: &[u8],
+    track_input: bool,
+) -> usize {
+    if track_input {
+        track_terminal_input(state, targets, data);
+    }
+    if let Some(log) = state.session_logs.get(source_session_id) {
+        log.lock().log_input(data);
+    }
+
+    let mut sent = 0;
+    for target_session_id in targets {
+        if input_senders
+            .get(target_session_id)
+            .is_some_and(|sender| sender.send(data.to_vec()).is_ok())
+        {
+            sent += 1;
+        } else {
+            tracing::warn!("[INPUT] target session unavailable: {target_session_id}");
+        }
+    }
+    sent
+}
+
+fn dispatch_terminal_input_bytes(
+    mut state: Signal<AppState>,
+    input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    source_session_id: &str,
+    targets: &[String],
+    data: Vec<u8>,
+    track_input: bool,
+) -> usize {
+    dispatch_terminal_input_bytes_in_state(
+        &mut state.write(),
+        &input_senders.read(),
+        source_session_id,
+        targets,
+        &data,
+        track_input,
+    )
+}
+
 fn send_workspace_command(
     state: &Signal<AppState>,
     input_senders: &Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
@@ -1354,6 +1443,7 @@ fn render_terminal_pane(
             let sid_for_scroll_down = tab.id.clone();
             let sid_for_scroll_bottom = tab.id.clone();
             let sid_for_sug_nav = tab.id.clone();
+            let sid_for_history_completion = tab.id.clone();
             let sid_for_sug_accept = tab.id.clone();
             let sid_for_sug_dismiss = tab.id.clone();
             let sid_for_sug_delete = tab.id.clone();
@@ -1389,6 +1479,8 @@ fn render_terminal_pane(
                 Some(SessionConnectionState::Disconnected | SessionConnectionState::Reconnecting)
             );
             let keybindings = state.read().keybindings.clone();
+            let history_completion_visible =
+                state.read().history_completion_sessions.contains(&tab.id);
             rsx! {
                 div {
                     style: "position: relative; width: 100%; height: 100%;",
@@ -1401,6 +1493,7 @@ fn render_terminal_pane(
                     suggestion_corrections: tab.suggestion_corrections.iter().cloned().collect(),
                     suggestion_selected: tab.suggestion_selected,
                     suggestion_visible: tab.suggestion_visible,
+                    history_completion_visible,
                     keybindings,
                     on_keybinding: move |action: KeybindingAction| {
                         if isolated {
@@ -1435,6 +1528,12 @@ fn render_terminal_pane(
                         }
                     },
                     on_input: move |data: Vec<u8>| {
+                        {
+                            let mut app = state_for_cmd.write();
+                            if app.history_completion_sessions.remove(&sid_clone) {
+                                app.suggestion_epoch = app.suggestion_epoch.wrapping_add(1);
+                            }
+                        }
                         // Any manual input supersedes the previous OneKey result.
                         state_for_cmd
                             .write()
@@ -1491,19 +1590,6 @@ fn render_terminal_pane(
                                 &mut state_for_cmd.write(),
                                 &input_targets,
                             );
-                        } else {
-                            track_terminal_input(
-                                &mut state_for_cmd.write(),
-                                &input_targets,
-                                &data,
-                            );
-                        }
-                        // Log input
-                        {
-                            let logs = state_for_cmd.read().session_logs.clone();
-                            if let Some(log) = logs.get(&sid_clone) {
-                                log.lock().log_input(&data);
-                            }
                         }
                         // --- Comparison-mode broadcast ---
                         // When the active tab's layout has comparison mode
@@ -1538,39 +1624,20 @@ fn render_terminal_pane(
                         // next arrow keypress).
                         let is_arrow = is_arrow_key_seq(&data);
                         let broadcast_targets = input_targets;
-                        let is_broadcast = !isolated && broadcast_targets.len() > 1;
-                        if is_broadcast {
+                        if !isolated && broadcast_targets.len() > 1 {
                             tracing::info!(
                                 "[INPUT] comparison mode ON — broadcasting to {} sessions",
                                 broadcast_targets.len()
                             );
-                            for target_sid in &broadcast_targets {
-                                if let Some(sender) = senders.read().get(target_sid).cloned() {
-                                    match sender.send(data.clone()) {
-                                        Ok(()) => tracing::info!(
-                                            "[INPUT] broadcast to session {} ok",
-                                            &target_sid[..target_sid.len().min(8)]
-                                        ),
-                                        Err(e) => tracing::warn!(
-                                            "[INPUT] broadcast to session {} FAILED: {}",
-                                            &target_sid[..target_sid.len().min(8)],
-                                            e
-                                        ),
-                                    }
-                                }
-                            }
-                        } else {
-                            // Non-broadcast path: send only to this pane's session.
-                            let send_ok = senders.read().get(&sid_clone).cloned();
-                            if let Some(sender) = send_ok {
-                                match sender.send(data) {
-                                    Ok(()) => tracing::info!("[INPUT] sent to PTY ok"),
-                                    Err(e) => tracing::warn!("[INPUT] FAILED to send to PTY: {}", e),
-                                }
-                            } else {
-                                tracing::warn!("[INPUT] no sender for session — PTY channel is dead");
-                            }
                         }
+                        dispatch_terminal_input_bytes(
+                            state_for_cmd,
+                            senders,
+                            &sid_clone,
+                            &broadcast_targets,
+                            data,
+                            !is_enter,
+                        );
                         // Query history for suggestion (on non-Enter input).
                         //
                         // Arrow-key CSI/SS3 sequences are skipped so that
@@ -1888,6 +1955,109 @@ fn render_terminal_pane(
                                 .map(|tab| tab.suggestion_selected = i);
                         }
                     },
+                    on_history_completion: move |_: ()| {
+                        let current = tracked_terminal_command(
+                            &state_for_cmd.read(),
+                            &sid_for_history_completion,
+                        )
+                        .unwrap_or_else(|| {
+                            let terminals = state_for_cmd.read().terminals.clone();
+                            terminals
+                                .get(&sid_for_history_completion)
+                                .map(|handle| {
+                                    let line = handle.lock().terminal.extract_current_line();
+                                    strip_prompt(line.trim()).to_string()
+                                })
+                                .unwrap_or_default()
+                        });
+                        let session_history = state_for_cmd
+                            .read()
+                            .sessions
+                            .iter()
+                            .find(|tab| tab.id == sid_for_history_completion)
+                            .map(|tab| tab.command_history.clone())
+                            .unwrap_or_default();
+                        let result_limit = (state_for_cmd.read().suggestion_count as usize).max(3);
+                        let epoch = {
+                            let mut app = state_for_cmd.write();
+                            app.suggestion_epoch = app.suggestion_epoch.wrapping_add(1);
+                            let epoch = app.suggestion_epoch;
+                            app.history_completion_sessions
+                                .insert(sid_for_history_completion.clone());
+                            if let Some(tab) = app
+                                .sessions
+                                .iter_mut()
+                                .find(|tab| tab.id == sid_for_history_completion)
+                            {
+                                tab.suggestion = None;
+                                tab.suggestions.clear();
+                                tab.suggestion_corrections.clear();
+                                tab.suggestion_selected = 0;
+                                tab.suggestion_visible = false;
+                            }
+                            epoch
+                        };
+                        let sid_for_query = sid_for_history_completion.clone();
+                        spawn(async move {
+                            let db_commands = {
+                                let db_path = dirs::data_dir()
+                                    .unwrap_or_default()
+                                    .join("rusterm")
+                                    .join("rusterm.db");
+                                match rusterm_db::Database::open(Some(db_path)).await {
+                                    Ok(db) => db
+                                        .list_history_page(
+                                            (!current.is_empty()).then_some(current.as_str()),
+                                            None,
+                                            None,
+                                            100,
+                                        )
+                                        .await
+                                        .map(|page| {
+                                            page.entries
+                                                .into_iter()
+                                                .map(|entry| entry.command)
+                                                .collect::<Vec<_>>()
+                                        })
+                                        .unwrap_or_default(),
+                                    Err(_) => Vec::new(),
+                                }
+                            };
+                            if state_for_cmd.read().suggestion_epoch != epoch {
+                                return;
+                            }
+                            let commands = session_history
+                                .into_iter()
+                                .rev()
+                                .chain(db_commands.into_iter());
+                            let candidates = history_completion_candidates(
+                                &current,
+                                commands,
+                                result_limit,
+                            );
+                            let mut app = state_for_cmd.write();
+                            if !app
+                                .history_completion_sessions
+                                .contains(&sid_for_query)
+                            {
+                                return;
+                            }
+                            if candidates.is_empty() {
+                                app.history_completion_sessions.remove(&sid_for_query);
+                            }
+                            if let Some(tab) = app
+                                .sessions
+                                .iter_mut()
+                                .find(|tab| tab.id == sid_for_query)
+                            {
+                                tab.suggestion = None;
+                                tab.suggestions = candidates;
+                                tab.suggestion_corrections.clear();
+                                tab.suggestion_selected = 0;
+                                tab.suggestion_visible = !tab.suggestions.is_empty();
+                            }
+                        });
+                    },
                     on_suggestion_accept: move |cmd: String| {
                         let is_correction = state_for_cmd
                             .read()
@@ -1899,28 +2069,55 @@ fn render_terminal_pane(
                         // replace the current input using DEL bytes and insert
                         // the corrected line without Enter, so the user still
                         // reviews and explicitly executes it.
-                        let input = {
+                        let current = tracked_terminal_command(
+                            &state_for_cmd.read(),
+                            &sid_for_sug_accept,
+                        )
+                        .unwrap_or_else(|| {
                             let terminals = state_for_cmd.read().terminals.clone();
-                            if let Some(handle) = terminals.get(&sid_for_sug_accept) {
-                                let line = handle.lock().terminal.extract_current_line();
-                                let cmd_part = strip_prompt(line.trim());
-                                if is_correction {
-                                    crate::command_correction::replacement_input(&cmd_part, &cmd)
-                                } else if cmd.starts_with(&cmd_part) && cmd_part.len() < cmd.len() {
-                                    cmd[cmd_part.len()..].as_bytes().to_vec()
-                                } else {
-                                    Vec::new()
-                                }
-                            } else {
-                                Vec::new()
-                            }
-                        };
+                            terminals
+                                .get(&sid_for_sug_accept)
+                                .map(|handle| {
+                                    let line = handle.lock().terminal.extract_current_line();
+                                    strip_prompt(line.trim()).to_string()
+                                })
+                                .unwrap_or_default()
+                        });
+                        let replace_line = state_for_cmd
+                            .read()
+                            .history_completion_sessions
+                            .contains(&sid_for_sug_accept);
+                        let input = suggestion_acceptance_input(
+                            &current,
+                            &cmd,
+                            is_correction,
+                            replace_line,
+                        );
                         if !input.is_empty() {
-                            if let Some(sender) = senders.read().get(&sid_for_sug_accept) {
-                                let _ = sender.send(input);
-                            }
+                            let input_targets = if isolated {
+                                vec![sid_for_sug_accept.clone()]
+                            } else {
+                                let targets = crate::state::broadcast_targets(&state_for_cmd.read());
+                                if targets.len() > 1 {
+                                    targets
+                                } else {
+                                    vec![sid_for_sug_accept.clone()]
+                                }
+                            };
+                            dispatch_terminal_input_bytes(
+                                state_for_cmd,
+                                senders,
+                                &sid_for_sug_accept,
+                                &input_targets,
+                                input,
+                                true,
+                            );
                         }
                         // Dismiss dropdown and clear suggestion
+                        state_for_cmd
+                            .write()
+                            .history_completion_sessions
+                            .remove(&sid_for_sug_accept);
                         state_for_cmd.write().sessions.iter_mut()
                             .find(|t| t.id == sid_for_sug_accept)
                             .map(|tab| {
@@ -1932,6 +2129,10 @@ fn render_terminal_pane(
                             });
                     },
                     on_suggestion_dismiss: move |_: ()| {
+                        state_for_cmd
+                            .write()
+                            .history_completion_sessions
+                            .remove(&sid_for_sug_dismiss);
                         state_for_cmd.write().sessions.iter_mut()
                             .find(|t| t.id == sid_for_sug_dismiss)
                             .map(|tab| {
@@ -5818,6 +6019,7 @@ fn dismiss_onekey_popup(
 }
 
 fn dismiss_terminal_popups_for_focus_change(state: &mut AppState, session_id: &str) {
+    state.history_completion_sessions.remove(session_id);
     if let Some(tab) = state.sessions.iter_mut().find(|tab| tab.id == session_id) {
         tab.suggestion_visible = false;
         tab.suggestion = None;
@@ -11869,6 +12071,7 @@ pub fn App() -> Element {
                     s.suggestion_count = count;
                     // If suggestions were just disabled, clear any showing popup.
                     if !enabled {
+                        s.history_completion_sessions.clear();
                         for tab in &mut s.sessions {
                             tab.suggestion = None;
                             tab.suggestions = Vec::new();
@@ -13077,6 +13280,99 @@ mod onekey_tests {
         let raw = b"\x1b[1;36mPassword\x1b[0m for 'https://host': ";
         let text = super::onekey_prompt_text(&state, "s1", raw);
         assert_eq!(text, "Password for 'https://host': ");
+    }
+}
+
+#[cfg(test)]
+mod suggestion_acceptance_tests {
+    use super::{
+        dispatch_terminal_input_bytes_in_state, history_completion_candidates,
+        suggestion_acceptance_input,
+    };
+    use crate::state::{AppState, track_terminal_input, tracked_terminal_command};
+    use std::collections::HashMap;
+    use tokio::sync::mpsc;
+
+    #[test]
+    fn accepted_history_suffix_updates_the_tracked_command_before_enter() {
+        let mut state = AppState::default();
+        let sessions = vec!["session".to_string()];
+        track_terminal_input(&mut state, &sessions, b"git st");
+
+        let input = suggestion_acceptance_input("git st", "git status", false, false);
+        assert_eq!(input, b"atus");
+        track_terminal_input(&mut state, &sessions, &input);
+
+        assert_eq!(
+            tracked_terminal_command(&state, "session").as_deref(),
+            Some("git status")
+        );
+    }
+
+    #[test]
+    fn accepted_suggestion_tracks_and_broadcasts_the_same_bytes_to_every_target() {
+        let mut state = AppState::default();
+        let sessions = vec!["one".to_string(), "two".to_string()];
+        track_terminal_input(&mut state, &sessions, b"git st");
+        let (sender_one, mut receiver_one) = mpsc::unbounded_channel();
+        let (sender_two, mut receiver_two) = mpsc::unbounded_channel();
+        let senders = HashMap::from([
+            ("one".to_string(), sender_one),
+            ("two".to_string(), sender_two),
+        ]);
+        let input = suggestion_acceptance_input("git st", "git status", false, false);
+
+        assert_eq!(
+            dispatch_terminal_input_bytes_in_state(
+                &mut state, &senders, "one", &sessions, &input, true,
+            ),
+            2
+        );
+        assert_eq!(receiver_one.try_recv().unwrap(), b"atus");
+        assert_eq!(receiver_two.try_recv().unwrap(), b"atus");
+        for session in &sessions {
+            assert_eq!(
+                tracked_terminal_command(&state, session).as_deref(),
+                Some("git status")
+            );
+        }
+    }
+
+    #[test]
+    fn case_mismatched_prefix_replaces_the_line_without_executing() {
+        let input = suggestion_acceptance_input("Git", "git status", false, false);
+        assert_eq!(&input[..3], &[0x7f; 3]);
+        assert_eq!(&input[3..], b"git status");
+        assert!(!input.contains(&b'\r'));
+    }
+
+    #[test]
+    fn history_completion_uses_contains_search_and_replaces_the_whole_line() {
+        assert_eq!(
+            history_completion_candidates(
+                "status",
+                vec![
+                    "systemctl status nginx".to_string(),
+                    "git status".to_string(),
+                    "git STATUS".to_string(),
+                    "cargo test".to_string(),
+                ],
+                10,
+            ),
+            vec![
+                "systemctl status nginx".to_string(),
+                "git status".to_string(),
+            ]
+        );
+        let input = suggestion_acceptance_input("status", "systemctl status nginx", false, true);
+        assert_eq!(&input[..6], &[0x7f; 6]);
+        assert_eq!(&input[6..], b"systemctl status nginx");
+        assert!(!input.contains(&b'\r'));
+    }
+
+    #[test]
+    fn unrelated_suggestion_produces_no_terminal_input() {
+        assert!(suggestion_acceptance_input("git", "cargo test", false, false).is_empty());
     }
 }
 

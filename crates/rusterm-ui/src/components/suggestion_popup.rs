@@ -45,6 +45,10 @@ pub fn SuggestionPopup(
     /// Correction rows are labelled and cannot be removed from history.
     #[props(default)]
     correction_suggestions: Vec<String>,
+    /// Explicit Alt+R history mode. Enter inserts the selected command without
+    /// sending a carriage return.
+    #[props(default)]
+    history_completion: bool,
     /// Maximum number of rows to display. Defaults to [`MAX_VISIBLE_ROWS`] (3)
     /// when not specified. The caller passes the user's configured value
     /// (3, 5, or 10) from `AppState::suggestion_count`.
@@ -106,6 +110,13 @@ pub fn SuggestionPopup(
             },
             onmouseup: move |e| e.stop_propagation(),
             onclick: move |e| e.stop_propagation(),
+            if history_completion {
+                div {
+                    style: "display:flex;align-items:center;justify-content:space-between;padding:4px 12px;border-bottom:1px solid #2a2b3d;background:#24283b;color:#c0caf5;font-size:11px;",
+                    span { { crate::i18n::t("suggestion.history_completion_title") } }
+                    span { style: "color:#9aa5ce;", "Alt+R" }
+                }
+            }
             for (i, cmd) in visible.iter().enumerate() {
                 {
                     let is_selected = i == current_selected;
@@ -200,7 +211,9 @@ pub fn SuggestionPopup(
                     font-size:11px;
                     background:#1a1b26;
                 ",
-                if has_corrections {
+                if history_completion {
+                    { crate::i18n::t("suggestion.history_completion_hint") }
+                } else if has_corrections {
                     { crate::i18n::t("suggestion.correction_hint") }
                 } else {
                     { crate::i18n::t("suggestion.history_hint") }

@@ -225,6 +225,11 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
             "纠正项：Tab 仅替换，不执行 · 历史项：× 删除",
         ),
         "suggestion.history_hint" => ("Shift+Del or click × to remove", "Shift+Del 或点击 × 删除"),
+        "suggestion.history_completion_title" => ("Complete from history", "补全历史"),
+        "suggestion.history_completion_hint" => (
+            "Ctrl+N/P selects · Enter inserts · Esc closes",
+            "Ctrl+N/P 选择 · Enter 插入 · Esc 关闭",
+        ),
 
         // ── send.* — Send panel ──────────────────────────────────────────
         "send.placeholder" => (
@@ -329,6 +334,27 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
             "Found {count} private key file(s) in ~/.ssh/",
             "提示：从 ~/.ssh/ 找到 {count} 个私钥文件",
         ),
+
+        // ── terminal_search.* — terminal find/selection tools ────────────
+        "terminal_search.find" => ("Find", "查找"),
+        "terminal_search.placeholder" => ("Search visible terminal text…", "搜索当前终端文本…"),
+        "terminal_search.no_matches" => ("No matches", "无匹配"),
+        "terminal_search.match_count" => ("{current}/{total}", "{current}/{total}"),
+        "terminal_search.previous" => ("Previous match (Shift+Enter)", "上一个匹配（Shift+Enter）"),
+        "terminal_search.next" => ("Next match (Enter)", "下一个匹配（Enter）"),
+        "terminal_search.find_selection" => {
+            ("Find the selected terminal text", "查找当前选中的终端文本")
+        }
+        "terminal_search.selection" => ("Selection", "选择"),
+        "terminal_search.online" => ("Online", "在线"),
+        "terminal_search.online_search_tip" => (
+            "Search the selected text online (only the selection is sent)",
+            "在线搜索选中文本（仅发送所选内容）",
+        ),
+        "terminal_search.highlight" => ("Keep highlights after closing", "关闭后保留高亮"),
+        "terminal_search.highlight_on" => ("Persistent highlights enabled", "已启用持续高亮"),
+        "terminal_search.highlight_label" => ("Highlight", "高亮"),
+        "terminal_search.close" => ("Close search (Esc)", "关闭查找（Esc）"),
 
         // ── layout.* — pane/tab layout UI ────────────────────────────────
         "layout.empty_pane" => ("Empty pane", "空白窗格"),

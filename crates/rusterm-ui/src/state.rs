@@ -205,6 +205,10 @@ pub struct AppState {
     /// Enter arrives immediately after a fast paste or Compare broadcast.
     #[serde(skip)]
     pub terminal_command_lines: HashMap<String, TrackedCommandLine>,
+    /// Sessions currently showing the explicit Alt+R history-completion picker.
+    /// This mode changes Enter from "execute" to "replace the current line".
+    #[serde(skip)]
+    pub history_completion_sessions: HashSet<String>,
     /// Commands that have just failed (rc != 0) and are awaiting the async
     /// `mark_command_failed` DB write to complete.
     ///
@@ -674,6 +678,7 @@ impl Default for AppState {
             suggestion_epoch: 0,
             pending_exit_check: HashMap::new(),
             terminal_command_lines: HashMap::new(),
+            history_completion_sessions: HashSet::new(),
             recent_failed_commands: HashSet::new(),
             last_failed_command_by_session: HashMap::new(),
             onekeys: Vec::new(),
@@ -1088,33 +1093,48 @@ pub fn track_terminal_input(state: &mut AppState, session_ids: &[String], data: 
             .terminal_command_lines
             .entry(session_id.clone())
             .or_insert_with(|| TrackedCommandLine::Reliable(String::new()));
-        match data {
-            [0x03] | [0x15] => *line = TrackedCommandLine::Reliable(String::new()),
-            [0x17] => {
-                if let TrackedCommandLine::Reliable(value) = line {
-                    while value.ends_with(char::is_whitespace) {
-                        value.pop();
-                    }
-                    while value.chars().last().is_some_and(|ch| !ch.is_whitespace()) {
-                        value.pop();
-                    }
+        let mut offset = 0;
+        while offset < data.len() {
+            match data[offset] {
+                0x03 | 0x15 => {
+                    *line = TrackedCommandLine::Reliable(String::new());
+                    offset += 1;
                 }
-            }
-            [0x7f] => {
-                if let TrackedCommandLine::Reliable(value) = line {
-                    value.pop();
-                }
-            }
-            _ if data.iter().all(|byte| *byte >= 0x20 && *byte != 0x7f) => {
-                if let Ok(text) = std::str::from_utf8(data) {
+                0x17 => {
                     if let TrackedCommandLine::Reliable(value) = line {
-                        value.push_str(text);
+                        while value.ends_with(char::is_whitespace) {
+                            value.pop();
+                        }
+                        while value.chars().last().is_some_and(|ch| !ch.is_whitespace()) {
+                            value.pop();
+                        }
                     }
-                } else {
+                    offset += 1;
+                }
+                0x7f => {
+                    if let TrackedCommandLine::Reliable(value) = line {
+                        value.pop();
+                    }
+                    offset += 1;
+                }
+                byte if byte >= 0x20 => {
+                    let start = offset;
+                    while offset < data.len() && data[offset] >= 0x20 && data[offset] != 0x7f {
+                        offset += 1;
+                    }
+                    if let Ok(text) = std::str::from_utf8(&data[start..offset]) {
+                        if let TrackedCommandLine::Reliable(value) = line {
+                            value.push_str(text);
+                        }
+                    } else {
+                        *line = TrackedCommandLine::Unreliable;
+                    }
+                }
+                _ => {
                     *line = TrackedCommandLine::Unreliable;
+                    offset += 1;
                 }
             }
-            _ => *line = TrackedCommandLine::Unreliable,
         }
     }
 }
@@ -1234,6 +1254,16 @@ mod pending_exit_helpers_tests {
         assert_eq!(
             tracked_terminal_command(&state, "session").as_deref(),
             Some("echo oop")
+        );
+
+        track_terminal_input(&mut state, &sessions, &[0x15]);
+        track_terminal_input(&mut state, &sessions, b"git st");
+        let mut replacement = vec![0x7f; 6];
+        replacement.extend_from_slice(b"git status");
+        track_terminal_input(&mut state, &sessions, &replacement);
+        assert_eq!(
+            tracked_terminal_command(&state, "session").as_deref(),
+            Some("git status")
         );
 
         track_terminal_input(&mut state, &sessions, b"\x1b[A");

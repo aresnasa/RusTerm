@@ -321,8 +321,51 @@ fn terminal_key_bytes(
     }
 }
 
-fn accepts_inline_suggestion(key: &Key) -> bool {
-    matches!(key, Key::End | Key::Tab)
+fn accepts_inline_suggestion(key: &Key, ctrl: bool, alt: bool, meta: bool, shift: bool) -> bool {
+    !ctrl && !alt && !meta && !shift && matches!(key, Key::End | Key::Tab)
+}
+
+fn is_history_completion_shortcut(
+    key: &Key,
+    ctrl: bool,
+    alt: bool,
+    meta: bool,
+    shift: bool,
+) -> bool {
+    alt && !ctrl
+        && !meta
+        && !shift
+        && matches!(key, Key::Character(value) if value.eq_ignore_ascii_case("r"))
+}
+
+fn accepts_history_completion(key: &Key, ctrl: bool, alt: bool, meta: bool, shift: bool) -> bool {
+    !ctrl && !alt && !meta && !shift && matches!(key, Key::Enter | Key::End | Key::Tab)
+}
+
+fn suggestion_navigation_index(
+    key: &Key,
+    ctrl: bool,
+    alt: bool,
+    meta: bool,
+    shift: bool,
+    selected: usize,
+    suggestion_count: usize,
+) -> Option<usize> {
+    if suggestion_count == 0 || !ctrl || alt || meta || shift {
+        return None;
+    }
+
+    match key {
+        Key::Character(value) if value.eq_ignore_ascii_case("n") => {
+            Some((selected + 1) % suggestion_count)
+        }
+        Key::Character(value) if value.eq_ignore_ascii_case("p") => Some(
+            selected
+                .checked_sub(1)
+                .unwrap_or(suggestion_count.saturating_sub(1)),
+        ),
+        _ => None,
+    }
 }
 
 /// What the OneKey autofill popup should do with a key while it is visible.
@@ -728,8 +771,7 @@ enum CellOverlay {
 }
 
 const SEARCH_MATCH_BG: &str = "background:rgba(224,175,104,0.26)";
-const SEARCH_CURRENT_BG: &str =
-    "background:rgba(122,162,247,0.48);outline:1px solid rgba(192,202,245,0.72);outline-offset:-1px";
+const SEARCH_CURRENT_BG: &str = "background:rgba(122,162,247,0.48);outline:1px solid rgba(192,202,245,0.72);outline-offset:-1px";
 
 fn overlay_for_col(
     col: usize,
@@ -740,16 +782,19 @@ fn overlay_for_col(
         return CellOverlay::Selection;
     }
 
-    search_ranges
+    if search_ranges
         .iter()
-        .find_map(|(start, end, current)| {
-            (col >= *start && col <= *end).then_some(if *current {
-                CellOverlay::CurrentSearchMatch
-            } else {
-                CellOverlay::SearchMatch
-            })
-        })
-        .unwrap_or_default()
+        .any(|(start, end, current)| *current && col >= *start && col <= *end)
+    {
+        CellOverlay::CurrentSearchMatch
+    } else if search_ranges
+        .iter()
+        .any(|(start, end, _)| col >= *start && col <= *end)
+    {
+        CellOverlay::SearchMatch
+    } else {
+        CellOverlay::None
+    }
 }
 
 fn overlay_style(overlay: CellOverlay) -> &'static str {
@@ -863,8 +908,14 @@ fn open_online_search(text: &str) {
         "opening URLs is unsupported on this platform",
     ));
 
-    if let Err(error) = result {
-        tracing::warn!("[SEARCH] failed to open browser: {error}");
+    match result {
+        Ok(mut child) => {
+            // Reap the short-lived platform launcher without blocking the UI.
+            std::thread::spawn(move || {
+                let _ = child.wait();
+            });
+        }
+        Err(error) => tracing::warn!("[SEARCH] failed to open browser: {error}"),
     }
 }
 
@@ -873,6 +924,24 @@ fn open_online_search(text: &str) {
 /// longer correspond to the application's current screen.
 fn app_owns_mouse(mouse_reporting: bool, scrollback_offset: usize, shift: bool) -> bool {
     mouse_reporting && scrollback_offset == 0 && !shift
+}
+
+fn is_find_shortcut(
+    key: &Key,
+    ctrl: bool,
+    alt: bool,
+    meta: bool,
+    shift: bool,
+    is_macos: bool,
+) -> bool {
+    let find_key = matches!(key, Key::Character(s) if s.eq_ignore_ascii_case("f"));
+    let platform_find = if is_macos {
+        meta && !ctrl && !shift
+    } else {
+        ctrl && !meta && !shift
+    };
+    let legacy_find = ctrl && shift && !meta;
+    !alt && find_key && (platform_find || legacy_find)
 }
 
 /// Render a terminal row to an HTML string. Uses `dangerous_inner_html`
@@ -976,9 +1045,7 @@ fn row_to_html(
             let cursor_overlay = overlay_for_col(i, sel, search_ranges);
             let overlay_css = overlay_style(cursor_overlay);
             let cursor_style = if base_style.is_empty() {
-                format!(
-                    "{overlay_css};border-left:2px solid {cursor_border};margin-left:-1px"
-                )
+                format!("{overlay_css};border-left:2px solid {cursor_border};margin-left:-1px")
             } else {
                 format!(
                     "{};{};border-left:2px solid {};margin-left:-1px",
@@ -1085,6 +1152,9 @@ pub fn TerminalView(
     #[props(default)] suggestion_corrections: Vec<String>,
     suggestion_selected: usize,
     suggestion_visible: bool,
+    /// True while the explicit Alt+R history picker is open. In this mode,
+    /// Enter replaces the current command line instead of executing it.
+    history_completion_visible: bool,
     #[props(default)] keybindings: Keybindings,
     #[props(default)] on_keybinding: EventHandler<KeybindingAction>,
     on_input: EventHandler<Vec<u8>>,
@@ -1095,6 +1165,7 @@ pub fn TerminalView(
     on_scroll_to_bottom: EventHandler<()>,
     on_suggestion_navigate: EventHandler<Option<usize>>,
     on_suggestion_accept: EventHandler<String>,
+    on_history_completion: EventHandler<()>,
     on_suggestion_dismiss: EventHandler<()>,
     /// Delete the currently-selected suggestion from history (dirty-data
     /// cleanup). Triggered by Shift+Delete while the suggestion panel is open.
@@ -1158,6 +1229,7 @@ pub fn TerminalView(
     let current_suggestion_corrections = suggestion_corrections.clone();
     let current_suggestion_visible = suggestion_visible;
     let current_suggestion_selected = suggestion_selected;
+    let current_history_completion_visible = history_completion_visible;
 
     let current_onekey_visible = onekey_visible;
     // Cap the entries used for selection and rendering to MAX_VISIBLE_ROWS so
@@ -1178,6 +1250,11 @@ pub fn TerminalView(
     let current_disconnected = disconnected;
 
     let closure_suggestions = current_suggestions.clone();
+    let closure_suggestion_count = closure_suggestions.len().min(if suggestion_max_rows == 0 {
+        crate::components::suggestion_popup::MAX_VISIBLE_ROWS
+    } else {
+        suggestion_max_rows
+    });
     let closure_suggestion_corrections = current_suggestion_corrections.clone();
     let sid_for_keydown_log = session_id.clone();
     let sid_for_copy = session_id.clone();
@@ -1298,9 +1375,8 @@ pub fn TerminalView(
         // used on other desktop platforms. Keep Ctrl+Shift+F as the established
         // RusTerm shortcut. Opening find seeds the query from a local terminal
         // selection when possible (the "find selection" workflow).
-        let find_shortcut = !alt
-            && matches!(key, Key::Character(ref s) if s.eq_ignore_ascii_case("f"))
-            && ((meta && !ctrl) || (ctrl && !meta));
+        let find_shortcut =
+            is_find_shortcut(&key, ctrl, alt, meta, shift, cfg!(target_os = "macos"));
         if find_shortcut {
             e.prevent_default();
             e.stop_propagation();
@@ -1436,6 +1512,11 @@ pub fn TerminalView(
             return;
         }
 
+        if is_history_completion_shortcut(&key, ctrl, alt, meta, shift) {
+            on_history_completion.call(());
+            return;
+        }
+
         // Ctrl+Shift+V / Shift+Insert: paste from clipboard
         if (ctrl && shift && matches!(key, Key::Character(ref s) if s == "v" || s == "V"))
             || (shift && matches!(key, Key::Insert))
@@ -1462,15 +1543,35 @@ pub fn TerminalView(
         // panel can still be driven via Tab (accept), Escape (dismiss), and
         // Shift+Delete (purge entry).
         if current_suggestion_visible && !closure_suggestions.is_empty() {
+            if let Some(next) = suggestion_navigation_index(
+                &key,
+                ctrl,
+                alt,
+                meta,
+                shift,
+                current_suggestion_selected,
+                closure_suggestion_count,
+            ) {
+                on_suggestion_navigate.call(Some(next));
+                return;
+            }
             match &key {
+                _ if current_history_completion_visible
+                    && accepts_history_completion(&key, ctrl, alt, meta, shift) =>
+                {
+                    if let Some(cmd) = closure_suggestions.get(current_suggestion_selected) {
+                        on_suggestion_accept.call(cmd.clone());
+                    }
+                    return;
+                }
                 // Arrow keys dismiss the panel and fall through to the PTY
                 // so the shell handles cursor movement / history navigation.
                 Key::ArrowDown | Key::ArrowUp | Key::ArrowLeft | Key::ArrowRight => {
                     on_suggestion_dismiss.call(());
                     // Don't return — let the key continue to the PTY.
                 }
-                Key::Tab => {
-                    // Tab accepts the selected suggestion
+                Key::Tab | Key::End if !ctrl && !alt && !meta && !shift => {
+                    // Unmodified Tab/End accepts the selected suggestion.
                     if let Some(cmd) = closure_suggestions.get(current_suggestion_selected) {
                         on_suggestion_accept.call(cmd.clone());
                     }
@@ -1518,7 +1619,7 @@ pub fn TerminalView(
         // End and Tab remain explicit acceptance keys. Ctrl+E must reach the
         // PTY because readline and shells use it to move to end-of-line.
         if current_suggestion.is_some() {
-            let is_accept = accepts_inline_suggestion(&key);
+            let is_accept = accepts_inline_suggestion(&key, ctrl, alt, meta, shift);
             if is_accept {
                 if let Some(ref sug) = current_suggestion {
                     on_input.call(sug.as_bytes().to_vec());
@@ -1951,7 +2052,10 @@ pub fn TerminalView(
         // held; 1003 reports every cell transition and uses pseudo-button 3
         // when no button is down.
         let pressed_button = mouse_button_down();
+        let mods = e.modifiers();
+        let shift_forces_local = mods.shift() && pressed_button.is_none();
         let should_report_motion = move_reporting
+            && !shift_forces_local
             && (move_any_motion || (move_button_motion && pressed_button.is_some()));
         if should_report_motion {
             let Some((row, col)) = event_cell(&e) else {
@@ -1959,7 +2063,6 @@ pub fn TerminalView(
             };
             if last_motion_cell() != Some((row, col)) {
                 last_motion_cell.set(Some((row, col)));
-                let mods = e.modifiers();
                 move_on_input.call(encode_mouse_report(
                     MouseReportKind::Motion,
                     pressed_button.unwrap_or(3),
@@ -2208,9 +2311,7 @@ pub fn TerminalView(
                 sm.iter()
                     .enumerate()
                     .filter(|(_, found)| found.row == row_idx)
-                    .map(|(index, found)| {
-                        (found.start_col, found.end_col, index == sidx)
-                    })
+                    .map(|(index, found)| (found.start_col, found.end_col, index == sidx))
                     .collect()
             } else {
                 Vec::new()
@@ -2344,42 +2445,73 @@ pub fn TerminalView(
                 }
             },
 
-            // Search overlay bar
+            // Search overlay bar: find next/previous, find selected text,
+            // online-search only the explicit selection, and optionally keep
+            // exact-match highlights after the bar closes.
             if search_visible() {
                 {
                     let query = search_query();
                     let matches = search_matches();
                     let match_idx = search_match_index();
                     let match_info = if matches.is_empty() {
-                        "No matches".to_string()
+                        crate::i18n::t("terminal_search.no_matches")
                     } else {
-                        format!("{}/{}", match_idx + 1, matches.len())
+                        crate::i18n::tf(
+                            "terminal_search.match_count",
+                            &[("current", &(match_idx + 1)), ("total", &matches.len())],
+                        )
+                    };
+                    let selected_text = search_query_from_selection(
+                        &selection_text(),
+                        selection(),
+                        &render_output.rows,
+                    );
+                    let selected_for_find = selected_text.clone().unwrap_or_default();
+                    let selected_for_online = selected_text.clone().unwrap_or_default();
+                    let has_selection = selected_text.is_some();
+                    let highlight_active = search_highlight_pinned();
+                    let highlight_style = if highlight_active {
+                        "background:#7aa2f7;border:1px solid #7aa2f7;color:#1a1b26;"
+                    } else {
+                        "background:#1a1b26;border:1px solid #2a2b3d;color:#9aa5ce;"
                     };
                     rsx! {
                         div {
+                            "data-rusterm-terminal-popup": "true",
                             style: "
                                 position: absolute;
                                 top: 0; left: 0; right: 0;
                                 z-index: 10;
                                 display: flex;
                                 align-items: center;
-                                gap: 8px;
-                                padding: 6px 10px;
-                                background: var(--skin-surface);
-                                border-bottom: 1px solid var(--skin-border);
+                                flex-wrap: wrap;
+                                gap: 6px;
+                                padding: 7px 10px;
+                                background: #24283b;
+                                border-bottom: 1px solid #2a2b3d;
                                 border-radius: 4px 4px 0 0;
+                                box-shadow: 0 4px 12px rgba(0,0,0,0.28);
                             ",
-                            span { style: "color: var(--skin-text-muted); font-size: 12px; white-space: nowrap;", "Find:" }
+                            onclick: move |e: MouseEvent| e.stop_propagation(),
+                            onmousedown: move |e: MouseEvent| e.stop_propagation(),
+                            span {
+                                style: "color:#9aa5ce;font-size:12px;white-space:nowrap;",
+                                { crate::i18n::t("terminal_search.find") }
+                            }
                             input {
+                                id: "{search_input_id}",
                                 r#type: "text",
                                 value: "{query}",
+                                autofocus: true,
+                                placeholder: crate::i18n::t("terminal_search.placeholder"),
                                 style: "
                                     flex: 1;
-                                    background: var(--skin-bg);
-                                    border: 1px solid var(--skin-border);
-                                    border-radius: 3px;
-                                    color: var(--skin-text);
-                                    padding: 3px 8px;
+                                    min-width: 120px;
+                                    background: #1a1b26;
+                                    border: 1px solid #2a2b3d;
+                                    border-radius: 4px;
+                                    color: #c0caf5;
+                                    padding: 4px 8px;
                                     font-size: 12px;
                                     font-family: 'JetBrains Mono', monospace;
                                     outline: none;
@@ -2391,51 +2523,96 @@ pub fn TerminalView(
                                 onkeydown: move |e: KeyboardEvent| {
                                     e.stop_propagation();
                                     if matches!(e.key(), Key::Escape) {
+                                        e.prevent_default();
                                         search_visible.set(false);
-                                        search_query.set(String::new());
-                                        search_matches.set(Vec::new());
-                                        search_match_index.set(0);
+                                        if !search_highlight_pinned() {
+                                            search_query.set(String::new());
+                                            search_matches.set(Vec::new());
+                                            search_match_index.set(0);
+                                        }
                                     } else if matches!(e.key(), Key::Enter) {
+                                        e.prevent_default();
                                         let matches = search_matches();
                                         if !matches.is_empty() {
-                                            let next = (search_match_index() + 1) % matches.len();
+                                            let current = search_match_index().min(matches.len() - 1);
+                                            let next = if e.modifiers().shift() {
+                                                current.checked_sub(1).unwrap_or(matches.len() - 1)
+                                            } else {
+                                                (current + 1) % matches.len()
+                                            };
                                             search_match_index.set(next);
                                         }
                                     }
                                 },
                             }
-                            span { style: "color: var(--skin-text-muted); font-size: 11px; white-space: nowrap; min-width: 60px; text-align: right;", "{match_info}" }
+                            span {
+                                style: "color:#9aa5ce;font-size:11px;white-space:nowrap;min-width:58px;text-align:right;",
+                                "{match_info}"
+                            }
                             button {
-                                style: "background:none;border:none;color:var(--skin-text-muted);cursor:pointer;font-size:14px;padding:0 4px;",
+                                title: crate::i18n::t("terminal_search.previous"),
+                                style: "background:#1a1b26;border:1px solid #2a2b3d;border-radius:4px;color:#c0caf5;cursor:pointer;font-size:13px;padding:3px 7px;",
                                 onclick: move |_| {
                                     let matches = search_matches();
                                     if !matches.is_empty() {
-                                        let next = (search_match_index() + 1) % matches.len();
-                                        search_match_index.set(next);
+                                        let current = search_match_index().min(matches.len() - 1);
+                                        search_match_index.set(current.checked_sub(1).unwrap_or(matches.len() - 1));
                                     }
                                 },
-                                "\u{25BC}"
+                                "▲"
                             }
                             button {
-                                style: "background:none;border:none;color:var(--skin-text-muted);cursor:pointer;font-size:14px;padding:0 4px;",
+                                title: crate::i18n::t("terminal_search.next"),
+                                style: "background:#1a1b26;border:1px solid #2a2b3d;border-radius:4px;color:#c0caf5;cursor:pointer;font-size:13px;padding:3px 7px;",
                                 onclick: move |_| {
                                     let matches = search_matches();
                                     if !matches.is_empty() {
-                                        let prev = if search_match_index() == 0 { matches.len() - 1 } else { search_match_index() - 1 };
-                                        search_match_index.set(prev);
+                                        search_match_index.set((search_match_index().min(matches.len() - 1) + 1) % matches.len());
                                     }
                                 },
-                                "\u{25B2}"
+                                "▼"
                             }
                             button {
-                                style: "background:none;border:none;color:var(--skin-text-muted);cursor:pointer;font-size:14px;padding:0 4px;",
+                                disabled: !has_selection,
+                                title: crate::i18n::t("terminal_search.find_selection"),
+                                style: if has_selection { "background:#1a1b26;border:1px solid #2a2b3d;border-radius:4px;color:#c0caf5;cursor:pointer;font-size:11px;padding:4px 7px;" } else { "background:#1a1b26;border:1px solid #2a2b3d;border-radius:4px;color:#565f89;cursor:not-allowed;font-size:11px;padding:4px 7px;" },
+                                onclick: move |_| {
+                                    if !selected_for_find.is_empty() {
+                                        search_query.set(selected_for_find.clone());
+                                        search_match_index.set(0);
+                                    }
+                                },
+                                { crate::i18n::t("terminal_search.selection") }
+                            }
+                            button {
+                                disabled: !has_selection,
+                                title: crate::i18n::t("terminal_search.online_search_tip"),
+                                style: if has_selection { "background:#1a1b26;border:1px solid #2a2b3d;border-radius:4px;color:#c0caf5;cursor:pointer;font-size:11px;padding:4px 7px;" } else { "background:#1a1b26;border:1px solid #2a2b3d;border-radius:4px;color:#565f89;cursor:not-allowed;font-size:11px;padding:4px 7px;" },
+                                onclick: move |_| {
+                                    if !selected_for_online.is_empty() {
+                                        open_online_search(&selected_for_online);
+                                    }
+                                },
+                                { crate::i18n::t("terminal_search.online") }
+                            }
+                            button {
+                                title: if highlight_active { crate::i18n::t("terminal_search.highlight_on") } else { crate::i18n::t("terminal_search.highlight") },
+                                style: "{highlight_style}border-radius:4px;cursor:pointer;font-size:11px;padding:4px 7px;",
+                                onclick: move |_| search_highlight_pinned.toggle(),
+                                { crate::i18n::t("terminal_search.highlight_label") }
+                            }
+                            button {
+                                title: crate::i18n::t("terminal_search.close"),
+                                style: "background:none;border:none;color:#9aa5ce;cursor:pointer;font-size:14px;padding:0 4px;",
                                 onclick: move |_| {
                                     search_visible.set(false);
-                                    search_query.set(String::new());
-                                    search_matches.set(Vec::new());
-                                    search_match_index.set(0);
+                                    if !search_highlight_pinned() {
+                                        search_query.set(String::new());
+                                        search_matches.set(Vec::new());
+                                        search_match_index.set(0);
+                                    }
                                 },
-                                "\u{2715}"
+                                "✕"
                             }
                         }
                     }
@@ -2503,6 +2680,7 @@ pub fn TerminalView(
                         on_suggestion_delete.call(cmd);
                     },
                     correction_suggestions: current_suggestion_corrections.clone(),
+                    history_completion: current_history_completion_visible,
                     max_rows: suggestion_max_rows,
                 }
             }
@@ -2545,11 +2723,14 @@ pub fn TerminalView(
 #[cfg(test)]
 mod tests {
     use super::{
-        ClipboardCopyOutcome, CopyShortcut, OneKeyKeyAction, PopupDirection,
-        TerminalOverlayKeyAction, TextSelection, accepts_inline_suggestion, cell_style,
-        color_to_css, copy_text_to_clipboard, cursor_key_seq, event_cell_from_coords,
-        onekey_popup_key_action, popup_layout, scroll_thumb_geometry, terminal_key_bytes,
-        terminal_overlay_key_action, terminal_selection_text, word_range_in_row,
+        ClipboardCopyOutcome, CopyShortcut, OneKeyKeyAction, PopupDirection, SEARCH_CURRENT_BG,
+        SEARCH_MATCH_BG, TerminalOverlayKeyAction, TextSelection, accepts_history_completion,
+        accepts_inline_suggestion, app_owns_mouse, cell_style, color_to_css,
+        copy_text_to_clipboard, cursor_key_seq, event_cell_from_coords, find_search_matches,
+        is_find_shortcut, is_history_completion_shortcut, onekey_popup_key_action,
+        online_search_url, popup_layout, scroll_thumb_geometry, search_query_from_selection,
+        suggestion_navigation_index, terminal_key_bytes, terminal_overlay_key_action,
+        terminal_selection_text, word_range_in_row,
     };
     use dioxus::prelude::{Code, Key};
     use rusterm_core::terminal::{CellColor, RenderCell, RenderRow};
@@ -2985,10 +3166,89 @@ mod tests {
     }
 
     #[test]
-    fn ctrl_e_is_reserved_for_readline_not_inline_suggestion_acceptance() {
-        assert!(!accepts_inline_suggestion(&Key::Character("e".into())));
-        assert!(accepts_inline_suggestion(&Key::End));
-        assert!(accepts_inline_suggestion(&Key::Tab));
+    fn only_unmodified_tab_and_end_accept_inline_suggestions() {
+        assert!(!accepts_inline_suggestion(
+            &Key::Character("e".into()),
+            true,
+            false,
+            false,
+            false,
+        ));
+        assert!(accepts_inline_suggestion(
+            &Key::End,
+            false,
+            false,
+            false,
+            false,
+        ));
+        assert!(accepts_inline_suggestion(
+            &Key::Tab,
+            false,
+            false,
+            false,
+            false,
+        ));
+        assert!(!accepts_inline_suggestion(
+            &Key::End,
+            false,
+            false,
+            false,
+            true,
+        ));
+        assert!(!accepts_inline_suggestion(
+            &Key::Tab,
+            true,
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn alt_r_opens_history_completion_and_enter_only_accepts_in_that_mode() {
+        let r = Key::Character("r".into());
+        assert!(is_history_completion_shortcut(
+            &r, false, true, false, false
+        ));
+        assert!(!is_history_completion_shortcut(
+            &r, true, true, false, false
+        ));
+        assert!(accepts_history_completion(
+            &Key::Enter,
+            false,
+            false,
+            false,
+            false,
+        ));
+        assert!(!accepts_history_completion(
+            &Key::Enter,
+            true,
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn ctrl_n_and_ctrl_p_cycle_visible_suggestions() {
+        let ctrl_n = Key::Character("n".into());
+        let ctrl_p = Key::Character("p".into());
+        assert_eq!(
+            suggestion_navigation_index(&ctrl_n, true, false, false, false, 0, 3),
+            Some(1)
+        );
+        assert_eq!(
+            suggestion_navigation_index(&ctrl_n, true, false, false, false, 2, 3),
+            Some(0)
+        );
+        assert_eq!(
+            suggestion_navigation_index(&ctrl_p, true, false, false, false, 0, 3),
+            Some(2)
+        );
+        assert_eq!(
+            suggestion_navigation_index(&ctrl_p, true, false, false, true, 0, 3),
+            None
+        );
     }
 
     #[test]
@@ -3061,7 +3321,7 @@ mod tests {
         };
         let row = mk("hello world");
         // Columns 6..=10 = "world".
-        let html = row_to_html(&row, None, &CellColor::Default, None, Some((6, 10)));
+        let html = row_to_html(&row, None, &CellColor::Default, None, Some((6, 10)), &[]);
         assert!(
             html.contains(SELECTION_BG),
             "selection highlight style must be present: {html}"
@@ -3079,8 +3339,110 @@ mod tests {
             "highlight must not cover cells before the start column: {html}"
         );
         // No selection → no highlight style anywhere.
-        let plain = row_to_html(&row, None, &CellColor::Default, None, None);
+        let plain = row_to_html(&row, None, &CellColor::Default, None, None, &[]);
         assert!(!plain.contains(SELECTION_BG));
+    }
+
+    #[test]
+    fn search_matches_exact_ascii_cell_ranges_and_overlaps() {
+        let rows = vec![row_from("banana BANANA")];
+        let matches = find_search_matches(&rows, "ana");
+        assert_eq!(matches.len(), 4);
+        assert_eq!(
+            (matches[0].row, matches[0].start_col, matches[0].end_col),
+            (0, 1, 3)
+        );
+        assert_eq!((matches[1].start_col, matches[1].end_col), (3, 5));
+        assert_eq!((matches[2].start_col, matches[2].end_col), (8, 10));
+        assert_eq!((matches[3].start_col, matches[3].end_col), (10, 12));
+    }
+
+    #[test]
+    fn search_matches_wide_char_cells_without_byte_offset_drift() {
+        let rows = vec![RenderRow {
+            cells: vec![
+                RenderCell {
+                    character: 'a',
+                    ..Default::default()
+                },
+                wide_cell('中'),
+                wide_next_cell(),
+                RenderCell {
+                    character: 'b',
+                    ..Default::default()
+                },
+            ],
+            wrapped: false,
+        }];
+        let matches = find_search_matches(&rows, "中b");
+        assert_eq!(matches.len(), 1);
+        assert_eq!((matches[0].start_col, matches[0].end_col), (1, 3));
+    }
+
+    #[test]
+    fn search_html_highlights_only_matches_and_marks_current_match() {
+        use super::row_to_html;
+        let row = row_from("alpha beta alpha");
+        let matches = find_search_matches(std::slice::from_ref(&row), "alpha");
+        let ranges = matches
+            .iter()
+            .enumerate()
+            .map(|(index, found)| (found.start_col, found.end_col, index == 1))
+            .collect::<Vec<_>>();
+        let html = row_to_html(&row, None, &CellColor::Default, None, None, &ranges);
+        assert_eq!(html.matches(SEARCH_MATCH_BG).count(), 1);
+        assert_eq!(html.matches(SEARCH_CURRENT_BG).count(), 1);
+        assert!(html.contains("beta"));
+    }
+
+    #[test]
+    fn selection_can_seed_find_but_multiline_selection_cannot() {
+        let rows = vec![row_from("alpha beta"), row_from("gamma")];
+        let one_line = TextSelection {
+            anchor: (0, 6),
+            head: (0, 9),
+        };
+        assert_eq!(
+            search_query_from_selection("", Some(one_line), &rows).as_deref(),
+            Some("beta")
+        );
+
+        let multiline = TextSelection {
+            anchor: (0, 6),
+            head: (1, 4),
+        };
+        assert_eq!(
+            search_query_from_selection("", Some(multiline), &rows),
+            None
+        );
+    }
+
+    #[test]
+    fn online_search_encodes_only_the_explicit_query() {
+        assert_eq!(
+            online_search_url("Rust 终端 & SSH").as_deref(),
+            Some("https://www.google.com/search?q=Rust%20%E7%BB%88%E7%AB%AF%20%26%20SSH")
+        );
+        assert_eq!(online_search_url("   "), None);
+    }
+
+    #[test]
+    fn find_shortcuts_preserve_macos_readline_and_layout_zoom() {
+        let f = Key::Character("f".into());
+        assert!(is_find_shortcut(&f, false, false, true, false, true));
+        assert!(!is_find_shortcut(&f, true, false, false, false, true));
+        assert!(!is_find_shortcut(&f, false, false, true, true, true));
+        assert!(is_find_shortcut(&f, true, false, false, true, true));
+        assert!(is_find_shortcut(&f, true, false, false, false, false));
+        assert!(!is_find_shortcut(&f, false, false, true, false, false));
+    }
+
+    #[test]
+    fn application_mouse_ownership_respects_shift_and_scrollback() {
+        assert!(app_owns_mouse(true, 0, false));
+        assert!(!app_owns_mouse(true, 0, true));
+        assert!(!app_owns_mouse(true, 12, false));
+        assert!(!app_owns_mouse(false, 0, false));
     }
 
     #[test]
