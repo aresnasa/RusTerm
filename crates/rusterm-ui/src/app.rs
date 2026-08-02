@@ -628,6 +628,7 @@ fn render_workspace_dock_panel(
                     selected_target_ids,
                     shell_content,
                     transfer_jobs: state.read().transfers.jobs.clone(),
+                    state,
                     on_height_change: move |_| {},
                     on_tab_change: move |tab: BottomPanelTab| {
                         let selected = match tab {
@@ -1775,23 +1776,18 @@ fn render_terminal_pane(
                                 //    recent command above a frequently-used older one. DuckDB's
                                 //    mirror captures total usage across all time, so commands the
                                 //    user runs dozens of times (but maybe not today) get a chance
-                                //    to appear. Gated behind the `analytics` feature — when the
-                                //    feature is off, `command_rankings_by_prefix` is a no-op.
-                                #[cfg(feature = "analytics")]
+                                //    to appear. When the `analytics` feature is off this is a
+                                //    no-op (returns an empty vec).
+                                if let Ok(rankings) = analytics.suggest_by_prefix(&cmd_part, (sug_count * 2) as u32)
                                 {
-                                    if let Ok(rankings) =
-                                        analytics.command_rankings_by_prefix(&cmd_part, sug_count * 2)
-                                    {
-                                        for ranking in rankings {
-                                            let cmd = ranking.command;
-                                            if cmd.to_lowercase().starts_with(&cmd_lower)
-                                                && cmd != cmd_part
-                                                && !seen.contains(cmd.to_lowercase().as_str())
-                                                && !recent_failed.contains(&cmd)
-                                            {
-                                                seen.insert(cmd.to_lowercase().clone());
-                                                all_suggestions.push(cmd);
-                                            }
+                                    for cmd in rankings {
+                                        if cmd.to_lowercase().starts_with(&cmd_lower)
+                                            && cmd != cmd_part
+                                            && !seen.contains(cmd.to_lowercase().as_str())
+                                            && !recent_failed.contains(&cmd)
+                                        {
+                                            seen.insert(cmd.to_lowercase().clone());
+                                            all_suggestions.push(cmd);
                                         }
                                     }
                                 }

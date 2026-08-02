@@ -4,8 +4,9 @@ use rusterm_core::config::{
     BottomPanelTab, MAX_BOTTOM_PANEL_HEIGHT_PX, MIN_BOTTOM_PANEL_HEIGHT_PX,
 };
 
+use crate::components::SendPanel;
 use crate::components::TransfersPanel;
-use crate::state::SendTargetOption;
+use crate::state::{AppState, SendTargetOption};
 use crate::transfers::TransferJob;
 
 #[component]
@@ -18,6 +19,10 @@ pub fn BottomToolPanel(
     selected_target_ids: Vec<String>,
     shell_content: Option<Element>,
     transfer_jobs: Vec<TransferJob>,
+    /// App state, used by the Send sub-panel to query history-based
+    /// completions (SQLite frecency + DuckDB frequency). Passed straight
+    /// through to [`SendPanel`].
+    state: Signal<AppState>,
     on_height_change: EventHandler<u16>,
     on_tab_change: EventHandler<BottomPanelTab>,
     on_send: EventHandler<String>,
@@ -31,7 +36,6 @@ pub fn BottomToolPanel(
     on_clear_transfers: EventHandler<()>,
     on_close: EventHandler<()>,
 ) -> Element {
-    let mut command = use_signal(String::new);
     let mut live_height = use_signal(|| height_px);
     let mut resize_drag = use_signal(|| Option::<(f64, u16)>::None);
     let mut target_picker_open = use_signal(|| false);
@@ -164,41 +168,10 @@ pub fn BottomToolPanel(
 
             match active_tab {
                 BottomPanelTab::Send => rsx! {
-                    div {
-                        style: "flex:1;display:flex;gap:8px;padding:9px;min-height:0;",
-                        textarea {
-                            style: "min-width:0;flex:1;resize:none;background:var(--skin-surface);border:1px solid var(--skin-border);border-radius:4px;padding:8px 9px;color:var(--skin-text);font:12px ui-monospace,SFMono-Regular,Menlo,monospace;outline:none;",
-                            placeholder: "Command to send (Ctrl/Cmd+Enter to run)...",
-                            value: "{command}",
-                            oninput: move |event| command.set(event.value()),
-                            onkeydown: move |event: KeyboardEvent| {
-                                if matches!(event.key(), Key::Enter)
-                                    && (event.modifiers().ctrl() || event.modifiers().meta())
-                                {
-                                    event.prevent_default();
-                                    let value = command().trim().to_string();
-                                    if !value.is_empty() && has_targets {
-                                        on_send.call(value);
-                                        command.set(String::new());
-                                    }
-                                }
-                            },
-                        }
-                        div {
-                            style: "display:flex;flex-direction:column;justify-content:flex-end;gap:6px;",
-                            button {
-                                class: "workspace-primary-button",
-                                disabled: command().trim().is_empty() || !has_targets,
-                                onclick: move |_| {
-                                    let value = command().trim().to_string();
-                                    if !value.is_empty() && has_targets {
-                                        on_send.call(value);
-                                        command.set(String::new());
-                                    }
-                                },
-                                "Send ↵"
-                            }
-                        }
+                    SendPanel {
+                        state,
+                        has_targets,
+                        on_send: move |command: String| on_send.call(command),
                     }
                 },
                 BottomPanelTab::Shell => rsx! {

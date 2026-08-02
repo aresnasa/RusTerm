@@ -145,17 +145,18 @@ pub mod enabled {
         /// with `prefix`. Powers the history-based completion in the Send
         /// panel and strengthens terminal suggestions with pure-frequency
         /// data (as opposed to SQLite's frecency blend).
-        pub fn command_rankings_by_prefix(
-            &self,
-            prefix: &str,
-            limit: u32,
-        ) -> Result<Vec<rusterm_analytics::CommandRanking>> {
+        ///
+        /// Returns just the command strings (not the full `CommandRanking`
+        /// with success/failure counts) so the disabled-feature stub can
+        /// return the same type without depending on `rusterm-analytics`.
+        pub fn suggest_by_prefix(&self, prefix: &str, limit: u32) -> Result<Vec<String>> {
             self.ensure_open()?;
             let guard = self.inner.lock();
-            guard
+            let rankings = guard
                 .as_ref()
                 .context("analytics db not open")?
-                .command_rankings_by_prefix(prefix, limit)
+                .command_rankings_by_prefix(prefix, limit)?;
+            Ok(rankings.into_iter().map(|r| r.command).collect())
         }
 
         pub fn classify(&self) -> Result<Vec<CategoryCount>> {
@@ -290,14 +291,11 @@ pub mod disabled {
         }
 
         /// Feature-off stub: DuckDB is not compiled in, so there are no
-        /// frequency rankings. Returning an empty vec keeps call sites
-        /// (Send panel completion, terminal suggestion pipeline) working
-        /// without `#[cfg]` guards.
-        pub fn command_rankings_by_prefix(
-            &self,
-            _prefix: &str,
-            _limit: u32,
-        ) -> Result<Vec<rusterm_analytics::CommandRanking>> {
+        /// frequency rankings. Returns an empty vec so call sites (Send
+        /// panel completion, terminal suggestion pipeline) work without
+        /// `#[cfg]` guards. Note we return plain `String`s rather than a
+        /// `rusterm_analytics` type so this module stays DuckDB-free.
+        pub fn suggest_by_prefix(&self, _prefix: &str, _limit: u32) -> Result<Vec<String>> {
             Ok(Vec::new())
         }
     }
