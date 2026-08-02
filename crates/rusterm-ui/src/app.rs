@@ -10225,6 +10225,48 @@ fn open_connection(
             start_shell_connection(state, input_senders, tab_id.clone(), shell_config.clone());
             assigned
         }
+        ConnectionKind::Telnet(telnet_config) => {
+            state.write().sessions.push(SessionTab {
+                id: tab_id.clone(),
+                name: conn.name.clone(),
+                kind: SessionType::Telnet,
+                render_output: Default::default(),
+                version: 0,
+                suggestion: None,
+                suggestions: Vec::new(),
+                suggestion_corrections: std::collections::HashSet::new(),
+                suggestion_selected: 0,
+                suggestion_visible: false,
+                command_history: Vec::new(),
+                hostname: Some(format!("{}:{}", telnet_config.host, telnet_config.port)),
+                cwd: None,
+                last_command_status: CommandStatus::default(),
+            });
+            let assigned = assign_opened_session(&mut state.write(), target.as_ref(), &tab_id);
+            start_telnet_connection(state, input_senders, tab_id.clone(), telnet_config.clone());
+            assigned
+        }
+        ConnectionKind::Serial(serial_config) => {
+            state.write().sessions.push(SessionTab {
+                id: tab_id.clone(),
+                name: conn.name.clone(),
+                kind: SessionType::Serial,
+                render_output: Default::default(),
+                version: 0,
+                suggestion: None,
+                suggestions: Vec::new(),
+                suggestion_corrections: std::collections::HashSet::new(),
+                suggestion_selected: 0,
+                suggestion_visible: false,
+                command_history: Vec::new(),
+                hostname: Some(serial_config.port.clone()),
+                cwd: None,
+                last_command_status: CommandStatus::default(),
+            });
+            let assigned = assign_opened_session(&mut state.write(), target.as_ref(), &tab_id);
+            start_serial_connection(state, input_senders, tab_id.clone(), serial_config.clone());
+            assigned
+        }
         _ => {
             let msg = format!(
                 "\r\n{}\r\n",
@@ -10333,6 +10375,12 @@ fn reconnect_session(
         }
         ConnectionKind::Shell(shell_config) => {
             start_shell_connection(state, input_senders, tab_id, shell_config);
+        }
+        ConnectionKind::Telnet(telnet_config) => {
+            start_telnet_connection(state, input_senders, tab_id, telnet_config);
+        }
+        ConnectionKind::Serial(serial_config) => {
+            start_serial_connection(state, input_senders, tab_id, serial_config);
         }
         _ => {
             state
