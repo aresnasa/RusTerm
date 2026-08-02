@@ -140,6 +140,24 @@ pub mod enabled {
                 .collect())
         }
 
+        /// Prefix-filtered command rankings from DuckDB — the user's
+        /// most-used commands (by total observation count) whose text starts
+        /// with `prefix`. Powers the history-based completion in the Send
+        /// panel and strengthens terminal suggestions with pure-frequency
+        /// data (as opposed to SQLite's frecency blend).
+        pub fn command_rankings_by_prefix(
+            &self,
+            prefix: &str,
+            limit: u32,
+        ) -> Result<Vec<rusterm_analytics::CommandRanking>> {
+            self.ensure_open()?;
+            let guard = self.inner.lock();
+            guard
+                .as_ref()
+                .context("analytics db not open")?
+                .command_rankings_by_prefix(prefix, limit)
+        }
+
         pub fn classify(&self) -> Result<Vec<CategoryCount>> {
             self.ensure_open()?;
             let guard = self.inner.lock();
