@@ -9156,6 +9156,276 @@ fn start_shell_connection(
     }
 }
 
+/// Start a serial-port connection.
+///
+/// Serial lines are synchronous (the `serialport` crate is a blocking API),
+/// so `SerialConnection::open` spawns its own reader/writer threads
+/// internally. We just wire the resulting session's channels into the app
+/// state and run the standard event-receive loop to forward output to the
+/// terminal model.
+///
+/// Failure to open the device (wrong path, permissions, device unplugged)
+/// emits a `Disconnected` event with the error message so the user sees a
+/// actionable message in the terminal instead of a silent failure.
+fn start_serial_connection(
+    mut state: Signal<AppState>,
+    mut input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    tab_id: String,
+    serial_config: SerialConfig,
+) {
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+
+    // `SerialConnection::open` is synchronous (blocking) because the
+    // `serialport` crate's `open()` does device probing that can briefly
+    // stall. Wrap it in `spawn_blocking` so the dioxus render loop never
+    // stalls on a missing device.
+    let open_cfg = serial_config.clone();
+    let open_sid = tab_id.clone();
+    spawn(async move {
+        let open_result = tokio::task::spawn_blocking(move || {
+            rusterm_proto::SerialConnection::open(&open_cfg, open_sid, event_tx)
+        })
+        .await;
+
+        match open_result {
+            Ok(Ok(session)) => {
+                {
+                    let mut app = state.write();
+                    app.session_connection_states
+                        .insert(tab_id.clone(), SessionConnectionState::Connected);
+                }
+                input_senders
+                    .write()
+                    .insert(tab_id.clone(), session.input_tx.clone());
+                state
+                    .write()
+                    .close_senders
+                    .push((tab_id.clone(), session.close_tx.clone()));
+                state
+                    .write()
+                    .resize_senders
+                    .insert(tab_id.clone(), session.resize_tx.clone());
+                if let Some(handle) = state.read().terminals.get(&tab_id) {
+                    let mut entry = handle.lock();
+                    entry.terminal.set_input_sender(session.input_tx.clone());
+                }
+                let _session_guard = session;
+
+                // Standard event-receive loop: forward SessionEvent::Output
+                // to the terminal model. Disconnected / Error events flip
+                // the connection state and render a reconnect hint.
+                while let Some(event) = event_rx.recv().await {
+                    match event {
+                        SessionEvent::Output(id, data) => {
+                            {
+                                let logs = state.read().session_logs.clone();
+                                if let Some(log) = logs.get(&id) {
+                                    log.lock().log_output(&data);
+                                }
+                            }
+                            let terminals = state.read().terminals.clone();
+                            if let Some(handle) = terminals.get(&id) {
+                                let render_result = {
+                                    let mut entry = handle.lock();
+                                    entry.process_and_render(&data)
+                                };
+                                let mut s = state.write();
+                                if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
+                                    tab.render_output = render_result;
+                                    tab.version += 1;
+                                }
+                            }
+                        }
+                        SessionEvent::Disconnected(id, reason) => {
+                            tracing::info!(
+                                "[SERIAL] session={} disconnected: {}",
+                                &id[..id.len().min(8)],
+                                reason
+                            );
+                            let failed = crate::i18n::t("session.disconnected_short");
+                            let reconnect = crate::i18n::t("session.reconnect_hint");
+                            let msg = format!("\r\n{failed}\r\n{reconnect}\r\n");
+                            let terminals = state.read().terminals.clone();
+                            if let Some(handle) = terminals.get(&id) {
+                                let render_result =
+                                    handle.lock().process_and_render(msg.as_bytes());
+                                let mut s = state.write();
+                                s.session_connection_states
+                                    .insert(id.clone(), SessionConnectionState::Disconnected);
+                                if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
+                                    tab.render_output = render_result;
+                                    tab.version += 1;
+                                }
+                            }
+                            break;
+                        }
+                        SessionEvent::Error(id, msg) => {
+                            tracing::warn!(
+                                "[SERIAL] session={} error: {}",
+                                &id[..id.len().min(8)],
+                                msg
+                            );
+                            let terminals = state.read().terminals.clone();
+                            if let Some(handle) = terminals.get(&id) {
+                                let render_result = handle
+                                    .lock()
+                                    .process_and_render(format!("\r\n{}\r\n", msg).as_bytes());
+                                let mut s = state.write();
+                                if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
+                                    tab.render_output = render_result;
+                                    tab.version += 1;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Err(e)) => {
+                let msg = format!("\r\nSerial open failed: {}\r\n", e);
+                let terminals = state.read().terminals.clone();
+                if let Some(handle) = terminals.get(&tab_id) {
+                    let render_result = handle.lock().process_and_render(msg.as_bytes());
+                    let mut s = state.write();
+                    s.session_connection_states
+                        .insert(tab_id.clone(), SessionConnectionState::Disconnected);
+                    if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == tab_id) {
+                        tab.render_output = render_result;
+                        tab.version += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::error!("[SERIAL] spawn_blocking panicked: {}", e);
+            }
+        }
+    });
+}
+
+/// Start a telnet connection.
+///
+/// Telnet runs on the Tokio runtime (`TcpStream` is async-native). The
+/// event-receive loop mirrors `start_serial_connection` — only the connect
+/// step differs.
+fn start_telnet_connection(
+    mut state: Signal<AppState>,
+    mut input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    tab_id: String,
+    telnet_config: TelnetConfig,
+) {
+    let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
+    spawn(async move {
+        match rusterm_proto::TelnetConnection::connect(&telnet_config, tab_id.clone(), event_tx)
+            .await
+        {
+            Ok(session) => {
+                {
+                    let mut app = state.write();
+                    app.session_connection_states
+                        .insert(tab_id.clone(), SessionConnectionState::Connected);
+                }
+                input_senders
+                    .write()
+                    .insert(tab_id.clone(), session.input_tx.clone());
+                state
+                    .write()
+                    .close_senders
+                    .push((tab_id.clone(), session.close_tx.clone()));
+                state
+                    .write()
+                    .resize_senders
+                    .insert(tab_id.clone(), session.resize_tx.clone());
+                if let Some(handle) = state.read().terminals.get(&tab_id) {
+                    let mut entry = handle.lock();
+                    entry.terminal.set_input_sender(session.input_tx.clone());
+                }
+                let _session_guard = session;
+
+                while let Some(event) = event_rx.recv().await {
+                    match event {
+                        SessionEvent::Output(id, data) => {
+                            {
+                                let logs = state.read().session_logs.clone();
+                                if let Some(log) = logs.get(&id) {
+                                    log.lock().log_output(&data);
+                                }
+                            }
+                            let terminals = state.read().terminals.clone();
+                            if let Some(handle) = terminals.get(&id) {
+                                let render_result = {
+                                    let mut entry = handle.lock();
+                                    entry.process_and_render(&data)
+                                };
+                                let mut s = state.write();
+                                if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
+                                    tab.render_output = render_result;
+                                    tab.version += 1;
+                                }
+                            }
+                        }
+                        SessionEvent::Disconnected(id, reason) => {
+                            tracing::info!(
+                                "[TELNET] session={} disconnected: {}",
+                                &id[..id.len().min(8)],
+                                reason
+                            );
+                            let failed = crate::i18n::t("session.disconnected_short");
+                            let reconnect = crate::i18n::t("session.reconnect_hint");
+                            let msg = format!("\r\n{failed}\r\n{reconnect}\r\n");
+                            let terminals = state.read().terminals.clone();
+                            if let Some(handle) = terminals.get(&id) {
+                                let render_result =
+                                    handle.lock().process_and_render(msg.as_bytes());
+                                let mut s = state.write();
+                                s.session_connection_states
+                                    .insert(id.clone(), SessionConnectionState::Disconnected);
+                                if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
+                                    tab.render_output = render_result;
+                                    tab.version += 1;
+                                }
+                            }
+                            break;
+                        }
+                        SessionEvent::Error(id, msg) => {
+                            tracing::warn!(
+                                "[TELNET] session={} error: {}",
+                                &id[..id.len().min(8)],
+                                msg
+                            );
+                            let terminals = state.read().terminals.clone();
+                            if let Some(handle) = terminals.get(&id) {
+                                let render_result = handle
+                                    .lock()
+                                    .process_and_render(format!("\r\n{}\r\n", msg).as_bytes());
+                                let mut s = state.write();
+                                if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
+                                    tab.render_output = render_result;
+                                    tab.version += 1;
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Err(e) => {
+                let msg = format!("\r\nTelnet connect failed: {}\r\n", e);
+                let terminals = state.read().terminals.clone();
+                if let Some(handle) = terminals.get(&tab_id) {
+                    let render_result = handle.lock().process_and_render(msg.as_bytes());
+                    let mut s = state.write();
+                    s.session_connection_states
+                        .insert(tab_id.clone(), SessionConnectionState::Disconnected);
+                    if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == tab_id) {
+                        tab.render_output = render_result;
+                        tab.version += 1;
+                    }
+                }
+            }
+        }
+    });
+}
+
 fn build_ssh_auth(form: &NewConnectionForm) -> SshAuth {
     match form.auth_type.as_str() {
         "key" => SshAuth::Key {

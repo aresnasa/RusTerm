@@ -325,6 +325,11 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
 
         // ── session.* — session/disconnect messages ─────────────────────
         "session.disconnected" => ("Session disconnected: {reason}", "会话已断开：{reason}"),
+        "session.disconnected_short" => ("Disconnected", "已断开"),
+        "session.reconnect_hint" => (
+            "Press Enter or right-click to reconnect",
+            "按 Enter 或右键重新连接",
+        ),
         "session.command_not_sent" => (
             "Target session unavailable, command not sent",
             "目标会话不可用，命令未发送",
@@ -336,9 +341,68 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
             "提示：从 {path} 读取到 {count} 个主机配置",
         ),
         "connection.identity_files_hint" => (
-            "Found {count} private key file(s) in ~/.ssh/",
+            "Found {count} private key file(s) in ~/ssh/",
             "提示：从 ~/.ssh/ 找到 {count} 个私钥文件",
         ),
+        // ── connection.* — quick-entry / protocol tabs / serial fields ───
+        "connection.quick_entry_label" => ("Quick entry", "快速录入"),
+        "connection.quick_entry_help" => (
+            "Paste user@host -p 22, host:port, or telnet://host:23 — fields below auto-fill.",
+            "粘贴 user@host -p 22、host:port 或 telnet://host:23，下方字段会自动填充。",
+        ),
+        "connection.serial_device" => ("Device", "设备路径"),
+        "connection.serial_ports_hint" => {
+            ("Found {count} serial port(s)", "检测到 {count} 个可用串口")
+        }
+        "connection.baud_rate" => ("Baud rate", "波特率"),
+        "connection.data_bits" => ("Data bits", "数据位"),
+        "connection.parity" => ("Parity", "校验"),
+        "connection.stop_bits" => ("Stop bits", "停止位"),
+        "connection.flow_control" => ("Flow control", "流控"),
+        "connection.host" => ("Host", "主机"),
+        "connection.port" => ("Port", "端口"),
+        "connection.name" => ("Name", "名称"),
+        "connection.name_placeholder" => ("My connection", "我的连接"),
+        "connection.group" => ("Group", "分组"),
+        "connection.username" => ("Username", "用户名"),
+        "connection.password" => ("Password", "密码"),
+        "connection.key" => ("Key", "密钥"),
+        "connection.agent" => ("Agent", "代理"),
+        "connection.authentication" => ("Authentication", "认证方式"),
+        "connection.private_key_path" => ("Private key path", "私钥路径"),
+        "connection.passphrase_optional" => ("Passphrase (optional)", "口令（可选）"),
+        "connection.passphrase_placeholder" => ("passphrase", "口令"),
+        "connection.password_placeholder" => ("password", "密码"),
+        "connection.password_keep_placeholder" => {
+            ("leave blank to keep current", "留空则保留原密码")
+        }
+        "connection.agent_hint" => (
+            "Will use keys loaded in ssh-agent (SSH_AUTH_SOCK).",
+            "使用 ssh-agent（SSH_AUTH_SOCK）中已加载的密钥。",
+        ),
+        "connection.proxy" => ("Proxy", "代理"),
+        "connection.proxy_direct" => ("Direct (no proxy)", "直连（无代理）"),
+        "connection.proxy_host" => ("Proxy host", "代理主机"),
+        "connection.proxy_username_optional" => ("Proxy username (optional)", "代理用户名（可选）"),
+        "connection.proxy_password_optional" => ("Proxy password (optional)", "代理密码（可选）"),
+        "connection.proxy_help" => (
+            "HTTPS means TLS to the proxy then HTTP CONNECT to the SSH target.",
+            "HTTPS 表示先与代理建立 TLS，再通过 HTTP CONNECT 到达 SSH 目标。",
+        ),
+        "connection.terminal_type" => ("Terminal type", "终端类型"),
+        "connection.onekey_connect" => ("One-Key Connect", "一键连接"),
+        "connection.onekey_hint" => (
+            "Auto-fill sudo / su passwords via a popup when prompted.",
+            "遇到 sudo / su 密码提示时自动通过弹窗填充。",
+        ),
+        "connection.login_script_label" => ("Login script (optional)", "登录脚本（可选）"),
+        "connection.login_script_help" => (
+            "expect/send lines to run after login. See docs for grammar.",
+            "登录后执行的 expect/send 脚本，语法见文档。",
+        ),
+        "connection.new_title" => ("New connection", "新建连接"),
+        "connection.edit_title" => ("Edit connection", "编辑连接"),
+        "connection.connect" => ("Connect", "连接"),
 
         // ── terminal_search.* — terminal find/selection tools ────────────
         "terminal_search.find" => ("Find", "查找"),
