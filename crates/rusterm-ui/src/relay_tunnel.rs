@@ -228,8 +228,8 @@ impl RelayRuntime {
 
 /// Build the tunnel manager for this app session and load `tunnels.json`.
 /// Does NOT start any tunnel — call `autostart` after connections load.
-pub fn init_tunnel_manager(state: Signal<AppState>) -> Arc<TunnelManager> {
-    let connector = Arc::new(AppTunnelConnector::new(state));
+pub fn init_tunnel_manager() -> Arc<TunnelManager> {
+    let connector = Arc::new(AppTunnelConnector);
     let manager = TunnelManager::with_runtime(connector, runtime_handle());
     if let Err(e) = manager.load_from_disk() {
         tracing::warn!("[tunnel] failed to load tunnels.json: {e:#}");
@@ -239,15 +239,14 @@ pub fn init_tunnel_manager(state: Signal<AppState>) -> Arc<TunnelManager> {
 
 /// Start the relay with the given config. Errors are returned as strings
 /// for direct display in the UI (e.g. "port already in use").
-pub fn start_relay(state: Signal<AppState>) -> Result<(), String> {
-    let (config, runtime) = {
-        let s = state.read();
-        (s.relay_config.clone(), s.relay_runtime.clone())
-    };
+pub fn start_relay(
+    config: rusterm_relay::RelayConfig,
+    runtime: RelayRuntime,
+) -> Result<(), String> {
     if runtime.is_running() {
         return Ok(());
     }
-    let executor: Arc<dyn RelayExecutor> = Arc::new(AppRelayExecutor::new(state));
+    let executor: Arc<dyn RelayExecutor> = Arc::new(AppRelayExecutor);
     let handle = runtime_handle();
     let (result_tx, result_rx) = std::sync::mpsc::channel::<anyhow::Result<RelayHandle>>();
     handle.spawn(async move {
@@ -273,10 +272,9 @@ pub fn start_relay(state: Signal<AppState>) -> Result<(), String> {
 /// not awaited synchronously — dropping the oneshot inside `shutdown()` is
 /// enough to stop accepting connections, and the serving task exits on its
 /// own within milliseconds.
-pub fn stop_relay(state: Signal<AppState>) {
+pub fn stop_relay(runtime: RelayRuntime) {
     let relay = {
-        let s = state.read();
-        let Ok(mut guard) = s.relay_runtime.0.write() else {
+        let Ok(mut guard) = runtime.0.write() else {
             return;
         };
         guard.take()
