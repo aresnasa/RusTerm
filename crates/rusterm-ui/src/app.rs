@@ -257,10 +257,12 @@ mod drain_output_batch_tests {
         assert_eq!(batch, b"initial");
     }
 
-    /// The batch must stop growing at `MAX_OUTPUT_BATCH_BYTES` even if the
-    /// channel has more data available. This is the memory-safety ceiling that
-    /// prevents a single coalesced `process` call from ingesting an unbounded
-    /// amount of data.
+    /// The batch must stop growing at roughly `MAX_OUTPUT_BATCH_BYTES` even
+    /// if the channel has more data available. Because `drain_output_batch`
+    /// checks the cap *before* appending a chunk (it can't split an SSH
+    /// message mid-flight), the batch can overshoot by at most one chunk.
+    /// This is the memory-safety ceiling that prevents a single coalesced
+    /// `process` call from ingesting an unbounded amount of data.
     #[test]
     fn caps_batch_at_max_bytes() {
         let (tx, mut rx) = mpsc::unbounded_channel::<SessionEvent>();
@@ -274,14 +276,18 @@ mod drain_output_batch_tests {
         let mut batch = Vec::new();
         let pending = drain_output_batch(&mut rx, "s1", &mut batch);
 
+        // The cap is checked *before* appending, so the batch may overshoot
+        // by at most one chunk (100_000 bytes). Anything beyond that means
+        // the cap check is broken and the batch grows unbounded.
         assert!(
-            batch.len() <= MAX_OUTPUT_BATCH_BYTES,
-            "batch {} must not exceed cap {}",
+            batch.len() <= MAX_OUTPUT_BATCH_BYTES + chunk.len(),
+            "batch {} must not exceed cap {} + one chunk ({})",
             batch.len(),
-            MAX_OUTPUT_BATCH_BYTES
+            MAX_OUTPUT_BATCH_BYTES,
+            chunk.len()
         );
         assert!(
-            batch.len() > MAX_OUTPUT_BATCH_BYTES - 100_000,
+            batch.len() > MAX_OUTPUT_BATCH_BYTES,
             "batch should have consumed at least one full chunk past the cap boundary"
         );
         // There's still data in the channel — the next drain_output_batch call
