@@ -47,15 +47,16 @@ use crate::state::{
     AppState, Modal, OneKeyMatch, OneKeyPopupState, OneKeySubmissionFeedback,
     PendingCommandPayload, PendingDangerousCommand, SessionConnectionState, SessionTab,
     TabDropOutcome, TerminalEntry, UnlockState, activate_session, append_pane_to_active,
-    begin_floating_pane_move, clear_terminal_command_lines, close_pane, close_session,
-    close_workspace, command_send_targets, distribute_sessions_across_panes, enqueue_pending_exit,
-    execute_tab_drop_on_pane, execute_tab_drop_on_pane_at, focus_pane_for_layout,
-    focused_pane_session, move_floating_pane_for_active, move_session_to_leftmost,
-    prepare_split_for_sidebar_drop, prepare_split_for_sidebar_drop_at, push_workspace_tab,
-    resize_layout_split, rollback_pending_exit, scroll_sync_targets, set_active_tab,
-    set_pane_session_for_layout, source_pane_for_copy, suppress_comparison_diff_warning,
-    toggle_comparison_mode, toggle_pane_zoom, toggle_split_mode, track_terminal_input,
-    tracked_terminal_command,
+    available_send_targets, begin_floating_pane_move, clear_terminal_command_lines, close_pane,
+    close_session, close_workspace, command_send_targets, distribute_sessions_across_panes,
+    enqueue_pending_exit, execute_tab_drop_on_pane, execute_tab_drop_on_pane_at,
+    focus_pane_for_layout, focused_pane_session, invert_send_targets,
+    move_floating_pane_for_active, move_session_to_leftmost, prepare_split_for_sidebar_drop,
+    prepare_split_for_sidebar_drop_at, push_workspace_tab, resize_layout_split,
+    rollback_pending_exit, scroll_sync_targets, select_all_send_targets, selected_send_target_ids,
+    set_active_tab, set_pane_session_for_layout, set_send_target_selected, source_pane_for_copy,
+    suppress_comparison_diff_warning, toggle_comparison_mode, toggle_pane_zoom, toggle_split_mode,
+    track_terminal_input, tracked_terminal_command,
 };
 use crate::transfers::{FileEndpoint, TransferJob, TransferRequest};
 
@@ -325,19 +326,20 @@ fn render_workspace_dock_panel(
                 PanelId::Transfers => BottomPanelTab::Transfers,
                 _ => unreachable!(),
             };
-            let target_label = {
+            let (target_options, selected_target_ids, target_label) = {
                 let app = state.read();
-                let targets = command_send_targets(&app);
-                match targets.as_slice() {
-                    [] => "No active session".to_string(),
-                    [session_id] => app
-                        .sessions
+                let options = available_send_targets(&app);
+                let selected = selected_send_target_ids(&app);
+                let label = match selected.as_slice() {
+                    [] => "None".to_string(),
+                    [session_id] => options
                         .iter()
-                        .find(|session| &session.id == session_id)
-                        .map(|session| session.name.clone())
-                        .unwrap_or_else(|| "Focused session".to_string()),
-                    _ => format!("{} synchronized sessions", targets.len()),
-                }
+                        .find(|target| &target.session_id == session_id)
+                        .map(|target| target.label.clone())
+                        .unwrap_or_else(|| "Connected session".to_string()),
+                    _ => format!("{} sessions", selected.len()),
+                };
+                (options, selected, label)
             };
             let shell_content = (panel == PanelId::EmbeddedShell)
                 .then(|| state.read().bottom_shell_session_id.clone())
@@ -349,6 +351,8 @@ fn render_workspace_dock_panel(
                     embedded: true,
                     active_tab,
                     target_label,
+                    target_options,
+                    selected_target_ids,
                     shell_content,
                     transfer_jobs: state.read().transfers.jobs.clone(),
                     on_height_change: move |_| {},
@@ -363,9 +367,25 @@ fn render_workspace_dock_panel(
                         });
                     },
                     on_send: move |command: String| {
-                        let sent = send_workspace_command(&state, &input_senders, &command);
+                        let targets = selected_send_target_ids(&state.read());
+                        let sent = request_command_submission(
+                            state,
+                            input_senders,
+                            command,
+                            targets,
+                            PendingCommandPayload::FullLine,
+                        );
                         tracing::info!("[SEND-PANEL] queued command for {} session(s)", sent);
                         restore_focus_to_active_session(state, 50);
+                    },
+                    on_target_toggle: move |(session_id, selected): (String, bool)| {
+                        let _ = set_send_target_selected(&mut state.write(), &session_id, selected);
+                    },
+                    on_select_all_targets: move |_| {
+                        select_all_send_targets(&mut state.write());
+                    },
+                    on_invert_targets: move |_| {
+                        invert_send_targets(&mut state.write());
                     },
                     on_open_shell: move |_| open_bottom_shell(state, input_senders),
                     on_terminate_shell: move |_| {

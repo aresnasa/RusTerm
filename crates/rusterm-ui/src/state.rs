@@ -266,6 +266,11 @@ pub struct AppState {
     /// while preserving the same session id and pane assignment.
     #[serde(skip)]
     pub session_connection_states: HashMap<String, SessionConnectionState>,
+    /// Explicit target selection for the docked Send panel. `None` preserves
+    /// the legacy initial behavior (focused pane / active tab); after the user
+    /// changes the selection, `Some` keeps that choice stable across renders.
+    #[serde(skip)]
+    pub send_target_selection: Option<HashSet<String>>,
     /// Authenticated SSH control sessions keyed by terminal session id. These
     /// handles are reused to open independent SFTP subsystem channels.
     #[serde(skip)]
@@ -453,6 +458,12 @@ pub enum SessionConnectionState {
     Reconnecting,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SendTargetOption {
+    pub session_id: String,
+    pub label: String,
+}
+
 /// Non-secret lifecycle state for a submitted OneKey credential.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OneKeySubmissionFeedback {
@@ -595,6 +606,7 @@ impl Default for AppState {
             onekey_skip_logged: HashSet::new(),
             session_configs: HashMap::new(),
             session_connection_states: HashMap::new(),
+            send_target_selection: None,
             ssh_sessions: HashMap::new(),
             sftp_clients: HashMap::new(),
             transfers: crate::transfers::TransferState::default(),
@@ -1564,6 +1576,81 @@ pub fn command_send_targets(state: &AppState) -> Vec<String> {
         .unwrap_or_default()
 }
 
+/// Sessions that can currently receive a command from the docked Send panel.
+/// Connecting, disconnected, and embedded-shell sessions are deliberately
+/// excluded: Send is for authenticated workspace terminals only.
+pub fn available_send_targets(state: &AppState) -> Vec<SendTargetOption> {
+    state
+        .sessions
+        .iter()
+        .filter(|session| {
+            state.session_connection_states.get(&session.id)
+                == Some(&SessionConnectionState::Connected)
+                && state.bottom_shell_session_id.as_deref() != Some(session.id.as_str())
+        })
+        .map(|session| SendTargetOption {
+            session_id: session.id.clone(),
+            label: session.name.clone(),
+        })
+        .collect()
+}
+
+/// Effective Send-panel targets in stable session order. Before the first
+/// explicit selection change, this is the legacy focused/comparison target.
+pub fn selected_send_target_ids(state: &AppState) -> Vec<String> {
+    let available = available_send_targets(state);
+    let selected = state
+        .send_target_selection
+        .clone()
+        .unwrap_or_else(|| command_send_targets(state).into_iter().collect());
+
+    available
+        .into_iter()
+        .filter(|target| selected.contains(&target.session_id))
+        .map(|target| target.session_id)
+        .collect()
+}
+
+pub fn set_send_target_selected(state: &mut AppState, session_id: &str, selected: bool) -> bool {
+    if !available_send_targets(state)
+        .iter()
+        .any(|target| target.session_id == session_id)
+    {
+        return false;
+    }
+
+    let mut selection: HashSet<String> = selected_send_target_ids(state).into_iter().collect();
+    if selected {
+        selection.insert(session_id.to_string());
+    } else {
+        selection.remove(session_id);
+    }
+    state.send_target_selection = Some(selection);
+    true
+}
+
+pub fn select_all_send_targets(state: &mut AppState) -> usize {
+    let selection: HashSet<String> = available_send_targets(state)
+        .into_iter()
+        .map(|target| target.session_id)
+        .collect();
+    let count = selection.len();
+    state.send_target_selection = Some(selection);
+    count
+}
+
+pub fn invert_send_targets(state: &mut AppState) -> usize {
+    let selected: HashSet<String> = selected_send_target_ids(state).into_iter().collect();
+    let selection: HashSet<String> = available_send_targets(state)
+        .into_iter()
+        .map(|target| target.session_id)
+        .filter(|session_id| !selected.contains(session_id))
+        .collect();
+    let count = selection.len();
+    state.send_target_selection = Some(selection);
+    count
+}
+
 /// Get the list of sessions whose terminals should move in response to a
 /// wheel event from `source_session_id`.
 ///
@@ -2224,6 +2311,9 @@ pub fn close_session(
         .onekey_skip_logged
         .retain(|(session_id, _)| session_id != id);
     state.session_connection_states.remove(id);
+    if let Some(selection) = state.send_target_selection.as_mut() {
+        selection.remove(id);
+    }
     state.session_configs.remove(id);
     state.pending_exit_check.remove(id);
     state.terminal_command_lines.remove(id);
@@ -3849,6 +3939,8 @@ mod tests {
         state
             .session_connection_states
             .insert("alpha".to_string(), SessionConnectionState::default());
+        state.send_target_selection =
+            Some(HashSet::from(["alpha".to_string(), "beta".to_string()]));
         state
             .pending_exit_check
             .insert("alpha".to_string(), VecDeque::new());
@@ -3862,6 +3954,12 @@ mod tests {
         assert!(!state.terminals.contains_key("alpha"));
         assert!(!state.onekey_popups.contains_key("alpha"));
         assert!(!state.session_connection_states.contains_key("alpha"));
+        assert!(
+            !state
+                .send_target_selection
+                .as_ref()
+                .is_some_and(|selection| selection.contains("alpha"))
+        );
         assert!(!state.session_configs.contains_key("alpha"));
         assert!(!state.pending_exit_check.contains_key("alpha"));
     }
@@ -4578,6 +4676,87 @@ mod tests {
         assert!(toggle_comparison_mode(&mut state).unwrap());
 
         assert_eq!(command_send_targets(&state), vec!["alpha", "beta"]);
+    }
+
+    #[test]
+    fn send_targets_initially_select_only_the_active_connected_session() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        for session_id in ["alpha", "beta"] {
+            state
+                .session_connection_states
+                .insert(session_id.to_string(), SessionConnectionState::Connected);
+        }
+
+        assert_eq!(selected_send_target_ids(&state), vec!["alpha"]);
+    }
+
+    #[test]
+    fn send_targets_support_select_all_and_invert() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma"]);
+        for session_id in ["alpha", "beta", "gamma"] {
+            state
+                .session_connection_states
+                .insert(session_id.to_string(), SessionConnectionState::Connected);
+        }
+
+        assert_eq!(select_all_send_targets(&mut state), 3);
+        assert_eq!(
+            selected_send_target_ids(&state),
+            vec!["alpha", "beta", "gamma"]
+        );
+        assert_eq!(invert_send_targets(&mut state), 0);
+        assert!(selected_send_target_ids(&state).is_empty());
+        assert_eq!(invert_send_targets(&mut state), 3);
+        assert_eq!(
+            selected_send_target_ids(&state),
+            vec!["alpha", "beta", "gamma"]
+        );
+    }
+
+    #[test]
+    fn send_targets_filter_disconnected_closed_and_embedded_shell_sessions() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma", "shell"]);
+        state
+            .session_connection_states
+            .insert("alpha".to_string(), SessionConnectionState::Connected);
+        state
+            .session_connection_states
+            .insert("beta".to_string(), SessionConnectionState::Disconnected);
+        state
+            .session_connection_states
+            .insert("gamma".to_string(), SessionConnectionState::Reconnecting);
+        state
+            .session_connection_states
+            .insert("shell".to_string(), SessionConnectionState::Connected);
+        state.bottom_shell_session_id = Some("shell".to_string());
+
+        assert_eq!(
+            available_send_targets(&state),
+            vec![SendTargetOption {
+                session_id: "alpha".to_string(),
+                label: "alpha".to_string(),
+            }]
+        );
+
+        select_all_send_targets(&mut state);
+        state.sessions.retain(|session| session.id != "alpha");
+        assert!(selected_send_target_ids(&state).is_empty());
+    }
+
+    #[test]
+    fn explicit_empty_send_selection_stays_empty_when_active_session_changes() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        for session_id in ["alpha", "beta"] {
+            state
+                .session_connection_states
+                .insert(session_id.to_string(), SessionConnectionState::Connected);
+        }
+
+        assert!(set_send_target_selected(&mut state, "alpha", false));
+        state.active_session = Some("beta".to_string());
+        state.active_tab = Some("beta".to_string());
+
+        assert!(selected_send_target_ids(&state).is_empty());
     }
 
     #[test]
