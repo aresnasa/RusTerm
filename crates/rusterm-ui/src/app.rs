@@ -10,8 +10,9 @@ use tokio_util::sync::CancellationToken;
 use rusterm_core::LoginStep;
 use rusterm_core::config::{
     BottomPanelTab, ConnectionConfig, ConnectionGroup, ConnectionKind, DockZone, KeybindingAction,
-    Keybindings, OneKey, OneKeyStep, PanelId, ProxyConfig, ProxyKind, RightPanelTab, ShellConfig,
-    SidebarPreferences, SkinSettings, SshAuth, SshConfig, WorkspacePreferences,
+    Keybindings, OneKey, OneKeyStep, PanelId, ProxyConfig, ProxyKind, RightPanelTab, SerialConfig,
+    ShellConfig, SidebarPreferences, SkinSettings, SshAuth, SshConfig, TelnetConfig,
+    WorkspacePreferences,
 };
 use rusterm_core::config_manager::ConfigManager;
 use rusterm_core::event::SessionEvent;
@@ -9287,36 +9288,71 @@ fn build_proxy_config(form: &NewConnectionForm) -> Option<ProxyConfig> {
 }
 
 /// Rebuild a `ConnectionConfig` from an edit-dialog form, preserving the
-/// original id and fields the dialog doesn't expose (`tags`, `proxy_jump`, and
-/// `keepalive_interval`). For non-SSH kinds, preserve the whole protocol config.
+/// original id and fields the dialog doesn't expose (`tags`, `proxy_jump`,
+/// and `keepalive_interval`).
+///
+/// The form's `protocol` field drives which kind is rebuilt:
+/// - When it matches the original kind (e.g. SSH tab editing an SSH
+///   connection), the kind is rebuilt from the form fields.
+/// - When the user switched protocol tabs (e.g. SSH tab while editing a
+///   Telnet connection), the new kind is built from the form and the old
+///   kind's protocol-specific fields are discarded — this is the expected
+///   behavior when the user explicitly changes the connection type.
+/// - For Shell/Tcp (which the dialog doesn't expose), the whole kind is
+///   preserved unchanged.
 fn rebuild_connection(original: &ConnectionConfig, form: &NewConnectionForm) -> ConnectionConfig {
+    // Decide which kind to build. For Shell/Tcp we preserve the original
+    // (the dialog doesn't expose those tabs); for SSH/Telnet/Serial we
+    // rebuild from the form's active protocol tab.
     let kind = match &original.kind {
-        ConnectionKind::Ssh(ssh) => {
-            let port: u16 = form.port.parse().unwrap_or(22);
-            let auth = build_ssh_auth(form);
-            let terminal_type = if form.terminal_type.is_empty() {
-                "xterm-256color".to_string()
-            } else {
-                form.terminal_type.clone()
-            };
-            ConnectionKind::Ssh(SshConfig {
-                host: form.host.clone(),
-                port,
-                username: form.username.clone(),
-                auth,
-                terminal_type,
-                proxy: build_proxy_config(form),
-                proxy_jump: ssh.proxy_jump.clone(),
-                keepalive_interval: ssh.keepalive_interval,
-                host_key_policy: ssh.host_key_policy.clone(),
-            })
-        }
-        other => other.clone(),
+        ConnectionKind::Shell(_) | ConnectionKind::Tcp(_) => original.kind.clone(),
+        _ => match form.protocol.as_str() {
+            "telnet" => ConnectionKind::Telnet(build_telnet_config_from_form(form)),
+            "serial" => ConnectionKind::Serial(build_serial_config_from_form(form)),
+            _ => {
+                // SSH tab. Preserve protocol-specific fields the dialog
+                // doesn't expose (proxy_jump, keepalive_interval,
+                // host_key_policy) when the original was also SSH.
+                let (proxy_jump, keepalive_interval, host_key_policy) =
+                    if let ConnectionKind::Ssh(ssh) = &original.kind {
+                        (
+                            ssh.proxy_jump.clone(),
+                            ssh.keepalive_interval,
+                            ssh.host_key_policy.clone(),
+                        )
+                    } else {
+                        (None, None, rusterm_core::config::default_host_key_policy())
+                    };
+                let port: u16 = form.port.parse().unwrap_or(22);
+                let auth = build_ssh_auth(form);
+                let terminal_type = if form.terminal_type.is_empty() {
+                    "xterm-256color".to_string()
+                } else {
+                    form.terminal_type.clone()
+                };
+                ConnectionKind::Ssh(SshConfig {
+                    host: form.host.clone(),
+                    port,
+                    username: form.username.clone(),
+                    auth,
+                    terminal_type,
+                    proxy: build_proxy_config(form),
+                    proxy_jump,
+                    keepalive_interval,
+                    host_key_policy,
+                })
+            }
+        },
     };
     ConnectionConfig {
         id: original.id.clone(),
         name: if form.name.is_empty() {
-            format!("{}@{}", form.username, form.host)
+            match &kind {
+                ConnectionKind::Ssh(ssh) => format!("{}@{}", ssh.username, ssh.host),
+                ConnectionKind::Telnet(t) => format!("telnet {}:{}", t.host, t.port),
+                ConnectionKind::Serial(s) => format!("serial {}@{}", s.baud_rate, s.port),
+                _ => original.name.clone(),
+            }
         } else {
             form.name.clone()
         },
@@ -12315,34 +12351,27 @@ pub fn App() -> Element {
                 modal.set(Modal::None);
             },
             on_create: move |form: NewConnectionForm| {
-                let port: u16 = form.port.parse().unwrap_or(22);
-                let auth = build_ssh_auth(&form);
-                let terminal_type = if form.terminal_type.is_empty() {
-                    "xterm-256color".to_string()
-                } else {
-                    form.terminal_type.clone()
-                };
-
-                let ssh_config = SshConfig {
-                    host: form.host.clone(),
-                    port,
-                    username: form.username.clone(),
-                    auth,
-                    terminal_type,
-                    proxy: build_proxy_config(&form),
-                    proxy_jump: None,
-                    keepalive_interval: None,
-                    host_key_policy: rusterm_core::config::default_host_key_policy(),
-                };
+                let (kind, session_type, hostname_for_tab) = build_connection_from_form(&form);
 
                 let config = ConnectionConfig {
                     id: uuid::Uuid::new_v4().to_string(),
                     name: if form.name.is_empty() {
-                        format!("{}@{}", form.username, form.host)
+                        match &kind {
+                            ConnectionKind::Ssh(ssh) => {
+                                format!("{}@{}", ssh.username, ssh.host)
+                            }
+                            ConnectionKind::Telnet(telnet) => {
+                                format!("telnet {}:{}", telnet.host, telnet.port)
+                            }
+                            ConnectionKind::Serial(serial) => {
+                                format!("serial {}@{}", serial.baud_rate, serial.port)
+                            }
+                            _ => "new connection".to_string(),
+                        }
                     } else {
                         form.name.clone()
                     },
-                    kind: ConnectionKind::Ssh(ssh_config.clone()),
+                    kind: kind.clone(),
                     group: form.group_id.clone(),
                     tags: vec![],
                     onekey: form.onekey,
@@ -12380,7 +12409,7 @@ pub fn App() -> Element {
                     s.sessions.push(SessionTab {
                         id: config.id.clone(),
                         name: config.name.clone(),
-                        kind: SessionType::Ssh,
+                        kind: session_type,
                         render_output,
                         version: 1,
                         suggestion: None,
@@ -12389,7 +12418,7 @@ pub fn App() -> Element {
                         suggestion_selected: 0,
                         suggestion_visible: false,
                         command_history: Vec::new(),
-                        hostname: Some(ssh_config.host.clone()),
+                        hostname: hostname_for_tab,
                         cwd: None,
                         last_command_status: CommandStatus::default(),
                     });
@@ -12399,7 +12428,23 @@ pub fn App() -> Element {
                 save_config(&state);
                 modal.set(Modal::None);
 
-                start_ssh_connection(state, input_senders, config.id, ssh_config);
+                // Dispatch the connection-start coroutine for the right kind.
+                // Each `start_*_connection` fn owns its own I/O lifecycle.
+                match &kind {
+                    ConnectionKind::Ssh(ssh_config) => {
+                        start_ssh_connection(state, input_senders, config.id, ssh_config.clone());
+                    }
+                    ConnectionKind::Telnet(telnet_config) => {
+                        start_telnet_connection(state, input_senders, config.id, telnet_config.clone());
+                    }
+                    ConnectionKind::Serial(serial_config) => {
+                        start_serial_connection(state, input_senders, config.id, serial_config.clone());
+                    }
+                    _ => {
+                        // Shell/Tcp aren't created via this dialog; fall back to
+                        // the not-supported branch in open_connection.
+                    }
+                }
             },
             on_edit: move |(id, form): (String, NewConnectionForm)| {
                 // Edit mode: find the original connection, rebuild it from the
