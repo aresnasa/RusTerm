@@ -388,3 +388,52 @@ The `drag_over_pane` signal is shared between `single_pane_with_drop` and `multi
 - `assets/AppIcon.icns` is the checked-in Dioxus bundle icon. `crates/rusterm-app/Dioxus.toml` declares `com.rusterm.app`, the ICNS icon, `../../assets` as the asset directory, and macOS metadata.
 - `scripts/bundle-macos.sh` creates and ad-hoc signs `dist/RusTerm.app`; it includes `Contents/Resources/AppIcon.icns`, the source SVG at `Contents/Resources/assets/gemini-svg.svg`, and an `Info.plist` with `CFBundleIconFile=AppIcon.icns`.
 - `scripts/verify-macos-bundle.sh` is the deterministic regression loop for bundle structure, plist metadata, ICNS format, SVG byte equality, executable permissions, and signature. `scripts/update-macos-icon.sh` refreshes the checked-in ICNS after SVG changes.
+
+## Usage-habits collection + login scripts + privacy export (Task #64, 2026-08-02)
+
+**Goal**: opt-in local usage-habit learning (DuckDB ranking of success/failure), per-connection login initialization scripts (expect/send DSL), a privacy toggle with explicit disclosure, and a privacy-safe JSON export. All credential material is sanitized before reaching the local store; nothing is ever auto-uploaded.
+
+### Privacy sanitizer (`rusterm-analytics/src/sanitize.rs`, NEW)
+- `pub fn contains_sensitive_material(text: &str) -> bool` — PEM private-key blocks, AWS `AKIA…`, `Authorization:` headers, ssh private-key material.
+- `pub fn sanitize_command(text: &str) -> Option<String>` — `None` drops the whole line (PEM block, AKIA key); otherwise redacts secret VALUES to `***` for: env assignments whose name matches `password|passwd|secret|token|api[-_]?key|private[-_]?key` (case-insensitive), long flags `--password=`/`--token=`/etc., `Authorization:` header values, glued `-p<secret>` ONLY for `mysql`/`mysqldump`/`psql`/`mongo`, 32+ hex / 40+ base64url bare tokens. `ssh-rsa`/`ssh-ed25519`/`ecdsa` PUBLIC key blobs are preserved (they are not secret).
+- **Wired into storage as defense-in-depth**: `AnalyticsDB::record_command` and `record_command_correction` call `sanitize_command` on insert — `None` ⇒ silent skip (`Ok(())`), `Some(redacted)` ⇒ persist the redacted form. So even if a caller forgets to gate, no secret reaches DuckDB.
+- 20 unit tests in `sanitize.rs`; `record_command` skip/redact behavior covered in lib.rs tests.
+
+### Habit-ranking APIs (`rusterm-analytics/src/lib.rs`)
+- `pub struct CommandRanking { command, successes, failures }` with `total()` and `success_rate()`.
+- `AnalyticsDB::command_rankings(limit: u32)` — per-full-command success/failure counts, most-used first; NULL-exit-code rows excluded from both buckets.
+- `AnalyticsDB::high_failure_commands(max_success_rate: f64, min_observations: u64, limit: u32)` — frequently-failed commands (observations ≥ min AND success_rate ≤ max), worst first. Intended for downgrading risky suggestions (not yet wired into the suggestion query — future work).
+- `AnalyticsDB::all_command_corrections()` — every typo→correction pair, most-observed first. Used by the export path.
+- analytics tests: 15 → 43.
+
+### Login-script DSL (`rusterm-core/src/login_script.rs`, NEW)
+- `pub enum LoginStep { Expect{pattern}, Send{text}, SendOneKey{name}, Delay{ms} }` — `SendOneKey` resolves its credential at runtime from the unlocked OneKey library; the script text itself never contains a password.
+- `pub fn parse_login_script(script: &str) -> Result<Vec<LoginStep>, LoginScriptError>` — line-based: `expect <regex>`, `send <text>`, `send_onekey <name>`, `delay <ms>`, `#` comments + blank lines ignored. `LoginScriptError` carries 1-based line number + offending text + reason.
+- `ConnectionConfig` and `PersistedConnection` gained `#[serde(default)] pub login_script: Option<String>` (raw DSL text); legacy settings.json deserializes with `None`. `ConfigManager` threads it through `encrypt_connection`/`decrypt_connection`.
+- 12 parser tests + 2 serde tests + 1 config_manager roundtrip test. core tests: 152 → 168.
+
+### Login-script runtime (`rusterm-ui/src/state.rs` + `app.rs`)
+- `LoginScriptRuntime { steps, idx, send_buffer, done, wait_started: Option<Instant> }` in `state.rs`; `AppState.login_scripts: HashMap<String, LoginScriptRuntime>` (serde-skip). One test pins the per-session map lifecycle.
+- Pure evaluator `login_script_evaluate(steps, idx, output_tail, onekeys) -> LoginScriptEvaluation { Advance{actions,next_idx} | Wait | Finished }` in `app.rs`. Eagerly consumes consecutive Send/SendOneKey/Delay after a matched Expect; `SendOneKey` resolves from `state.onekeys` (locked library ⇒ skip step, not abort).
+- `drive_login_script(state, input_senders, session_id, data)` — called from BOTH SSH and shell `SessionEvent::Output` handlers right after `check_onekey_match`. Lazily parses `session_configs[session_id].login_script` on first output; feeds the stripped last non-empty line (`login_script_output_tail`, mirrors OneKey's prompt extraction); executes sends via `input_senders` (appends `\r`); `Delay` blocks the spawned task (capped at 2000ms); per-Expect timeout `LOGIN_SCRIPT_EXPECT_TIMEOUT_SECS = 30` aborts stuck scripts. Runtime removed on session disconnect.
+- Connection dialog (`connection_dialog.rs`) gained a `login_script: String` field on `NewConnectionForm` + a textarea (with DSL hint + "never paste passwords here" note). `on_create`/`on_edit` in `app.rs` propagate the form value (`None` when empty).
+
+### Usage-habits opt-in toggle + privacy disclosure
+- `PersistedConfig.collect_usage_habits: bool` (serde default **false** — opt-in). `ConfigManager::load_usage_habits_enabled()` / `save_usage_habits_enabled(bool)` (read-modify-write, mirrors `save_suggestion_settings`). Threaded through ALL 10 `save_*` PersistedConfig constructions + `read_persisted` default.
+- `AppState.collect_usage_habits: bool` (serde-skip; loaded at startup alongside suggestion settings). Default `false`.
+- **Gating**: the 4 analytics recording spawns (2× `record_command` on rc==0, 2× `record_command_correction` on accepted typo) are wrapped in `if state.read().collect_usage_habits { ... }`. When off, no analytics task is spawned at all (the `#[cfg(feature="analytics")]` block inside is empty when the feature is off, so this compiles in both configs).
+- Settings dialog (`settings_dialog.rs`) gained a "Usage habits & privacy / 使用习惯与隐私" section: a checkbox + a disclosure box listing **what is collected** (command name + category, success/failure counts, hourly distribution, typo→correction pairs, distinct-host count) and **what is never collected** (passwords, passphrases, private keys, API tokens, OneKey credential values, env var values, remote output, full command args when a credential flag is detected). Bilingual (EN + 中文). Save/Reset buttons thread the toggle.
+
+### Privacy-safe JSON export
+- `AnalyticsHandle::build_usage_habits_report() -> Result<UsageHabitsReport>` (feature-gated). `UsageHabitsReport` (in `analytics.rs`) carries only aggregated fields: `generated_at`, `total_commands`, `classifications`, `hourly_usage`, `prefix_success_rates`, `typo_corrections`. The disabled-feature stub returns an empty report (just `generated_at`) so call sites compile without DuckDB.
+- The export re-runs `sanitize_command` on every `typo_corrections` row as defense-in-depth (the storage layer already sanitized on insert).
+- Settings dialog "Export privacy-safe report (JSON)" button (disabled when collection is off) fires `on_export_usage_habits`, which spawns `build_usage_habits_report` + `serde_json::to_string_pretty` + `std::fs::write` to `~/Downloads/rusterm-usage-habits-<timestamp>.json`. **No automatic upload** — the disclosure text states the user pastes the file into their uploader of choice (GitHub Gist / object storage) with their own token; RusTerm never transmits anything automatically.
+
+### Workspace note (IMPORTANT)
+- An external process periodically rewrites+commits the working tree (commits like `fix rusterm`, `Update *.rs`). Uncommitted edits get clobbered on each cycle (~1-2 min). Lesson: **commit immediately after a green test run**, or accept that work may need redoing. All Task #64 work is in commit `5da72ff` (HEAD as of 2026-08-02 12:15).
+- Test totals: rusterm-analytics 43, rusterm-core 168, rusterm-ui 524 (default) / 523 (`--features analytics`). Workspace `cargo test --workspace` = all green, 0 failures.
+
+### Future work (not done in #64)
+- Wire `high_failure_commands` into the suggestion query to downgrade/remove risky suggestions (the SQLite `HAVING` clause already filters fully-failed commands; this would additionally suppress commands with low success rate but ≥1 success).
+- Native Gist upload via `reqwest` (the handoff suggested it; v1 ships file export only to keep the dependency surface unchanged and to avoid auto-transmission).
+- A dedicated analytics panel UI (the `behavior_summary` API has been ready since 2026-07-18; no panel exists yet).
