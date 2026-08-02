@@ -1131,11 +1131,13 @@ pub fn TerminalView(
     #[props(default)]
     suggestion_max_rows: usize,
 ) -> Element {
+    let _lang = crate::i18n::LANGUAGE();
     let mut focused = use_signal(|| false);
     let mut search_visible = use_signal(|| false);
     let mut search_query = use_signal(String::new);
     let mut search_match_index = use_signal(|| 0usize);
-    let mut search_matches: Signal<Vec<(usize, usize)>> = use_signal(Vec::new);
+    let mut search_matches: Signal<Vec<SearchMatch>> = use_signal(Vec::new);
+    let mut search_highlight_pinned = use_signal(|| false);
 
     // ── Mouse selection & reporting state ──
     let mut selection: Signal<Option<TextSelection>> = use_signal(|| None);
