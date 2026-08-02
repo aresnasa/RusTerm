@@ -8249,6 +8249,7 @@ fn start_ssh_connection(
                                 }
                             }
                             check_onekey_match(state, &id, &data);
+                            drive_login_script(state, input_senders, &id, &data);
                         }
                         SessionEvent::Disconnected(id, reason) => {
                             {
