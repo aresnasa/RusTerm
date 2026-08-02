@@ -284,36 +284,36 @@ async fn fetch_send_completions(state: &Signal<AppState>, prefix: &str) -> Vec<S
         .unwrap_or_default()
         .join("rusterm")
         .join("rusterm.db");
-    if let Ok(db) = rusterm_db::Database::open(Some(db_path)).await {
-        if let Ok(results) = db.search_history(prefix, sug_count * 2).await {
-            for entry in results {
-                if entry.command.to_lowercase().starts_with(&prefix_lower)
-                    && entry.command != prefix
-                    && !seen.contains(&entry.command.to_lowercase())
-                    && !recent_failed.contains(&entry.command)
-                {
-                    seen.insert(entry.command.to_lowercase());
-                    all.push(entry.command);
-                }
+    if let Ok(db) = rusterm_db::Database::open(Some(db_path)).await
+        && let Ok(results) = db.search_history(prefix, sug_count * 2).await
+    {
+        for entry in results {
+            if entry.command.to_lowercase().starts_with(&prefix_lower)
+                && entry.command != prefix
+                && !seen.contains(&entry.command.to_lowercase())
+                && !recent_failed.contains(&entry.command)
+            {
+                seen.insert(entry.command.to_lowercase());
+                all.push(entry.command);
             }
         }
     }
 
     // 2. DuckDB pure-frequency (analytics mirror). No-op when the analytics
     //    feature is off (returns an empty vec).
-    if all.len() < sug_count {
-        if let Ok(rankings) = analytics.suggest_by_prefix(prefix, (sug_count * 2) as u32) {
-            for cmd in rankings {
-                if cmd.to_lowercase().starts_with(&prefix_lower)
-                    && cmd != prefix
-                    && !seen.contains(&cmd.to_lowercase())
-                    && !recent_failed.contains(&cmd)
-                {
-                    seen.insert(cmd.to_lowercase());
-                    all.push(cmd);
-                    if all.len() >= sug_count {
-                        break;
-                    }
+    if all.len() < sug_count
+        && let Ok(rankings) = analytics.suggest_by_prefix(prefix, (sug_count * 2) as u32)
+    {
+        for cmd in rankings {
+            if cmd.to_lowercase().starts_with(&prefix_lower)
+                && cmd != prefix
+                && !seen.contains(&cmd.to_lowercase())
+                && !recent_failed.contains(&cmd)
+            {
+                seen.insert(cmd.to_lowercase());
+                all.push(cmd);
+                if all.len() >= sug_count {
+                    break;
                 }
             }
         }
