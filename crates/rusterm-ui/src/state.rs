@@ -366,6 +366,15 @@ pub struct AppState {
     /// Maximum number of suggestion items shown in the dropdown (3, 5, or 10).
     /// Persisted in settings.json. Default 3 for a compact popup.
     pub suggestion_count: u8,
+    /// Whether local usage-habit statistics are collected (opt-in via the
+    /// settings dialog; persisted in settings.json). When false, analytics
+    /// recording is a no-op even when the `analytics` feature is compiled in.
+    #[serde(skip)]
+    pub collect_usage_habits: bool,
+    /// Per-session login-initialization script runtimes (see `LoginScriptRuntime`).
+    /// Keyed by session id; removed when the script finishes or the session closes.
+    #[serde(skip)]
+    pub login_scripts: std::collections::HashMap<String, LoginScriptRuntime>,
     /// Whether the close-confirmation dialog is currently visible. This is a
     /// transient UI flag (not persisted) — it's set by the `CloseRequested`
     /// wry event handler and cleared by the dialog's "取消" / "确认" buttons.
@@ -661,6 +670,8 @@ impl Default for AppState {
             comparison_diff_warning_enabled: true,
             suggestion_enabled: true,
             suggestion_count: 3,
+            collect_usage_habits: false,
+            login_scripts: std::collections::HashMap::new(),
             close_dialog_visible: false,
             close_dialog_dont_ask_again: true,
             pending_dangerous_command: None,
@@ -3979,6 +3990,7 @@ mod tests {
                 group: None,
                 tags: Vec::new(),
                 onekey: false,
+                login_script: None,
             },
         );
         state
@@ -6776,4 +6788,69 @@ pub enum Modal {
     OneKeyManager,
     Tunnels,
     Relay,
+}
+
+/// Runtime progress of a per-connection login initialization script (the
+/// expect/send DSL parsed by `rusterm_core::parse_login_script`). Steps are
+/// driven from the session-output path in `app.rs`: whenever new PTY output
+/// arrives, the driver re-evaluates the current `Expect` step against the
+/// last non-empty output line and emits sends/delays until the script ends.
+///
+/// The struct holds NO plaintext credential longer than the send itself —
+/// `SendOneKey` steps resolve their value from the unlocked OneKey library at
+/// send time, and the resolved value is cleared from `send_buffer` right
+/// after it is queued to the PTY.
+#[derive(Debug, Clone)]
+pub struct LoginScriptRuntime {
+    /// Parsed steps, in order.
+    pub steps: Vec<rusterm_core::LoginStep>,
+    /// Index of the step currently being waited on (an `Expect`, `Send`,
+    /// `SendOneKey` or `Delay`). Steps after a matched Expect are executed
+    /// eagerly until the next Expect or the end of the script.
+    pub idx: usize,
+    /// Non-empty while a `Delay { ms }` is being executed asynchronously —
+    /// the remaining sends/delays queued for when the sleep ends.
+    pub send_buffer: std::collections::VecDeque<String>,
+    /// Whether the script has finished (all steps consumed) or been aborted
+    /// (timeout / unresolvable reference).
+    pub done: bool,
+    /// Timeout marker: when the current Expect started waiting. `None` before
+    /// the first wait. Used by the driver to abort a stuck script after
+    /// `LOGIN_SCRIPT_EXPECT_TIMEOUT_SECS`.
+    pub wait_started: Option<std::time::Instant>,
+}
+
+#[cfg(test)]
+mod login_script_runtime_tests {
+    use super::*;
+
+    /// The per-session runtime map is empty on a fresh state and can hold one
+    /// runtime per session id; a finished runtime stays `done` even if more
+    /// output arrives.
+    #[test]
+    fn login_scripts_map_lifecycle_is_per_session() {
+        let mut state = AppState::default();
+        assert!(state.login_scripts.is_empty());
+        state.login_scripts.insert(
+            "sess-1".to_string(),
+            LoginScriptRuntime {
+                steps: vec![
+                    rusterm_core::LoginStep::Expect {
+                        pattern: r"password:".to_string(),
+                    },
+                    rusterm_core::LoginStep::SendOneKey {
+                        name: "root".to_string(),
+                    },
+                ],
+                idx: 0,
+                send_buffer: Default::default(),
+                done: false,
+                wait_started: None,
+            },
+        );
+        assert_eq!(state.login_scripts["sess-1"].steps.len(), 2);
+        state.login_scripts.get_mut("sess-1").unwrap().done = true;
+        state.login_scripts.remove("sess-1");
+        assert!(state.login_scripts.is_empty());
+    }
 }

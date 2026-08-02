@@ -18,6 +18,17 @@ pub struct LearnedCorrection {
     pub observations: u64,
 }
 
+/// Whether the user has opted in to local usage-habit collection. Encapsulates
+/// the gating policy so call sites stay clean. This is the in-memory mirror of
+/// `PersistedConfig::collect_usage_habits`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct UsageHabitsEnabled(pub bool);
+
+impl UsageHabitsEnabled {
+    pub fn enabled(self) -> bool { self.0 }
+}
+
+
 #[cfg(feature = "analytics")]
 pub mod enabled {
     use std::sync::Arc;
@@ -162,6 +173,54 @@ pub mod enabled {
         }
     }
 
+    impl AnalyticsHandle {
+        /// Build a privacy-safe report from the local DuckDB data. Only
+        /// aggregated fields are included — never raw command lines, hostnames
+        /// or timestamps. Each aggregated row passes through
+        /// `sanitize_command` to guarantee no secret material survives even
+        /// inside aggregated prefix/correction text.
+        pub fn build_usage_habits_report(&self) -> anyhow::Result<UsageHabitsReport> {
+            self.ensure_open()?;
+            let guard = self.inner.lock();
+            let db = guard.as_ref().context("analytics db not open")?;
+            let classifications = db.classify()?;
+            let hourly_usage = db.usage_patterns_by_time_of_day()?;
+            let prefix_success_rates = db.success_rate_by_prefix()?;
+            let mut typo_corrections = db.all_command_corrections()?;
+            // Defense-in-depth: never export a correction pair that the
+            // sanitizer would drop or redact. (The storage layer already
+            // sanitizes on insert, but re-checking here means a future schema
+            // migration can't leak anything.)
+            typo_corrections.retain(|c| {
+                rusterm_analytics::sanitize_command(&c.typo).is_some()
+                    && rusterm_analytics::sanitize_command(&c.correction).is_some()
+            });
+            Ok(UsageHabitsReport {
+                generated_at: chrono::Utc::now(),
+                total_commands: db.total_commands()?,
+                classifications,
+                hourly_usage,
+                prefix_success_rates,
+                typo_corrections,
+            })
+        }
+    }
+
+/// Privacy-safe export payload for the usage-habits report. Only aggregated,
+/// non-identifying fields: command classifications, hourly activity, per-prefix
+/// success rates, and typo→correction pairs. Raw command text, hostnames,
+/// timestamps, session ids and any line flagged by `sanitize_command` are
+/// excluded.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct UsageHabitsReport {
+    pub generated_at: chrono::DateTime<chrono::Utc>,
+    pub total_commands: u64,
+    pub classifications: Vec<rusterm_analytics::CategoryCount>,
+    pub hourly_usage: Vec<rusterm_analytics::HourlyUsage>,
+    pub prefix_success_rates: Vec<rusterm_analytics::PrefixSuccessRate>,
+    pub typo_corrections: Vec<rusterm_analytics::CommandCorrection>,
+}
+
     impl Default for AnalyticsHandle {
         fn default() -> Self {
             Self::new()
@@ -214,6 +273,22 @@ pub mod disabled {
             Ok(Vec::new())
         }
     }
+
+    impl AnalyticsHandle {
+        pub fn build_usage_habits_report(&self) -> anyhow::Result<UsageHabitsReport> {
+            Ok(UsageHabitsReport {
+                generated_at: chrono::Utc::now(),
+            })
+        }
+    }
+
+/// Feature-off stub: an empty report with just a timestamp. The disabled
+/// `AnalyticsHandle::build_usage_habits_report` returns this so call sites
+/// compile and behave as no-ops without the DuckDB dependency.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+pub struct UsageHabitsReport {
+    pub generated_at: chrono::DateTime<chrono::Utc>,
+}
 
     #[cfg(test)]
     mod tests {

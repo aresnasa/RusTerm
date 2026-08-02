@@ -24,6 +24,9 @@ pub struct NewConnectionForm {
     pub proxy_password: String,
     pub group_id: Option<String>,
     pub onekey: bool,
+    /// Raw login-script DSL text (expect/send/send_onekey/delay lines).
+    /// Empty string means "no script". Only meaningful for SSH/Shell kinds.
+    pub login_script: String,
 }
 
 const TERMINAL_TYPES: &[&str] = &[
@@ -114,7 +117,8 @@ fn form_from_connection(c: &ConnectionConfig) -> NewConnectionForm {
                 proxy_password,
                 group_id: c.group.clone(),
                 onekey: c.onekey,
-            }
+                    login_script: c.login_script.clone().unwrap_or_default(),
+    }
         }
         // Non-SSH connections can still be renamed / onekey-toggled; the SSH
         // fields are irrelevant and ignored on save (kind is preserved).
@@ -122,6 +126,7 @@ fn form_from_connection(c: &ConnectionConfig) -> NewConnectionForm {
             name: c.name.clone(),
             group_id: c.group.clone(),
             onekey: c.onekey,
+            login_script: String::new(),
             ..default_form()
         },
     }
@@ -323,6 +328,30 @@ pub fn ConnectionDialog(
                             label { style: "font-size: 12px; color: #9ece6a; cursor: pointer; pointer-events: none;", "One-Key Connect" }
                             span { style: "font-size: 11px; color: #565f89; line-height: 1.4; pointer-events: none;",
                                 "Auto-suggest a matching OneKey credential when this host asks for a password." }
+                        }
+                    }
+
+                    // Login initialization script (expect/send DSL). Optional; only
+                    // SSH and Shell connections run it after login. See
+                    // rusterm_core::parse_login_script for the grammar.
+                    div {
+                        style: "display: flex; flex-direction: column; gap: 4px; margin-top: 8px;",
+                        label {
+                            style: "font-size: 12px; color: #565f89;",
+                            "Login script (optional, expect/send DSL)"
+                        }
+                        textarea {
+                            style: "background: #1a1b26; border: 1px solid #2a2b3d; border-radius: 4px; padding: 8px; color: #c0caf5; font-size: 12px; font-family: 'JetBrains Mono', monospace; outline: none; min-height: 80px; resize: vertical;",
+                            placeholder: "expect [sudo] password for alice: $
+send_onekey prod-sudo
+send source /etc/profile.d/prod.sh
+delay 250",
+                            value: "{form().login_script}",
+                            oninput: move |e| form.write().login_script = e.value(),
+                        }
+                        span {
+                            style: "font-size: 10px; color: #565f89; line-height: 1.4;",
+                            "Lines: expect <regex> | send <text> | send_onekey <name> | delay <ms>. Credentials are resolved from your unlocked OneKey library — never paste passwords here."
                         }
                     }
 
@@ -738,6 +767,7 @@ mod tests {
             group: None,
             tags: vec![],
             onekey: false,
+            login_script: String::new(),
         };
 
         let form = form_from_connection(&connection);

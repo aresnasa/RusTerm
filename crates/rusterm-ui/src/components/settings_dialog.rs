@@ -51,6 +51,16 @@ pub fn SettingsDialog(
     #[props(default)] on_save_keybindings: EventHandler<Keybindings>,
     #[props(default)] skin: SkinSettings,
     #[props(default)] on_save_skin: EventHandler<SkinSettings>,
+    /// Whether local usage-habit collection is enabled (opt-in).
+    #[props(default)]
+    usage_habits_enabled: bool,
+    /// Fires with the new enabled state when the user toggles the checkbox.
+    #[props(default)]
+    on_save_usage_habits: EventHandler<bool>,
+    /// Fires when the user clicks "Export privacy-safe report". The handler
+    /// in app.rs builds the JSON report and writes it to the downloads dir.
+    #[props(default)]
+    on_export_usage_habits: EventHandler<()>,
 ) -> Element {
     let mut draft = use_signal(|| appearance.normalized());
     let preview = draft().normalized();
@@ -64,6 +74,7 @@ pub fn SettingsDialog(
     let mut sug_enabled = use_signal(|| suggestion_enabled);
     let mut sug_count = use_signal(|| suggestion_count);
     let mut comparison_warning_enabled = use_signal(|| comparison_diff_warning_enabled);
+    let mut usage_habits = use_signal(|| usage_habits_enabled);
     let mut keybinding_draft = use_signal(|| keybindings.normalized());
     let mut skin_draft = use_signal(|| skin.normalized());
     let skin_preview = skin_draft().palette();
@@ -324,6 +335,63 @@ pub fn SettingsDialog(
                     }
                 }
 
+                // ── Usage habits (privacy) ────────────────────────────────
+                h3 {
+                    style: "margin: 24px 0 6px; font-size: 16px;",
+                    "Usage habits & privacy / 使用习惯与隐私"
+                }
+                p {
+                    style: "margin: 0 0 12px; color: var(--settings-text-muted); font-size: 12px; line-height: 1.5;",
+                    "Opt in to local command-habit learning. Data stays on this machine in a local DuckDB file unless you explicitly export it below."
+                }
+                div {
+                    style: "display: flex; align-items: center; justify-content: space-between; gap: 16px;",
+                    label {
+                        style: "font-size: 12px; color: var(--settings-text);",
+                        "Collect usage habits / 收集使用习惯"
+                    }
+                    div {
+                        style: "display: flex; align-items: center; gap: 8px;",
+                        input {
+                            r#type: "checkbox",
+                            checked: "{usage_habits()}",
+                            style: "width: 16px; height: 16px; cursor: pointer; accent-color: var(--settings-accent);",
+                            onchange: move |e| usage_habits.set(e.checked()),
+                        }
+                        span {
+                            style: "font-size: 11px; color: var(--settings-text-muted);",
+                            {usage_habits().then_some("ON").unwrap_or("OFF")}
+                        }
+                    }
+                }
+                div {
+                    style: "background: var(--settings-bg); border: 1px solid var(--settings-border); border-radius: 6px; padding: 12px; margin-top: 8px; font-size: 11px; color: var(--settings-text-muted); line-height: 1.6;",
+                    div { style: "color: var(--settings-text); font-weight: 600; margin-bottom: 6px;", "What is collected / 收集内容" }
+                    div { "• Command name + first-token category (git, docker, kubectl, …)" }
+                    div { "• Success / failure counts and per-hour activity distribution" }
+                    div { "• Typo → correction pairs that you accept (e.g. dockre → docker)" }
+                    div { "• Number of distinct hosts (hostnames are NOT stored)" }
+                    div { style: "color: var(--settings-text); font-weight: 600; margin: 10px 0 6px;", "Never collected / 绝不收集" }
+                    div { "• Passwords, passphrases, private keys, API tokens, bearer tokens" }
+                    div { "• OneKey credential values or expect-matched secret responses" }
+                    div { "• Environment variable values, remote command output, session content" }
+                    div { "• Full command arguments when a credential flag is detected (the whole line is dropped or the value redacted to ***)" }
+                    div { style: "margin-top: 10px; color: var(--settings-text-muted);", "Secret material is filtered by a dedicated sanitizer before anything reaches the local DuckDB store. Turning this off stops all future collection; existing local data is retained until you clear it." }
+                }
+                div {
+                    style: "display: flex; gap: 8px; margin-top: 10px;",
+                    button {
+                        style: "background: var(--settings-bg); border: 1px solid var(--settings-border-strong); color: var(--settings-text); border-radius: 4px; padding: 6px 12px; cursor: pointer; font-size: 11px;",
+                        disabled: "{!usage_habits()}",
+                        onclick: move |_| on_export_usage_habits.call(()),
+                        "Export privacy-safe report (JSON)"
+                    }
+                }
+                div {
+                    style: "font-size: 10px; color: var(--settings-text-muted); margin-top: 6px; line-height: 1.5;",
+                    "Export writes an aggregated, sanitized JSON file (no raw commands, no hostnames, no timestamps beyond the report generation time) to your downloads directory. Upload to GitHub Gist or object storage is a manual next step — paste the token into your uploader of choice; RusTerm never transmits anything automatically."
+                }
+
                 h3 {
                     style: "margin: 24px 0 6px; font-size: 16px;",
                     "Keyboard shortcuts"
@@ -427,6 +495,7 @@ pub fn SettingsDialog(
                             sug_enabled.set(true);
                             sug_count.set(3);
                             comparison_warning_enabled.set(true);
+                            usage_habits.set(false);
                             keybinding_draft.set(Keybindings::default());
                             skin_draft.set(SkinSettings::default());
                             capturing_keybinding.set(None);
@@ -449,6 +518,7 @@ pub fn SettingsDialog(
                                 on_save_comparison_diff_warning.call(comparison_warning_enabled());
                                 on_save_keybindings.call(keybinding_draft().normalized());
                                 on_save_skin.call(skin_draft().normalized());
+                                on_save_usage_habits.call(usage_habits());
                             },
                             "Save"
                         }

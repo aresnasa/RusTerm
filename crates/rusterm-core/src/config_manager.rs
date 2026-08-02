@@ -485,7 +485,15 @@ impl ConfigManager {
             skin: existing.skin,
             collect_usage_habits: enabled,
         };
-        self.write_persisted(persisted)
+
+        let json =
+            serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
+
+        let temp_path = self.config_path.with_extension("json.tmp");
+        fs::write(&temp_path, &json).context("Failed to write config file")?;
+        fs::rename(&temp_path, &self.config_path).context("Failed to rename temp config file")?;
+
+        Ok(())
     }
 
     /// Persist the suggestion-popup settings to settings.json. Preserves all

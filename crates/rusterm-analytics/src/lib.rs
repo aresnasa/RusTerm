@@ -308,6 +308,31 @@ impl AnalyticsDB {
         Ok(rows)
     }
 
+    /// Every recorded typo → correction pair, sorted by observation count
+    /// (most observed first) and then by recency. Used by the privacy-safe
+    /// export path (`UsageHabitsReport`). Rows are passed through the
+    /// sanitizer at insert time as well, so this should never contain secret
+    /// material; the export layer re-checks defensively.
+    pub fn all_command_corrections(&self) -> Result<Vec<CommandCorrection>> {
+        let conn = self.conn.lock();
+        let mut statement = conn.prepare(
+            "SELECT typo, correction, observations, last_seen
+             FROM command_corrections
+             ORDER BY observations DESC, last_seen DESC, typo ASC, correction ASC",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok(CommandCorrection {
+                    typo: row.get(0)?,
+                    correction: row.get(1)?,
+                    observations: row.get::<_, i64>(2)? as u64,
+                    last_seen: row.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Total row count in the `commands` table. Used by tests and the
     /// behavior summary.
     pub fn total_commands(&self) -> Result<u64> {

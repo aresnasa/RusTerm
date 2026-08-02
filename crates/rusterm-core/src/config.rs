@@ -1862,6 +1862,7 @@ mod tests {
             workspace: WorkspacePreferences::default(),
             keybindings: Keybindings::default(),
             skin: SkinSettings::default(),
+            collect_usage_habits: false,
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: PersistedConfig = serde_json::from_str(&json).unwrap();

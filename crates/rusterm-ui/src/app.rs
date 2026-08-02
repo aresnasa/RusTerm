@@ -13,6 +13,7 @@ use rusterm_core::config::{
     SidebarPreferences, SkinSettings, SshAuth, SshConfig, WorkspacePreferences,
 };
 use rusterm_core::config_manager::ConfigManager;
+use rusterm_core::LoginStep;
 use rusterm_core::event::SessionEvent;
 use rusterm_core::session::SessionType;
 use rusterm_core::session_log::SessionLog;
@@ -107,6 +108,249 @@ fn save_workspace_preferences(state: &Signal<AppState>) {
     };
     if let Err(error) = config_manager.save_workspace_preferences(&preferences) {
         tracing::error!("Failed to save workspace preferences: {}", error);
+    }
+}
+
+/// Maximum wall-clock seconds a single `expect` step of a login script may
+/// wait for its pattern to appear before the script is aborted. Keeps a
+/// misconfigured expect from silently hanging the session initialization.
+const LOGIN_SCRIPT_EXPECT_TIMEOUT_SECS: u64 = 30;
+
+/// One discrete action the login-script driver queues for the PTY. Emitted by
+/// `login_script_evaluate` and consumed by `drive_login_script`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LoginScriptAction {
+    /// Send this literal text. The driver appends a carriage return before
+    /// writing to the PTY (expect/send semantics).
+    Send(String),
+    /// Sleep this many milliseconds before the next action.
+    DelayMs(u64),
+}
+
+/// Pure (no-I/O) evaluation of the current position in a login script.
+#[derive(Debug, PartialEq)]
+enum LoginScriptEvaluation {
+    /// Perform these actions, then set `idx` to `next_idx` (the index of the
+    /// next `Expect` step, or `steps.len()` if the script ends).
+    Advance { actions: Vec<LoginScriptAction>, next_idx: usize },
+    /// The current step is an Expect that has not matched yet. Stay put and
+    /// re-evaluate on the next chunk of output.
+    Wait,
+    /// The script has run to completion (or is past its last step).
+    Finished,
+}
+
+fn login_script_evaluate(
+    steps: &[LoginStep],
+    idx: usize,
+    output_tail: &str,
+    onekeys: &[OneKey],
+) -> LoginScriptEvaluation {
+    if idx >= steps.len() {
+        return LoginScriptEvaluation::Finished;
+    }
+    let mut i = idx;
+    if let LoginStep::Expect { pattern } = &steps[i] {
+        if !pattern.is_empty() {
+            let re = match regex::Regex::new(pattern) {
+                Ok(re) => re,
+                Err(_) => return LoginScriptEvaluation::Wait,
+            };
+            if !re.is_match(output_tail) {
+                return LoginScriptEvaluation::Wait;
+            }
+        }
+        i += 1;
+    }
+    let mut actions = Vec::new();
+    while i < steps.len() {
+        match &steps[i] {
+            LoginStep::Expect { .. } => break,
+            LoginStep::Send { text } => {
+                actions.push(LoginScriptAction::Send(text.clone()));
+                i += 1;
+            }
+            LoginStep::SendOneKey { name } => {
+                if let Some(entry) = onekeys.iter().find(|k| &k.name == name) {
+                    if let Some(first) = entry.steps.first() {
+                        actions.push(LoginScriptAction::Send(first.send.clone()));
+                    }
+                }
+                i += 1;
+            }
+            LoginStep::Delay { ms } => {
+                actions.push(LoginScriptAction::DelayMs(*ms));
+                i += 1;
+            }
+        }
+    }
+    LoginScriptEvaluation::Advance { actions, next_idx: i }
+}
+
+/// Strip ANSI escape sequences and return the last non-empty line of `data`
+/// decoded as UTF-8 (lossy). Mirrors the OneKey prompt-extraction strategy.
+fn login_script_output_tail(data: &[u8]) -> String {
+    let raw = String::from_utf8_lossy(data);
+    let stripped = strip_ansi(&raw);
+    stripped
+        .lines()
+        .rev()
+        .find(|l| !l.trim().is_empty())
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Drive the per-session login script forward by feeding it a new chunk of
+/// PTY output. Called from the SSH and shell session-event loops right after
+/// `check_onekey_match`. Lazily parses the connection's `login_script` DSL on
+/// first output; executes sends/delays inline; advances the runtime state.
+fn drive_login_script(
+    mut state: Signal<AppState>,
+    input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    session_id: &str,
+    data: &[u8],
+) {
+    use crate::state::LoginScriptRuntime;
+
+    // Lazy init.
+    {
+        let needs_init = {
+            let s = state.read();
+            let done_or_absent = s
+                .login_scripts
+                .get(session_id)
+                .map(|rt| rt.done)
+                .unwrap_or(true);
+            let has_script = s
+                .session_configs
+                .get(session_id)
+                .and_then(|c| c.login_script.as_deref())
+                .map(|t| !t.trim().is_empty())
+                .unwrap_or(false);
+            done_or_absent && has_script
+        };
+        if needs_init {
+            let script = state
+                .read()
+                .session_configs
+                .get(session_id)
+                .and_then(|c| c.login_script.clone())
+                .unwrap_or_default();
+            match rusterm_core::parse_login_script(&script) {
+                Ok(steps) if !steps.is_empty() => {
+                    let rt = LoginScriptRuntime {
+                        steps,
+                        idx: 0,
+                        send_buffer: Default::default(),
+                        done: false,
+                        wait_started: Some(std::time::Instant::now()),
+                    };
+                    state.write().login_scripts.insert(session_id.to_string(), rt);
+                    tracing::info!("[LOGIN-SCRIPT] initialized runtime for session {}", session_id);
+                }
+                Ok(_) => {
+                    let rt = LoginScriptRuntime {
+                        steps: vec![],
+                        idx: 0,
+                        send_buffer: Default::default(),
+                        done: true,
+                        wait_started: None,
+                    };
+                    state.write().login_scripts.insert(session_id.to_string(), rt);
+                    return;
+                }
+                Err(e) => {
+                    tracing::warn!("[LOGIN-SCRIPT] failed to parse script for {}: {}", session_id, e);
+                    let rt = LoginScriptRuntime {
+                        steps: vec![],
+                        idx: 0,
+                        send_buffer: Default::default(),
+                        done: true,
+                        wait_started: None,
+                    };
+                    state.write().login_scripts.insert(session_id.to_string(), rt);
+                    return;
+                }
+            }
+        }
+    }
+
+    let (steps, idx, wait_started, done) = {
+        let s = state.read();
+        match s.login_scripts.get(session_id) {
+            Some(rt) => (rt.steps.clone(), rt.idx, rt.wait_started, rt.done),
+            None => return,
+        }
+    };
+    if done {
+        return;
+    }
+
+    let tail = login_script_output_tail(data);
+    let onekeys = state.read().onekeys.clone();
+    let now = std::time::Instant::now();
+
+    if let Some(started) = wait_started {
+        if now.duration_since(started).as_secs() >= LOGIN_SCRIPT_EXPECT_TIMEOUT_SECS {
+            tracing::warn!(
+                "[LOGIN-SCRIPT] {} timed out after {}s — aborting",
+                session_id,
+                LOGIN_SCRIPT_EXPECT_TIMEOUT_SECS
+            );
+            if let Some(rt) = state.write().login_scripts.get_mut(session_id) {
+                rt.done = true;
+            }
+            return;
+        }
+    }
+
+    let eval = login_script_evaluate(&steps, idx, &tail, &onekeys);
+    match eval {
+        LoginScriptEvaluation::Wait => {
+            if wait_started.is_none() {
+                if let Some(rt) = state.write().login_scripts.get_mut(session_id) {
+                    rt.wait_started = Some(now);
+                }
+            }
+        }
+        LoginScriptEvaluation::Finished => {
+            if let Some(rt) = state.write().login_scripts.get_mut(session_id) {
+                rt.done = true;
+            }
+            tracing::info!("[LOGIN-SCRIPT] {} finished", session_id);
+        }
+        LoginScriptEvaluation::Advance { actions, next_idx } => {
+            let sender = input_senders.read().get(session_id).cloned();
+            for action in actions {
+                match action {
+                    LoginScriptAction::Send(text) => {
+                        if let Some(tx) = sender.as_ref() {
+                            let mut bytes = text.into_bytes();
+                            bytes.push(b'\r');
+                            let _ = tx.send(bytes);
+                        }
+                    }
+                    LoginScriptAction::DelayMs(ms) => {
+                        // The session-event task is async; a brief blocking
+                        // sleep here paces multi-step login scripts (delays
+                        // are typically a few hundred ms). Long delays would
+                        // stall output processing, so cap at 2 seconds.
+                        let capped = ms.min(2000);
+                        std::thread::sleep(std::time::Duration::from_millis(capped));
+                    }
+                }
+            }
+            if let Some(rt) = state.write().login_scripts.get_mut(session_id) {
+                rt.idx = next_idx;
+                if next_idx >= rt.steps.len() {
+                    rt.done = true;
+                    rt.wait_started = None;
+                    tracing::info!("[LOGIN-SCRIPT] {} finished", session_id);
+                } else {
+                    rt.wait_started = Some(std::time::Instant::now());
+                }
+            }
+        }
     }
 }
 
@@ -6340,6 +6584,7 @@ mod session_startup_tests {
             group: None,
             tags: Vec::new(),
             onekey: true,
+            login_script: None,
         };
         let mut disabled = enabled.clone();
         disabled.id = "disabled".to_string();
@@ -6407,6 +6652,7 @@ mod session_startup_tests {
                 group: None,
                 tags: Vec::new(),
                 onekey: true,
+                login_script: None,
             },
         );
         state.onekeys.push(OneKey {
@@ -6735,6 +6981,7 @@ mod session_startup_tests {
             group: None,
             tags: vec![],
             onekey: false,
+            login_script: None,
         };
 
         let mut form = NewConnectionForm {
@@ -6815,6 +7062,7 @@ mod session_startup_tests {
             group: None,
             tags: vec![],
             onekey: false, // ← this is what the user's settings.json still says; the bug
+            login_script: None,
         };
 
         let mut state = AppState::default();
@@ -6915,6 +7163,7 @@ mod session_startup_tests {
                 group: None,
                 tags: vec![],
                 onekey: false, // ← user never enabled it
+                login_script: None,
             },
         );
         state.onekeys.push(OneKey {
@@ -7895,7 +8144,8 @@ fn start_ssh_connection(
                                     // cfg-gated out entirely.
                                     let _analytics_cmd = cmd.clone();
                                     let _analytics_host = hostname.clone();
-                                    if let Some(typo) = learned_typo {
+                                    if state.read().collect_usage_habits && learned_typo.is_some() {
+                                        let typo = learned_typo.clone().unwrap();
                                         let analytics_handle = state.read().analytics.clone();
                                         let correction = cmd.clone();
                                         spawn(async move {
@@ -8003,6 +8253,7 @@ fn start_ssh_connection(
                                 }
                             }
                             input_senders.write().remove(&id);
+                            state.write().login_scripts.remove(&id);
                             let msg = format!(
                                 "\r\n--- Disconnected: {} ---\r\nPress Enter to reconnect.\r\n",
                                 reason
@@ -8395,7 +8646,8 @@ fn start_shell_connection(
                                     // cfg-gated out entirely.
                                     let _analytics_cmd = cmd.clone();
                                     let _analytics_host = hostname.clone();
-                                    if let Some(typo) = learned_typo {
+                                    if state.read().collect_usage_habits && learned_typo.is_some() {
+                                        let typo = learned_typo.clone().unwrap();
                                         let analytics_handle = state.read().analytics.clone();
                                         let correction = cmd.clone();
                                         spawn(async move {
@@ -8484,6 +8736,7 @@ fn start_shell_connection(
                                 .shadow_sandbox
                                 .fail_execution(&id, format!("会话断开：{reason}"));
                             input_senders.write().remove(&id);
+                            state.write().login_scripts.remove(&id);
                             let msg = format!(
                                 "\r\n--- Disconnected: {} ---\r\nPress Enter to reconnect.\r\n",
                                 reason
@@ -8634,7 +8887,11 @@ fn rebuild_connection(original: &ConnectionConfig, form: &NewConnectionForm) -> 
         group: form.group_id.clone(),
         tags: original.tags.clone(),
         onekey: form.onekey,
-        login_script: original.login_script.clone(),
+        login_script: if form.login_script.trim().is_empty() {
+            None
+        } else {
+            Some(form.login_script.clone())
+        },
     }
 }
 
@@ -9291,6 +9548,7 @@ mod connection_target_tests {
             group: None,
             tags: Vec::new(),
             onekey: false,
+            login_script: None,
         }
     }
 
@@ -10501,6 +10759,7 @@ pub fn App() -> Element {
                                 let (sug_enabled, sug_count) = cm.load_suggestion_settings();
                                 s.suggestion_enabled = sug_enabled;
                                 s.suggestion_count = sug_count;
+                                s.collect_usage_habits = cm.load_usage_habits_enabled();
                                 s.keybindings = cm.load_keybindings();
                                 s.skin = cm.load_skin_settings();
                                 s.config_manager = Some(cm);
@@ -11441,6 +11700,7 @@ pub fn App() -> Element {
                 comparison_diff_warning_enabled: state.read().comparison_diff_warning_enabled,
                 keybindings: state.read().keybindings.clone(),
                 skin: state.read().skin.clone(),
+                usage_habits_enabled: state.read().collect_usage_habits,
                 on_close: move |_| modal.set(Modal::None),
                 on_save: move |appearance: rusterm_core::FocusedTabAppearance| {
                     let appearance = appearance.normalized();
@@ -11509,6 +11769,72 @@ pub fn App() -> Element {
                         }
                     }
                 },
+                on_save_usage_habits: move |enabled: bool| {
+                    if let Some(cm) = state.read().config_manager.clone() {
+                        if let Err(e) = cm.save_usage_habits_enabled(enabled) {
+                            tracing::error!("Failed to save usage-habits setting: {}", e);
+                        }
+                    }
+                    state.write().collect_usage_habits = enabled;
+                    if !enabled {
+                        // Clear any in-memory login-script runtimes? No — those
+                        // are independent of analytics. Just log the change.
+                        tracing::info!(
+                            "[USAGE-HABITS] collection disabled; existing local DuckDB data retained"
+                        );
+                    } else {
+                        tracing::info!(
+                            "[USAGE-HABITS] collection enabled; future commands recorded locally"
+                        );
+                    }
+                },
+                on_export_usage_habits: move |_| {
+                    let handle = state.read().analytics.clone();
+                    spawn(async move {
+                        match handle.build_usage_habits_report() {
+                            Ok(report) => {
+                                let json = match serde_json::to_string_pretty(&report) {
+                                    Ok(j) => j,
+                                    Err(e) => {
+                                        tracing::error!("[USAGE-HABITS] serialize report: {}", e);
+                                        return;
+                                    }
+                                };
+                                // Default save location: the user's downloads
+                                // dir, with a timestamped filename. A native
+                                // save dialog would be nicer but rfd's async
+                                // save dialog isn't wired here — a deterministic
+                                // path keeps the feature usable offline.
+                                let fname = format!(
+                                    "rusterm-usage-habits-{}.json",
+                                    report.generated_at.format("%Y%m%d-%H%M%S")
+                                );
+                                let path = dirs::download_dir()
+                                    .or_else(dirs::home_dir)
+                                    .map(|d| d.join(&fname))
+                                    .unwrap_or_else(|| std::path::PathBuf::from(&fname));
+                                if let Err(e) = std::fs::write(&path, &json) {
+                                    tracing::error!(
+                                        "[USAGE-HABITS] failed to write report to {:?}: {}",
+                                        path,
+                                        e
+                                    );
+                                    return;
+                                }
+                                tracing::info!(
+                                    "[USAGE-HABITS] exported privacy-safe report to {:?}",
+                                    path
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "[USAGE-HABITS] failed to build report: {}",
+                                    e
+                                );
+                            }
+                        }
+                    });
+                },
             }
         }
 
@@ -11553,7 +11879,11 @@ pub fn App() -> Element {
                     group: form.group_id.clone(),
                     tags: vec![],
                     onekey: form.onekey,
-                    login_script: None,
+                    login_script: if form.login_script.trim().is_empty() {
+                        None
+                    } else {
+                        Some(form.login_script.clone())
+                    },
                 };
 
                 let tab_id = config.id.clone();
