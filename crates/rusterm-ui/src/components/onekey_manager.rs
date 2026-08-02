@@ -382,6 +382,7 @@ pub fn OneKeyManager(
                             if entries().is_empty() {
                                 div { style: "padding: 16px 10px; color: #9aa5ce; font-size: 12px;",
                                     { crate::i18n::t("onekey.empty") }
+                                }
                             }
                         }
                         button {

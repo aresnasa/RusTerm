@@ -17,6 +17,28 @@ use rusterm_relay::{RelayAccount, hash_password};
 
 use crate::state::AppState;
 
+/// Which payload the curl builder should emit. Mirrors the three mutually
+/// exclusive fields of the relay's `ExecRequest`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CurlMode {
+    /// `{"command": "..."}` — single-line, backward compatible.
+    Command,
+    /// `{"script": "..."}` — multi-line, validated by `validate_script`.
+    Script,
+    /// `{"script_base64": "..."}` — base64-encoded script.
+    ScriptBase64,
+}
+
+/// The payload to embed in the generated curl's JSON body. The UI produces
+/// one of these from the active [`CurlMode`]; the curl generator emits the
+/// corresponding JSON field.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CurlPayload {
+    Command(String),
+    Script(String),
+    ScriptBase64(String),
+}
+
 /// Build the base URL the relay is reachable at, given a running handle's
 /// reported URL OR (when not yet started) the configured bind/port so the
 /// curl preview can show the intended URL ahead of time.
@@ -61,6 +83,9 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
 
     // curl-builder scratch state.
     let mut curl_command = use_signal(|| "uname -a".to_string());
+    let mut curl_script = use_signal(String::new);
+    let mut curl_script_base64 = use_signal(String::new);
+    let mut curl_mode = use_signal(|| CurlMode::Command);
     let mut curl_elevated = use_signal(|| true);
     let mut copied = use_signal(|| false);
 

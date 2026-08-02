@@ -320,6 +320,35 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         "api.saved" => ("Saved to relay.json", "已保存到 relay.json"),
         "api.account_exists" => ("Account \"{name}\" already exists", "账号“{name}”已存在"),
         "api.fill_user_pass" => ("Username and password are required", "用户名和密码不能为空"),
+        // ── Script mode (issue 73) ───────────────────────────────────────
+        "api.mode_command" => ("Command", "命令"),
+        "api.mode_script" => ("Script", "脚本"),
+        "api.mode_script_base64" => ("Script (base64)", "脚本 (base64)"),
+        "api.script_label" => ("Script", "脚本"),
+        "api.script_edit_hint" => (
+            "↓ Multi-line shell script. Each line passes the hard-floor validator; the whole script is scanned by dcg if installed.",
+            "↓ 多行 shell 脚本。每行都经过硬底线校验；若已安装 dcg，整段脚本会被额外扫描。",
+        ),
+        "api.script_base64_label" => ("Script (base64)", "脚本 (base64)"),
+        "api.script_base64_edit_hint" => (
+            "↓ Paste a base64-encoded script. Decoded before validation; standard and URL-safe alphabets accepted.",
+            "↓ 粘贴 base64 编码的脚本。解码后校验；支持标准和 URL-safe 字符表。",
+        ),
+        "api.script_too_long" => (
+            "Script exceeds 64 KiB or 4096 lines.",
+            "脚本超过 64 KiB 或 4096 行。",
+        ),
+        "api.base64_invalid" => (
+            "Not valid base64 (standard or URL-safe).",
+            "不是有效的 base64（标准或 URL-safe）。",
+        ),
+        "api.dcg_blocked" => ("dcg blocked: {reason}", "dcg 拒绝：{reason}"),
+        "api.sandbox_failed" => ("sandbox failed: {reason}", "沙盒校验失败：{reason}"),
+        "api.script_marker_title" => ("EDIT REMOTE SCRIPT BELOW", "在下方修改远程脚本"),
+        "api.script_marker_help" => (
+            "The script is forwarded verbatim to the SSH target's login shell. Multi-line constructs (heredocs, loops) are preserved.",
+            "脚本会原样转发到 SSH 目标的登录 shell。多行结构（heredoc、循环）会被保留。",
+        ),
 
         // ── ai.* — AI panel ──────────────────────────────────────────────
         "ai.title" => ("AI suggestions · shadow sandbox", "AI 建议 · 影子沙盒"),
