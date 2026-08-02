@@ -724,6 +724,7 @@ mod tests {
             stdout: Vec::new(),
             stderr: b"application error".to_vec(),
             timed_out: false,
+            truncated: false,
         };
         assert!(!sudo_authorization_failed(&command_failure));
 
@@ -732,6 +733,7 @@ mod tests {
             stdout: Vec::new(),
             stderr: b"sudo: a password is required".to_vec(),
             timed_out: false,
+            truncated: false,
         };
         assert!(sudo_authorization_failed(&auth_failure));
 
@@ -740,6 +742,7 @@ mod tests {
             stdout: Vec::new(),
             stderr: b"sudo: interactive authentication is required\n".to_vec(),
             timed_out: false,
+            truncated: false,
         };
         assert!(sudo_authorization_failed(&interactive_auth_failure));
     }

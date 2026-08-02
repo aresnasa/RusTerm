@@ -174,6 +174,125 @@ fn drain_output_batch(
     None
 }
 
+#[cfg(test)]
+mod drain_output_batch_tests {
+    use super::*;
+
+    /// The happy path: several `Output` events for the same session queued
+    /// back-to-back get coalesced into one buffer, and the channel is drained
+    /// to empty. No pending event is returned.
+    #[test]
+    fn coalesces_consecutive_same_session_output_events() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<SessionEvent>();
+        tx.send(SessionEvent::Output("s1".into(), b"hello ".to_vec()))
+            .unwrap();
+        tx.send(SessionEvent::Output("s1".into(), b"world".to_vec()))
+            .unwrap();
+        tx.send(SessionEvent::Output("s1".into(), b"!".to_vec()))
+            .unwrap();
+
+        let mut batch = b"seed ".to_vec();
+        let pending = drain_output_batch(&mut rx, "s1", &mut batch);
+
+        assert_eq!(batch, b"seed hello world!");
+        assert!(pending.is_none(), "no non-Output event was queued");
+    }
+
+    /// A non-`Output` event sitting behind `Output` events must be returned as
+    /// the pending event so the caller's loop can process it on the next
+    /// iteration instead of dropping it.
+    #[test]
+    fn returns_non_output_event_as_pending() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<SessionEvent>();
+        tx.send(SessionEvent::Output("s1".into(), b"data1".to_vec()))
+            .unwrap();
+        tx.send(SessionEvent::Disconnected("s1".into(), "bye".into()))
+            .unwrap();
+
+        let mut batch = Vec::new();
+        let pending = drain_output_batch(&mut rx, "s1", &mut batch);
+
+        assert_eq!(batch, b"data1");
+        match pending {
+            Some(SessionEvent::Disconnected(id, reason)) => {
+                assert_eq!(id, "s1");
+                assert_eq!(reason, "bye");
+            }
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
+    }
+
+    /// `Output` for a different session must NOT be folded into the current
+    /// batch — it's returned as pending so the caller's outer loop routes it
+    /// to the right terminal.
+    #[test]
+    fn stops_at_output_for_different_session() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<SessionEvent>();
+        tx.send(SessionEvent::Output("s1".into(), b"for-s1".to_vec()))
+            .unwrap();
+        tx.send(SessionEvent::Output("s2".into(), b"for-s2".to_vec()))
+            .unwrap();
+
+        let mut batch = Vec::new();
+        let pending = drain_output_batch(&mut rx, "s1", &mut batch);
+
+        assert_eq!(batch, b"for-s1");
+        match pending {
+            Some(SessionEvent::Output(id, data)) => {
+                assert_eq!(id, "s2");
+                assert_eq!(data, b"for-s2");
+            }
+            other => panic!("expected Output for s2, got {other:?}"),
+        }
+    }
+
+    /// An empty channel returns `None` — the caller's loop should block on
+    /// `recv().await` for the next event.
+    #[test]
+    fn empty_channel_returns_none() {
+        let (_tx, mut rx) = mpsc::unbounded_channel::<SessionEvent>();
+        let mut batch = b"initial".to_vec();
+        let pending = drain_output_batch(&mut rx, "s1", &mut batch);
+        assert!(pending.is_none());
+        assert_eq!(batch, b"initial");
+    }
+
+    /// The batch must stop growing at `MAX_OUTPUT_BATCH_BYTES` even if the
+    /// channel has more data available. This is the memory-safety ceiling that
+    /// prevents a single coalesced `process` call from ingesting an unbounded
+    /// amount of data.
+    #[test]
+    fn caps_batch_at_max_bytes() {
+        let (tx, mut rx) = mpsc::unbounded_channel::<SessionEvent>();
+        // Push far more than MAX_OUTPUT_BATCH_BYTES worth of data.
+        let chunk = vec![b'x'; 100_000];
+        for _ in 0..50 {
+            tx.send(SessionEvent::Output("s1".into(), chunk.clone()))
+                .unwrap();
+        }
+
+        let mut batch = Vec::new();
+        let pending = drain_output_batch(&mut rx, "s1", &mut batch);
+
+        assert!(
+            batch.len() <= MAX_OUTPUT_BATCH_BYTES,
+            "batch {} must not exceed cap {}",
+            batch.len(),
+            MAX_OUTPUT_BATCH_BYTES
+        );
+        assert!(
+            batch.len() > MAX_OUTPUT_BATCH_BYTES - 100_000,
+            "batch should have consumed at least one full chunk past the cap boundary"
+        );
+        // There's still data in the channel — the next drain_output_batch call
+        // (on the next loop iteration) will pick it up.
+        assert!(
+            pending.is_none(),
+            "pending should be None when we stopped due to the byte cap, not a non-Output event"
+        );
+    }
+}
+
 /// One discrete action the login-script driver queues for the PTY. Emitted by
 /// `login_script_evaluate` and consumed by `drive_login_script`.
 #[derive(Debug, Clone, PartialEq, Eq)]
