@@ -65,54 +65,85 @@ impl CommandValidator {
         // extras.
         let api_raw: &[(&str, &str)] = &[
             // Killing init / kernel threads or every process at once.
-            (r"\bkill(9|all)?\s+-(9|KILL)\s+(-1\b|1\b)", "kill init or all processes"),
+            (
+                r"\bkill(9|all)?\s+-(9|KILL)\s+(-1\b|1\b)",
+                "kill init or all processes",
+            ),
             (r"\bkillall\s+-(9|KILL)\b", "killall -9"),
             // Writing to memory or system devices.
-            (r">\s*/dev/(k?mem|null2|port|core)\b", "write to system device"),
+            (
+                r">\s*/dev/(k?mem|null2|port|core)\b",
+                "write to system device",
+            ),
             // Messing with mount/umount of system filesystems.
-            (r"\b(mount|umount)\b[^;&|]*\s/(boot|sys|proc|dev|usr|etc|var)?\s*$", "mount/unmount of system path"),
+            (
+                r"\b(mount|umount)\b[^;&|]*\s/(boot|sys|proc|dev|usr|etc|var)?\s*$",
+                "mount/unmount of system path",
+            ),
             // iptables flush / disabling the firewall remotely.
             (r"\biptables\s+-F", "flush firewall rules"),
-            (r"\b(?:systemctl\s+(?:stop|disable|mask)\s+firewalld|ufw\s+disable)", "disable firewall"),
+            (
+                r"\b(?:systemctl\s+(?:stop|disable|mask)\s+firewalld|ufw\s+disable)",
+                "disable firewall",
+            ),
             // Disabling SELinux.
             (r"\bsetenforce\s+0", "disable SELinux"),
             // Overwriting authorized_keys / sshd config remotely.
             (r"authorized_keys", "modifying SSH authorized_keys"),
-            (r">\s*[^;&|]*\b(?:sshd_config|/etc/passwd|/etc/shadow|/etc/sudoers)", "overwriting system auth config"),
+            (
+                r">\s*[^;&|]*\b(?:sshd_config|/etc/passwd|/etc/shadow|/etc/sudoers)",
+                "overwriting system auth config",
+            ),
             // Deleting or rewriting shell history is an anti-forensics
             // signal for abuse of the relay.
             (r"\bhistory\s+-c\b", "clearing shell history"),
             (r">\s*[^;&|]*\.\w*history\b", "truncating shell history"),
             // curl/wget piped directly into a shell download-and-execute —
             // the single most abused pattern on an open relay.
-            (r"\b(?:curl|wget)\b[^;&|]*\|\s*(?:sudo\s+)?(?:ba|z|fi)?sh\b", "download-and-execute pipe into shell"),
+            (
+                r"\b(?:curl|wget)\b[^;&|]*\|\s*(?:sudo\s+)?(?:ba|z|fi)?sh\b",
+                "download-and-execute pipe into shell",
+            ),
             // `eval` of untrusted text — defeats pattern checking.
             (r"\beval\s", "eval wrapper"),
             // Base64-blind execution: `echo <blob> | base64 -d | sh`.
-            (r"base64\s+(-d|--decode)[^;&|]*\|\s*(?:sudo\s+)?(?:ba|z|fi)?sh\b", "base64-obfuscated shell exec"),
+            (
+                r"base64\s+(-d|--decode)[^;&|]*\|\s*(?:sudo\s+)?(?:ba|z|fi)?sh\b",
+                "base64-obfuscated shell exec",
+            ),
             // User management.
-            (r"\b(?:useradd|userdel|usermod|passwd)\b", "account management on remote host"),
+            (
+                r"\b(?:useradd|userdel|usermod|passwd)\b",
+                "account management on remote host",
+            ),
             // chmod/chown recursive on sensitive trees.
-            (r"\b(?:chmod|chown|chgrp)\s+[^;&|]*-R[^;&|]*\s/(etc|boot|usr|lib|var|sys|proc|dev)\b", "recursive permission change on system tree"),
+            (
+                r"\b(?:chmod|chown|chgrp)\s+[^;&|]*-R[^;&|]*\s/(etc|boot|usr|lib|var|sys|proc|dev)\b",
+                "recursive permission change on system tree",
+            ),
             // Cron tampering.
             (r"\bcrontab\s+-[^l]", "crontab modification"),
             // Kernel modules.
-            (r"\b(?:insmod|rmmod|modprobe\s+-r)\b", "kernel module load/unload"),
-        ]
-        .iter()
-        .map(|(pat, reason)| {
             (
-                Regex::new(pat).unwrap_or_else(|e| panic!("invalid API regex {:?}: {e}", pat)),
-                *reason,
-            )
-        })
-        .collect::<Vec<_>>();
+                r"\b(?:insmod|rmmod|modprobe\s+-r)\b",
+                "kernel module load/unload",
+            ),
+        ];
+        let api_patterns: Vec<(Regex, &'static str)> = api_raw
+            .iter()
+            .map(|(pat, reason)| {
+                (
+                    Regex::new(pat).unwrap_or_else(|e| panic!("invalid API regex {:?}: {e}", pat)),
+                    *reason,
+                )
+            })
+            .collect();
 
         // Patterns that classify a command as *mutating*. Used to enforce the
         // read-only account flag. This is coarse by design — false positives
         // (blocking a read) are safe; false negatives (allowing a write) are
         // not, so we lean towards "mutating".
-        let mutating_raw: &[&str] = &[
+        let mutating_defs: &[&str] = &[
             r"\b(?:rm|rmdir|mv|cp|install|touch|mkdir|ln|truncate)\b",
             r"\b(?:dd|mkfs|fdisk|parted|mount|umount)\b",
             r"\b(?:kill|pkill|killall)\b",
@@ -125,15 +156,18 @@ impl CommandValidator {
             r">+\s*[^|]", // any output redirection
             r"\btee\b",
             r"\bsed\s+-i\b",
-        ]
-        .iter()
-        .map(|pat| Regex::new(pat).unwrap_or_else(|e| panic!("invalid mutating regex {:?}: {e}", pat)))
-        .collect();
+        ];
+        let mutating_patterns: Vec<Regex> = mutating_defs
+            .iter()
+            .map(|pat| {
+                Regex::new(pat).unwrap_or_else(|e| panic!("invalid mutating regex {:?}: {e}", pat))
+            })
+            .collect();
 
         Self {
             terminal_checker: CommandSafetyChecker::new(),
-            api_patterns: api_raw,
-            mutating_patterns: mutating_raw,
+            api_patterns,
+            mutating_patterns,
         }
     }
 
