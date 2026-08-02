@@ -1058,7 +1058,7 @@ delay 250",
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rusterm_core::config::{ProxyConfig, SshConfig};
+    use rusterm_core::config::{ProxyConfig, SerialConfig, SshConfig, TelnetConfig};
 
     #[test]
     fn edit_form_restores_proxy_configuration() {
@@ -1094,5 +1094,149 @@ mod tests {
         assert_eq!(form.proxy_port, "443");
         assert_eq!(form.proxy_username, "proxy-user");
         assert_eq!(form.proxy_password, "proxy-password");
+    }
+
+    #[test]
+    fn edit_form_restores_ssh_protocol_tab() {
+        let connection = ConnectionConfig {
+            id: "ssh-1".to_string(),
+            name: "SSH".to_string(),
+            kind: ConnectionKind::Ssh(SshConfig {
+                host: "host".to_string(),
+                port: 22,
+                username: "root".to_string(),
+                auth: SshAuth::Agent,
+                terminal_type: "xterm-256color".to_string(),
+                proxy: None,
+                proxy_jump: None,
+                keepalive_interval: None,
+                host_key_policy: rusterm_core::config::default_host_key_policy(),
+            }),
+            group: None,
+            tags: vec![],
+            onekey: false,
+            login_script: None,
+        };
+        let form = form_from_connection(&connection);
+        assert_eq!(form.protocol, "ssh");
+        assert_eq!(form.host, "host");
+        assert_eq!(form.port, "22");
+        assert_eq!(form.username, "root");
+    }
+
+    #[test]
+    fn edit_form_restores_telnet_protocol_tab() {
+        let connection = ConnectionConfig {
+            id: "telnet-1".to_string(),
+            name: "Telnet".to_string(),
+            kind: ConnectionKind::Telnet(TelnetConfig {
+                host: "router.lan".to_string(),
+                port: 23,
+            }),
+            group: None,
+            tags: vec![],
+            onekey: false,
+            login_script: None,
+        };
+        let form = form_from_connection(&connection);
+        assert_eq!(form.protocol, "telnet");
+        assert_eq!(form.host, "router.lan");
+        assert_eq!(form.port, "23");
+    }
+
+    #[test]
+    fn edit_form_restores_serial_protocol_tab() {
+        let connection = ConnectionConfig {
+            id: "serial-1".to_string(),
+            name: "Serial console".to_string(),
+            kind: ConnectionKind::Serial(SerialConfig {
+                port: "/dev/ttyUSB0".to_string(),
+                baud_rate: 115200,
+                data_bits: 8,
+                parity: "none".to_string(),
+                stop_bits: 1,
+                flow_control: "none".to_string(),
+            }),
+            group: None,
+            tags: vec![],
+            onekey: false,
+            login_script: None,
+        };
+        let form = form_from_connection(&connection);
+        assert_eq!(form.protocol, "serial");
+        assert_eq!(form.serial_port, "/dev/ttyUSB0");
+        assert_eq!(form.baud_rate, "115200");
+        assert_eq!(form.data_bits, "8");
+        assert_eq!(form.parity, "none");
+        assert_eq!(form.stop_bits, "1");
+        assert_eq!(form.flow_control, "none");
+    }
+
+    #[test]
+    fn default_form_seeds_ssh_protocol_and_default_port() {
+        let form = default_form();
+        assert_eq!(form.protocol, "ssh");
+        assert_eq!(form.port, "22");
+        // Serial defaults are populated too, even though the user only sees
+        // them after switching to the Serial tab.
+        assert_eq!(form.baud_rate, "115200");
+        assert_eq!(form.data_bits, "8");
+        assert_eq!(form.parity, "none");
+        assert_eq!(form.stop_bits, "1");
+        assert_eq!(form.flow_control, "none");
+    }
+
+    #[test]
+    fn default_port_for_protocol_returns_conventional_values() {
+        assert_eq!(default_port_for_protocol("ssh"), "22");
+        assert_eq!(default_port_for_protocol("telnet"), "23");
+        // Serial has no port — returns a sentinel.
+        assert_eq!(default_port_for_protocol("serial"), "0");
+        // Unknown protocols fall back to the SSH default.
+        assert_eq!(default_port_for_protocol("unknown"), "22");
+    }
+
+    #[test]
+    fn apply_host_spec_fills_user_host_port_and_protocol() {
+        let mut form = default_form();
+        let spec = parse_host_input("xuchao@jump.zs.shaipower.online -p 22").unwrap();
+        apply_host_spec(&spec, &mut form);
+        assert_eq!(form.username, "xuchao");
+        assert_eq!(form.host, "jump.zs.shaipower.online");
+        assert_eq!(form.port, "22");
+        assert_eq!(form.protocol, "ssh");
+        assert!(form.quick_error.is_empty());
+    }
+
+    #[test]
+    fn apply_host_spec_switches_protocol_tab_for_telnet() {
+        let mut form = default_form();
+        // Initial protocol is ssh; parsing a telnet:// URL should switch it.
+        let spec = parse_host_input("telnet://router.lan:23").unwrap();
+        apply_host_spec(&spec, &mut form);
+        assert_eq!(form.protocol, "telnet");
+        assert_eq!(form.host, "router.lan");
+        assert_eq!(form.port, "23");
+    }
+
+    #[test]
+    fn apply_host_spec_fills_default_port_when_not_specified() {
+        let mut form = default_form();
+        // Bare host — no port in the input. `resolved_port` should fill in
+        // the SSH default (22).
+        let spec = parse_host_input("bare.host").unwrap();
+        apply_host_spec(&spec, &mut form);
+        assert_eq!(form.port, "22");
+    }
+
+    #[test]
+    fn apply_host_spec_does_not_overwrite_username_when_absent() {
+        let mut form = default_form();
+        form.username = "preset-user".to_string();
+        // `host -p 22` — no user part. `apply_host_spec` should leave the
+        // existing username alone (not clear it).
+        let spec = parse_host_input("host -p 22").unwrap();
+        apply_host_spec(&spec, &mut form);
+        assert_eq!(form.username, "preset-user");
     }
 }
