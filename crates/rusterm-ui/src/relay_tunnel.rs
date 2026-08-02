@@ -563,6 +563,7 @@ impl RelayExecutor for AppRelayExecutor {
             stdout: result.stdout_string(),
             stderr: result.stderr_string(),
             timed_out: result.timed_out,
+            truncated: result.truncated,
             duration_ms: started.elapsed().as_millis() as u64,
         })
     }

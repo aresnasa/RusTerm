@@ -64,6 +64,11 @@ pub struct ExecResult {
     pub stderr: Vec<u8>,
     /// The command was killed locally because `timeout` elapsed.
     pub timed_out: bool,
+    /// Combined stdout+stderr exceeded [`MAX_EXEC_OUTPUT`] and the surplus
+    /// was discarded. Callers should surface a truncation marker so the user
+    /// knows the output is incomplete — a silent truncation is indistinguishable
+    /// from a command that genuinely produced exactly 8 MiB.
+    pub truncated: bool,
 }
 
 impl ExecResult {
@@ -166,15 +171,21 @@ impl DirectHandle {
         loop {
             match reader.wait().await {
                 Some(ChannelMsg::Data { data }) => {
-                    if result.stdout.len() + result.stderr.len() < MAX_EXEC_OUTPUT {
+                    let combined = result.stdout.len() + result.stderr.len();
+                    if combined < MAX_EXEC_OUTPUT {
                         let data: &[u8] = &data;
                         result.stdout.extend_from_slice(data);
+                    } else {
+                        result.truncated = true;
                     }
                 }
                 Some(ChannelMsg::ExtendedData { data, ext }) if ext == 1 => {
-                    if result.stdout.len() + result.stderr.len() < MAX_EXEC_OUTPUT {
+                    let combined = result.stdout.len() + result.stderr.len();
+                    if combined < MAX_EXEC_OUTPUT {
                         let data: &[u8] = &data;
                         result.stderr.extend_from_slice(data);
+                    } else {
+                        result.truncated = true;
                     }
                 }
                 Some(ChannelMsg::ExitStatus { exit_status }) => {

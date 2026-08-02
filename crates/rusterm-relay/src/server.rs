@@ -401,6 +401,7 @@ struct ExecResponse {
     stdout: String,
     stderr: String,
     timed_out: bool,
+    truncated: bool,
     duration_ms: u64,
 }
 
@@ -611,6 +612,7 @@ async fn exec(
             stdout,
             stderr,
             timed_out,
+            truncated,
             duration_ms,
         }) => {
             state.audit.log(AuditEntry {
@@ -641,6 +643,7 @@ async fn exec(
                 stdout,
                 stderr,
                 timed_out,
+                truncated,
                 duration_ms,
             })
             .into_response()
@@ -949,6 +952,7 @@ mod tests {
                 stdout: String::new(),
                 stderr: String::new(),
                 timed_out: false,
+                truncated: false,
                 duration_ms: 1,
             })
         }

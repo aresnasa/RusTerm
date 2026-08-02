@@ -24,6 +24,7 @@ pub struct ExecOutcome {
     pub stdout: String,
     pub stderr: String,
     pub timed_out: bool,
+    pub truncated: bool,
     pub duration_ms: u64,
 }
 
