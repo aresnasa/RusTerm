@@ -1546,11 +1546,16 @@ fn render_terminal_pane(
                                 app.suggestion_epoch = app.suggestion_epoch.wrapping_add(1);
                             }
                         }
-                        // Any manual input supersedes the previous OneKey result.
-                        state_for_cmd
-                            .write()
-                            .onekey_submission_feedback
-                            .remove(&sid_clone);
+                        // Any manual input proves the previous credential flow
+                        // has moved on. Keep the learned preference, but clear
+                        // only the per-session attempt so a future prompt can
+                        // auto-fill again instead of being mistaken for a retry.
+                        {
+                            let mut app = state_for_cmd.write();
+                            app.onekey_submission_feedback.remove(&sid_clone);
+                            app.onekey_submission_cooldown.remove(&sid_clone);
+                            app.onekey_preference_attempts.remove(&sid_clone);
+                        }
                         let is_enter = data.contains(&0x0d);
                         tracing::info!(
                             "[INPUT] session={} is_enter={} data_len={}",
@@ -6536,6 +6541,7 @@ fn check_onekey_match_in_state(state: &mut AppState, session_id: &str, data: &[u
     check_onekey_match_with_senders_in_state(state, &HashMap::new(), session_id, data);
 }
 
+#[cfg(test)]
 fn check_onekey_match_with_senders_in_state(
     state: &mut AppState,
     senders: &HashMap<String, mpsc::UnboundedSender<Vec<u8>>>,
@@ -7305,19 +7311,161 @@ mod session_startup_tests {
         check_onekey_match_in_state(&mut state, session_id, prompt);
         let selected = take_onekey_selection(&mut state.onekey_popups, session_id, 1)
             .expect("the second matching credential should be selectable");
-        assert_eq!(selected.0, "preferred-secret");
+        assert_eq!(selected.credential, "preferred-secret");
+        remember_onekey_preference(
+            &mut state,
+            selected
+                .preference
+                .expect("multi-match selection should produce a stable preference"),
+        );
         // A later prompt starts with no per-session submission feedback (for
         // example after reconnecting), but should retain the stable
         // connection-level preference learned from the user's selection.
         state.onekey_submission_feedback.clear();
         state.onekey_submission_cooldown.clear();
 
-        check_onekey_match_in_state(&mut state, session_id, prompt);
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let senders = HashMap::from([(session_id.to_string(), sender)]);
+        check_onekey_match_with_senders_in_state(&mut state, &senders, session_id, prompt);
 
         assert!(
             !state.onekey_popups.contains_key(session_id),
             "the remembered credential should be reused without another popup"
         );
+        assert_eq!(receiver.try_recv().unwrap(), b"preferred-secret\r");
+    }
+
+    #[test]
+    fn repeated_prompt_invalidates_remembered_selection_and_reopens_popup() {
+        let session_id = "sudo-pane";
+        let expect = r"password:";
+        let prompt = b"[sudo: authenticate] Password: ";
+        let mut state = state_with_enabled_onekey(expect);
+        state.onekeys.push(OneKey {
+            id: "preferred-sudo-credential".to_string(),
+            name: "preferred sudo".to_string(),
+            steps: vec![OneKeyStep {
+                label: "Password".to_string(),
+                expect: expect.to_string(),
+                send: "preferred-secret".to_string(),
+            }],
+        });
+
+        check_onekey_match_in_state(&mut state, session_id, prompt);
+        let selected = take_onekey_selection(&mut state.onekey_popups, session_id, 1).unwrap();
+        remember_onekey_preference(&mut state, selected.preference.unwrap());
+        state.onekey_submission_feedback.clear();
+        state.onekey_submission_cooldown.clear();
+
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let senders = HashMap::from([(session_id.to_string(), sender)]);
+        check_onekey_match_with_senders_in_state(&mut state, &senders, session_id, prompt);
+        assert_eq!(receiver.try_recv().unwrap(), b"preferred-secret\r");
+        state.onekey_submission_cooldown.insert(
+            session_id.to_string(),
+            (
+                expect.to_string(),
+                std::time::Instant::now()
+                    - ONEKEY_SUBMISSION_COOLDOWN
+                    - std::time::Duration::from_secs(1),
+            ),
+        );
+
+        check_onekey_match_with_senders_in_state(&mut state, &senders, session_id, prompt);
+
+        assert!(state.onekey_preferences.is_empty());
+        assert!(state.onekey_preference_attempts.get(session_id).is_none());
+        assert!(state.onekey_popups.contains_key(session_id));
+        assert!(
+            receiver.try_recv().is_err(),
+            "failed preference must not retry"
+        );
+
+        let replacement = take_onekey_selection(&mut state.onekey_popups, session_id, 0).unwrap();
+        remember_onekey_preference(&mut state, replacement.preference.unwrap());
+        assert_eq!(state.onekey_preferences[0].onekey_id, "sudo-credential");
+    }
+
+    #[test]
+    fn remembered_selection_is_scoped_to_the_saved_connection() {
+        let session_id = "sudo-pane";
+        let prompt = b"[sudo: authenticate] Password: ";
+        let mut state = state_with_enabled_onekey(r"password:");
+        state.onekeys.push(OneKey {
+            id: "preferred".to_string(),
+            name: "preferred".to_string(),
+            steps: vec![OneKeyStep {
+                label: "Password".to_string(),
+                expect: r"password:".to_string(),
+                send: "preferred-secret".to_string(),
+            }],
+        });
+        check_onekey_match_in_state(&mut state, session_id, prompt);
+        let selected = take_onekey_selection(&mut state.onekey_popups, session_id, 1).unwrap();
+        remember_onekey_preference(&mut state, selected.preference.unwrap());
+        state.session_configs.get_mut(session_id).unwrap().id = "another-connection".to_string();
+
+        check_onekey_match_in_state(&mut state, session_id, prompt);
+
+        assert!(state.onekey_popups.contains_key(session_id));
+        assert_eq!(state.onekey_preferences[0].connection_id, session_id);
+    }
+
+    #[test]
+    fn sudo_and_git_password_prompts_do_not_share_a_preference() {
+        let session_id = "sudo-pane";
+        let expect = rusterm_core::config::DEFAULT_ONEKEY_PASSWORD_EXPECT;
+        let sudo_prompt = b"[sudo: authenticate] Password: ";
+        let git_prompt = b"Password for 'https://alice@gitlab.example.com': ";
+        let mut sudo_state = state_with_enabled_onekey_for_prompt(expect, sudo_prompt);
+        sudo_state.onekeys.push(OneKey {
+            id: "other-password".to_string(),
+            name: "other password".to_string(),
+            steps: vec![OneKeyStep {
+                label: "Password".to_string(),
+                expect: expect.to_string(),
+                send: "other-secret".to_string(),
+            }],
+        });
+        check_onekey_match_in_state(&mut sudo_state, session_id, sudo_prompt);
+        let selected = take_onekey_selection(&mut sudo_state.onekey_popups, session_id, 1).unwrap();
+        remember_onekey_preference(&mut sudo_state, selected.preference.unwrap());
+
+        let mut git_state = state_with_enabled_onekey_for_prompt(expect, git_prompt);
+        git_state.onekeys = sudo_state.onekeys;
+        git_state.onekey_preferences = sudo_state.onekey_preferences;
+        check_onekey_match_in_state(&mut git_state, session_id, git_prompt);
+
+        assert!(git_state.onekey_popups.contains_key(session_id));
+        assert_ne!(
+            git_state.onekey_popups[session_id].prompt_fingerprint,
+            Some(git_state.onekey_preferences[0].prompt_fingerprint.clone())
+        );
+    }
+
+    #[test]
+    fn deleted_onekey_makes_a_dangling_preference_fall_back_to_the_popup() {
+        let session_id = "sudo-pane";
+        let prompt = b"[sudo: authenticate] Password: ";
+        let mut state = state_with_enabled_onekey(r"password:");
+        state.onekeys.push(OneKey {
+            id: "soon-deleted".to_string(),
+            name: "soon deleted".to_string(),
+            steps: vec![OneKeyStep {
+                label: "Password".to_string(),
+                expect: r"password:".to_string(),
+                send: "deleted-secret".to_string(),
+            }],
+        });
+        check_onekey_match_in_state(&mut state, session_id, prompt);
+        let selected = take_onekey_selection(&mut state.onekey_popups, session_id, 1).unwrap();
+        remember_onekey_preference(&mut state, selected.preference.unwrap());
+        state.onekeys.retain(|onekey| onekey.id != "soon-deleted");
+
+        check_onekey_match_in_state(&mut state, session_id, prompt);
+
+        assert!(state.onekey_preferences.is_empty());
+        assert_eq!(state.onekey_popups[session_id].matches.len(), 1);
     }
 
     #[test]
@@ -9051,6 +9199,7 @@ fn start_ssh_connection(
                             s.onekey_popups.remove(&id);
                             s.onekey_submission_feedback.remove(&id);
                             s.onekey_submission_cooldown.remove(&id);
+                            s.onekey_preference_attempts.remove(&id);
                             if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
                                 // Keep disconnect feedback exclusively in session
                                 // chrome. TerminalView already maps Enter/right-click
@@ -9545,6 +9694,7 @@ fn start_shell_connection(
                             s.onekey_popups.remove(&id);
                             s.onekey_submission_feedback.remove(&id);
                             s.onekey_submission_cooldown.remove(&id);
+                            s.onekey_preference_attempts.remove(&id);
                             if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
                                 // Keep disconnect feedback exclusively in session
                                 // chrome. TerminalView already maps Enter/right-click
@@ -11067,6 +11217,7 @@ fn reconnect_session(
         s.onekey_popups.remove(&tab_id);
         s.onekey_submission_feedback.remove(&tab_id);
         s.onekey_submission_cooldown.remove(&tab_id);
+        s.onekey_preference_attempts.remove(&tab_id);
         s.pending_exit_check.remove(&tab_id);
     }
     input_senders.write().remove(&tab_id);
@@ -12004,6 +12155,7 @@ pub fn App() -> Element {
                                         Vec::new()
                                     }
                                 };
+                                let onekey_preferences = cm.load_onekey_preferences();
                                 let mut s = state.write();
                                 // Load the persisted `restore_disabled` flag from
                                 // settings.json so we know whether to even
@@ -12026,7 +12178,7 @@ pub fn App() -> Element {
                                 s.workspace_preferences = workspace_preferences;
                                 s.connections = connections;
                                 s.onekeys = onekeys;
-                                s.onekey_preferences = cm.load_onekey_preferences();
+                                s.onekey_preferences = onekey_preferences;
                                 s.unlock_state = UnlockState::Unlocked;
                                 s.master_password_error = None;
 
@@ -13997,6 +14149,7 @@ mod onekey_tests {
                 visible: true,
                 connection_id: None,
                 prompt_fingerprint: None,
+                is_sudo_password: false,
                 matches: vec![OneKeyMatch {
                     onekey_id: "saved-account-id".to_string(),
                     step_index: 0,
@@ -14013,9 +14166,8 @@ mod onekey_tests {
         let senders = HashMap::from([(session_id.to_string(), sender)]);
 
         for _ in 0..2 {
-            if let Some((send, _matched_expect)) = take_onekey_selection(&mut popups, session_id, 0)
-            {
-                send_onekey_submission(&senders, session_id, &send).unwrap();
+            if let Some(selection) = take_onekey_selection(&mut popups, session_id, 0) {
+                send_onekey_submission(&senders, session_id, &selection.credential).unwrap();
             }
         }
 

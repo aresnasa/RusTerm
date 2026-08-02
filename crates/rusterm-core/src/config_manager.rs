@@ -1062,9 +1062,10 @@ impl ConfigManager {
 mod tests {
     use super::*;
     use crate::config::{
-        ConnectionGroup, ConnectionKind, DockZone, KeyChord, Keybindings, OneKey, OneKeyStep,
-        PanelId, ProxyConfig, ProxyKind, SerialConfig, SidebarPreferences, SkinKind, SkinPalette,
-        SkinSettings, SshAuth, SshConfig, TcpConfig, TelnetConfig, default_host_key_policy,
+        ConnectionGroup, ConnectionKind, DockZone, KeyChord, Keybindings, OneKey, OneKeyPreference,
+        OneKeyStep, PanelId, ProxyConfig, ProxyKind, SerialConfig, SidebarPreferences, SkinKind,
+        SkinPalette, SkinSettings, SshAuth, SshConfig, TcpConfig, TelnetConfig,
+        default_host_key_policy,
     };
 
     fn test_config_manager() -> (ConfigManager, tempfile::TempDir) {
@@ -1283,6 +1284,38 @@ mod tests {
         cm.save_connections(&[]).unwrap();
         let loaded = cm.load_connections().unwrap();
         assert!(loaded.is_empty());
+    }
+
+    #[test]
+    fn onekey_preferences_roundtrip_and_survive_other_saves() {
+        let (cm, _dir) = test_config_manager();
+        let preferences = vec![OneKeyPreference {
+            connection_id: "connection-a".to_string(),
+            prompt_fingerprint: "sha256-prompt".to_string(),
+            onekey_id: "onekey-b".to_string(),
+            step_index: 2,
+        }];
+
+        cm.save_onekey_preferences(&preferences).unwrap();
+        assert_eq!(cm.load_onekey_preferences(), preferences);
+
+        cm.save_connections(&[]).unwrap();
+        cm.save_onekeys(&[]).unwrap();
+        cm.save_language(Language::En).unwrap();
+
+        assert_eq!(cm.load_onekey_preferences(), preferences);
+    }
+
+    #[test]
+    fn legacy_config_without_onekey_preferences_loads_an_empty_list() {
+        let (cm, _dir) = test_config_manager();
+        fs::write(
+            &cm.config_path,
+            r#"{"version":1,"connections":[],"onekeys":[]}"#,
+        )
+        .unwrap();
+
+        assert!(cm.load_onekey_preferences().is_empty());
     }
 
     #[test]
