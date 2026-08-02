@@ -9650,7 +9650,22 @@ fn start_ssh_connection(
                                         rc,
                                         popped.as_ref().map(|(c, _)| c.clone())
                                     );
-                                    if rc == 0 {
+                                    // Decide whether to commit the command to history or
+                                    // mark it as failed. `rc == 0` is the simple-command case.
+                                    // For compound commands (containing `|`, `||`, `&&`, `;`)
+                                    // the shell reports only the *last* segment's exit code, so
+                                    // a non-zero rc does NOT mean the line as a whole failed —
+                                    // e.g. `ls; false` (rc=1) still ran `ls`, and
+                                    // `ls | grep none` (grep rc=1) still ran the pipeline. We
+                                    // commit these regardless of rc so the full line (operators
+                                    // included) is preserved in history and the analytics DB.
+                                    // Failed simple commands still get marked failed so they stop
+                                    // being suggested (typos, broken commands).
+                                    if rc == 0
+                                        || popped
+                                            .as_ref()
+                                            .is_some_and(|(cmd, _)| contains_shell_operator(cmd))
+                                    {
                                         // Successful: commit to history + DB (with
                                         // exit_code=Some(0) so search_history's HAVING
                                         // clause treats it as a known-good command).
@@ -10209,7 +10224,18 @@ fn start_shell_connection(
                                         rc,
                                         popped.as_ref().map(|(c, _)| c.clone())
                                     );
-                                    if rc == 0 {
+                                    // Decide whether to commit the command to history or
+                                    // mark it as failed. `rc == 0` is the simple-command case.
+                                    // For compound commands (containing `|`, `||`, `&&`, `;`)
+                                    // the shell reports only the *last* segment's exit code, so
+                                    // a non-zero rc does NOT mean the line as a whole failed —
+                                    // see the SSH branch for the full rationale. We commit the
+                                    // full line regardless of rc so operators are preserved.
+                                    if rc == 0
+                                        || popped
+                                            .as_ref()
+                                            .is_some_and(|(cmd, _)| contains_shell_operator(cmd))
+                                    {
                                         // Successful: commit to history + DB (with
                                         // exit_code=Some(0) so search_history's HAVING
                                         // clause treats it as a known-good command).
@@ -14643,6 +14669,54 @@ pub fn App() -> Element {
     }
 }
 
+/// Detect shell control operators that join multiple commands on one line.
+///
+/// RusTerm commits a queued command to history only when the shell reports a
+/// zero exit code (`rc == 0`). For a *simple* command this correctly drops
+/// typos and broken commands. But for a *compound* command the shell reports a
+/// single exit code that reflects only the **last** segment — without
+/// `pipefail`, `cmd1 | cmd2` reports `cmd2`'s rc; `cmd1 ; cmd2` reports
+/// `cmd2`'s rc even though `cmd1` ran unconditionally; `cmd1 || cmd2` reports
+/// the last command that executed.
+///
+/// That means a compound line like `ls; false` (rc=1) or `ls | grep none`
+/// (grep returns 1 when nothing matches) would be silently dropped from
+/// history even though the user successfully ran it. This helper lets the
+/// commit path treat compound lines as "executed" regardless of the trailing
+/// exit code, so the full line — operators included — is preserved in history
+/// and the analytics DB.
+///
+/// Recognised operators: `|` (pipe), `||` (logical-or), `&&` (logical-and),
+/// `;` (sequence). Note `|` also matches the `||` case, and `&` (background)
+/// is intentionally NOT included — `sleep 10 &` is a single command, not a
+/// compound line, and its exit code is meaningful (0 when backgrounded).
+fn contains_shell_operator(command: &str) -> bool {
+    // Scan for the operator runes outside of quotes. We don't need a full
+    // shell tokenizer — we only need to avoid false positives from `|`, `&`,
+    // and `;` appearing inside a quoted argument such as `echo "a | b"`.
+    let mut in_single = false;
+    let mut in_double = false;
+    let bytes = command.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' if !in_double => in_single = !in_single,
+            b'"' if !in_single => in_double = !in_double,
+            b'|' if !in_single && !in_double => return true, // matches both | and ||
+            b'&' if !in_single && !in_double => {
+                // `&&` is an operator; a lone `&` (background) is not.
+                if i + 1 < bytes.len() && bytes[i + 1] == b'&' {
+                    return true;
+                }
+            }
+            b';' if !in_single && !in_double => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
+}
+
 /// Strip shell prompt from a terminal line, returning just the command part.
 /// Handles common prompt patterns:
 ///   - "user@host:~$ cmd"        (bash / sh — marker at end → command right after)
@@ -15392,7 +15466,7 @@ mod suggestion_acceptance_tests {
 
 #[cfg(test)]
 mod prompt_tests {
-    use super::strip_prompt;
+    use super::{contains_shell_operator, strip_prompt};
 
     #[test]
     fn bash_prompt_strips_to_command() {
@@ -15450,6 +15524,104 @@ mod prompt_tests {
     fn custom_prompt_with_bare_greater_than() {
         // Python REPL, custom PS1="> ", mysql, etc.
         assert_eq!(strip_prompt("> SELECT 1"), "SELECT 1");
+    }
+
+    // ── Compound commands (|, ||, &&, ;) must be preserved ──────────────
+    // Regression coverage: the user reported that commands containing shell
+    // operators were not being saved to history. The root cause was in the
+    // prompt-stripping heuristics and the deferred-recording commit path; these
+    // tests pin the contract that the FULL compound line (operators included)
+    // survives `strip_prompt`.
+    #[test]
+    fn bash_prompt_preserves_pipe_operator() {
+        assert_eq!(
+            strip_prompt("xuchao@host:~$ ls | grep foo"),
+            "ls | grep foo"
+        );
+    }
+
+    #[test]
+    fn bash_prompt_preserves_logical_or_operator() {
+        assert_eq!(strip_prompt("xuchao@host:~$ cmd1 || cmd2"), "cmd1 || cmd2");
+    }
+
+    #[test]
+    fn bash_prompt_preserves_logical_and_operator() {
+        assert_eq!(
+            strip_prompt("xuchao@host:~$ make && ./run"),
+            "make && ./run"
+        );
+    }
+
+    #[test]
+    fn bash_prompt_preserves_semicolon_operator() {
+        assert_eq!(
+            strip_prompt("xuchao@host:~$ cd src; cargo build"),
+            "cd src; cargo build"
+        );
+    }
+
+    #[test]
+    fn starship_prompt_preserves_pipe_operator() {
+        // ❯ ls | grep foo — starship/oh-my-zsh style prompt with a pipe.
+        assert_eq!(strip_prompt("❯ ls | grep foo"), "ls | grep foo");
+    }
+
+    #[test]
+    fn omz_prompt_preserves_compound_with_pipe_and_semicolon() {
+        // ➜  ~ git:(main) ✗ ls | grep foo; echo done
+        assert_eq!(
+            strip_prompt("➜  ~ git:(main) ✗ ls | grep foo; echo done"),
+            "ls | grep foo; echo done"
+        );
+    }
+
+    // ── contains_shell_operator ─────────────────────────────────────────
+    // Drives the commit-path decision: compound commands (|, ||, &&, ;) must
+    // be saved to history even when the trailing exit code is non-zero, while
+    // simple commands and quoted-operator arguments must NOT be flagged as
+    // compound (so a genuine typo still gets marked failed).
+    #[test]
+    fn operator_detector_recognises_all_four_operators() {
+        assert!(contains_shell_operator("ls | grep foo"));
+        assert!(contains_shell_operator("cmd1 || cmd2"));
+        assert!(contains_shell_operator("make && ./run"));
+        assert!(contains_shell_operator("cd src; cargo build"));
+        // `|` also covers `||` (two pipes); make sure the bare-pipe path works
+        // when the second char is not another pipe.
+        assert!(contains_shell_operator("a | b | c"));
+    }
+
+    #[test]
+    fn operator_detector_ignores_quoted_operators() {
+        // Operators inside double quotes are arguments, not control operators.
+        assert!(!contains_shell_operator("echo \"a | b\""));
+        assert!(!contains_shell_operator("echo \"a; b\""));
+        assert!(!contains_shell_operator("echo 'a && b'"));
+        // Mixed quotes: a pipe inside single quotes should not count even when
+        // a real pipe follows later — but here we only test the quoted-only case.
+        assert!(!contains_shell_operator("printf '%s | done' msg"));
+    }
+
+    #[test]
+    fn operator_detector_ignores_background_ampersand() {
+        // A lone `&` backgrounds a single command — it is NOT a compound line,
+        // and its exit code is meaningful (0 when backgrounded successfully).
+        // It must not be flagged as compound, otherwise `sleep 10 &` would be
+        // saved even on failure.
+        assert!(!contains_shell_operator("sleep 10 &"));
+        assert!(!contains_shell_operator("longjob --opt &"));
+    }
+
+    #[test]
+    fn operator_detector_false_for_simple_commands() {
+        assert!(!contains_shell_operator("ls -la"));
+        assert!(!contains_shell_operator("git status"));
+        assert!(!contains_shell_operator(""));
+        assert!(!contains_shell_operator("echo hello world"));
+        // Redirections (`>`, `<`) are NOT compound operators — a redirected
+        // command is still a single command with a meaningful exit code.
+        assert!(!contains_shell_operator("echo foo > out.txt"));
     }
 }
 
