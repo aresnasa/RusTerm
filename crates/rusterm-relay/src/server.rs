@@ -26,7 +26,7 @@ use crate::config::RelayConfig;
 #[cfg(test)]
 use crate::executor::NullExecutor;
 use crate::executor::{ExecOutcome, ExecutorError, HostInfo, RelayExecutor};
-use crate::validator::{CommandValidator, compile_allowlist};
+use crate::validator::{CommandValidator, ValidationError, compile_allowlist};
 
 /// Shared per-process state handed to every handler.
 #[derive(Clone)]

