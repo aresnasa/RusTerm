@@ -21,6 +21,7 @@ use rusterm_core::terminal::{Terminal, TerminalSize};
 
 use crate::components::AiPanel;
 use crate::components::CloseConfirmationDialog;
+use crate::components::CommandStatusBadge;
 use crate::components::ConnectionDialog;
 use crate::components::DangerousCommandDialog;
 use crate::components::DockDragGhost;
@@ -825,6 +826,17 @@ fn dispatch_approved_command(
             .is_some_and(|sender| sender.send(bytes.clone()).is_ok());
         if send_ok {
             sent += 1;
+            // A new command is now running. Clear the previous completion
+            // result so session chrome never shows stale success/failure
+            // while waiting for the next OSC 133;D exit code.
+            if let Some(tab) = state
+                .write()
+                .sessions
+                .iter_mut()
+                .find(|tab| tab.id == session_id)
+            {
+                tab.last_command_status = CommandStatus::Idle;
+            }
         } else {
             let mut app = state.write();
             let _ = rollback_pending_exit(&mut app, &session_id, &history_id);
@@ -1294,87 +1306,6 @@ fn scroll_terminal_sessions(
     }
 }
 
-/// Render the colored command-status badge for the terminal pane top bar
-/// (Task #65).
-///
-/// Returns an `Element` that floats in the top-right corner of the terminal
-/// pane. `Idle` renders nothing (no badge for a freshly-opened session or
-/// before the first command finishes). The badge uses inline styles so it
-/// doesn't depend on skin CSS variables being loaded — green for success,
-/// red for failure/disconnect.
-///
-/// This is a pure render function (no state mutation), extracted so the
-/// `render_terminal_pane` body stays focused on wiring up TerminalView's
-/// event handlers.
-fn render_command_status_badge(status: &CommandStatus) -> Element {
-    match status {
-        CommandStatus::Idle => rsx! {},
-        CommandStatus::Success => rsx! {
-            span {
-                style: "
-                    position: absolute;
-                    top: 4px;
-                    right: 8px;
-                    z-index: 8;
-                    background: rgba(76, 175, 80, 0.9);
-                    color: #ffffff;
-                    font-size: 11px;
-                    font-family: 'JetBrains Mono', monospace;
-                    padding: 2px 8px;
-                    border-radius: 3px;
-                    pointer-events: none;
-                    user-select: none;
-                    white-space: nowrap;
-                ",
-                "✓ 成功"
-            }
-        },
-        CommandStatus::Failed(rc) => {
-            let label = format!("✗ 失败 (exit {rc})");
-            rsx! {
-                span {
-                    style: "
-                        position: absolute;
-                        top: 4px;
-                        right: 8px;
-                        z-index: 8;
-                        background: rgba(244, 67, 54, 0.9);
-                        color: #ffffff;
-                        font-size: 11px;
-                        font-family: 'JetBrains Mono', monospace;
-                        padding: 2px 8px;
-                        border-radius: 3px;
-                        pointer-events: none;
-                        user-select: none;
-                        white-space: nowrap;
-                    ",
-                    "{label}"
-                }
-            }
-        }
-        CommandStatus::Disconnected(_) => rsx! {
-            span {
-                style: "
-                    position: absolute;
-                    top: 4px;
-                    right: 8px;
-                    z-index: 8;
-                    background: rgba(244, 67, 54, 0.9);
-                    color: #ffffff;
-                    font-size: 11px;
-                    font-family: 'JetBrains Mono', monospace;
-                    padding: 2px 8px;
-                    border-radius: 3px;
-                    pointer-events: none;
-                    user-select: none;
-                    white-space: nowrap;
-                ",
-                "⚠ 断开"
-            }
-        },
-    }
-}
-
 /// Render a single TerminalView for the session identified by `session_id`.
 ///
 /// This is the shared rendering helper used by both the single-pane path
@@ -1456,11 +1387,6 @@ fn render_terminal_pane(
                 Some(SessionConnectionState::Disconnected | SessionConnectionState::Reconnecting)
             );
             let keybindings = state.read().keybindings.clone();
-            // Task #65: snapshot the last command status so we can render a
-            // colored badge (green ✓ / red ✗ / red ⚠) in the terminal pane
-            // top bar. Cloned because `CommandStatus` is `Clone` and the
-            // read lock must release before the rsx! render.
-            let last_command_status = tab.last_command_status.clone();
             rsx! {
                 div {
                     style: "position: relative; width: 100%; height: 100%;",
@@ -2303,11 +2229,6 @@ fn render_terminal_pane(
                     row_diffs: row_diffs.clone(),
                     suggestion_max_rows: state.read().suggestion_count as usize,
                 }
-                // Task #65: colored status badge overlay (top-right corner).
-                // Renders on top of the terminal output without injecting ANSI
-                // into the PTY stream. z-index is below the search bar (10) and
-                // popups so they stay interactive.
-                {render_command_status_badge(&last_command_status)}
                 }
             }
         }
@@ -4679,6 +4600,7 @@ fn multi_pane_container(
         Option<PaneDropRegion>,
         &'static str,
         String,
+        CommandStatus,
         String,
         u32,
         &'static str,
@@ -4811,16 +4733,16 @@ fn multi_pane_container(
             // the free-split gesture) — label it explicitly. Otherwise
             // fall back to the session id if the session was closed
             // between the layout snapshot and this render.
-            let title = if sid.is_empty() {
-                "空白窗格".to_string()
+            let (title, command_status) = if sid.is_empty() {
+                ("空白窗格".to_string(), CommandStatus::Idle)
             } else {
                 state
                     .read()
                     .sessions
                     .iter()
                     .find(|t| t.id == sid)
-                    .map(|t| t.name.clone())
-                    .unwrap_or_else(|| sid.clone())
+                    .map(|t| (t.name.clone(), t.last_command_status.clone()))
+                    .unwrap_or_else(|| (sid.clone(), CommandStatus::Idle))
             };
             // `drag_sid` is a second clone for the ondragstart closure
             // (the first clone `drop_session_id` is consumed by the
@@ -4888,6 +4810,7 @@ fn multi_pane_container(
                 drag_over_region,
                 title_chrome,
                 title,
+                command_status,
                 drag_sid,
                 z_index,
                 window_chrome,
@@ -5033,7 +4956,7 @@ fn multi_pane_container(
             // when the dragged pane actually changes. This aligns with the
             // user's frequency-vs-feedback preference: fewer re-renders over
             // per-tick feedback.
-            for (idx, session_id, (x, y, w, h), drop_session_id, border_style, drag_over_region, title_chrome, pane_title, drag_sid, z_index, window_chrome, pane_actions, pane_owner_for_click, pane_owner_for_title, accent_color, content_dim_style) in pane_items.into_iter() {
+            for (idx, session_id, (x, y, w, h), drop_session_id, border_style, drag_over_region, title_chrome, pane_title, command_status, drag_sid, z_index, window_chrome, pane_actions, pane_owner_for_click, pane_owner_for_title, accent_color, content_dim_style) in pane_items.into_iter() {
                 div {
                     key: "pane-{idx}-{session_id}",
                     style: format!(
@@ -5398,6 +5321,10 @@ fn multi_pane_container(
                             style: "flex: 1; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding-left: 2px;",
                             "{pane_title}"
                         }
+                        // Task #65: every split pane reports its own command
+                        // result in the pane title bar. This never overlays or
+                        // mutates terminal output.
+                        CommandStatusBadge { status: command_status }
                         {pane_actions}
                     },
                     // Terminal content area: fills the remaining height
@@ -7360,18 +7287,6 @@ mod session_startup_tests {
     }
 }
 
-/// Format a red disconnection notice for session loss (Task #65).
-///
-/// Used by both SSH and local-shell `SessionEvent::Disconnected` handlers.
-/// Red because a disconnect is always an abnormal terminal state from the
-/// user's perspective.
-fn format_disconnected_line(reason: &str) -> String {
-    format!(
-        "\r\n\x1b[31m--- 会话断开: {} ---\x1b[0m\r\n按 Enter 重新连接\r\n",
-        reason
-    )
-}
-
 fn start_ssh_connection(
     mut state: Signal<AppState>,
     mut input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
@@ -8401,26 +8316,18 @@ fn start_ssh_connection(
                             }
                             input_senders.write().remove(&id);
                             state.write().login_scripts.remove(&id);
-                            let msg = format_disconnected_line(&reason);
-                            let terminals = state.read().terminals.clone();
-                            if let Some(handle) = terminals.get(&id) {
-                                let render_result =
-                                    handle.lock().process_and_render(msg.as_bytes());
-                                let mut s = state.write();
-                                s.session_connection_states
-                                    .insert(id.clone(), SessionConnectionState::Disconnected);
-                                s.onekey_popups.remove(&id);
-                                s.onekey_submission_feedback.remove(&id);
-                                s.onekey_submission_cooldown.remove(&id);
-                                if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
-                                    tab.render_output = render_result;
-                                    tab.version += 1;
-                                    // Task #65: show a red "disconnected" badge in
-                                    // the top bar so the user sees the session is
-                                    // down without scanning the terminal output.
-                                    tab.last_command_status =
-                                        CommandStatus::Disconnected(reason.clone());
-                                }
+                            let mut s = state.write();
+                            s.session_connection_states
+                                .insert(id.clone(), SessionConnectionState::Disconnected);
+                            s.onekey_popups.remove(&id);
+                            s.onekey_submission_feedback.remove(&id);
+                            s.onekey_submission_cooldown.remove(&id);
+                            if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
+                                // Keep disconnect feedback exclusively in session
+                                // chrome. TerminalView already maps Enter/right-click
+                                // to reconnect while this connection state is set.
+                                tab.last_command_status =
+                                    CommandStatus::Disconnected(reason.clone());
                             }
                         }
                         SessionEvent::RemoteHistory(id, commands) => {
@@ -8901,26 +8808,18 @@ fn start_shell_connection(
                                 .fail_execution(&id, format!("会话断开：{reason}"));
                             input_senders.write().remove(&id);
                             state.write().login_scripts.remove(&id);
-                            let msg = format_disconnected_line(&reason);
-                            let terminals = state.read().terminals.clone();
-                            if let Some(handle) = terminals.get(&id) {
-                                let render_result =
-                                    handle.lock().process_and_render(msg.as_bytes());
-                                let mut s = state.write();
-                                s.session_connection_states
-                                    .insert(id.clone(), SessionConnectionState::Disconnected);
-                                s.onekey_popups.remove(&id);
-                                s.onekey_submission_feedback.remove(&id);
-                                s.onekey_submission_cooldown.remove(&id);
-                                if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
-                                    tab.render_output = render_result;
-                                    tab.version += 1;
-                                    // Task #65: show a red "disconnected" badge in
-                                    // the top bar so the user sees the session is
-                                    // down without scanning the terminal output.
-                                    tab.last_command_status =
-                                        CommandStatus::Disconnected(reason.clone());
-                                }
+                            let mut s = state.write();
+                            s.session_connection_states
+                                .insert(id.clone(), SessionConnectionState::Disconnected);
+                            s.onekey_popups.remove(&id);
+                            s.onekey_submission_feedback.remove(&id);
+                            s.onekey_submission_cooldown.remove(&id);
+                            if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
+                                // Keep disconnect feedback exclusively in session
+                                // chrome. TerminalView already maps Enter/right-click
+                                // to reconnect while this connection state is set.
+                                tab.last_command_status =
+                                    CommandStatus::Disconnected(reason.clone());
                             }
                         }
                         SessionEvent::RemoteHistory(id, commands) => {
@@ -14699,32 +14598,7 @@ mod tab_drag_tests {
 
 #[cfg(test)]
 mod command_status_tests {
-    use super::format_disconnected_line;
     use crate::state::CommandStatus;
-
-    #[test]
-    fn disconnected_is_red_and_mentions_reconnect() {
-        let line = format_disconnected_line("network error");
-        assert!(
-            line.contains("\x1b[31m"),
-            "disconnect must be red: {:?}",
-            line
-        );
-        assert!(line.contains("\x1b[0m"), "missing reset SGR: {:?}", line);
-        assert!(line.contains("network error"), "missing reason: {:?}", line);
-        assert!(
-            line.contains("会话断开"),
-            "missing Chinese label: {:?}",
-            line
-        );
-        // The reconnect hint must be present so the user knows what to do.
-        assert!(line.contains("Enter"), "missing reconnect hint: {:?}", line);
-        assert!(
-            !line.contains("\x1b[32m"),
-            "disconnect must not be green: {:?}",
-            line
-        );
-    }
 
     #[test]
     fn command_status_default_is_idle() {

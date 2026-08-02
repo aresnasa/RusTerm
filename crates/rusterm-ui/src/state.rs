@@ -567,7 +567,7 @@ mod onekey_match_tests {
 }
 
 /// Runtime status of the last command executed in a session, used to
-/// render a colored badge in the terminal pane's top bar (Task #65).
+/// render a colored badge in workspace tabs and pane title bars (Task #65).
 /// `Idle` is the default for newly-opened sessions (no command has
 /// finished yet). This is `#[serde(skip)]` on `SessionTab` because it is
 /// ephemeral UI state, not something to persist across restarts.
@@ -626,7 +626,7 @@ pub struct SessionTab {
     #[serde(skip)]
     pub cwd: Option<String>,
     /// Runtime status of the last finished command (or disconnect). Drives
-    /// the colored badge in the terminal pane top bar. Updated whenever the
+    /// the colored badge in workspace tabs and pane title bars. Updated whenever the
     /// shell reports an exit code (OSC 133;D, zsh/bash only) or when the
     /// session channel drops. Not persisted across restarts.
     #[serde(skip)]

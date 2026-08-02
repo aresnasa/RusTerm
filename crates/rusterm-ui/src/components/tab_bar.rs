@@ -1,6 +1,7 @@
 use dioxus::prelude::*;
 
-use crate::state::{SessionTab, WorkspaceTab};
+use crate::components::CommandStatusBadge;
+use crate::state::{CommandStatus, SessionTab, WorkspaceTab};
 use rusterm_core::FocusedTabAppearance;
 use rusterm_core::session::SessionType;
 
@@ -130,6 +131,11 @@ pub fn TabBar(
                     let is_hover = hover_tab() == Some(tab.id.clone());
                     let color = session_type_color(&kind);
                     let _label = session_type_label(&kind);
+                    let command_status = sessions
+                        .iter()
+                        .find(|session| session.id == session_id)
+                        .map(|session| session.last_command_status.clone())
+                        .unwrap_or(CommandStatus::Idle);
                     let bg = if is_active { "var(--skin-surface)" } else if is_hover { "var(--skin-surface-hover)" } else { "transparent" };
                     let border_bottom = if is_active { format!("2px solid {color}") } else { "2px solid transparent".to_string() };
                     let (pane_focus_shadow, pane_focus_radius) =
@@ -217,6 +223,10 @@ pub fn TabBar(
                                 style: "overflow: hidden; text-overflow: ellipsis; max-width: 120px;",
                                 "{session_name}"
                             }
+
+                            // Task #65: status belongs to the session's real top
+                            // bar, not to the terminal output surface.
+                            CommandStatusBadge { status: command_status }
 
                             // Close button (show on hover or active)
                             if is_hover || is_active {
