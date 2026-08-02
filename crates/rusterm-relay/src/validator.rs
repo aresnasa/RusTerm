@@ -767,7 +767,7 @@ mod tests {
     #[test]
     fn user_pattern_does_not_block_benign_commands() {
         let v = validator_with_extra(&[
-            ((r"\bnc\s+-e\b", "reverse shell"), "user"),
+            (r"\bnc\s+-e\b", "reverse shell", "user"),
         ]);
         // Commands that don't match the user pattern still pass.
         assert!(v.validate("docker ps", &[], false).is_ok());
@@ -780,7 +780,7 @@ mod tests {
         // account with a permissive allowlist (".*") still can't run rm -rf /
         // or a user-blocked command.
         let v = validator_with_extra(&[
-            ((r"\bnc\s+-e\b", "reverse shell"), "user"),
+            (r"\bnc\s+-e\b", "reverse shell", "user"),
         ]);
         let allow = compile_allowlist(&[".*".to_string()]).unwrap();
         assert!(matches!(
