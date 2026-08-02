@@ -375,6 +375,32 @@ async fn exec(
         Err(r) => return r,
     };
 
+    // Resolve command XOR script XOR script_base64 into a single payload.
+    // Errors here are 400 — the request was malformed, not unauthorized.
+    let (payload, is_script) = match body.resolve_payload() {
+        Ok(v) => v,
+        Err(e) => {
+            state.audit.log(AuditEntry {
+                ts: now_iso(),
+                account: account.username.clone(),
+                client_ip: addr.ip().to_string(),
+                action: if is_script_field_set(&body) {
+                    AuditAction::ScriptRejected
+                } else {
+                    AuditAction::ExecRejected
+                },
+                host_id: Some(body.host_id.clone()),
+                command: None,
+                outcome: AuditOutcome::rejected(e.to_string()),
+            });
+            return error_response_with_code(
+                StatusCode::BAD_REQUEST,
+                &e.to_string(),
+                Some(e.code()),
+            );
+        }
+    };
+
     let config = state.config.read().clone();
     if !state
         .limiter
@@ -384,15 +410,22 @@ async fn exec(
             ts: now_iso(),
             account: account.username.clone(),
             client_ip: addr.ip().to_string(),
-            action: AuditAction::ExecRejected,
+            action: if is_script {
+                AuditAction::ScriptRejected
+            } else {
+                AuditAction::ExecRejected
+            },
             host_id: Some(body.host_id.clone()),
-            command: Some(body.command.clone()),
+            command: Some(payload.clone()),
             outcome: AuditOutcome::rejected("account rate limit exceeded"),
         });
         return too_many_requests();
     }
 
     // Validate: safety checker + API deny-list + readonly + allowlist.
+    // For scripts, use the richer validate_script pipeline (per-line hard
+    // floor + script injection patterns + dcg). For commands, use the
+    // single-command validator (backward compatible).
     let allowlist = match compile_allowlist(&account.allowed_commands) {
         Ok(v) => v,
         Err(errors) => {
@@ -407,20 +440,71 @@ async fn exec(
             );
         }
     };
-    if let Err(validation) = state
-        .validator
-        .validate(&body.command, &allowlist, account.readonly)
-    {
+    let validation = if is_script {
+        state
+            .validator
+            .validate_script(&payload, &allowlist, account.readonly)
+            .map_err(|e| {
+                // Map ScriptError to a ValidationError-shaped string for
+                // the audit log. We keep the variant for the HTTP code.
+                match e {
+                    crate::validator::ScriptError::DcgBlocked(reason) => {
+                        ValidationError::Dangerous(format!("dcg blocked: {reason}"))
+                    }
+                    other => ValidationError::Dangerous(other.to_string()),
+                }
+            })
+    } else {
+        state
+            .validator
+            .validate(&payload, &allowlist, account.readonly)
+    };
+    if let Err(validation) = validation {
+        let is_dcg_block = validation.to_string().contains("dcg blocked");
         state.audit.log(AuditEntry {
             ts: now_iso(),
             account: account.username.clone(),
             client_ip: addr.ip().to_string(),
-            action: AuditAction::ExecRejected,
+            action: if is_dcg_block {
+                AuditAction::DcgBlocked
+            } else if is_script {
+                AuditAction::ScriptRejected
+            } else {
+                AuditAction::ExecRejected
+            },
             host_id: Some(body.host_id.clone()),
-            command: Some(body.command.clone()),
+            command: Some(payload.clone()),
             outcome: AuditOutcome::rejected(validation.to_string()),
         });
         return error_response(StatusCode::FORBIDDEN, &validation.to_string());
+    }
+
+    // Script-only: sandbox pre-flight (syntax check + dcg). The hard floor
+    // has already run in validate_script; this stage adds the syntax check
+    // and a second dcg pass over the whole script (dcg's AST analysis can
+    // catch multi-line constructs the per-line pass doesn't see).
+    if is_script {
+        match crate::sandbox::preflight(&payload) {
+            crate::sandbox::SandboxVerdict::Safe { note } => {
+                tracing::debug!("[relay] script sandbox preflight ok: {note}");
+            }
+            crate::sandbox::SandboxVerdict::Unsafe { reason } => {
+                state.audit.log(AuditEntry {
+                    ts: now_iso(),
+                    account: account.username.clone(),
+                    client_ip: addr.ip().to_string(),
+                    action: AuditAction::SandboxFailed,
+                    host_id: Some(body.host_id.clone()),
+                    command: Some(payload.clone()),
+                    outcome: AuditOutcome::rejected(reason.clone()),
+                });
+                return error_response_with_code(
+                    StatusCode::FORBIDDEN,
+                    &reason,
+                    Some("sandbox_failed"),
+                );
+            }
+        }
     }
 
     // Host authorization happens against the executor's host list.
@@ -435,9 +519,13 @@ async fn exec(
                 ts: now_iso(),
                 account: account.username.clone(),
                 client_ip: addr.ip().to_string(),
-                action: AuditAction::ExecRejected,
+                action: if is_script {
+                    AuditAction::ScriptRejected
+                } else {
+                    AuditAction::ExecRejected
+                },
                 host_id: Some(body.host_id.clone()),
-                command: Some(body.command.clone()),
+                command: Some(payload.clone()),
                 outcome: AuditOutcome::rejected("host not allowed for account"),
             });
             return error_response(StatusCode::FORBIDDEN, "host not allowed for this account");
@@ -457,9 +545,13 @@ async fn exec(
         ts: now_iso(),
         account: account.username.clone(),
         client_ip: addr.ip().to_string(),
-        action: AuditAction::ExecAccepted,
+        action: if is_script {
+            AuditAction::ScriptAccepted
+        } else {
+            AuditAction::ExecAccepted
+        },
         host_id: Some(host.id.clone()),
-        command: Some(body.command.clone()),
+        command: Some(payload.clone()),
         outcome: AuditOutcome {
             success: true,
             exit_code: None,
@@ -471,7 +563,7 @@ async fn exec(
     let started = Instant::now();
     match state
         .executor
-        .exec(&host.id, &body.command, body.elevated, timeout)
+        .exec(&host.id, &payload, body.elevated, timeout)
         .await
     {
         Ok(ExecOutcome {
@@ -485,9 +577,13 @@ async fn exec(
                 ts: now_iso(),
                 account: account.username.clone(),
                 client_ip: addr.ip().to_string(),
-                action: AuditAction::ExecAccepted,
+                action: if is_script {
+                    AuditAction::ScriptAccepted
+                } else {
+                    AuditAction::ExecAccepted
+                },
                 host_id: Some(host.id.clone()),
-                command: Some(body.command.clone()),
+                command: Some(payload.clone()),
                 outcome: AuditOutcome::ok(exit_code, duration_ms),
             });
             Json(ExecResponse {
@@ -507,7 +603,7 @@ async fn exec(
                     client_ip: addr.ip().to_string(),
                     action: AuditAction::ExecFailed,
                     host_id: Some(host.id.clone()),
-                    command: Some(body.command.clone()),
+                    command: Some(payload.clone()),
                     outcome: AuditOutcome {
                         success: false,
                         exit_code: None,
@@ -533,7 +629,7 @@ async fn exec(
                 client_ip: addr.ip().to_string(),
                 action: AuditAction::ExecFailed,
                 host_id: Some(host.id.clone()),
-                command: Some(body.command.clone()),
+                command: Some(payload.clone()),
                 outcome: AuditOutcome {
                     success: false,
                     exit_code: None,
@@ -544,6 +640,12 @@ async fn exec(
             error_response(status, msg)
         }
     }
+}
+
+/// Whether the request carried a `script` or `script_base64` field (even if
+/// invalid). Used to pick the right audit action for resolve errors.
+fn is_script_field_set(body: &ExecRequest) -> bool {
+    body.script.is_some() || body.script_base64.is_some()
 }
 
 #[derive(Debug, Deserialize)]
