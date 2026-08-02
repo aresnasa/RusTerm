@@ -7101,6 +7101,7 @@ dependencies = [
  "dirs",
  "duckdb",
  "parking_lot",
+ "regex",
  "rusqlite",
  "rusterm-db",
  "serde",
@@ -7335,6 +7336,7 @@ name = "rusterm-tunnel"
 version = "0.0.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "parking_lot",
  "rusterm-core",
@@ -7353,6 +7355,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "arboard",
+ "async-trait",
  "chrono",
  "dioxus",
  "dioxus-router",
@@ -7368,7 +7371,9 @@ dependencies = [
  "rusterm-history",
  "rusterm-plugins",
  "rusterm-proto",
+ "rusterm-relay",
  "rusterm-ssh",
+ "rusterm-tunnel",
  "serde",
  "serde_json",
  "tempfile",

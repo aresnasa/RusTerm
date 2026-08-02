@@ -8,6 +8,10 @@ pub struct ConnectionConfig {
     pub group: Option<String>,
     pub tags: Vec<String>,
     pub onekey: bool,
+    /// Optional per-connection login initialization script (DSL text).
+    /// `None` means no script runs after login.
+    #[serde(default)]
+    pub login_script: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -1275,6 +1279,10 @@ pub struct PersistedConnection {
     pub group: Option<String>,
     pub tags: Vec<String>,
     pub onekey: bool,
+    /// Raw login-script DSL text; plaintext, so it only ever references
+    /// OneKey entries by name and never a credential itself.
+    #[serde(default)]
+    pub login_script: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

@@ -158,10 +158,10 @@ pub async fn serve(stream: TcpStream, handle: DirectHandle) -> anyhow::Result<()
         }
     };
 
-    let peer = stream.peer_addr().ok();
-    let originator = peer
-        .map(|SocketAddr { ip, port }| (ip.to_string(), port))
-        .unwrap_or_else(|| ("127.0.0.1".to_string(), 0));
+    let originator = stream
+        .peer_addr()
+        .map(|addr: SocketAddr| (addr.ip().to_string(), addr.port()))
+        .unwrap_or_else(|_| ("127.0.0.1".to_string(), 0));
 
     let mut upstream = match handle
         .open_direct_tcpip(&target.host(), target.port(), (&originator.0, originator.1))

@@ -6,6 +6,7 @@ pub mod components;
 pub mod keybindings;
 pub mod layout;
 pub mod layout_state;
+pub mod relay_tunnel;
 pub mod skin;
 pub mod state;
 pub mod transfers;

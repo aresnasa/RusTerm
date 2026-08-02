@@ -783,6 +783,7 @@ impl ConfigManager {
             group: conn.group.clone(),
             tags: conn.tags.clone(),
             onekey: conn.onekey,
+            login_script: conn.login_script.clone(),
         })
     }
 
@@ -858,6 +859,7 @@ impl ConfigManager {
             group: pc.group,
             tags: pc.tags,
             onekey: pc.onekey,
+            login_script: pc.login_script,
         })
     }
 

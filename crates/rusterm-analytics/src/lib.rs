@@ -55,9 +55,11 @@ use serde::{Deserialize, Serialize};
 
 pub mod classify;
 pub mod mirror;
+pub mod sanitize;
 
 pub use classify::{CommandCategory, classify_commands};
 pub use mirror::mirror_from_sqlite;
+pub use sanitize::{contains_sensitive_material, sanitize_command};
 
 /// One row in the analytics-optimized `commands` table.
 ///

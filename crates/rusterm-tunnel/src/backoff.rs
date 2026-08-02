@@ -77,13 +77,12 @@ mod tests {
 
     #[test]
     fn jitter_bounds() {
-        // At the cap: attempt 10 raw would exceed 60s, so delay must sit
-        // in [48s, 60s] (cap applied before jitter; lower jitter bound).
-        let lo = backoff_delay(10, 0.0);
-        let hi = backoff_delay(10, 0.999);
-        assert!(lo >= Duration::from_secs(48));
-        // jitter can exceed the cap slightly on the high side — bounded.
-        assert!(hi <= Duration::from_secs(73));
+        // Attempt 15: raw 800ms·1.5¹⁴ ≈ 233s, so the 60s cap applies and
+        // jitter spreads the delay into [48s, 72s].
+        let lo = backoff_delay(15, 0.0);
+        let hi = backoff_delay(15, 0.999);
+        assert!(lo >= Duration::from_secs(48), "{lo:?}");
+        assert!(hi <= Duration::from_secs(73), "{hi:?}");
     }
 
     #[test]

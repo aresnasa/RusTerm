@@ -3,6 +3,7 @@ pub mod config;
 pub mod config_manager;
 pub mod event;
 pub mod logging;
+pub mod login_script;
 pub mod paths;
 pub mod session;
 pub mod session_log;
@@ -17,6 +18,7 @@ pub use config::{
 pub use config_manager::ConfigManager;
 pub use event::{SessionEvent, TerminalEvent};
 pub use logging::{LogGuard, init_logging, log_dir, redact};
+pub use login_script::{LoginScriptError, LoginStep, parse_login_script};
 pub use session::{Session, SessionId, SessionManager, SessionType};
 pub use session_log::SessionLog;
 pub use session_state::{MasterKey, PersistedSession, PersistedTerminalSize, SessionState};

@@ -426,6 +426,34 @@ pub struct AppState {
     /// comparison session. Reset to `false` when comparison mode is toggled.
     #[serde(skip)]
     pub comparison_diff_confirmed: bool,
+
+    // ── REST relay (feature #63) ─────────────────────────────────────────
+    //
+    // `relay_config` is the in-memory copy of `relay.json`. It lives
+    // outside `PersistedConfig` by design (adding a field there touches a
+    // dozen read-modify-write sites); the relay panel edits this and calls
+    // `RelayConfig::save()` after each mutation. The running server handle
+    // lives in `relay_runtime`.
+    #[serde(skip)]
+    pub relay_config: rusterm_relay::RelayConfig,
+    #[serde(skip)]
+    pub relay_runtime: crate::relay_tunnel::RelayRuntime,
+    /// Visibility of the relay panel. Not persisted — panels start closed.
+    #[serde(skip)]
+    pub relay_panel_open: bool,
+    /// Last relay start/stop error, shown in the panel.
+    #[serde(skip)]
+    pub relay_status_message: Option<String>,
+
+    // ── SSH tunnel manager (feature #63) ─────────────────────────────────
+    //
+    // The manager owns supervisor tasks (one per running tunnel). Created
+    // after unlock in `app.rs`; `None` before that or if construction
+    // failed (the panel then shows a placeholder).
+    #[serde(skip)]
+    pub tunnel_manager: Option<std::sync::Arc<rusterm_tunnel::TunnelManager>>,
+    #[serde(skip)]
+    pub tunnel_panel_open: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -641,6 +669,12 @@ impl Default for AppState {
             comparison_diffs: None,
             comparison_diff_warning: None,
             comparison_diff_confirmed: false,
+            relay_config: rusterm_relay::RelayConfig::default(),
+            relay_runtime: crate::relay_tunnel::RelayRuntime::default(),
+            relay_panel_open: false,
+            relay_status_message: None,
+            tunnel_manager: None,
+            tunnel_panel_open: false,
         }
     }
 }

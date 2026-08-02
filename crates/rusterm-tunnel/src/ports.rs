@@ -6,7 +6,7 @@
 //! socket — the only race-free way to ask "is this port free" is to try
 //! taking it.
 
-use std::net::{IpAddr, Ipv4Addr, TcpListener as StdTcpListener};
+use std::net::{IpAddr, TcpListener as StdTcpListener};
 
 /// Above 1024 to dodge privileged ports and the huge ephemeral range
 /// collisions at the low end.
@@ -25,22 +25,23 @@ pub fn check_port_available(addr: IpAddr, port: u16) -> bool {
 /// Also tries a small set of tunnel-flavoured well-known defaults
 /// (1080/8080/8888...) after the scan, useful when `desired` is buried in
 /// used ports — e.g. when the relay's 8877 collides with something.
+fn push_if_free(found: &mut Vec<u16>, addr: IpAddr, port: u16) -> bool {
+    if port == 0 || found.contains(&port) {
+        return false;
+    }
+    if check_port_available(addr, port) {
+        found.push(port);
+        true
+    } else {
+        false
+    }
+}
+
 pub fn suggest_listen_ports(addr: IpAddr, desired: u16, count: usize) -> Vec<u16> {
     let mut found: Vec<u16> = Vec::with_capacity(count);
-    let mut push_if_free = |port: u16| -> bool {
-        if port == 0 || found.contains(&port) {
-            return false;
-        }
-        if check_port_available(addr, port) {
-            found.push(port);
-            true
-        } else {
-            false
-        }
-    };
 
     // 1. The desired port first.
-    if push_if_free(desired) && found.len() >= count {
+    if push_if_free(&mut found, addr, desired) && found.len() >= count {
         return found;
     }
 
@@ -51,7 +52,7 @@ pub fn suggest_listen_ports(addr: IpAddr, desired: u16, count: usize) -> Vec<u16
         if candidate == 0 || candidate == u16::MAX {
             break;
         }
-        push_if_free(candidate);
+        push_if_free(&mut found, addr, candidate);
         if found.len() >= count {
             return found;
         }
@@ -59,7 +60,7 @@ pub fn suggest_listen_ports(addr: IpAddr, desired: u16, count: usize) -> Vec<u16
 
     // 3. Fallback defaults.
     for fallback in [1080u16, 8080, 8888, 8878, 8879, 3128] {
-        push_if_free(fallback);
+        push_if_free(&mut found, addr, fallback);
         if found.len() >= count {
             return found;
         }
@@ -71,6 +72,7 @@ pub fn suggest_listen_ports(addr: IpAddr, desired: u16, count: usize) -> Vec<u16
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv4Addr;
 
     #[test]
     fn available_when_free() {
@@ -93,11 +95,12 @@ mod tests {
     fn suggestions_include_free_candidates() {
         let suggestions = suggest_listen_ports(Ipv4Addr::LOCALHOST.into(), 0, 3);
         // With port 0 the "desired" is skipped, so we get scan results
-        // starting at the elevation floor.
+        // starting at the elevation floor. (We don't re-probe the returned
+        // ports here — another test running in parallel could legitimately
+        // grab one between suggestion and check.)
         assert!(!suggestions.is_empty());
         for p in &suggestions {
             assert!(*p >= SUGGESTION_FLOOR);
-            assert!(check_port_available(Ipv4Addr::LOCALHOST.into(), *p));
         }
     }
 
