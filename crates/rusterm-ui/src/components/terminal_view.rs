@@ -1294,17 +1294,65 @@ pub fn TerminalView(
             TerminalOverlayKeyAction::OneKey(_) | TerminalOverlayKeyAction::None => {}
         }
 
-        // Ctrl+Shift+F remains terminal-local search. It intentionally wins
-        // over an application shortcut so focused terminal users never lose
-        // the established search behavior.
-        if ctrl && shift && matches!(key, Key::Character(ref s) if s == "f" || s == "F") {
+        // Standard terminal find shortcuts. Cmd+F is used on macOS; Ctrl+F is
+        // used on other desktop platforms. Keep Ctrl+Shift+F as the established
+        // RusTerm shortcut. Opening find seeds the query from a local terminal
+        // selection when possible (the "find selection" workflow).
+        let find_shortcut = !alt
+            && matches!(key, Key::Character(ref s) if s.eq_ignore_ascii_case("f"))
+            && ((meta && !ctrl) || (ctrl && !meta));
+        if find_shortcut {
             e.prevent_default();
             e.stop_propagation();
-            search_visible.toggle();
-            if !search_visible() {
-                search_query.set(String::new());
-                search_matches.set(Vec::new());
-                search_match_index.set(0);
+            if let Some(selected) =
+                search_query_from_selection(&selection_text(), selection(), &copy_rows)
+            {
+                if search_query() != selected {
+                    search_query.set(selected);
+                    search_match_index.set(0);
+                }
+            }
+            search_visible.set(true);
+            let input_id = search_input_id_for_keydown.clone();
+            spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                let _ = dioxus::document::eval(&format!(
+                    "const el=document.getElementById('{}'); if(el){{el.focus();el.select();}}",
+                    input_id
+                ))
+                .await;
+            });
+            return;
+        }
+
+        // Screenshot-compatible navigation: Alt+F3 moves through the current
+        // query; Cmd+F3 first replaces the query with the terminal selection.
+        if matches!(key, Key::F3) && (alt || meta) {
+            e.prevent_default();
+            e.stop_propagation();
+            if meta {
+                if let Some(selected) =
+                    search_query_from_selection(&selection_text(), selection(), &copy_rows)
+                {
+                    let found = find_search_matches(&copy_rows, &selected);
+                    search_query.set(selected);
+                    search_matches.set(found.clone());
+                    search_match_index.set(if shift && !found.is_empty() {
+                        found.len() - 1
+                    } else {
+                        0
+                    });
+                }
+            } else {
+                let matches = search_matches();
+                if !matches.is_empty() {
+                    let current = search_match_index().min(matches.len() - 1);
+                    search_match_index.set(if shift {
+                        current.checked_sub(1).unwrap_or(matches.len() - 1)
+                    } else {
+                        (current + 1) % matches.len()
+                    });
+                }
             }
             return;
         }
