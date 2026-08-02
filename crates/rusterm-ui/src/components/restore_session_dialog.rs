@@ -22,6 +22,7 @@ pub fn RestoreSessionDialog(
     on_skip: EventHandler<()>,
     on_never_ask: EventHandler<()>,
 ) -> Element {
+    let _lang = crate::i18n::LANGUAGE();
     rsx! {
         div {
             style: "
@@ -49,11 +50,11 @@ pub fn RestoreSessionDialog(
                     style: "text-align: center; margin-bottom: 20px;",
                     h2 {
                         style: "margin: 0 0 8px; font-size: 20px; font-weight: 600; color: #7aa2f7;",
-                        "恢复上次会话"
+                        { crate::i18n::t("restore.title") }
                     }
                     p {
                         style: "margin: 0; font-size: 13px; color: #565f89; line-height: 1.5;",
-                        "检测到 {session_count} 个上次会话（保存于 {saved_at}）"
+                        { crate::i18n::tf("restore.detected", &[("session_count", &session_count), ("saved_at", &saved_at)]) }
                     }
                 }
 
@@ -70,15 +71,15 @@ pub fn RestoreSessionDialog(
                     ",
                     p {
                         style: "margin: 0 0 8px; color: #9ece6a; font-weight: 500;",
-                        "✓ 恢复后会自动 cd 到上次的工作目录"
+                        { crate::i18n::t("restore.will_cd") }
                     }
                     p {
                         style: "margin: 0 0 8px; color: #e0af68;",
-                        "✗ 不会执行任何历史命令或脚本"
+                        { crate::i18n::t("restore.no_history_run") }
                     }
                     p {
                         style: "margin: 0; color: #565f89; font-size: 12px;",
-                        "选择“跳过”可使用空白会话开始；选择“不再询问”将永久禁用此功能。"
+                        { crate::i18n::t("restore.skip_hint") }
                     }
                 }
 
@@ -101,7 +102,7 @@ pub fn RestoreSessionDialog(
                             transition: background 0.15s;
                         ",
                         onclick: move |_| on_restore.call(()),
-                        "恢复上次会话"
+                        { crate::i18n::t("restore.title") }
                     }
 
                     // Skip (secondary, neutral)
@@ -118,7 +119,7 @@ pub fn RestoreSessionDialog(
                             transition: background 0.15s;
                         ",
                         onclick: move |_| on_skip.call(()),
-                        "跳过（开始空白会话）"
+                        { crate::i18n::t("restore.skip_blank") }
                     }
 
                     // Never ask (tertiary, muted)
@@ -135,7 +136,7 @@ pub fn RestoreSessionDialog(
                             transition: color 0.15s;
                         ",
                         onclick: move |_| on_never_ask.call(()),
-                        "不再询问"
+                        { crate::i18n::t("common.dont_ask_again") }
                     }
                 }
             }

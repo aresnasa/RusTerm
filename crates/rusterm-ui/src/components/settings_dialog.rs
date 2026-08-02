@@ -1,7 +1,7 @@
 use dioxus::prelude::*;
 
 use rusterm_core::FocusedTabAppearance;
-use rusterm_core::config::{KeybindingAction, Keybindings, SkinKind, SkinSettings};
+use rusterm_core::config::{KeybindingAction, Keybindings, Language, SkinKind, SkinSettings};
 
 use crate::keybindings::{event_chord, format_key_chord};
 
@@ -61,6 +61,13 @@ pub fn SettingsDialog(
     /// in app.rs builds the JSON report and writes it to the downloads dir.
     #[props(default)]
     on_export_usage_habits: EventHandler<()>,
+    /// Current UI language.
+    #[props(default)]
+    language: Language,
+    /// Fires with the newly chosen language when the user picks one. Applied
+    /// immediately (no Save needed) since it re-renders the whole dialog.
+    #[props(default)]
+    on_save_language: EventHandler<Language>,
 ) -> Element {
     let mut draft = use_signal(|| appearance.normalized());
     let preview = draft().normalized();
@@ -80,6 +87,11 @@ pub fn SettingsDialog(
     let skin_preview = skin_draft().palette();
     let mut capturing_keybinding: Signal<Option<KeybindingAction>> = use_signal(|| None);
     let mut keybinding_error: Signal<Option<String>> = use_signal(|| None);
+    // Current language code for the <select value=...> binding.
+    let language_code = match language {
+        Language::Zh => "zh",
+        Language::En => "en",
+    };
 
     rsx! {
         div {
@@ -93,7 +105,35 @@ pub fn SettingsDialog(
                 "aria-label": "Settings",
                 style: "background:var(--settings-surface);border:1px solid var(--settings-border-strong);border-radius:10px;padding:24px;width:min(520px,100%);max-height:calc(100vh - 48px);box-sizing:border-box;overflow-y:auto;color:var(--settings-text);color-scheme:dark;accent-color:var(--settings-accent);opacity:1;box-shadow:0 20px 64px rgba(0,0,0,0.72);",
 
-                h3 { style: "margin: 0 0 6px; font-size: 16px;", "Appearance" }
+                h3 { style: "margin: 0 0 6px; font-size: 16px;", { crate::i18n::t("settings.title") } }
+
+                // Language selector — top of the dialog since it affects how
+                // every other label reads. Applied immediately on change.
+                div {
+                    style: "display:flex;align-items:center;justify-content:space-between;gap:16px;margin:0 0 20px;padding-bottom:16px;border-bottom:1px solid var(--settings-border);",
+                    div {
+                        label {
+                            style: "font-size:12px;color:var(--settings-text);display:block;margin-bottom:3px;",
+                            { crate::i18n::t("settings.language") }
+                        }
+                        span {
+                            style: "font-size:11px;color:var(--settings-text-muted);",
+                            { crate::i18n::t("settings.language_help") }
+                        }
+                    }
+                    select {
+                        style: "min-width:120px;background:var(--settings-bg);color:var(--settings-text);border:1px solid var(--settings-border-strong);border-radius:4px;padding:5px 8px;font-size:12px;cursor:pointer;",
+                        value: "{language_code}",
+                        onchange: move |e| {
+                            let lang = if e.value() == "en" { Language::En } else { Language::Zh };
+                            on_save_language.call(lang);
+                        },
+                        option { value: "zh", selected: language == Language::Zh, { Language::Zh.label() } }
+                        option { value: "en", selected: language == Language::En, { Language::En.label() } }
+                    }
+                }
+
+                h3 { style: "margin: 0 0 6px; font-size: 16px;", { crate::i18n::t("settings.appearance") } }
                 p {
                     style: "margin: 0 0 20px; color: var(--settings-text-muted); font-size: 12px; line-height: 1.5;",
                     "Customize the complete outline around the top tab for the focused pane."

@@ -34,6 +34,8 @@ pub fn SendPanel(
     has_targets: bool,
     on_send: EventHandler<String>,
 ) -> Element {
+    // Subscribe to language changes so the placeholder/button re-render.
+    let _lang = crate::i18n::LANGUAGE();
     let mut command = use_signal(String::new);
     let mut suggestions = use_signal(Vec::<String>::new);
     let mut selected = use_signal(|| 0usize);
@@ -54,7 +56,7 @@ pub fn SendPanel(
                 style: "position:relative;min-width:0;flex:1;display:flex;",
                 textarea {
                     style: "min-width:0;flex:1;resize:none;background:var(--skin-surface);border:1px solid var(--skin-border);border-radius:4px;padding:8px 9px;color:var(--skin-text);font:12px ui-monospace,SFMono-Regular,Menlo,monospace;outline:none;",
-                    placeholder: "Command to send (Ctrl/Cmd+Enter to run, Tab to complete)...",
+                    placeholder: crate::i18n::t("send.placeholder"),
                     value: "{command}",
                     oninput: move |event| {
                         let value = event.value();
@@ -181,7 +183,7 @@ pub fn SendPanel(
                             epoch += 1;
                         }
                     },
-                    "Send ↵"
+                    { crate::i18n::t("send.run") }
                 }
             }
         }

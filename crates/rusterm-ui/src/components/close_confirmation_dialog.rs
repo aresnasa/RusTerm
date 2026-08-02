@@ -45,6 +45,8 @@ pub fn CloseConfirmationDialog(
     /// (the window has already been re-shown by the reshow future).
     on_cancel: EventHandler<()>,
 ) -> Element {
+    // Subscribe to language changes so the dialog re-renders on switch.
+    let _lang = crate::i18n::LANGUAGE();
     rsx! {
         div {
             style: "
@@ -73,11 +75,11 @@ pub fn CloseConfirmationDialog(
                     style: "text-align: center; margin-bottom: 20px;",
                     h2 {
                         style: "margin: 0 0 8px; font-size: 18px; font-weight: 600; color: #7aa2f7;",
-                        "关闭确认"
+                        { crate::i18n::t("close_confirm.title") }
                     }
                     p {
                         style: "margin: 0; font-size: 13px; color: #565f89;",
-                        "即将关闭最后一个窗口"
+                        { crate::i18n::t("close_confirm.closing_last_window") }
                     }
                 }
 
@@ -90,7 +92,7 @@ pub fn CloseConfirmationDialog(
                         line-height: 1.6;
                         margin-bottom: 20px;
                     ",
-                    "是否确实要关闭本软件？"
+                    { crate::i18n::t("close_confirm.body") }
                 }
 
                 // Checkbox (default checked — "默认勾选")
@@ -123,7 +125,7 @@ pub fn CloseConfirmationDialog(
                         // click either the checkbox or the label text to
                         // toggle.
                     }
-                    span { "下次关闭时不再询问" }
+                    span { { crate::i18n::t("close_confirm.dont_ask_again") } }
                 }
 
                 // Buttons — both visible ("都要显示给用户选择").
@@ -148,7 +150,7 @@ pub fn CloseConfirmationDialog(
                             transition: background 0.15s;
                         ",
                         onclick: move |_| on_cancel.call(()),
-                        "取消"
+                        { crate::i18n::t("common.cancel") }
                     }
 
                     // 确认关闭 (Confirm Close) — destructive, exits the app.
@@ -166,7 +168,7 @@ pub fn CloseConfirmationDialog(
                             transition: background 0.15s;
                         ",
                         onclick: move |_| on_confirm.call(()),
-                        "确认关闭"
+                        { crate::i18n::t("close_confirm.confirm_close") }
                     }
                 }
             }

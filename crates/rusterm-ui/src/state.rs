@@ -371,6 +371,11 @@ pub struct AppState {
     /// recording is a no-op even when the `analytics` feature is compiled in.
     #[serde(skip)]
     pub collect_usage_habits: bool,
+    /// UI display language. Mirrored into the global `i18n::LANGUAGE` signal
+    /// on startup so call sites can use `t("key")` without reading state.
+    /// Persisted in settings.json via `PersistedConfig::language`.
+    #[serde(skip)]
+    pub language: rusterm_core::config::Language,
     /// Per-session login-initialization script runtimes (see `LoginScriptRuntime`).
     /// Keyed by session id; removed when the script finishes or the session closes.
     #[serde(skip)]
@@ -696,6 +701,7 @@ impl Default for AppState {
             suggestion_enabled: true,
             suggestion_count: 3,
             collect_usage_habits: false,
+            language: rusterm_core::config::Language::default(),
             login_scripts: std::collections::HashMap::new(),
             close_dialog_visible: false,
             close_dialog_dont_ask_again: true,

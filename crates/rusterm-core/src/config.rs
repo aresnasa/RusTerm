@@ -1,5 +1,32 @@
 use serde::{Deserialize, Serialize};
 
+/// UI display language. Lives in `rusterm-core::config` (not `rusterm-ui`)
+/// so `PersistedConfig` can hold it without `rusterm-core` depending on the
+/// UI crate. `rusterm-ui::i18n` re-uses this type for its `GlobalSignal` and
+/// translation catalog.
+///
+/// Default is `Zh` for backward compatibility — the app shipped in Chinese
+/// before i18n was added, so existing settings files (which omit the field
+/// via `#[serde(default)]`) keep the original behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Language {
+    #[default]
+    Zh,
+    En,
+}
+
+impl Language {
+    /// Human-readable label in the language's own script, for the settings
+    /// dropdown.
+    pub fn label(self) -> &'static str {
+        match self {
+            Language::Zh => "中文",
+            Language::En => "English",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct ConnectionConfig {
     pub id: String,
@@ -1189,6 +1216,11 @@ pub struct PersistedConfig {
     /// anything is stored, regardless of this flag.
     #[serde(default)]
     pub collect_usage_habits: bool,
+    /// UI display language. Defaults to `Zh` for backward compatibility
+    /// (the app shipped in Chinese before i18n). Existing settings files
+    /// omit this field and get `Zh` via `Language`'s `#[default]`.
+    #[serde(default)]
+    pub language: Language,
 }
 
 /// Default for `PersistedConfig::confirm_close_on_exit`. Kept as a function
@@ -1863,6 +1895,7 @@ mod tests {
             keybindings: Keybindings::default(),
             skin: SkinSettings::default(),
             collect_usage_habits: false,
+            language: Language::default(),
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: PersistedConfig = serde_json::from_str(&json).unwrap();

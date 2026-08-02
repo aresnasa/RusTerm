@@ -146,6 +146,7 @@ pub fn ConnectionDialog(
     editing: Option<ConnectionConfig>,
     on_edit: EventHandler<(String, NewConnectionForm)>,
 ) -> Element {
+    let _lang = crate::i18n::LANGUAGE();
     let mut form = use_signal(default_form);
     // Tracks the id of the connection currently reflected in `form`. When the
     // `editing` prop changes (e.g. user clicks Edit on a different row, or
@@ -410,10 +411,14 @@ delay 250",
                             // come from (so they know to edit `~/.ssh/config`
                             // if a host is missing). Only shown when the
                             // config file exists / is readable.
-                            {(ssh_config_path_display().is_some() && !host_suggestions().is_empty()).then(|| rsx! {
-                                div {
-                                    style: "font-size: 11px; color: #565f89; margin-top: 2px;",
-                                    "提示：从 {ssh_config_path_display().as_deref().unwrap_or(\"~/.ssh/config\")} 读取到 {host_suggestions().len()} 个主机配置"
+                            {(ssh_config_path_display().is_some() && !host_suggestions().is_empty()).then(|| {
+                                let host_count = host_suggestions().len();
+                                let ssh_path = ssh_config_path_display().as_deref().unwrap_or("~/.ssh/config").to_string();
+                                rsx! {
+                                    div {
+                                        style: "font-size: 11px; color: #565f89; margin-top: 2px;",
+                                        { crate::i18n::tf("connection.ssh_hosts_hint", &[("count", &host_count), ("path", &ssh_path)]) }
+                                    }
                                 }
                             })}
                             // Datalist of host aliases from `~/.ssh/config`.
@@ -541,10 +546,13 @@ delay 250",
                                 // Hint showing how many identity files were
                                 // found in `~/.ssh/` (so the user knows the
                                 // dropdown is populated).
-                                {(!identity_suggestions().is_empty()).then(|| rsx! {
-                                    div {
-                                        style: "font-size: 11px; color: #565f89; margin-top: 2px;",
-                                        "提示：从 ~/.ssh/ 找到 {identity_suggestions().len()} 个私钥文件"
+                                {(!identity_suggestions().is_empty()).then(|| {
+                                    let identity_count = identity_suggestions().len();
+                                    rsx! {
+                                        div {
+                                            style: "font-size: 11px; color: #565f89; margin-top: 2px;",
+                                            { crate::i18n::tf("connection.identity_files_hint", &[("count", &identity_count)]) }
+                                        }
                                     }
                                 })}
                                 // Datalist of identity files from `~/.ssh/`.

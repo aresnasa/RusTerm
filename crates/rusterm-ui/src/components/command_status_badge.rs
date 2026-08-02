@@ -13,19 +13,19 @@ fn command_status_presentation(status: &CommandStatus) -> Option<CommandStatusPr
     match status {
         CommandStatus::Idle => None,
         CommandStatus::Success => Some(CommandStatusPresentation {
-            label: "✓ 成功".to_string(),
+            label: crate::i18n::t("cmd_status.success"),
             background: "rgba(76, 175, 80, 0.92)",
-            title: "上一条命令执行成功（exit 0）".to_string(),
+            title: crate::i18n::t("cmd_status.success_tip"),
         }),
         CommandStatus::Failed(exit_code) => Some(CommandStatusPresentation {
-            label: format!("✗ 失败 (exit {exit_code})"),
+            label: crate::i18n::tf("cmd_status.failed", &[("exit_code", exit_code)]),
             background: "rgba(244, 67, 54, 0.92)",
-            title: format!("上一条命令执行失败（exit {exit_code}）"),
+            title: crate::i18n::tf("cmd_status.failed_tip", &[("exit_code", exit_code)]),
         }),
         CommandStatus::Disconnected(reason) => Some(CommandStatusPresentation {
-            label: "⚠ 断开".to_string(),
+            label: crate::i18n::t("cmd_status.disconnected"),
             background: "rgba(244, 67, 54, 0.92)",
-            title: format!("会话已断开：{reason}。按 Enter 或右键重新连接"),
+            title: crate::i18n::tf("cmd_status.disconnected_tip", &[("reason", reason)]),
         }),
     }
 }
@@ -34,6 +34,8 @@ fn command_status_presentation(status: &CommandStatus) -> Option<CommandStatusPr
 /// title bars). This component never writes to the terminal/PTY output.
 #[component]
 pub fn CommandStatusBadge(status: CommandStatus) -> Element {
+    // Subscribe to language changes so the badge re-renders on switch.
+    let _lang = crate::i18n::LANGUAGE();
     let Some(presentation) = command_status_presentation(&status) else {
         return rsx! {};
     };

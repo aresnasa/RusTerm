@@ -9,10 +9,10 @@ use rand::RngCore;
 
 use crate::config::{
     ConnectionConfig, ConnectionKind, DEFAULT_ONEKEY_PASSWORD_EXPECT, EncryptedValue,
-    FocusedTabAppearance, Keybindings, OneKey, OneKeyStep, PersistedConfig, PersistedConnection,
-    PersistedConnectionKind, PersistedOneKey, PersistedOneKeyStep, PersistedProxyConfig,
-    PersistedSshAuth, PersistedSshConfig, ProxyConfig, SidebarPreferences, SkinSettings, SshAuth,
-    SshConfig, WorkspacePreferences,
+    FocusedTabAppearance, Keybindings, Language, OneKey, OneKeyStep, PersistedConfig,
+    PersistedConnection, PersistedConnectionKind, PersistedOneKey, PersistedOneKeyStep,
+    PersistedProxyConfig, PersistedSshAuth, PersistedSshConfig, ProxyConfig, SidebarPreferences,
+    SkinSettings, SshAuth, SshConfig, WorkspacePreferences,
 };
 use rusterm_crypto::{KeyringStore, decrypt_data, encrypt_data};
 
@@ -258,6 +258,7 @@ impl ConfigManager {
             keybindings: existing.keybindings,
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
+            language: existing.language,
         };
 
         let json =
@@ -292,6 +293,7 @@ impl ConfigManager {
             keybindings: existing.keybindings,
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
+            language: existing.language,
         };
 
         let json =
@@ -333,6 +335,7 @@ impl ConfigManager {
             keybindings: existing.keybindings,
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
+            language: existing.language,
         };
 
         let json =
@@ -371,6 +374,7 @@ impl ConfigManager {
             keybindings: existing.keybindings,
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
+            language: existing.language,
         };
 
         let json =
@@ -406,6 +410,7 @@ impl ConfigManager {
             keybindings: keybindings.clone().normalized(),
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
+            language: existing.language,
         };
         let json =
             serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
@@ -441,6 +446,7 @@ impl ConfigManager {
             keybindings: existing.keybindings,
             skin: skin.clone().normalized(),
             collect_usage_habits: existing.collect_usage_habits,
+            language: existing.language,
         };
         let json =
             serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
@@ -484,11 +490,50 @@ impl ConfigManager {
             keybindings: existing.keybindings,
             skin: existing.skin,
             collect_usage_habits: enabled,
+            language: existing.language,
         };
 
         let json =
             serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
 
+        let temp_path = self.config_path.with_extension("json.tmp");
+        fs::write(&temp_path, &json).context("Failed to write config file")?;
+        fs::rename(&temp_path, &self.config_path).context("Failed to rename temp config file")?;
+
+        Ok(())
+    }
+
+    /// Load the persisted UI language. Defaults to `Zh` for legacy settings
+    /// files that predate the field (via `Language`'s `#[default]`).
+    pub fn load_language(&self) -> Language {
+        self.read_persisted().language
+    }
+
+    /// Persist the UI language choice. Read-modify-write: preserves every
+    /// other field.
+    pub fn save_language(&self, language: Language) -> Result<()> {
+        let existing = self.read_persisted();
+        let persisted = PersistedConfig {
+            version: CONFIG_VERSION,
+            connections: existing.connections,
+            onekeys: existing.onekeys,
+            master_password_hash: self.master_password_hash.clone(),
+            restore_disabled: existing.restore_disabled,
+            confirm_close_on_exit: existing.confirm_close_on_exit,
+            comparison_diff_warning_enabled: existing.comparison_diff_warning_enabled,
+            focused_tab_appearance: existing.focused_tab_appearance,
+            suggestion_enabled: existing.suggestion_enabled,
+            suggestion_count: existing.suggestion_count,
+            sidebar: existing.sidebar,
+            workspace: existing.workspace,
+            keybindings: existing.keybindings,
+            skin: existing.skin,
+            collect_usage_habits: existing.collect_usage_habits,
+            language,
+        };
+
+        let json =
+            serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
         let temp_path = self.config_path.with_extension("json.tmp");
         fs::write(&temp_path, &json).context("Failed to write config file")?;
         fs::rename(&temp_path, &self.config_path).context("Failed to rename temp config file")?;
@@ -522,6 +567,7 @@ impl ConfigManager {
             keybindings: existing.keybindings,
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
+            language: existing.language,
         };
 
         let json =
@@ -559,6 +605,7 @@ impl ConfigManager {
             keybindings: existing.keybindings,
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
+            language: existing.language,
         };
 
         let json =
@@ -594,6 +641,7 @@ impl ConfigManager {
             keybindings: existing.keybindings,
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
+            language: existing.language,
         };
 
         let json =
@@ -671,6 +719,7 @@ impl ConfigManager {
             keybindings: existing.keybindings,
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
+            language: existing.language,
         };
 
         let json =
@@ -701,6 +750,7 @@ impl ConfigManager {
             keybindings: Keybindings::default(),
             skin: SkinSettings::default(),
             collect_usage_habits: false,
+            language: Language::default(),
         };
 
         let mut persisted = if self.config_path.exists() {
@@ -737,6 +787,7 @@ impl ConfigManager {
             keybindings: existing.keybindings,
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
+            language: existing.language,
         };
 
         let json =

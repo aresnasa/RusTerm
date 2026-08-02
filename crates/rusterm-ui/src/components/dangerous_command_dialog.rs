@@ -22,6 +22,7 @@ pub fn DangerousCommandDialog(
     on_proceed: EventHandler<()>,
     on_cancel: EventHandler<()>,
 ) -> Element {
+    let _lang = crate::i18n::LANGUAGE();
     rsx! {
         div {
             style: "
@@ -50,11 +51,11 @@ pub fn DangerousCommandDialog(
                     style: "text-align: center; margin-bottom: 20px;",
                     h2 {
                         style: "margin: 0 0 8px; font-size: 18px; font-weight: 600; color: #f7768e;",
-                        "⚠ 高危命令确认"
+                        { crate::i18n::t("danger.title") }
                     }
                     p {
                         style: "margin: 0; font-size: 12px; color: #565f89;",
-                        "此命令可能造成不可逆破坏，请确认后继续"
+                        { crate::i18n::t("danger.body") }
                     }
                 }
 
@@ -109,7 +110,7 @@ pub fn DangerousCommandDialog(
                             transition: background 0.15s;
                         ",
                         onclick: move |_| on_cancel.call(()),
-                        "取消"
+                        { crate::i18n::t("common.cancel") }
                     }
 
                     // Proceed (danger, red)
@@ -127,7 +128,7 @@ pub fn DangerousCommandDialog(
                             transition: background 0.15s;
                         ",
                         onclick: move |_| on_proceed.call(()),
-                        "仍然继续"
+                        { crate::i18n::t("danger.continue_anyway") }
                     }
                 }
             }

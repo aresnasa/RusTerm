@@ -36,6 +36,8 @@ pub fn BottomToolPanel(
     on_clear_transfers: EventHandler<()>,
     on_close: EventHandler<()>,
 ) -> Element {
+    // Subscribe to language changes so tabs/labels re-render on switch.
+    let _lang = crate::i18n::LANGUAGE();
     let mut live_height = use_signal(|| height_px);
     let mut resize_drag = use_signal(|| Option::<(f64, u16)>::None);
     let mut target_picker_open = use_signal(|| false);
@@ -76,28 +78,28 @@ pub fn BottomToolPanel(
                 button {
                     class: if active_tab == BottomPanelTab::Send { "workspace-tab active" } else { "workspace-tab" },
                     onclick: move |_| on_tab_change.call(BottomPanelTab::Send),
-                    "Send"
+                    { crate::i18n::t("send.tab_title") }
                 }
                 button {
                     class: if active_tab == BottomPanelTab::Shell { "workspace-tab active" } else { "workspace-tab" },
                     onclick: move |_| on_tab_change.call(BottomPanelTab::Shell),
-                    "Shell"
+                    { crate::i18n::t("shell.tab_title") }
                 }
                 button {
                     class: if active_tab == BottomPanelTab::Transfers { "workspace-tab active" } else { "workspace-tab" },
                     onclick: move |_| on_tab_change.call(BottomPanelTab::Transfers),
-                    "Transfers"
+                    { crate::i18n::t("transfers.tab_title") }
                 }
                 }
                 if active_tab == BottomPanelTab::Send {
                     button {
                         class: if target_picker_open() { "send-target-button active" } else { "send-target-button" },
-                        title: "Choose connected sessions",
+                        title: crate::i18n::t("send.choose_targets"),
                         onclick: move |event: MouseEvent| {
                             event.stop_propagation();
                             target_picker_open.set(!target_picker_open());
                         },
-                        "Target: {target_label} ▾"
+                        { crate::i18n::tf("send.target", &[("label", &target_label)]) }
                     }
                 } else {
                     span { style: "margin-left:auto;" }
@@ -105,9 +107,9 @@ pub fn BottomToolPanel(
                 if active_tab == BottomPanelTab::Shell && shell_content.is_some() {
                     button {
                         style: "border:0;background:transparent;color:var(--skin-danger);cursor:pointer;padding:4px 7px;font-size:11px;",
-                        title: "Terminate embedded shell",
+                        title: crate::i18n::t("shell.terminate"),
                         onclick: move |_| on_terminate_shell.call(()),
-                        "Terminate"
+                        { crate::i18n::t("shell.terminate") }
                     }
                 }
                 if !embedded {
@@ -129,25 +131,25 @@ pub fn BottomToolPanel(
                     onclick: move |event: MouseEvent| event.stop_propagation(),
                     div {
                         style: "display:flex;align-items:center;flex-wrap:wrap;gap:6px;padding:7px;border-bottom:1px solid var(--skin-border);",
-                        span { style: "color:var(--skin-text);font-size:11px;font-weight:600;", "Send targets" }
+                        span { style: "color:var(--skin-text);font-size:11px;font-weight:600;", { crate::i18n::t("send.targets") } }
                         span { style: "margin-left:auto;color:var(--skin-text-muted);font-size:10px;", "{selected_target_count}/{target_count} selected" }
                         button {
                             class: "send-target-action",
                             disabled: !has_available_targets,
                             onclick: move |_| on_select_all_targets.call(()),
-                            "全选"
+                            { crate::i18n::t("send.all") }
                         }
                         button {
                             class: "send-target-action",
                             disabled: !has_available_targets,
                             onclick: move |_| on_invert_targets.call(()),
-                            "反选"
+                            { crate::i18n::t("send.invert") }
                         }
                     }
                     div {
                         style: "min-height:0;overflow:auto;padding:4px;",
                         if !has_available_targets {
-                            div { style: "padding:12px 8px;text-align:center;color:var(--skin-text-muted);font-size:11px;", "No connected sessions" }
+                            div { style: "padding:12px 8px;text-align:center;color:var(--skin-text-muted);font-size:11px;", { crate::i18n::t("send.no_sessions") } }
                         }
                         for (session_id, label, selected) in target_rows {
                             label {
@@ -184,8 +186,8 @@ pub fn BottomToolPanel(
                         div {
                             style: "flex:1;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:9px;color:var(--skin-text-muted);font-size:12px;",
                             div { style: "font-size:24px;color:var(--skin-accent);", ">_" }
-                            div { "Start a local shell embedded in this bottom panel." }
-                            button { class: "workspace-primary-button", onclick: move |_| on_open_shell.call(()), "Start local shell" }
+                            div { { crate::i18n::t("shell.start_hint") } }
+                            button { class: "workspace-primary-button", onclick: move |_| on_open_shell.call(()), { crate::i18n::t("shell.start") } }
                         }
                     }
                 },

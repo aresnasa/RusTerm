@@ -11,6 +11,7 @@ pub fn AiPanel(
     on_close: EventHandler<()>,
     on_review: EventHandler<String>,
 ) -> Element {
+    let _lang = crate::i18n::LANGUAGE();
     if !visible {
         return rsx! {};
     }
@@ -35,7 +36,7 @@ pub fn AiPanel(
             div {
                 style: "padding:12px 16px;border-bottom:1px solid var(--skin-border);",
                 div { style: "display:flex;justify-content:space-between;align-items:center;",
-                    span { style: "font-weight:600;font-size:13px;", "AI 建议 · 影子沙盒" }
+                    span { style: "font-weight:600;font-size:13px;", { crate::i18n::t("ai.title") } }
                     button {
                         style: "background:none;border:none;color:var(--skin-text-muted);cursor:pointer;font-size:14px;",
                         onclick: move |_| on_close.call(()),
@@ -44,14 +45,14 @@ pub fn AiPanel(
                 }
                 p {
                     style: "margin:8px 0 0;color:var(--skin-text-muted);font-size:11px;line-height:1.5;",
-                    "模型只能提出建议。选择后仍需在独立弹窗中确认，模型无权直接写入终端。"
+                    { crate::i18n::t("ai.disclaimer") }
                 }
             }
 
             div {
                 style: "padding:9px 12px;background:var(--skin-bg);border-bottom:1px solid var(--skin-border);font-size:11px;line-height:1.5;",
                 div { style: "color:var(--skin-text-muted);", "{status}" }
-                div { style: "margin-top:3px;color:var(--skin-accent);", "已授权给模型的本机结果：{shared_result_count}" }
+                div { style: "margin-top:3px;color:var(--skin-accent);", { crate::i18n::tf("ai.shared_results", &[("shared_result_count", &shared_result_count)]) } }
             }
 
             div {
@@ -73,7 +74,7 @@ pub fn AiPanel(
                             button {
                                 style: "background:var(--skin-accent);color:var(--skin-bg);border:0;border-radius:4px;padding:5px 9px;font-size:11px;font-weight:600;cursor:pointer;",
                                 onclick: move |_| on_review.call(suggestion.command.clone()),
-                                "审查执行"
+                                { crate::i18n::t("ai.review") }
                             }
                         }
                     }
@@ -82,7 +83,7 @@ pub fn AiPanel(
                 if is_empty {
                     div {
                         style: "text-align:center;color:var(--skin-text-muted);padding:40px 16px;font-size:12px;line-height:1.6;",
-                        "暂无模型建议。\n设置 OPENAI_API_KEY 或 ANTHROPIC_API_KEY 后重新打开 AI 面板。"
+                        { crate::i18n::t("ai.empty") }
                     }
                 }
             }

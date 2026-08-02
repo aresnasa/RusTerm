@@ -51,6 +51,7 @@ pub fn SuggestionPopup(
     #[props(default)]
     max_rows: usize,
 ) -> Element {
+    let _lang = crate::i18n::LANGUAGE();
     if suggestions.is_empty() {
         return rsx! {};
     }
@@ -134,7 +135,7 @@ pub fn SuggestionPopup(
                                 if is_correction {
                                     span {
                                         style: "flex-shrink:0;color:#9ece6a;font-size:11px;",
-                                        "纠正 ·"
+                                        { crate::i18n::t("suggestion.correction_prefix") }
                                     }
                                 }
                                 span {
@@ -200,9 +201,9 @@ pub fn SuggestionPopup(
                     background:#1a1b26;
                 ",
                 if has_corrections {
-                    "纠正项：Tab 仅替换，不执行 · 历史项：× 删除"
+                    { crate::i18n::t("suggestion.correction_hint") }
                 } else {
-                    "Shift+Del or click × to remove"
+                    { crate::i18n::t("suggestion.history_hint") }
                 }
             }
             // Hover rule for the × button on non-selected rows. Selected rows

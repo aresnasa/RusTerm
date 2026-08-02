@@ -1025,13 +1025,11 @@ fn request_ai_suggestions(
         .ok()
         .filter(|key| !key.trim().is_empty());
     if openai_key.is_none() && anthropic_key.is_none() {
-        ai_status.set(
-            "未配置模型：请在启动环境中设置 OPENAI_API_KEY 或 ANTHROPIC_API_KEY。".to_string(),
-        );
+        ai_status.set(crate::i18n::t("ai_runtime.not_configured"));
         return;
     }
 
-    ai_status.set("正在请求模型建议；仅发送已授权的执行结果…".to_string());
+    ai_status.set(crate::i18n::t("ai_runtime.requesting"));
     spawn(async move {
         let mut engine = rusterm_ai::SuggestionEngine::new();
         let provider = if let Some(api_key) = openai_key {
@@ -1061,13 +1059,14 @@ fn request_ai_suggestions(
             Ok(suggestions) => {
                 let count = suggestions.len();
                 ai_suggestions.set(suggestions);
-                ai_status.set(format!(
-                    "模型返回 {count} 条建议。建议不会自动执行，请逐条审查。"
-                ));
+                ai_status.set(crate::i18n::tf("ai_runtime.returned", &[("count", &count)]));
             }
             Err(error) => {
                 tracing::warn!("[SHADOW-SANDBOX] model suggestion failed: {}", error);
-                ai_status.set(format!("模型请求失败：{error}"));
+                ai_status.set(crate::i18n::tf(
+                    "ai_runtime.request_failed",
+                    &[("error", &error)],
+                ));
             }
         }
     });
@@ -4228,7 +4227,7 @@ fn empty_pane_title_actions(
             rsx! {
                 button {
                     style: "height: 18px; min-width: 24px; padding: 0 6px; border: 1px solid #414868; border-radius: 3px; background: #24283b; color: #7aa2f7; cursor: pointer; font-size: 12px; line-height: 16px; transition: background 0.12s ease, color 0.12s ease;",
-                    title: "复制当前焦点会话：{source_name}",
+                    title: crate::i18n::tf("layout.clone_focused", &[("source_name", &source_name)]),
                     // stop_propagation on mousedown prevents the pane title
                     // bar's onmousedown (which starts a tab drag) from firing.
                     // We do NOT call prevent_default here — in some webview
@@ -4261,7 +4260,7 @@ fn empty_pane_title_actions(
         None => rsx! {
             button {
                 style: "height: 18px; min-width: 24px; padding: 0 6px; border: 1px solid #2a2b3d; border-radius: 3px; background: #1f2335; color: #414868; cursor: not-allowed; font-size: 12px; line-height: 16px;",
-                title: "没有可复制的焦点会话",
+                title: crate::i18n::t("layout.no_focused_to_clone"),
                 disabled: true,
                 "⧉"
             }
@@ -4274,7 +4273,7 @@ fn empty_pane_title_actions(
             {copy_button}
             button {
                 style: "height: 18px; min-width: 24px; padding: 0 6px; border: 1px solid #414868; border-radius: 3px; background: #24283b; color: #9ece6a; cursor: pointer; font-size: 13px; line-height: 16px; transition: background 0.12s ease, color 0.12s ease;",
-                title: "打开侧栏，将自定义连接拖入此窗格",
+                title: crate::i18n::t("layout.drop_custom_conn"),
                 // Same as the copy button: stop_propagation only, NO
                 // prevent_default (prevent_default blocks click in webkit).
                 onmousedown: move |e: MouseEvent| {
@@ -4296,7 +4295,7 @@ fn empty_pane_title_actions(
             }
             button {
                 style: "height: 18px; min-width: 24px; padding: 0 6px; border: 1px solid #414868; border-radius: 3px; background: #24283b; color: #f7768e; cursor: pointer; font-size: 13px; line-height: 16px; transition: background 0.12s ease, color 0.12s ease;",
-                title: "关闭此窗格（从布局中移除）",
+                title: crate::i18n::t("layout.close_pane"),
                 // Same as the other buttons: stop_propagation only, NO
                 // prevent_default (prevent_default blocks click in webkit —
                 // see occupied_pane_title_actions for the same lesson).
@@ -4377,7 +4376,7 @@ fn occupied_pane_title_actions(
             style: "display: inline-flex; align-items: center; gap: 4px; margin-left: 6px;",
             button {
                 style: "height: 18px; min-width: 24px; padding: 0 6px; border: 1px solid #414868; border-radius: 3px; background: #24283b; color: #f7768e; cursor: pointer; font-size: 13px; line-height: 16px; transition: background 0.12s ease, color 0.12s ease;",
-                title: "关闭此窗格（从布局中移除，Cmd+W / Ctrl+Shift+W 亦可）",
+                title: crate::i18n::t("layout.close_pane_hint"),
                 onmousedown: move |e: MouseEvent| {
                     e.stop_propagation();
                 },
@@ -4757,7 +4756,7 @@ fn multi_pane_container(
             // fall back to the session id if the session was closed
             // between the layout snapshot and this render.
             let (title, command_status) = if sid.is_empty() {
-                ("空白窗格".to_string(), CommandStatus::Idle)
+                (crate::i18n::t("layout.empty_pane"), CommandStatus::Idle)
             } else {
                 state
                     .read()
@@ -5231,7 +5230,7 @@ fn multi_pane_container(
                             z-index: 10;
                             transition: background 0.12s ease;
                         "),
-                        title: "拖动会话标题可移动到其他窗格；⠿ 单击开始/停止移动浮动窗",
+                        title: crate::i18n::t("layout.drag_to_repane"),
                         onmousedown: move |e: MouseEvent| {
                             // Only start a drag on primary button (left
                             // click). Middle/right clicks have other
@@ -5304,7 +5303,7 @@ fn multi_pane_container(
                         span {
                             class: "pane-drag-handle",
                             style: "display: inline-flex; align-items: center; justify-content: center; width: 18px; margin-right: 5px; cursor: move; color: #7aa2f7; font-size: 13px; transition: color 0.12s ease, transform 0.12s ease;",
-                            title: "单击开始移动小窗口，再次按下左键或按 Esc 停止",
+                            title: crate::i18n::t("layout.move_float_hint"),
                             onmousedown: move |e: MouseEvent| {
                                 if e.trigger_button() == Some(MouseButton::Primary) {
                                     // Keep the title bar's session drag gesture from starting.
@@ -5489,15 +5488,15 @@ fn multi_pane_container(
                                 }
                                 div {
                                     style: "color: #7aa2f7; font-weight: 600; font-size: 12px;",
-                                    "空白窗格"
+                                    { crate::i18n::t("layout.empty_pane") }
                                 }
                                 div {
                                     style: "color: #565f89; font-size: 11px; line-height: 1.5;",
-                                    "点击标题栏 ⧉ 复制焦点会话"
+                                    { crate::i18n::t("layout.empty_pane_clone_hint") }
                                     br {}
-                                    "拖动左侧会话到此处新建会话"
+                                    { crate::i18n::t("layout.drop_new_session") }
                                     br {}
-                                    "或拖动标签页/会话标题到此处"
+                                    { crate::i18n::t("layout.or_drag_tab") }
                                 }
                             }
                         } else {
@@ -8316,9 +8315,10 @@ fn start_ssh_connection(
                         SessionEvent::Disconnected(id, reason) => {
                             {
                                 let mut app = state.write();
-                                let _ = app
-                                    .shadow_sandbox
-                                    .fail_execution(&id, format!("会话断开：{reason}"));
+                                let _ = app.shadow_sandbox.fail_execution(
+                                    &id,
+                                    crate::i18n::tf("session.disconnected", &[("reason", &reason)]),
+                                );
                                 app.ssh_sessions.remove(&id);
                                 app.sftp_clients.remove(&id);
                                 app.transfers.cancel_for_session(&id);
@@ -8825,10 +8825,10 @@ fn start_shell_connection(
                             drive_login_script(state, input_senders, &id, &data);
                         }
                         SessionEvent::Disconnected(id, reason) => {
-                            let _ = state
-                                .write()
-                                .shadow_sandbox
-                                .fail_execution(&id, format!("会话断开：{reason}"));
+                            let _ = state.write().shadow_sandbox.fail_execution(
+                                &id,
+                                crate::i18n::tf("session.disconnected", &[("reason", &reason)]),
+                            );
                             input_senders.write().remove(&id);
                             state.write().login_scripts.remove(&id);
                             let mut s = state.write();
@@ -9956,10 +9956,11 @@ fn reconnect_session(
 
 #[component]
 pub fn App() -> Element {
+    let _lang = crate::i18n::LANGUAGE();
     let mut state = use_signal(AppState::default);
     let mut modal = use_signal(|| Modal::None);
     let ai_suggestions = use_signal(Vec::<rusterm_ai::suggestion::AiSuggestion>::new);
-    let mut ai_status = use_signal(|| "模型建议不会自动执行。".to_string());
+    let mut ai_status = use_signal(|| crate::i18n::t("ai_runtime.wont_autorun"));
     let mut input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>> =
         use_signal(HashMap::new);
     // Connection currently being edited in the ConnectionDialog. `None` means
@@ -10853,6 +10854,8 @@ pub fn App() -> Element {
                                 s.suggestion_enabled = sug_enabled;
                                 s.suggestion_count = sug_count;
                                 s.collect_usage_habits = cm.load_usage_habits_enabled();
+                                s.language = cm.load_language();
+                                crate::i18n::init_language(s.language);
                                 s.keybindings = cm.load_keybindings();
                                 s.skin = cm.load_skin_settings();
                                 s.config_manager = Some(cm);
@@ -11360,12 +11363,12 @@ pub fn App() -> Element {
                             };
 
                             let Some(request) = request else {
-                                ai_status.set("没有可执行建议的活动会话。".to_string());
+                                ai_status.set(crate::i18n::t("ai_runtime.no_active_session"));
                                 return;
                             };
                             match state.write().shadow_sandbox.propose(request) {
                                 Ok(()) => modal.set(Modal::None),
-                                Err(error) => ai_status.set(format!("无法开始审批：{error}")),
+                                Err(error) => ai_status.set(crate::i18n::tf("ai_runtime.cannot_start_approval", &[("error", &error)])),
                             }
                         },
                     }
@@ -11794,6 +11797,16 @@ pub fn App() -> Element {
                 keybindings: state.read().keybindings.clone(),
                 skin: state.read().skin.clone(),
                 usage_habits_enabled: state.read().collect_usage_habits,
+                language: state.read().language,
+                on_save_language: move |lang: rusterm_core::config::Language| {
+                    if let Some(cm) = state.read().config_manager.clone() {
+                        if let Err(e) = cm.save_language(lang) {
+                            tracing::error!("Failed to save language setting: {}", e);
+                        }
+                    }
+                    state.write().language = lang;
+                    crate::i18n::set_language(lang);
+                },
                 on_close: move |_| modal.set(Modal::None),
                 on_save: move |appearance: rusterm_core::FocusedTabAppearance| {
                     let appearance = appearance.normalized();
@@ -12240,12 +12253,12 @@ pub fn App() -> Element {
                             if sent == 0 {
                                 let _ = state.write().shadow_sandbox.fail_execution(
                                     &session_id,
-                                    "目标会话不可用，命令未发送",
+                                    crate::i18n::t("session.command_not_sent"),
                                 );
                             }
                         }
                         Err(error) => {
-                            ai_status.set(format!("执行审批已失效：{error}"));
+                            ai_status.set(crate::i18n::tf("ai_runtime.approval_invalid", &[("error", &error)]));
                         }
                     }
                 },
@@ -12265,7 +12278,7 @@ pub fn App() -> Element {
                     let approval = state.write().shadow_sandbox.approve_result_sharing();
                     match approval {
                         Ok(_) => request_ai_suggestions(state, modal, ai_suggestions, ai_status),
-                        Err(error) => ai_status.set(format!("结果授权已失效：{error}")),
+                        Err(error) => ai_status.set(crate::i18n::tf("ai_runtime.result_auth_invalid", &[("error", &error)])),
                     }
                 },
                 on_reject: move |_| {
@@ -12325,11 +12338,16 @@ pub fn App() -> Element {
                     style: "background:#24283b;border:1px solid #e0af68;border-radius:8px;padding:28px;width:480px;font-family:'Segoe UI',system-ui,sans-serif;color:#c0caf5;",
                     div {
                         style: "font-size:15px;font-weight:600;margin-bottom:12px;",
-                        "⚠ 检测到大量输出差异"
+                        { crate::i18n::t("layout.diff_too_large") }
                     }
                     div {
                         style: "font-size:13px;color:#a9b1d6;line-height:1.6;margin-bottom:20px;",
-                        "比对模式发现 {summary.diff_rows} / {summary.total_rows} 行（{(summary.diff_fraction() * 100.0) as u32}%）存在差异。\n输出的内容差异过大，高亮所有差异行可能会影响阅读。\n是否仍然显示差异高亮？"
+                        {
+                            let diff_rows = summary.diff_rows;
+                            let total_rows = summary.total_rows;
+                            let pct = (summary.diff_fraction() * 100.0) as u32;
+                            crate::i18n::tf("layout.diff_warning_body", &[("diff_rows", &diff_rows), ("total_rows", &total_rows), ("pct", &pct)])
+                        }
                     }
                     div {
                         style: "display:flex;gap:12px;justify-content:flex-end;",
@@ -12345,7 +12363,7 @@ pub fn App() -> Element {
                                 s.comparison_diff_warning = None;
                                 toggle_comparison_mode(&mut s);
                             },
-                            "取消"
+                            { crate::i18n::t("common.cancel") }
                         }
                         button {
                             style: "padding:8px 20px;background:transparent;border:1px solid #e0af68;border-radius:4px;color:#e0af68;font-size:13px;cursor:pointer;",
@@ -12361,7 +12379,7 @@ pub fn App() -> Element {
                                 }
                                 suppress_comparison_diff_warning(&mut state.write());
                             },
-                            "不再提示"
+                            { crate::i18n::t("common.dont_show_again") }
                         }
                         button {
                             style: "padding:8px 20px;background:#7aa2f7;border:1px solid #7aa2f7;border-radius:4px;color:#1a1b26;font-size:13px;font-weight:600;cursor:pointer;",
@@ -12371,7 +12389,7 @@ pub fn App() -> Element {
                                 s.comparison_diff_confirmed = true;
                                 s.comparison_diff_warning = None;
                             },
-                            "继续显示"
+                            { crate::i18n::t("layout.keep_showing") }
                         }
                     }
                 }
