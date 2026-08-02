@@ -455,16 +455,81 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
                     if selected_sessions().is_empty() {
                         div { class: "api-hint", style: "color:#e0af68;", { crate::i18n::t("api.select_session_hint") } }
                     }
-                    div { class: "api-field api-command-field",
-                        span { { crate::i18n::t("api.command") } }
-                        div { class: "api-command-edit-hint",
-                            { crate::i18n::t("api.command_edit_hint") }
+                    // Mode toggle: Command | Script | Script (base64). Drives
+                    // which JSON field the generated curl sends and which
+                    // input element is shown below.
+                    div { class: "api-row", style: "gap:6px;margin-bottom:8px;",
+                        button {
+                            class: "api-btn",
+                            style: if curl_mode() == CurlMode::Command { "font-weight:bold;" } else { "" },
+                            onclick: move |_| curl_mode.set(CurlMode::Command),
+                            { crate::i18n::t("api.mode_command") }
                         }
-                        input {
-                            class: "api-input",
-                            value: "{curl_command}",
-                            placeholder: "kubectl get pods",
-                            oninput: move |e| curl_command.set(e.value()),
+                        button {
+                            class: "api-btn",
+                            style: if curl_mode() == CurlMode::Script { "font-weight:bold;" } else { "" },
+                            onclick: move |_| curl_mode.set(CurlMode::Script),
+                            { crate::i18n::t("api.mode_script") }
+                        }
+                        button {
+                            class: "api-btn",
+                            style: if curl_mode() == CurlMode::ScriptBase64 { "font-weight:bold;" } else { "" },
+                            onclick: move |_| curl_mode.set(CurlMode::ScriptBase64),
+                            { crate::i18n::t("api.mode_script_base64") }
+                        }
+                    }
+                    div { class: "api-field api-command-field",
+                        span {
+                            {
+                                match curl_mode() {
+                                    CurlMode::Command => crate::i18n::t("api.command"),
+                                    CurlMode::Script => crate::i18n::t("api.script_label"),
+                                    CurlMode::ScriptBase64 => crate::i18n::t("api.script_base64_label"),
+                                }
+                            }
+                        }
+                        div { class: "api-command-edit-hint",
+                            {
+                                match curl_mode() {
+                                    CurlMode::Command => crate::i18n::t("api.command_edit_hint"),
+                                    CurlMode::Script => crate::i18n::t("api.script_edit_hint"),
+                                    CurlMode::ScriptBase64 => crate::i18n::t("api.script_base64_edit_hint"),
+                                }
+                            }
+                        }
+                        // Single-line input for Command mode; multi-line
+                        // textarea for Script and ScriptBase64. The textarea
+                        // is wide enough to read a typical script without
+                        // horizontal scrolling, but the JSON body still
+                        // serialises newlines as `\n` so the curl --data
+                        // argument stays a single shell-quoted string.
+                        match curl_mode() {
+                            CurlMode::Command => rsx! {
+                                input {
+                                    class: "api-input",
+                                    value: "{curl_command}",
+                                    placeholder: "kubectl get pods",
+                                    oninput: move |e| curl_command.set(e.value()),
+                                }
+                            },
+                            CurlMode::Script => rsx! {
+                                textarea {
+                                    class: "api-input",
+                                    style: "min-height:120px;font-family:monospace;resize:vertical;",
+                                    value: "{curl_script}",
+                                    placeholder: "#!/bin/sh\nset -e\necho hello\nuptime",
+                                    oninput: move |e| curl_script.set(e.value()),
+                                }
+                            },
+                            CurlMode::ScriptBase64 => rsx! {
+                                textarea {
+                                    class: "api-input",
+                                    style: "min-height:80px;font-family:monospace;resize:vertical;",
+                                    value: "{curl_script_base64}",
+                                    placeholder: "IyEvYmluL3NoCmVjaG8gaGVsbG8K",
+                                    oninput: move |e| curl_script_base64.set(e.value()),
+                                }
+                            },
                         }
                     }
                     label {
@@ -478,11 +543,20 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
                     }
 
                     {
+                        // Build the payload from the active mode. Empty
+                        // script/base64 falls back to an empty string so the
+                        // curl preview still renders (the relay will reject
+                        // it with `script_rejected`/`base64_invalid`).
+                        let payload = match curl_mode() {
+                            CurlMode::Command => CurlPayload::Command(curl_command()),
+                            CurlMode::Script => CurlPayload::Script(curl_script()),
+                            CurlMode::ScriptBase64 => CurlPayload::ScriptBase64(curl_script_base64()),
+                        };
                         let preview = gen_curl_preview(
                             &url,
                             &default_user,
                             &selected_sessions(),
-                            &curl_command(),
+                            &payload,
                             curl_elevated(),
                         );
                         let CurlPreviewParts {
@@ -505,11 +579,16 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
                             // Clone into the move closure so `url` itself isn't
                             // moved out of the render scope.
                             onclick: move |_| {
+                                let payload = match curl_mode() {
+                                    CurlMode::Command => CurlPayload::Command(curl_command()),
+                                    CurlMode::Script => CurlPayload::Script(curl_script()),
+                                    CurlMode::ScriptBase64 => CurlPayload::ScriptBase64(curl_script_base64()),
+                                };
                                 let curl = gen_curl(
                                     &url_for_copy,
                                     &default_user,
                                     &selected_sessions(),
-                                    &curl_command(),
+                                    &payload,
                                     curl_elevated(),
                                 );
                                 let _ = dioxus::document::eval(&format!(
