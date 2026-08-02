@@ -92,7 +92,7 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
     };
     // Default the selected session to the first available; keep the last
     // selection if still valid.
-    let selected_session = use_signal(|| sessions.first().map(|(id, _)| id.clone()));
+    let mut selected_session = use_signal(|| sessions.first().map(|(id, _)| id.clone()));
     if selected_session()
         .as_ref()
         .is_some_and(|s| !sessions.iter().any(|(id, _)| id == s))
