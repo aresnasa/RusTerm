@@ -6335,21 +6335,73 @@ fn onekey_popup_for_output(
     })
 }
 
+fn save_onekey_preferences(state: &AppState) {
+    let Some(config_manager) = state.config_manager.clone() else {
+        return;
+    };
+    if let Err(error) = config_manager.save_onekey_preferences(&state.onekey_preferences) {
+        tracing::error!("Failed to save OneKey preferences: {}", error);
+    }
+}
+
+fn remember_onekey_preference(state: &mut AppState, preference: OneKeyPreference) {
+    state.onekey_preferences.retain(|current| {
+        current.connection_id != preference.connection_id
+            || current.prompt_fingerprint != preference.prompt_fingerprint
+    });
+    state.onekey_preferences.push(preference);
+    save_onekey_preferences(state);
+}
+
+fn forget_onekey_preference(state: &mut AppState, preference: &OneKeyPreference) -> bool {
+    let before = state.onekey_preferences.len();
+    state.onekey_preferences.retain(|current| {
+        current.connection_id != preference.connection_id
+            || current.prompt_fingerprint != preference.prompt_fingerprint
+    });
+    let removed = state.onekey_preferences.len() != before;
+    if removed {
+        save_onekey_preferences(state);
+    }
+    removed
+}
+
+fn preference_for_popup(state: &AppState, popup: &OneKeyPopupState) -> Option<OneKeyPreference> {
+    let connection_id = popup.connection_id.as_deref()?;
+    let prompt_fingerprint = popup.prompt_fingerprint.as_deref()?;
+    state
+        .onekey_preferences
+        .iter()
+        .find(|preference| {
+            preference.connection_id == connection_id
+                && preference.prompt_fingerprint == prompt_fingerprint
+        })
+        .cloned()
+}
+
+/// Update submission feedback and report whether this is a genuine repeated
+/// prompt for the previously submitted credential.
 fn note_onekey_prompt_after_submission(
     state: &mut AppState,
     session_id: &str,
     popup: &OneKeyPopupState,
-) {
+) -> bool {
     let Some(previous) = state.onekey_submission_feedback.get(session_id).cloned() else {
-        return;
+        return false;
     };
     let previous_expect = match &previous {
         OneKeySubmissionFeedback::Submitted { matched_expect }
         | OneKeySubmissionFeedback::Rejected { matched_expect } => matched_expect,
     };
 
-    match popup.matched_expect.as_deref() {
-        Some(current_expect) if current_expect == previous_expect => {
+    let repeated_expect = popup
+        .matches
+        .iter()
+        .find(|candidate| candidate.matched_expect == *previous_expect)
+        .map(|candidate| candidate.matched_expect.as_str());
+
+    match repeated_expect {
+        Some(current_expect) => {
             if matches!(&previous, OneKeySubmissionFeedback::Submitted { .. }) {
                 crate::relay_tunnel::clear_sudo_credential_for_session(session_id);
                 tracing::info!(
@@ -6363,21 +6415,135 @@ fn note_onekey_prompt_after_submission(
                     matched_expect: current_expect.to_string(),
                 },
             );
+            true
         }
-        Some(_) => {
+        None => {
             // A different matching prompt is the next step of a multi-step
             // exchange, not a rejection of the previous credential.
             state.onekey_submission_feedback.remove(session_id);
+            state.onekey_preference_attempts.remove(session_id);
+            false
         }
-        None => {}
+    }
+}
+
+fn apply_onekey_popup(
+    state: &mut AppState,
+    senders: &HashMap<String, mpsc::UnboundedSender<Vec<u8>>>,
+    session_id: &str,
+    popup: OneKeyPopupState,
+) {
+    // An auto/manual remembered attempt is rejected only by the same concrete
+    // prompt scope. A Git password prompt and a sudo password prompt can share
+    // the same broad expect regex, so expect equality alone is insufficient.
+    let attempt_matches_prompt = state
+        .onekey_preference_attempts
+        .get(session_id)
+        .map(|attempt| {
+            popup.connection_id.as_deref() == Some(attempt.preference.connection_id.as_str())
+                && popup.prompt_fingerprint.as_deref()
+                    == Some(attempt.preference.prompt_fingerprint.as_str())
+                && popup
+                    .matches
+                    .iter()
+                    .any(|candidate| candidate.matched_expect == attempt.matched_expect)
+        });
+    if attempt_matches_prompt == Some(false) {
+        state.onekey_preference_attempts.remove(session_id);
+        state.onekey_submission_feedback.remove(session_id);
+    }
+
+    let repeated_prompt = note_onekey_prompt_after_submission(state, session_id, &popup);
+    if repeated_prompt {
+        if let Some(attempt) = state.onekey_preference_attempts.remove(session_id) {
+            if forget_onekey_preference(state, &attempt.preference) {
+                tracing::info!(
+                    "[ONEKEY-PREFERENCE] session={} invalidated after repeated prompt",
+                    &session_id[..session_id.len().min(8)]
+                );
+            }
+        }
+        state.onekey_popups.insert(session_id.to_string(), popup);
+        return;
+    }
+
+    let Some(preference) = preference_for_popup(state, &popup) else {
+        state.onekey_popups.insert(session_id.to_string(), popup);
+        return;
+    };
+    let Some(candidate) = popup
+        .matches
+        .iter()
+        .find(|candidate| {
+            candidate.onekey_id == preference.onekey_id
+                && candidate.step_index == preference.step_index
+        })
+        .cloned()
+    else {
+        // The OneKey or step was deleted/reordered. Never guess another entry;
+        // drop the dangling record and return to the explicit chooser.
+        forget_onekey_preference(state, &preference);
+        state.onekey_popups.insert(session_id.to_string(), popup);
+        return;
+    };
+
+    match send_onekey_submission(senders, session_id, &candidate.send) {
+        Ok(()) => {
+            state.onekey_submission_feedback.insert(
+                session_id.to_string(),
+                OneKeySubmissionFeedback::Submitted {
+                    matched_expect: candidate.matched_expect.clone(),
+                },
+            );
+            state.onekey_submission_cooldown.insert(
+                session_id.to_string(),
+                (candidate.matched_expect.clone(), std::time::Instant::now()),
+            );
+            state.onekey_preference_attempts.insert(
+                session_id.to_string(),
+                OneKeyPreferenceAttempt {
+                    preference,
+                    matched_expect: candidate.matched_expect,
+                },
+            );
+            if popup.is_sudo_password {
+                if let Some(connection) = state.session_configs.get(session_id) {
+                    crate::relay_tunnel::cache_sudo_credential(
+                        connection,
+                        session_id,
+                        &candidate.send,
+                    );
+                }
+            }
+            tracing::info!(
+                "[ONEKEY-PREFERENCE] session={} automatically submitted remembered credential",
+                &session_id[..session_id.len().min(8)]
+            );
+        }
+        Err(error) => {
+            tracing::warn!(
+                "[ONEKEY-PREFERENCE] session={} auto-submit failed: {:?}",
+                &session_id[..session_id.len().min(8)],
+                error
+            );
+            state.onekey_popups.insert(session_id.to_string(), popup);
+        }
     }
 }
 
 #[cfg(test)]
 fn check_onekey_match_in_state(state: &mut AppState, session_id: &str, data: &[u8]) {
+    check_onekey_match_with_senders_in_state(state, &HashMap::new(), session_id, data);
+}
+
+fn check_onekey_match_with_senders_in_state(
+    state: &mut AppState,
+    senders: &HashMap<String, mpsc::UnboundedSender<Vec<u8>>>,
+    session_id: &str,
+    data: &[u8],
+) {
     if let Ok(popup) = onekey_popup_for_output(state, session_id, data) {
-        note_onekey_prompt_after_submission(state, session_id, &popup);
-        state.onekey_popups.insert(session_id.to_string(), popup);
+        apply_onekey_popup(state, senders, session_id, popup);
     }
 }
 
@@ -6443,7 +6609,12 @@ fn note_onekey_skip(state: &mut AppState, session_id: &str, reason: OneKeySkip) 
         .insert((session_id.to_string(), reason))
 }
 
-fn check_onekey_match(mut state: Signal<AppState>, session_id: &str, data: &[u8]) {
+fn check_onekey_match(
+    mut state: Signal<AppState>,
+    input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    session_id: &str,
+    data: &[u8],
+) {
     // Decide from a read snapshot first so the read guard is released before
     // we take the write guard below.
     let (outcome, onekeys_count) = {
@@ -6455,9 +6626,8 @@ fn check_onekey_match(mut state: Signal<AppState>, session_id: &str, data: &[u8]
     };
     match outcome {
         Ok(popup) => {
-            let mut app = state.write();
-            note_onekey_prompt_after_submission(&mut app, session_id, &popup);
-            app.onekey_popups.insert(session_id.to_string(), popup);
+            let senders = input_senders.read();
+            apply_onekey_popup(&mut state.write(), &senders, session_id, popup);
         }
         Err(reason) => {
             let mut s = state.write();
@@ -6914,6 +7084,7 @@ mod session_startup_tests {
             visible: true,
             connection_id: None,
             prompt_fingerprint: None,
+            is_sudo_password: false,
             matches: vec![OneKeyMatch {
                 onekey_id: "account-id".to_string(),
                 step_index: 0,
@@ -6929,6 +7100,7 @@ mod session_startup_tests {
             visible: true,
             connection_id: None,
             prompt_fingerprint: None,
+            is_sudo_password: false,
             matches: vec![OneKeyMatch {
                 onekey_id: "account-id".to_string(),
                 step_index: 0,
@@ -8844,7 +9016,7 @@ fn start_ssh_connection(
                                     }
                                 }
                             }
-                            check_onekey_match(state, &id, &data);
+                            check_onekey_match(state, input_senders, &id, &data);
                         }
                         SessionEvent::Disconnected(id, reason) => {
                             {
@@ -9357,7 +9529,7 @@ fn start_shell_connection(
                                     }
                                 }
                             }
-                            check_onekey_match(state, &id, &data);
+                            check_onekey_match(state, input_senders, &id, &data);
                             drive_login_script(state, input_senders, &id, &data);
                         }
                         SessionEvent::Disconnected(id, reason) => {
@@ -11854,6 +12026,7 @@ pub fn App() -> Element {
                                 s.workspace_preferences = workspace_preferences;
                                 s.connections = connections;
                                 s.onekeys = onekeys;
+                                s.onekey_preferences = cm.load_onekey_preferences();
                                 s.unlock_state = UnlockState::Unlocked;
                                 s.master_password_error = None;
 
