@@ -465,7 +465,7 @@ pub fn RemoteFilesPanel(
                                     path_draft.set(path);
                                     action_error.set(None);
                                 }
-                                Err(key) => action_error.set(Some(crate::i18n::t(key))),
+                                Err(key) => action_error.set(Some(key.to_string())),
                             }
                         }
                     },
@@ -480,7 +480,7 @@ pub fn RemoteFilesPanel(
                                 path_draft.set(path);
                                 action_error.set(None);
                             }
-                            Err(key) => action_error.set(Some(crate::i18n::t(key))),
+                            Err(key) => action_error.set(Some(key.to_string())),
                         }
                     },
                     { crate::i18n::t("remote_files.go") }
@@ -529,11 +529,11 @@ pub fn RemoteFilesPanel(
                         let remote_directory = current_path.peek().clone();
                         action_busy.set(true);
                         action_error.set(None);
-                        status.set(Some(crate::i18n::t("remote_files.choosing_local_file")));
+                        status.set(Some("remote_files.choosing_local_file".to_string()));
                         spawn(async move {
                             let Some(file) = rfd::AsyncFileDialog::new().pick_file().await else {
                                 action_busy.set(false);
-                                status.set(Some(crate::i18n::t("remote_files.upload_cancelled")));
+                                status.set(Some("remote_files.upload_cancelled".to_string()));
                                 return;
                             };
                             let local_path = file.path().to_path_buf();
@@ -543,7 +543,7 @@ pub fn RemoteFilesPanel(
                                 .map(str::to_owned)
                             else {
                                 action_busy.set(false);
-                                action_error.set(Some(crate::i18n::t("remote_files.invalid_utf8_filename")));
+                                action_error.set(Some("remote_files.invalid_utf8_filename".to_string()));
                                 status.set(None);
                                 return;
                             };
@@ -551,7 +551,7 @@ pub fn RemoteFilesPanel(
                                 Ok(metadata) if metadata.is_file() => metadata,
                                 Ok(_) => {
                                     action_busy.set(false);
-                                    action_error.set(Some(crate::i18n::t("remote_files.select_regular_file")));
+                                    action_error.set(Some("remote_files.select_regular_file".to_string()));
                                     status.set(None);
                                     return;
                                 }
@@ -592,9 +592,9 @@ pub fn RemoteFilesPanel(
                         }
                         action_busy.set(true);
                         action_error.set(None);
-                        status.set(Some(crate::i18n::t(
-                                                    "remote_files.choosing_download_destination",
-                                                )));
+                        status.set(Some(
+                            "remote_files.choosing_download_destination".to_string(),
+                        ));
                         spawn(async move {
                             let Some(destination) = rfd::AsyncFileDialog::new()
                                 .set_file_name(&entry.name)
@@ -602,7 +602,7 @@ pub fn RemoteFilesPanel(
                                 .await
                             else {
                                 action_busy.set(false);
-                                status.set(Some(crate::i18n::t("remote_files.download_cancelled")));
+                                status.set(Some("remote_files.download_cancelled".to_string()));
                                 return;
                             };
                             let local_path: PathBuf = destination.path().to_path_buf();
@@ -628,12 +628,12 @@ pub fn RemoteFilesPanel(
                 div { style: "padding:6px 8px;border-bottom:1px solid var(--skin-border);font-size:10px;color:var(--skin-accent);", { crate::i18n::t("remote_files.loading") } }
             }
             if let Some(error) = load_error() {
-                div { style: "padding:6px 8px;border-bottom:1px solid var(--skin-border);font-size:10px;color:var(--skin-danger);overflow-wrap:anywhere;", "{error}" }
+                div { style: "padding:6px 8px;border-bottom:1px solid var(--skin-border);font-size:10px;color:var(--skin-danger);overflow-wrap:anywhere;", { crate::i18n::t(&error) } }
             }
             if let Some(error) = action_error() {
-                div { style: "padding:6px 8px;border-bottom:1px solid var(--skin-border);font-size:10px;color:var(--skin-danger);overflow-wrap:anywhere;", "{error}" }
+                div { style: "padding:6px 8px;border-bottom:1px solid var(--skin-border);font-size:10px;color:var(--skin-danger);overflow-wrap:anywhere;", { crate::i18n::t(&error) } }
             } else if let Some(message) = status() {
-                div { style: "padding:6px 8px;border-bottom:1px solid var(--skin-border);font-size:10px;color:var(--skin-text-muted);overflow-wrap:anywhere;", "{message}" }
+                div { style: "padding:6px 8px;border-bottom:1px solid var(--skin-border);font-size:10px;color:var(--skin-text-muted);overflow-wrap:anywhere;", { crate::i18n::t(&message) } }
             }
 
             div {
@@ -756,7 +756,7 @@ pub fn RemoteFilesPanel(
                                                 let name = match validate_entry_name(&input) {
                                                     Ok(name) => name.to_string(),
                                                     Err(key) => {
-                                                        action_error.set(Some(crate::i18n::t(key)));
+                                                        action_error.set(Some(key.to_string()));
                                                         return;
                                                     }
                                                 };
@@ -773,7 +773,7 @@ pub fn RemoteFilesPanel(
                                                 let name = match validate_entry_name(&input) {
                                                     Ok(name) => name.to_string(),
                                                     Err(key) => {
-                                                        action_error.set(Some(crate::i18n::t(key)));
+                                                        action_error.set(Some(key.to_string()));
                                                         return;
                                                     }
                                                 };
@@ -804,7 +804,7 @@ pub fn RemoteFilesPanel(
                                         pending_dialog.set(None);
                                         action_busy.set(true);
                                         action_error.set(None);
-                                        status.set(Some(crate::i18n::t("remote_files.applying_operation")));
+                                        status.set(Some("remote_files.applying_operation".to_string()));
                                         spawn(async move {
                                             match future.await {
                                                 Ok(()) => {
