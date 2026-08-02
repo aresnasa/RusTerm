@@ -1945,6 +1945,7 @@ pub fn TerminalView(
     let move_on_input = on_input;
     let move_reporting = down_reporting;
     let move_button_motion = render_output.mode_mouse_button_motion;
+    let move_any_motion = render_output.mode_mouse_any_motion;
     let move_sgr = render_output.mode_mouse_sgr;
     let on_mouse_move = move |e: MouseEvent| {
         if selecting() {
@@ -2032,12 +2033,10 @@ pub fn TerminalView(
 
     // Double-click selects the word under the cursor (WindTerm behaviour) and
     // copies it immediately. When an application has enabled mouse reporting
-    // (vim `set mouse=a`, tmux, htop) and Shift isn't held, xterm forwards the
-    // double-click as a second press report and the application performs its
-    // own word selection — we must NOT also run a local selection, otherwise
-    // both the app and the terminal try to own the click. Shift forces local
-    // word selection even under app reporting (same override as single-click
-    // drag selection).
+    // (vim `set mouse=a`, tmux, htop), the two ordinary mousedown/mouseup pairs
+    // are already forwarded; the later DOM `dblclick` notification only skips
+    // local selection. Shift forces local word selection even under app
+    // reporting (same override as single-click drag selection).
     let dbl_reporting = render_output.mode_mouse_reporting;
     let dbl_scrollback_offset = render_output.scrollback_offset;
     let dbl_rows = render_output.rows.clone();
