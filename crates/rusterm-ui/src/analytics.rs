@@ -25,9 +25,10 @@ pub struct LearnedCorrection {
 pub struct UsageHabitsEnabled(pub bool);
 
 impl UsageHabitsEnabled {
-    pub fn enabled(self) -> bool { self.0 }
+    pub fn enabled(self) -> bool {
+        self.0
+    }
 }
-
 
 #[cfg(feature = "analytics")]
 pub mod enabled {
@@ -206,20 +207,20 @@ pub mod enabled {
         }
     }
 
-/// Privacy-safe export payload for the usage-habits report. Only aggregated,
-/// non-identifying fields: command classifications, hourly activity, per-prefix
-/// success rates, and typo→correction pairs. Raw command text, hostnames,
-/// timestamps, session ids and any line flagged by `sanitize_command` are
-/// excluded.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
-pub struct UsageHabitsReport {
-    pub generated_at: chrono::DateTime<chrono::Utc>,
-    pub total_commands: u64,
-    pub classifications: Vec<rusterm_analytics::CategoryCount>,
-    pub hourly_usage: Vec<rusterm_analytics::HourlyUsage>,
-    pub prefix_success_rates: Vec<rusterm_analytics::PrefixSuccessRate>,
-    pub typo_corrections: Vec<rusterm_analytics::CommandCorrection>,
-}
+    /// Privacy-safe export payload for the usage-habits report. Only aggregated,
+    /// non-identifying fields: command classifications, hourly activity, per-prefix
+    /// success rates, and typo→correction pairs. Raw command text, hostnames,
+    /// timestamps, session ids and any line flagged by `sanitize_command` are
+    /// excluded.
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+    pub struct UsageHabitsReport {
+        pub generated_at: chrono::DateTime<chrono::Utc>,
+        pub total_commands: u64,
+        pub classifications: Vec<rusterm_analytics::CategoryCount>,
+        pub hourly_usage: Vec<rusterm_analytics::HourlyUsage>,
+        pub prefix_success_rates: Vec<rusterm_analytics::PrefixSuccessRate>,
+        pub typo_corrections: Vec<rusterm_analytics::CommandCorrection>,
+    }
 
     impl Default for AnalyticsHandle {
         fn default() -> Self {
@@ -282,13 +283,13 @@ pub mod disabled {
         }
     }
 
-/// Feature-off stub: an empty report with just a timestamp. The disabled
-/// `AnalyticsHandle::build_usage_habits_report` returns this so call sites
-/// compile and behave as no-ops without the DuckDB dependency.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
-pub struct UsageHabitsReport {
-    pub generated_at: chrono::DateTime<chrono::Utc>,
-}
+    /// Feature-off stub: an empty report with just a timestamp. The disabled
+    /// `AnalyticsHandle::build_usage_habits_report` returns this so call sites
+    /// compile and behave as no-ops without the DuckDB dependency.
+    #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+    pub struct UsageHabitsReport {
+        pub generated_at: chrono::DateTime<chrono::Utc>,
+    }
 
     #[cfg(test)]
     mod tests {

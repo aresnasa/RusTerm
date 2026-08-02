@@ -117,8 +117,8 @@ fn form_from_connection(c: &ConnectionConfig) -> NewConnectionForm {
                 proxy_password,
                 group_id: c.group.clone(),
                 onekey: c.onekey,
-                    login_script: c.login_script.clone().unwrap_or_default(),
-    }
+                login_script: c.login_script.clone().unwrap_or_default(),
+            }
         }
         // Non-SSH connections can still be renamed / onekey-toggled; the SSH
         // fields are irrelevant and ignored on save (kind is preserved).

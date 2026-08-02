@@ -7,13 +7,13 @@ use parking_lot::Mutex;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
+use rusterm_core::LoginStep;
 use rusterm_core::config::{
     BottomPanelTab, ConnectionConfig, ConnectionGroup, ConnectionKind, DockZone, KeybindingAction,
     Keybindings, OneKey, OneKeyStep, PanelId, ProxyConfig, ProxyKind, RightPanelTab, ShellConfig,
     SidebarPreferences, SkinSettings, SshAuth, SshConfig, WorkspacePreferences,
 };
 use rusterm_core::config_manager::ConfigManager;
-use rusterm_core::LoginStep;
 use rusterm_core::event::SessionEvent;
 use rusterm_core::session::SessionType;
 use rusterm_core::session_log::SessionLog;
@@ -132,7 +132,10 @@ enum LoginScriptAction {
 enum LoginScriptEvaluation {
     /// Perform these actions, then set `idx` to `next_idx` (the index of the
     /// next `Expect` step, or `steps.len()` if the script ends).
-    Advance { actions: Vec<LoginScriptAction>, next_idx: usize },
+    Advance {
+        actions: Vec<LoginScriptAction>,
+        next_idx: usize,
+    },
     /// The current step is an Expect that has not matched yet. Stay put and
     /// re-evaluate on the next chunk of output.
     Wait,
@@ -184,7 +187,10 @@ fn login_script_evaluate(
             }
         }
     }
-    LoginScriptEvaluation::Advance { actions, next_idx: i }
+    LoginScriptEvaluation::Advance {
+        actions,
+        next_idx: i,
+    }
 }
 
 /// Strip ANSI escape sequences and return the last non-empty line of `data`
@@ -245,8 +251,14 @@ fn drive_login_script(
                         done: false,
                         wait_started: Some(std::time::Instant::now()),
                     };
-                    state.write().login_scripts.insert(session_id.to_string(), rt);
-                    tracing::info!("[LOGIN-SCRIPT] initialized runtime for session {}", session_id);
+                    state
+                        .write()
+                        .login_scripts
+                        .insert(session_id.to_string(), rt);
+                    tracing::info!(
+                        "[LOGIN-SCRIPT] initialized runtime for session {}",
+                        session_id
+                    );
                 }
                 Ok(_) => {
                     let rt = LoginScriptRuntime {
@@ -256,11 +268,18 @@ fn drive_login_script(
                         done: true,
                         wait_started: None,
                     };
-                    state.write().login_scripts.insert(session_id.to_string(), rt);
+                    state
+                        .write()
+                        .login_scripts
+                        .insert(session_id.to_string(), rt);
                     return;
                 }
                 Err(e) => {
-                    tracing::warn!("[LOGIN-SCRIPT] failed to parse script for {}: {}", session_id, e);
+                    tracing::warn!(
+                        "[LOGIN-SCRIPT] failed to parse script for {}: {}",
+                        session_id,
+                        e
+                    );
                     let rt = LoginScriptRuntime {
                         steps: vec![],
                         idx: 0,
@@ -268,7 +287,10 @@ fn drive_login_script(
                         done: true,
                         wait_started: None,
                     };
-                    state.write().login_scripts.insert(session_id.to_string(), rt);
+                    state
+                        .write()
+                        .login_scripts
+                        .insert(session_id.to_string(), rt);
                     return;
                 }
             }
