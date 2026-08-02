@@ -767,7 +767,7 @@ mod tests {
             group: None,
             tags: vec![],
             onekey: false,
-            login_script: String::new(),
+            login_script: None,
         };
 
         let form = form_from_connection(&connection);
