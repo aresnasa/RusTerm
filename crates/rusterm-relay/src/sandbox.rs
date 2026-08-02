@@ -161,7 +161,7 @@ mod tests {
     fn benign_script_passes_preflight() {
         // A trivially safe script. dcg may or may not be installed; if it
         // is absent, the verdict is Safe (hard-floor validator authoritative).
-        match prelight_helper("echo hello\necho world\n") {
+        match preflight_helper("echo hello\necho world\n") {
             SandboxVerdict::Safe { .. } => {}
             SandboxVerdict::Unsafe { reason } => {
                 // If dcg is installed and denies this, that's a dcg false
@@ -175,7 +175,7 @@ mod tests {
 
     #[test]
     fn syntax_error_is_unsafe() {
-        let verdict = prelight_helper("if true; then echo broken\n");
+        let verdict = preflight_helper("if true; then echo broken\n");
         match verdict {
             SandboxVerdict::Unsafe { reason } => {
                 assert!(reason.contains("syntax"), "got: {reason}");
