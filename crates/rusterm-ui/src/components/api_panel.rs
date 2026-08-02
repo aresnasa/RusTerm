@@ -397,7 +397,7 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
 GET  {url}/api/v1/hosts        # list hosts (BasicAuth)
 POST {url}/api/v1/exec         # {{ host_id, command, timeout_ms? }}
 POST {url}/api/v1/parse-curl   # parse a pasted curl into JSON",
-                        url = url,
+                        url = url.clone(),
                     );
                     rsx! {
                         div { class: "api-code", "{endpoints}" }
