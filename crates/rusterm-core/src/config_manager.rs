@@ -9,10 +9,10 @@ use rand::RngCore;
 
 use crate::config::{
     ConnectionConfig, ConnectionKind, DEFAULT_ONEKEY_PASSWORD_EXPECT, EncryptedValue,
-    FocusedTabAppearance, Keybindings, Language, OneKey, OneKeyStep, PersistedConfig,
-    PersistedConnection, PersistedConnectionKind, PersistedOneKey, PersistedOneKeyStep,
-    PersistedProxyConfig, PersistedSshAuth, PersistedSshConfig, ProxyConfig, SidebarPreferences,
-    SkinSettings, SshAuth, SshConfig, WorkspacePreferences,
+    FocusedTabAppearance, Keybindings, Language, OneKey, OneKeyPreference, OneKeyStep,
+    PersistedConfig, PersistedConnection, PersistedConnectionKind, PersistedOneKey,
+    PersistedOneKeyStep, PersistedProxyConfig, PersistedSshAuth, PersistedSshConfig, ProxyConfig,
+    SidebarPreferences, SkinSettings, SshAuth, SshConfig, WorkspacePreferences,
 };
 use rusterm_crypto::{KeyringStore, decrypt_data, encrypt_data};
 
@@ -246,6 +246,7 @@ impl ConfigManager {
             version: CONFIG_VERSION,
             connections: existing.connections,
             onekeys: existing.onekeys,
+            onekey_preferences: existing.onekey_preferences,
             master_password_hash: self.master_password_hash.clone(),
             restore_disabled: existing.restore_disabled,
             confirm_close_on_exit: existing.confirm_close_on_exit,
@@ -281,6 +282,7 @@ impl ConfigManager {
             version: CONFIG_VERSION,
             connections: existing.connections,
             onekeys: existing.onekeys,
+            onekey_preferences: existing.onekey_preferences,
             master_password_hash: self.master_password_hash.clone(),
             restore_disabled,
             confirm_close_on_exit: existing.confirm_close_on_exit,
@@ -323,6 +325,7 @@ impl ConfigManager {
             version: CONFIG_VERSION,
             connections: existing.connections,
             onekeys: existing.onekeys,
+            onekey_preferences: existing.onekey_preferences,
             master_password_hash: self.master_password_hash.clone(),
             restore_disabled: existing.restore_disabled,
             confirm_close_on_exit,
@@ -362,6 +365,7 @@ impl ConfigManager {
             version: CONFIG_VERSION,
             connections: existing.connections,
             onekeys: existing.onekeys,
+            onekey_preferences: existing.onekey_preferences,
             master_password_hash: self.master_password_hash.clone(),
             restore_disabled: existing.restore_disabled,
             confirm_close_on_exit: existing.confirm_close_on_exit,
@@ -398,6 +402,7 @@ impl ConfigManager {
             version: CONFIG_VERSION,
             connections: existing.connections,
             onekeys: existing.onekeys,
+            onekey_preferences: existing.onekey_preferences,
             master_password_hash: self.master_password_hash.clone(),
             restore_disabled: existing.restore_disabled,
             confirm_close_on_exit: existing.confirm_close_on_exit,
@@ -434,6 +439,7 @@ impl ConfigManager {
             version: CONFIG_VERSION,
             connections: existing.connections,
             onekeys: existing.onekeys,
+            onekey_preferences: existing.onekey_preferences,
             master_password_hash: self.master_password_hash.clone(),
             restore_disabled: existing.restore_disabled,
             confirm_close_on_exit: existing.confirm_close_on_exit,
@@ -478,6 +484,7 @@ impl ConfigManager {
             version: CONFIG_VERSION,
             connections: existing.connections,
             onekeys: existing.onekeys,
+            onekey_preferences: existing.onekey_preferences,
             master_password_hash: self.master_password_hash.clone(),
             restore_disabled: existing.restore_disabled,
             confirm_close_on_exit: existing.confirm_close_on_exit,
@@ -517,6 +524,7 @@ impl ConfigManager {
             version: CONFIG_VERSION,
             connections: existing.connections,
             onekeys: existing.onekeys,
+            onekey_preferences: existing.onekey_preferences,
             master_password_hash: self.master_password_hash.clone(),
             restore_disabled: existing.restore_disabled,
             confirm_close_on_exit: existing.confirm_close_on_exit,
@@ -555,6 +563,7 @@ impl ConfigManager {
             version: CONFIG_VERSION,
             connections: existing.connections,
             onekeys: existing.onekeys,
+            onekey_preferences: existing.onekey_preferences,
             master_password_hash: self.master_password_hash.clone(),
             restore_disabled: existing.restore_disabled,
             confirm_close_on_exit: existing.confirm_close_on_exit,
@@ -593,6 +602,7 @@ impl ConfigManager {
             version: CONFIG_VERSION,
             connections: existing.connections,
             onekeys: existing.onekeys,
+            onekey_preferences: existing.onekey_preferences,
             master_password_hash: self.master_password_hash.clone(),
             restore_disabled: existing.restore_disabled,
             confirm_close_on_exit: existing.confirm_close_on_exit,
@@ -629,6 +639,7 @@ impl ConfigManager {
             version: CONFIG_VERSION,
             connections: existing.connections,
             onekeys: existing.onekeys,
+            onekey_preferences: existing.onekey_preferences,
             master_password_hash: self.master_password_hash.clone(),
             restore_disabled: existing.restore_disabled,
             confirm_close_on_exit: existing.confirm_close_on_exit,
@@ -707,6 +718,7 @@ impl ConfigManager {
                 .map(|c| self.encrypt_connection(c))
                 .collect::<Result<Vec<_>>>()?,
             onekeys: existing.onekeys,
+            onekey_preferences: existing.onekey_preferences,
             master_password_hash: self.master_password_hash.clone(),
             restore_disabled: existing.restore_disabled,
             confirm_close_on_exit: existing.confirm_close_on_exit,
@@ -738,6 +750,7 @@ impl ConfigManager {
             version: CONFIG_VERSION,
             connections: vec![],
             onekeys: vec![],
+            onekey_preferences: vec![],
             master_password_hash: None,
             restore_disabled: false,
             confirm_close_on_exit: true,
@@ -775,6 +788,7 @@ impl ConfigManager {
                 .iter()
                 .map(|ok| self.encrypt_onekey(ok))
                 .collect::<Result<Vec<_>>>()?,
+            onekey_preferences: existing.onekey_preferences,
             master_password_hash: self.master_password_hash.clone(),
             restore_disabled: existing.restore_disabled,
             confirm_close_on_exit: existing.confirm_close_on_exit,
@@ -806,6 +820,25 @@ impl ConfigManager {
             .into_iter()
             .map(|pok| self.decrypt_onekey(pok))
             .collect()
+    }
+
+    /// Persist non-secret multi-match selections. Read-modify-write preserves
+    /// encrypted credentials and every unrelated setting.
+    pub fn save_onekey_preferences(&self, preferences: &[OneKeyPreference]) -> Result<()> {
+        let mut persisted = self.read_persisted();
+        persisted.version = CONFIG_VERSION;
+        persisted.master_password_hash = self.master_password_hash.clone();
+        persisted.onekey_preferences = preferences.to_vec();
+        let json =
+            serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
+        let temp_path = self.config_path.with_extension("json.tmp");
+        fs::write(&temp_path, &json).context("Failed to write config file")?;
+        fs::rename(&temp_path, &self.config_path).context("Failed to rename temp config file")?;
+        Ok(())
+    }
+
+    pub fn load_onekey_preferences(&self) -> Vec<OneKeyPreference> {
+        self.read_persisted().onekey_preferences
     }
 
     fn encrypt_onekey(&self, ok: &OneKey) -> Result<PersistedOneKey> {

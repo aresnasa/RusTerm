@@ -7047,6 +7047,40 @@ mod session_startup_tests {
     }
 
     #[test]
+    fn repeated_multi_match_prompt_reuses_the_users_previous_selection() {
+        let session_id = "sudo-pane";
+        let expect = r"password:";
+        let prompt = b"[sudo: authenticate] Password: ";
+        let mut state = state_with_enabled_onekey(expect);
+        state.onekeys.push(OneKey {
+            id: "preferred-sudo-credential".to_string(),
+            name: "preferred sudo".to_string(),
+            steps: vec![OneKeyStep {
+                label: "Password".to_string(),
+                expect: expect.to_string(),
+                send: "preferred-secret".to_string(),
+            }],
+        });
+
+        check_onekey_match_in_state(&mut state, session_id, prompt);
+        let selected = take_onekey_selection(&mut state.onekey_popups, session_id, 1)
+            .expect("the second matching credential should be selectable");
+        assert_eq!(selected.0, "preferred-secret");
+        // A later prompt starts with no per-session submission feedback (for
+        // example after reconnecting), but should retain the stable
+        // connection-level preference learned from the user's selection.
+        state.onekey_submission_feedback.clear();
+        state.onekey_submission_cooldown.clear();
+
+        check_onekey_match_in_state(&mut state, session_id, prompt);
+
+        assert!(
+            !state.onekey_popups.contains_key(session_id),
+            "the remembered credential should be reused without another popup"
+        );
+    }
+
+    #[test]
     fn submission_cooldown_suppresses_duplicate_popup_from_residual_prompt() {
         let session_id = "sudo-pane";
         let expect = r"password:";

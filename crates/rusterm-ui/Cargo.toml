@@ -22,6 +22,7 @@ regex.workspace = true
 arboard.workspace = true
 rfd.workspace = true
 zeroize.workspace = true
+sha2.workspace = true
 
 rusterm-core.workspace = true
 rusterm-ssh.workspace = true

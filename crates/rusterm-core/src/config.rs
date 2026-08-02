@@ -1176,6 +1176,11 @@ pub struct PersistedConfig {
     pub connections: Vec<PersistedConnection>,
     #[serde(default)]
     pub onekeys: Vec<PersistedOneKey>,
+    /// Stable OneKey selections learned from multi-match prompts. These records
+    /// contain identifiers only; credential values and display labels are never
+    /// persisted here.
+    #[serde(default)]
+    pub onekey_preferences: Vec<OneKeyPreference>,
     #[serde(default)]
     pub master_password_hash: Option<String>,
     /// Whether the user picked "不再询问" on the session-state restore dialog.
@@ -1264,6 +1269,19 @@ fn default_suggestion_count() -> u8 {
 }
 
 // --- OneKeys (ZOC-style Expect/Send auto-fill) ---
+
+/// A remembered selection for one connection and one normalized prompt.
+/// `prompt_fingerprint` is a SHA-256 digest produced by the UI, so remote
+/// prompt text is not written to settings.json. `step_index` is stable while
+/// the referenced OneKey keeps its step order; stale references safely fall
+/// back to the chooser.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OneKeyPreference {
+    pub connection_id: String,
+    pub prompt_fingerprint: String,
+    pub onekey_id: String,
+    pub step_index: usize,
+}
 
 /// Built-in matcher for password and SSH key passphrase prompts. Matching is
 /// case-insensitive and runs against the terminal's current prompt line.
@@ -1897,6 +1915,7 @@ mod tests {
             version: 1,
             connections: vec![],
             onekeys: vec![],
+            onekey_preferences: vec![],
             master_password_hash: None,
             restore_disabled: false,
             confirm_close_on_exit: true,

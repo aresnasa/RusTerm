@@ -7,8 +7,8 @@ use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 
 use rusterm_core::config::{
-    ConnectionConfig, FocusedTabAppearance, Keybindings, OneKey, SidebarPreferences, SkinSettings,
-    WorkspacePreferences,
+    ConnectionConfig, FocusedTabAppearance, Keybindings, OneKey, OneKeyPreference,
+    SidebarPreferences, SkinSettings, WorkspacePreferences,
 };
 use rusterm_core::config_manager::ConfigManager;
 use rusterm_core::session::SessionType;
@@ -241,6 +241,14 @@ pub struct AppState {
     /// OneKey library (ZOC-style Expect/Send), decrypted in memory after unlock.
     #[serde(skip)]
     pub onekeys: Vec<OneKey>,
+    /// Persisted connection/prompt selections learned from multi-match popups.
+    /// Records stable IDs only; no credential values or translated labels.
+    #[serde(skip)]
+    pub onekey_preferences: Vec<OneKeyPreference>,
+    /// Per-session remembered-selection submission awaiting acceptance or a
+    /// repeated prompt. A repeated matching prompt invalidates the preference.
+    #[serde(skip)]
+    pub onekey_preference_attempts: HashMap<String, OneKeyPreferenceAttempt>,
     /// Per-session OneKey autofill popup state. Only shown when new output matches
     /// an OneKey's expect regex; persists across focus changes (no re-scan).
     #[serde(skip)]
@@ -527,6 +535,10 @@ pub enum OneKeySubmissionFeedback {
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct OneKeyPopupState {
     pub visible: bool,
+    /// Stable saved-connection identity used to scope remembered selections.
+    pub connection_id: Option<String>,
+    /// SHA-256 of the normalized current prompt. Prompt text is never persisted.
+    pub prompt_fingerprint: Option<String>,
     /// Matching entries (one per OneKey whose step matched), each carrying the
     /// send value of the matched step.
     pub matches: Vec<OneKeyMatch>,
@@ -539,11 +551,21 @@ pub struct OneKeyPopupState {
 /// exact step that matched the current prompt; it must never appear in logs.
 #[derive(Clone, Default, PartialEq)]
 pub struct OneKeyMatch {
+    /// Stable identifiers used by remembered selections. Display names and
+    /// translated labels are intentionally not business keys.
+    pub onekey_id: String,
+    pub step_index: usize,
     pub name: String,
     pub label: String,
     pub send: String,
     /// Expect regex belonging to this exact match. Kept so selecting among
     /// several matching OneKeys correlates rejection with the chosen entry.
+    pub matched_expect: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OneKeyPreferenceAttempt {
+    pub preference: OneKeyPreference,
     pub matched_expect: String,
 }
 
@@ -564,6 +586,8 @@ mod onekey_match_tests {
     #[test]
     fn debug_redacts_the_decrypted_send_value() {
         let entry = OneKeyMatch {
+            onekey_id: "account-id".to_string(),
+            step_index: 0,
             name: "account".to_string(),
             label: "Password".to_string(),
             send: "never-log-this-secret".to_string(),
@@ -682,6 +706,8 @@ impl Default for AppState {
             recent_failed_commands: HashSet::new(),
             last_failed_command_by_session: HashMap::new(),
             onekeys: Vec::new(),
+            onekey_preferences: Vec::new(),
+            onekey_preference_attempts: HashMap::new(),
             onekey_popups: HashMap::new(),
             onekey_submission_feedback: HashMap::new(),
             onekey_submission_cooldown: HashMap::new(),
