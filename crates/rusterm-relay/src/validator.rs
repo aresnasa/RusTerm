@@ -681,7 +681,7 @@ mod tests {
     #[test]
     fn user_blocklist_pattern_rejects_matching_command() {
         let v = validator_with_extra(&[
-            ((r"\bnc\s+-e", "reverse shell via nc"), "user"),
+            (r"\bnc\s+-e", "reverse shell via nc", "user"),
         ]);
         // Benign command passes.
         assert!(v.validate("ls -la", &[], false).is_ok());
@@ -697,10 +697,7 @@ mod tests {
     #[test]
     fn skill_blocklist_pattern_carries_attribution() {
         let v = validator_with_extra(&[
-            (
-                (r"\bDROP\s+DATABASE", "DROP DATABASE via skill"),
-                "skill:dbadmin",
-            ),
+            (r"\bDROP\s+DATABASE", "DROP DATABASE via skill", "skill"),
         ]);
         match v.validate("psql -c 'DROP DATABASE prod'", &[], false) {
             Err(ValidationError::Dangerous(reason)) => {
@@ -725,7 +722,7 @@ mod tests {
         let v = validator_with_extra(&[
             // A user pattern that matches "rm -rf /" too — but the hard floor
             // already catches it first, so the user reason is irrelevant.
-            ((r"rm", "user also blocks rm"), "user"),
+            (r"rm", "user also blocks rm", "user"),
         ]);
         // rm -rf / is caught by the hard floor (terminal checker), not the
         // user pattern. The reason should be the terminal checker's, not the
