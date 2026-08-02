@@ -26,6 +26,28 @@ fn expect_mode_key(onekey_id: &str, step_index: usize) -> String {
     format!("{onekey_id}:{step_index}")
 }
 
+fn localized_step_label(label: &str) -> String {
+    match label.trim() {
+        "Username" => crate::i18n::t("onekey.credential_username"),
+        "Password" => crate::i18n::t("onekey.credential_password"),
+        "Token" => crate::i18n::t("onekey.credential_token"),
+        label => label.to_string(),
+    }
+}
+
+fn stable_step_label(label: &str) -> String {
+    let label = label.trim();
+    if label == crate::i18n::t("onekey.credential_username") {
+        "Username".to_string()
+    } else if label == crate::i18n::t("onekey.credential_password") {
+        "Password".to_string()
+    } else if label == crate::i18n::t("onekey.credential_token") {
+        "Token".to_string()
+    } else {
+        label.to_string()
+    }
+}
+
 fn validate_onekeys(onekeys: &[OneKey]) -> Option<String> {
     for (entry_index, onekey) in onekeys.iter().enumerate() {
         let entry_number = entry_index + 1;
@@ -62,7 +84,7 @@ fn validate_onekeys(onekeys: &[OneKey]) -> Option<String> {
             } else {
                 crate::i18n::tf(
                     "onekey.validation.step_named",
-                    &[("label", &step.label.trim())],
+                    &[("label", &localized_step_label(&step.label))],
                 )
             };
             if step.expect.trim().is_empty() {
@@ -475,6 +497,9 @@ pub fn OneKeyManager(
                                                 "password"
                                             };
                                             let mode_key_for_change = mode_key.clone();
+                                            let step_label = localized_step_label(
+                                                &entries.read()[idx].steps[step_idx].label,
+                                            );
                                             let mode_prefix_for_remove = format!(
                                                 "{}:",
                                                 entries.read()[idx].id,
@@ -489,8 +514,11 @@ pub fn OneKeyManager(
                                                             style: "background: #16161e; border: 1px solid #2a2b3d; border-radius: 3px; padding: 5px; color: #9ece6a; font-size: 12px; outline: none; width: 120px;",
                                                             r#type: "text",
                                                             placeholder: crate::i18n::t("onekey.step_label_placeholder"),
-                                                            value: "{entries.read()[idx].steps[step_idx].label}",
-                                                            oninput: move |e| entries.write()[idx].steps[step_idx].label = e.value(),
+                                                            value: "{step_label}",
+                                                            oninput: move |e| {
+                                                                entries.write()[idx].steps[step_idx].label =
+                                                                    stable_step_label(&e.value());
+                                                            },
                                                         }
                                                         button {
                                                             style: "margin-left: auto; background: transparent; color: #f7768e; border: none; cursor: pointer; font-size: 14px; padding: 0 4px;",
