@@ -563,14 +563,14 @@ fn gen_curl_preview(
     url: &str,
     default_user: &str,
     sessions: &[String],
-    command: &str,
+    payload: &CurlPayload,
     elevated: bool,
 ) -> CurlPreviewParts {
     gen_curl_preview_for_language(
         url,
         default_user,
         sessions,
-        command,
+        payload,
         elevated,
         crate::i18n::current_language(),
     )
@@ -580,7 +580,7 @@ fn gen_curl_preview_for_language(
     url: &str,
     default_user: &str,
     sessions: &[String],
-    command: &str,
+    payload: &CurlPayload,
     elevated: bool,
     language: crate::i18n::Language,
 ) -> CurlPreviewParts {
@@ -595,13 +595,28 @@ fn gen_curl_preview_for_language(
     let command_marker_title = crate::i18n::t_for("api.command_marker_title", language);
     let command_marker_help = crate::i18n::t_for("api.command_marker_help", language);
     let request_failed = shell_escape(&crate::i18n::t_for("api.request_failed", language));
+    // Build the JSON body for one host. The payload variant selects the
+    // field name (`command`, `script`, or `script_base64`); the relay
+    // enforces mutual exclusivity server-side.
     let request_body = |host: &str| {
-        serde_json::json!({
-            "host_id": host,
-            "command": command,
-            "elevated": elevated,
-        })
-        .to_string()
+        let body = match payload {
+            CurlPayload::Command(cmd) => serde_json::json!({
+                "host_id": host,
+                "command": cmd,
+                "elevated": elevated,
+            }),
+            CurlPayload::Script(script) => serde_json::json!({
+                "host_id": host,
+                "script": script,
+                "elevated": elevated,
+            }),
+            CurlPayload::ScriptBase64(b64) => serde_json::json!({
+                "host_id": host,
+                "script_base64": b64,
+                "elevated": elevated,
+            }),
+        };
+        body.to_string()
     };
     let invocation = |host: &str, body: &str| {
         format!(
@@ -613,19 +628,25 @@ fn gen_curl_preview_for_language(
 
     let first_host = &hosts[0];
     let first_body = request_body(first_host);
-    let command_json = serde_json::to_string(command).expect("strings always serialize to JSON");
-    let command_key = "\"command\":";
+    // Locate the payload value inside the JSON so we can highlight it. The
+    // field name differs per mode; find whichever key is present.
+    let (field_key, field_value) = match payload {
+        CurlPayload::Command(v) => ("\"command":", v),
+        CurlPayload::Script(v) => ("\"script":", v),
+        CurlPayload::ScriptBase64(v) => ("\"script_base64":", v),
+    };
+    let field_json = serde_json::to_string(field_value).expect("strings always serialize to JSON");
     let value_start = first_body
-        .find(command_key)
-        .map(|start| start + command_key.len())
-        .expect("generated JSON body always contains the command field");
-    let value_end = value_start + command_json.len();
+        .find(field_key)
+        .map(|start| start + field_key.len())
+        .expect("generated JSON body always contains the payload field");
+    let value_end = value_start + field_json.len();
 
     // Keep the JSON quotes outside the highlighted fragment. Escaping each
     // fragment independently is equivalent to escaping the concatenated body,
-    // including commands containing apostrophes.
+    // including payloads containing apostrophes or newlines.
     let body_before_command = &first_body[..value_start + 1];
-    let body_command = &command_json[1..command_json.len() - 1];
+    let body_command = &field_json[1..field_json.len() - 1];
     let body_after_command = &first_body[value_end - 1..];
 
     let mut after_command = format!(
@@ -695,10 +716,10 @@ fn gen_curl(
     url: &str,
     default_user: &str,
     sessions: &[String],
-    command: &str,
+    payload: &CurlPayload,
     elevated: bool,
 ) -> String {
-    gen_curl_preview(url, default_user, sessions, command, elevated).into_script()
+    gen_curl_preview(url, default_user, sessions, payload, elevated).into_script()
 }
 
 #[cfg(test)]
