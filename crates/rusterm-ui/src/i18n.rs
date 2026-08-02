@@ -949,8 +949,304 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         "remote_files.upload_cancelled" => ("Upload cancelled", "已取消上传"),
         "remote_files.upload_queued" => ("Queued upload: {name}", "已加入上传队列：{name}"),
 
-        // ── shadow.* — shadow sandbox dialog ─────────────────────────────
-        // (Keys filled in by the shadow_sandbox_dialog conversion.)
+        // ── common / keybindings additions ─────────────────────────────
+        "common.hide" => ("Hide", "隐藏"),
+        "common.show" => ("Show", "显示"),
+        "keybindings.disabled" => ("Disabled", "已禁用"),
+
+        // ── settings.* — settings dialog additions ─────────────────────
+        "settings.appearance_help" => (
+            "Customize the complete outline around the top tab for the focused pane.",
+            "自定义聚焦窗格顶部标签页的完整轮廓。",
+        ),
+        "settings.outline_color" => ("Outline color", "轮廓颜色"),
+        "settings.outline_width" => ("Outline width", "轮廓宽度"),
+        "settings.corner_radius" => ("Corner radius", "圆角半径"),
+        "settings.preview" => ("Preview", "预览"),
+        "settings.focused_session" => ("Focused session", "聚焦会话"),
+        "settings.skin_help" => (
+            "Choose a built-in skin or tune the Custom palette. This changes application chrome only; terminal ANSI and xterm colors remain independent.",
+            "选择内置皮肤或调整自定义调色板。此设置只会更改应用界面；终端 ANSI 和 xterm 颜色保持独立。",
+        ),
+        "settings.skin_tokyo_night" => ("Tokyo Night", "Tokyo Night"),
+        "settings.skin_one_dark" => ("One Dark", "One Dark"),
+        "settings.skin_solarized_dark" => ("Solarized Dark", "Solarized Dark"),
+        "settings.skin_custom" => ("Custom", "自定义"),
+        "settings.skin_preview" => ("Skin preview", "皮肤预览"),
+        "settings.skin_preview_connected" => ("Connected", "已连接"),
+        "settings.skin_preview_action" => ("Action", "操作"),
+        "settings.color_background" => ("Background", "背景"),
+        "settings.color_surface" => ("Surface", "表面"),
+        "settings.color_surface_hover" => ("Surface hover", "表面悬停"),
+        "settings.color_border" => ("Border", "边框"),
+        "settings.color_border_strong" => ("Strong border", "强调边框"),
+        "settings.color_text" => ("Text", "文本"),
+        "settings.color_text_muted" => ("Muted text", "弱化文本"),
+        "settings.color_accent" => ("Accent", "强调色"),
+        "settings.color_accent_secondary" => ("Secondary accent", "次强调色"),
+        "settings.color_success" => ("Success", "成功"),
+        "settings.color_warning" => ("Warning", "警告"),
+        "settings.color_danger" => ("Danger", "危险"),
+        "settings.suggestions_help" => (
+            "Inline fish-style suggestions based on your command history.",
+            "根据命令历史提供 fish 风格的行内建议。",
+        ),
+        "settings.on" => ("ON", "开启"),
+        "settings.off" => ("OFF", "关闭"),
+        "settings.suggestion_count_compact" => (
+            "compact popup, minimal screen coverage",
+            "紧凑弹窗，占用屏幕最少",
+        ),
+        "settings.suggestion_count_balanced" => {
+            ("balanced view of recent commands", "均衡显示最近的命令")
+        }
+        "settings.suggestion_count_extensive" => {
+            ("extensive history at a glance", "一览更多历史记录")
+        }
+        "settings.comparison_help" => (
+            "Control the warning shown before highlighting a comparison where more than half of the visible rows differ.",
+            "控制在高亮超过半数可见行存在差异的比对结果前是否显示警告。",
+        ),
+        "settings.usage_habits_help" => (
+            "Opt in to local command-habit learning. Data stays on this machine in a local DuckDB file unless you explicitly export it below.",
+            "选择加入本地命令习惯学习。除非你在下方明确导出，否则数据只会保存在本机的 DuckDB 文件中。",
+        ),
+        "settings.collected_command_category" => (
+            "• Command name + first-token category (git, docker, kubectl, …)",
+            "• 命令名称和首个词元类别（git、docker、kubectl 等）",
+        ),
+        "settings.collected_activity_counts" => (
+            "• Success / failure counts and per-hour activity distribution",
+            "• 成功/失败次数和每小时活动分布",
+        ),
+        "settings.collected_corrections" => (
+            "• Typo → correction pairs that you accept (e.g. dockre → docker)",
+            "• 你接受的拼写错误 → 更正配对（例如 dockre → docker）",
+        ),
+        "settings.collected_host_count" => (
+            "• Number of distinct hosts (hostnames are NOT stored)",
+            "• 不同主机的数量（不会存储主机名）",
+        ),
+        "settings.never_collected_credentials" => (
+            "• Passwords, passphrases, private keys, API tokens, bearer tokens",
+            "• 密码、口令、私钥、API 令牌、Bearer 令牌",
+        ),
+        "settings.never_collected_onekey" => (
+            "• OneKey credential values or Expect-matched secret responses",
+            "• OneKey 凭据值或由 Expect 匹配的机密响应",
+        ),
+        "settings.never_collected_session_data" => (
+            "• Environment variable values, remote command output, session content",
+            "• 环境变量值、远程命令输出、会话内容",
+        ),
+        "settings.never_collected_sensitive_arguments" => (
+            "• Full command arguments when a credential flag is detected (the whole line is dropped or the value redacted to ***)",
+            "• 检测到凭据参数时的完整命令参数（整行会被丢弃，或将值替换为 ***）",
+        ),
+        "settings.privacy_sanitizer_help" => (
+            "Secret material is filtered by a dedicated sanitizer before anything reaches the local DuckDB store. Turning this off stops all future collection; existing local data is retained until you clear it.",
+            "任何内容写入本地 DuckDB 存储前，都会由专用清理器过滤机密材料。关闭此功能将停止后续收集；现有本地数据会保留，直到你将其清除。",
+        ),
+        "settings.export_report_help" => (
+            "Export writes an aggregated, sanitized JSON file (no raw commands, no hostnames, no timestamps beyond the report generation time) to your downloads directory. Upload to GitHub Gist or object storage is a manual next step — paste the token into your uploader of choice; RusTerm never transmits anything automatically.",
+            "导出操作会将聚合并清理过的 JSON 文件写入下载目录（不含原始命令、主机名，也不含报告生成时间以外的时间戳）。上传到 GitHub Gist 或对象存储需要手动完成——请将令牌粘贴到你选择的上传工具中；RusTerm 绝不会自动传输任何内容。",
+        ),
+        "settings.keybindings_help" => (
+            "Click a shortcut, then press a new combination. Application shortcuts require Cmd/Ctrl + Shift so standard terminal controls remain available.",
+            "点击快捷键，然后按下新的组合键。应用快捷键必须包含 Cmd/Ctrl + Shift，以保留标准终端控制键。",
+        ),
+        "settings.keybinding_close_focused_pane" => ("Close focused pane", "关闭聚焦窗格"),
+        "settings.keybinding_append_pane" => ("Add split pane", "添加分屏窗格"),
+        "settings.keybinding_toggle_comparison" => ("Toggle synchronized input", "切换同步输入"),
+        "settings.keybinding_toggle_pane_zoom" => ("Toggle pane zoom", "切换窗格缩放"),
+        "settings.keybinding_press_shortcut" => ("Press shortcut…", "请按快捷键…"),
+        "settings.keybinding_disabled" => ("Disabled", "已禁用"),
+        "settings.keybinding_error_unsafe" => (
+            "Use Cmd/Ctrl + Shift plus a key to keep terminal controls safe.",
+            "请使用 Cmd/Ctrl + Shift 加一个按键，以免占用终端控制键。",
+        ),
+        "settings.keybinding_error_conflict" => {
+            ("Already used by {action}.", "已被“{action}”使用。")
+        }
+        "settings.keybinding_disable" => ("Disable", "禁用"),
+        "settings.reset_default" => ("Reset default", "恢复默认设置"),
+
+        // ── suggestion.* — suggestion popup additions ──────────────────
+        "suggestion.remove_history_tooltip" => (
+            "Remove from history (Shift+Del)",
+            "从历史记录中删除（Shift+Del）",
+        ),
+        "suggestion.remove_history_aria" => ("Remove command from history", "从历史记录中删除命令"),
+
+        // ── master_password.* — credential-store unlock dialog ─────────
+        "master_password.create_title" => ("Create Master Password", "创建主密码"),
+        "master_password.unlock_title" => ("Unlock RusTerm", "解锁 RusTerm"),
+        "master_password.create_subtitle" => (
+            "Set a master password to protect your connection credentials.",
+            "设置主密码以保护你的连接凭据。",
+        ),
+        "master_password.unlock_subtitle" => (
+            "Enter your master password to decrypt your connections.",
+            "输入主密码以解密你的连接。",
+        ),
+        "master_password.label" => ("Master Password", "主密码"),
+        "master_password.enter_placeholder" => ("Enter password", "输入密码"),
+        "master_password.toggle_visibility" => ("Show / hide password", "显示/隐藏密码"),
+        "master_password.confirm_label" => ("Confirm Password", "确认密码"),
+        "master_password.confirm_placeholder" => ("Confirm password", "再次输入密码"),
+        "master_password.mismatch" => ("Passwords do not match", "两次输入的密码不一致"),
+        "master_password.verifying" => ("Verifying...", "正在验证..."),
+        "master_password.create_and_unlock" => ("Create & Unlock", "创建并解锁"),
+        "master_password.unlock" => ("Unlock", "解锁"),
+        "master_password.recovery_warning" => (
+            "Your master password cannot be recovered if lost.\nIt protects all saved connection credentials.",
+            "主密码丢失后无法恢复。\n它用于保护所有已保存的连接凭据。",
+        ),
+
+        // ── onekey.* — OneKey manager and credential popup ─────────────
+        "onekey.manager_title" => (
+            "OneKeys (Expect / Send steps)",
+            "OneKeys（Expect / Send 步骤）",
+        ),
+        "onekey.manager_description" => (
+            "Each OneKey is a sequence of prompt/Send steps. Choose a built-in prompt type for common Username, Password, sudo, Git, bastion, and SSH key passphrase prompts. Send values are encrypted at rest.",
+            "每个 OneKey 都由一系列提示/Send 步骤组成。常见的 Username、Password、sudo、Git、堡垒机和 SSH 密钥口令提示可选择内置提示类型。Send 值在静态存储时会被加密。",
+        ),
+        "onekey.custom_regex_help" => (
+            "Use Custom regex only for unusual prompts. Matching is case-insensitive and runs only for connections with One-Key Connect enabled — set it in the connection's Edit dialog (checkbox right under Name).",
+            "仅对特殊提示使用自定义正则表达式。匹配不区分大小写，并且只会对已启用 One-Key Connect 的连接运行——可在连接的编辑对话框中设置（名称正下方的复选框）。",
+        ),
+        "onekey.hide_send_values" => ("Hide Send values", "隐藏 Send 值"),
+        "onekey.show_send_values" => ("Show Send values", "显示 Send 值"),
+        "onekey.drag_manager" => ("Drag to move OneKey Manager", "拖动以移动 OneKey 管理器"),
+        "onekey.reveal_send_values_tooltip" => (
+            "Temporarily reveal Send values so they can be verified",
+            "暂时显示 Send 值以便核对",
+        ),
+        "onekey.untitled" => ("(untitled)", "（未命名）"),
+        "onekey.step_count" => ("({count} steps)", "（{count} 个步骤）"),
+        "onekey.empty" => (
+            "No OneKeys yet.\nClick + to add one.",
+            "尚无 OneKey。\n点击 + 添加一个。",
+        ),
+        "onekey.add" => ("+ Add OneKey", "+ 添加 OneKey"),
+        "onekey.name" => ("Name", "名称"),
+        "onekey.name_placeholder" => ("ecs-user / git-inesa", "ecs-user / git-inesa"),
+        "onekey.steps_label" => ("Expect / Send steps", "Expect / Send 步骤"),
+        "onekey.add_step" => ("+ Step", "+ 步骤"),
+        "onekey.step_label_placeholder" => ("label (Username)", "标签（用户名）"),
+        "onekey.remove_step" => ("Remove step", "删除步骤"),
+        "onekey.password_prompt_option" => ("Password prompt (recommended)", "密码提示（推荐）"),
+        "onekey.username_prompt_option" => ("Git username prompt", "Git 用户名提示"),
+        "onekey.custom_regex_option" => ("Custom regex (advanced)", "自定义正则表达式（高级）"),
+        "onekey.custom_expect_placeholder" => ("Custom Expect regex", "自定义 Expect 正则表达式"),
+        "onekey.password_prompt_help" => (
+            "Matches Password, sudo, Git/bastion password, and SSH key passphrase prompts.",
+            "匹配 Password、sudo、Git/堡垒机密码以及 SSH 密钥口令提示。",
+        ),
+        "onekey.username_prompt_help" => (
+            "Matches Git HTTPS username prompts.",
+            "匹配 Git HTTPS 用户名提示。",
+        ),
+        "onekey.send_placeholder" => ("Send (secret — encrypted)", "Send（机密内容 — 已加密）"),
+        "onekey.delete" => ("Delete OneKey", "删除 OneKey"),
+        "onekey.select_or_add" => (
+            "Select a OneKey, or click + Add OneKey to create one.",
+            "选择一个 OneKey，或点击 + 添加 OneKey 进行创建。",
+        ),
+        "onekey.shortcuts" => (
+            "Esc Cancel · Ctrl/Cmd+Enter Save",
+            "Esc 取消 · Ctrl/Cmd+Enter 保存",
+        ),
+        "onekey.validation.entry_numbered" => ("OneKey #{number}", "OneKey #{number}"),
+        "onekey.validation.entry_named" => ("OneKey ‘{name}’", "OneKey“{name}”"),
+        "onekey.validation.name_required" => ("{entry} needs a name.", "{entry} 需要填写名称。"),
+        "onekey.validation.steps_required" => (
+            "{entry} needs at least one Expect / Send step.",
+            "{entry} 至少需要一个 Expect / Send 步骤。",
+        ),
+        "onekey.validation.step_numbered" => ("step #{number}", "步骤 #{number}"),
+        "onekey.validation.step_named" => ("step ‘{label}’", "步骤“{label}”"),
+        "onekey.validation.expect_required" => (
+            "{entry} {step} needs an Expect regex.",
+            "{entry} 的{step}需要填写 Expect 正则表达式。",
+        ),
+        "onekey.validation.invalid_expect" => (
+            "{entry} {step} has an invalid Expect regex: {error}",
+            "{entry} 的{step}包含无效的 Expect 正则表达式：{error}",
+        ),
+        "onekey.validation.send_required" => (
+            "{entry} {step} needs a Send value.",
+            "{entry} 的{step}需要填写 Send 值。",
+        ),
+        "onekey.popup.cancel" => ("Cancel credential popup", "取消凭据弹窗"),
+        "onekey.popup.cancel_tooltip" => {
+            ("Cancel credential popup (Escape)", "取消凭据弹窗（Escape）")
+        }
+        "onekey.popup.rejected" => (
+            "Credential was sent, but the remote requested it again. Verify the saved value.",
+            "凭据已发送，但远端再次请求该凭据。请核对已保存的值。",
+        ),
+        "onekey.popup.use_credential" => (
+            "Use {name} · {label} (Enter or Tab)",
+            "使用 {name} · {label}（Enter 或 Tab）",
+        ),
+        "onekey.popup.save" => ("Save In OneKeys", "保存到 OneKeys"),
+        "onekey.submission_feedback" => (
+            "Credential sent · input hidden by remote",
+            "凭据已发送 · 输入已由远端隐藏",
+        ),
+
+        // ── relay / session additions ───────────────────────────────────
+        "relay.sudo_authorization_unavailable" => (
+            "No reusable sudo authorization is available for this host. Run sudo once in its RusTerm session with OneKey enabled, then retry.",
+            "此主机没有可复用的 sudo 授权。请在其已启用 OneKey 的 RusTerm 会话中运行一次 sudo，然后重试。",
+        ),
+        "relay.sudo_authorization_rejected" => (
+            "The reusable sudo credential was rejected or sudo policy denied this command. Re-authorize sudo in the target RusTerm session.",
+            "可复用的 sudo 凭据被拒绝，或 sudo 策略拒绝了此命令。请在目标 RusTerm 会话中重新授权 sudo。",
+        ),
+        "relay.start_timeout_or_runtime_wedged" => (
+            "Relay start timed out or runtime is wedged: {error}",
+            "中转启动超时或运行时卡死：{error}",
+        ),
+        "session.serial_open_failed" => ("Serial open failed: {error}", "打开串口失败：{error}"),
+        "session.telnet_connect_failed" => {
+            ("Telnet connect failed: {error}", "Telnet 连接失败：{error}")
+        }
+
+        // ── shadow.* — shadow sandbox dialog ────────────────────────────
+        "shadow.unknown" => ("Unknown", "未知"),
+        "shadow.execution_title" => ("Shadow sandbox: confirm execution", "影子沙盒：确认执行"),
+        "shadow.execution_description" => (
+            "The following is only a model suggestion. The model cannot execute commands; only after you click “Confirm execution” will the command be written to the current login session.",
+            "以下内容只是模型建议。模型不能执行命令；只有你点击“确认执行”后，命令才会写入当前登录会话。",
+        ),
+        "shadow.target_session" => ("Target session", "目标会话"),
+        "shadow.working_directory" => ("Working directory", "工作目录"),
+        "shadow.risk_warning" => ("Risk warning: ", "风险提示："),
+        "shadow.execution_warning" => (
+            "Verify the arguments, quoting, target host, and working directory yourself. Once confirmed, the command runs in the real session, not an OS-isolated sandbox.",
+            "请自行核对参数、引号、目标主机和工作目录。确认后命令会在真实会话中执行，并非 OS 隔离沙盒。",
+        ),
+        "shadow.confirm_execute" => ("Confirm execution", "确认执行"),
+        "shadow.exit_code_unavailable" => ("Unavailable", "未获取"),
+        "shadow.output_truncated" => (
+            "Output exceeds {limit}; preview and shared content have been truncated.",
+            "输出超过 {limit}，预览和共享内容已截断。",
+        ),
+        "shadow.result_title" => (
+            "Shadow sandbox: execution result awaiting authorization",
+            "影子沙盒：执行结果待授权",
+        ),
+        "shadow.result_description" => (
+            "The result is currently stored only in temporary local state and has not been added to an LLM request. Preview it, then decide whether to allow it to be sent to the model.",
+            "结果目前只保存在本地临时状态，尚未加入 LLM 请求。请预览后决定是否允许发送给模型。",
+        ),
+        "shadow.exit_code" => ("Exit code", "退出码"),
+        "shadow.command" => ("Command", "命令"),
+        "shadow.do_not_share" => ("Do not share", "不分享"),
+        "shadow.confirm_send_to_model" => ("Confirm send to model", "确认发送给模型"),
 
         // Fallback: unknown key.
         _ => return None,
@@ -981,6 +1277,14 @@ mod tests {
     const DYNAMIC_SOURCE_KEYS: &[&str] = &[
         "layout.summary",
         "layout.summary_tab_tiled",
+        "settings.keybinding_append_pane",
+        "settings.keybinding_close_focused_pane",
+        "settings.keybinding_toggle_comparison",
+        "settings.keybinding_toggle_pane_zoom",
+        "settings.skin_custom",
+        "settings.skin_one_dark",
+        "settings.skin_solarized_dark",
+        "settings.skin_tokyo_night",
         "relay.account_required_before_start",
         "relay.confirm_public_bind_before_start",
         "relay.password_required",
@@ -1043,10 +1347,10 @@ mod tests {
         while let Some(index) = remaining.find(marker) {
             remaining = &remaining[index + marker.len()..];
             let argument = remaining.trim_start();
-            if let Some(quoted) = argument.strip_prefix('"')
-                && let Some(end) = quoted.find('"')
-            {
-                keys.push(quoted[..end].to_string());
+            if let Some(quoted) = argument.strip_prefix('"') {
+                if let Some(end) = quoted.find('"') {
+                    keys.push(quoted[..end].to_string());
+                }
             }
         }
         keys
@@ -1063,6 +1367,7 @@ mod tests {
         for source in sources {
             keys.extend(literal_keys_after(&source, "crate::i18n::t("));
             keys.extend(literal_keys_after(&source, "crate::i18n::tf("));
+            keys.extend(literal_keys_after(&source, "crate::i18n::t_for("));
         }
         keys.extend(DYNAMIC_SOURCE_KEYS.iter().map(|key| (*key).to_string()));
         keys
