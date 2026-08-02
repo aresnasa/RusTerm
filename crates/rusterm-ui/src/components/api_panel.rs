@@ -441,3 +441,71 @@ fn gen_curl(url: &str, default_user: &str, session: &Option<String>, command: &s
         body = body_sq,
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn curl_includes_endpoint_user_and_body() {
+        let curl = gen_curl(
+            "http://127.0.0.1:8080",
+            "alice",
+            &Some("prod-web".to_string()),
+            "uname -a",
+        );
+        assert!(
+            curl.contains("http://127.0.0.1:8080/api/v1/exec"),
+            "missing endpoint: {curl}"
+        );
+        assert!(
+            curl.contains("-u 'alice:PASS'"),
+            "missing basic-auth: {curl}"
+        );
+        assert!(
+            curl.contains("host_id\":\"prod-web\""),
+            "missing host_id: {curl}"
+        );
+        assert!(
+            curl.contains("command\":\"uname -a\""),
+            "missing command: {curl}"
+        );
+    }
+
+    #[test]
+    fn curl_escapes_json_special_chars_in_command() {
+        // A command with a double-quote and backslash must be JSON-escaped so
+        // the generated body stays valid JSON the relay can parse. The raw
+        // command `echo "hi" \n` must become `echo \"hi\" \\n` in the
+        // JSON value (quotes → \", backslash → \\).
+        let curl = gen_curl("http://x", "u", &Some("h".to_string()), r#"echo "hi" \n"#);
+        assert!(
+            curl.contains(r#"command":"echo \"hi\" \\n""#),
+            "bad escape: {curl}"
+        );
+    }
+
+    #[test]
+    fn curl_handles_missing_session_with_placeholder() {
+        let curl = gen_curl("http://x", "u", &None, "ls");
+        assert!(
+            curl.contains("HOST"),
+            "missing-session should use HOST placeholder: {curl}"
+        );
+    }
+
+    #[test]
+    fn base_url_prefers_running_url() {
+        assert_eq!(
+            base_url(&Some("http://1.2.3.4:90/".to_string()), "127.0.0.1", 8080),
+            "http://1.2.3.4:90"
+        );
+    }
+
+    #[test]
+    fn base_url_falls_back_to_bind_and_port() {
+        assert_eq!(base_url(&None, "127.0.0.1", 8080), "http://127.0.0.1:8080");
+        // 0.0.0.0 is shown as 127.0.0.1 so the local curl preview works.
+        assert_eq!(base_url(&None, "0.0.0.0", 8080), "http://127.0.0.1:8080");
+    }
+}
