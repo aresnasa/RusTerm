@@ -711,6 +711,170 @@ fn cell_class(cells: &[RenderCell], idx: usize) -> CharClass {
     char_class(cells[idx].character)
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct SearchMatch {
+    row: usize,
+    start_col: usize,
+    end_col: usize,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum CellOverlay {
+    #[default]
+    None,
+    SearchMatch,
+    CurrentSearchMatch,
+    Selection,
+}
+
+const SEARCH_MATCH_BG: &str = "background:rgba(224,175,104,0.26)";
+const SEARCH_CURRENT_BG: &str =
+    "background:rgba(122,162,247,0.48);outline:1px solid rgba(192,202,245,0.72);outline-offset:-1px";
+
+fn overlay_for_col(
+    col: usize,
+    selection: Option<(usize, usize)>,
+    search_ranges: &[(usize, usize, bool)],
+) -> CellOverlay {
+    if selection.is_some_and(|(start, end)| col >= start && col <= end) {
+        return CellOverlay::Selection;
+    }
+
+    search_ranges
+        .iter()
+        .find_map(|(start, end, current)| {
+            (col >= *start && col <= *end).then_some(if *current {
+                CellOverlay::CurrentSearchMatch
+            } else {
+                CellOverlay::SearchMatch
+            })
+        })
+        .unwrap_or_default()
+}
+
+fn overlay_style(overlay: CellOverlay) -> &'static str {
+    match overlay {
+        CellOverlay::None => "",
+        CellOverlay::SearchMatch => SEARCH_MATCH_BG,
+        CellOverlay::CurrentSearchMatch => SEARCH_CURRENT_BG,
+        CellOverlay::Selection => SELECTION_BG,
+    }
+}
+
+/// Find case-insensitive matches while preserving terminal cell columns.
+///
+/// Matching through a folded `Vec<char>` avoids confusing UTF-8 byte offsets
+/// with grid columns. Each folded character retains the source glyph's cell
+/// range, so CJK/wide cells and lowercase expansions are highlighted correctly.
+fn find_search_matches(rows: &[RenderRow], query: &str) -> Vec<SearchMatch> {
+    let needle: Vec<char> = query.chars().flat_map(char::to_lowercase).collect();
+    if needle.is_empty() {
+        return Vec::new();
+    }
+
+    let mut matches = Vec::new();
+    for (row_idx, row) in rows.iter().enumerate() {
+        let mut folded = Vec::new();
+        let mut source_cols = Vec::new();
+        for (col, cell) in row.cells.iter().enumerate() {
+            if cell.wide_next {
+                continue;
+            }
+            let end_col = if cell.wide {
+                (col + 1).min(row.cells.len().saturating_sub(1))
+            } else {
+                col
+            };
+            for ch in cell.character.to_lowercase() {
+                folded.push(ch);
+                source_cols.push((col, end_col));
+            }
+        }
+
+        if needle.len() > folded.len() {
+            continue;
+        }
+        for start in 0..=folded.len() - needle.len() {
+            if folded[start..start + needle.len()] == needle {
+                matches.push(SearchMatch {
+                    row: row_idx,
+                    start_col: source_cols[start].0,
+                    end_col: source_cols[start + needle.len() - 1].1,
+                });
+            }
+        }
+    }
+    matches
+}
+
+fn search_query_from_selection(
+    cached: &str,
+    selection: Option<TextSelection>,
+    rows: &[RenderRow],
+) -> Option<String> {
+    let text = terminal_selection_text(cached, selection, rows);
+    let text = text.trim();
+    (!text.is_empty() && !text.contains(['\r', '\n']) && text.chars().count() <= 256)
+        .then(|| text.to_owned())
+}
+
+fn percent_encode_query(text: &str) -> String {
+    let mut encoded = String::with_capacity(text.len());
+    for byte in text.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(*byte as char);
+            }
+            _ => {
+                use std::fmt::Write as _;
+                let _ = write!(encoded, "%{byte:02X}");
+            }
+        }
+    }
+    encoded
+}
+
+fn online_search_url(text: &str) -> Option<String> {
+    let text = text.trim();
+    (!text.is_empty()).then(|| {
+        format!(
+            "https://www.google.com/search?q={}",
+            percent_encode_query(text)
+        )
+    })
+}
+
+fn open_online_search(text: &str) {
+    let Some(url) = online_search_url(text) else {
+        return;
+    };
+
+    #[cfg(target_os = "macos")]
+    let result = std::process::Command::new("open").arg(&url).spawn();
+    #[cfg(target_os = "windows")]
+    let result = std::process::Command::new("rundll32")
+        .args(["url.dll,FileProtocolHandler", &url])
+        .spawn();
+    #[cfg(all(unix, not(target_os = "macos")))]
+    let result = std::process::Command::new("xdg-open").arg(&url).spawn();
+    #[cfg(not(any(unix, target_os = "windows")))]
+    let result: std::io::Result<std::process::Child> = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "opening URLs is unsupported on this platform",
+    ));
+
+    if let Err(error) = result {
+        tracing::warn!("[SEARCH] failed to open browser: {error}");
+    }
+}
+
+/// Application mouse tracking owns live-view pointer events unless Shift is
+/// held. Scrolled-back content is always local because its coordinates no
+/// longer correspond to the application's current screen.
+fn app_owns_mouse(mouse_reporting: bool, scrollback_offset: usize, shift: bool) -> bool {
+    mouse_reporting && scrollback_offset == 0 && !shift
+}
+
 /// Render a terminal row to an HTML string. Uses `dangerous_inner_html`
 /// for fast DOM updates — avoids Dioxus per-span VDOM diffing overhead.
 ///
@@ -719,20 +883,22 @@ fn cell_class(cells: &[RenderCell], idx: usize) -> CharClass {
 /// typically empty spaces and would push the suggestion to the end of the row.
 ///
 /// `sel` is the inclusive cell-column range `(start, end)` inside the active
-/// mouse selection for this row, if any; covered cells get [`SELECTION_BG`].
+/// mouse selection for this row. `search_ranges` contains exact match ranges;
+/// selection takes precedence over the current match, then other matches.
 fn row_to_html(
     row: &RenderRow,
     cursor_col: Option<usize>,
     cursor_color: &CellColor,
     suggestion: Option<&str>,
     sel: Option<(usize, usize)>,
+    search_ranges: &[(usize, usize, bool)],
 ) -> String {
     let mut html = String::with_capacity(row.cells.len() * 4);
 
     let mut cur_fg = CellColor::Default;
     let mut cur_bg = CellColor::Default;
     let mut cur_flags = CellFlags::empty();
-    let mut cur_sel = false;
+    let mut cur_overlay = CellOverlay::None;
     let mut cur_text = String::new();
 
     let flush = |html: &mut String,
@@ -740,18 +906,17 @@ fn row_to_html(
                  fg: &CellColor,
                  bg: &CellColor,
                  flags: CellFlags,
-                 sel: bool| {
+                 overlay: CellOverlay| {
         if text.is_empty() {
             return;
         }
         let mut style = cell_style(fg, bg, flags);
-        if sel {
-            if style.is_empty() {
-                style = SELECTION_BG.to_string();
-            } else {
+        let overlay_css = overlay_style(overlay);
+        if !overlay_css.is_empty() {
+            if !style.is_empty() {
                 style.push(';');
-                style.push_str(SELECTION_BG);
             }
+            style.push_str(overlay_css);
         }
         let escaped = html_escape(text);
         if style.is_empty() {
@@ -786,7 +951,14 @@ fn row_to_html(
 
         let is_cursor = cursor_col == Some(i);
         if is_cursor {
-            flush(&mut html, &cur_text, &cur_fg, &cur_bg, cur_flags, cur_sel);
+            flush(
+                &mut html,
+                &cur_text,
+                &cur_fg,
+                &cur_bg,
+                cur_flags,
+                cur_overlay,
+            );
             cur_text.clear();
 
             let ch = if cell.character == ' ' {
@@ -801,12 +973,16 @@ fn row_to_html(
             } else {
                 &cursor_border
             };
+            let cursor_overlay = overlay_for_col(i, sel, search_ranges);
+            let overlay_css = overlay_style(cursor_overlay);
             let cursor_style = if base_style.is_empty() {
-                format!("border-left:2px solid {cursor_border};margin-left:-1px")
+                format!(
+                    "{overlay_css};border-left:2px solid {cursor_border};margin-left:-1px"
+                )
             } else {
                 format!(
-                    "{};border-left:2px solid {};margin-left:-1px",
-                    base_style, cursor_border
+                    "{};{};border-left:2px solid {};margin-left:-1px",
+                    base_style, overlay_css, cursor_border
                 )
             };
             html.push_str("<span style=\"");
@@ -818,27 +994,42 @@ fn row_to_html(
             cur_fg = CellColor::Default;
             cur_bg = CellColor::Default;
             cur_flags = CellFlags::empty();
-            // cur_sel persists across the cursor — the selection underneath
-            // the cursor cell continues after it.
+            cur_overlay = CellOverlay::None;
             continue;
         }
 
-        let in_sel = sel.is_some_and(|(a, b)| i >= a && i <= b);
-        let same_style =
-            cell.fg == cur_fg && cell.bg == cur_bg && cell.flags == cur_flags && in_sel == cur_sel;
+        let overlay = overlay_for_col(i, sel, search_ranges);
+        let same_style = cell.fg == cur_fg
+            && cell.bg == cur_bg
+            && cell.flags == cur_flags
+            && overlay == cur_overlay;
         if !cur_text.is_empty() && !same_style {
-            flush(&mut html, &cur_text, &cur_fg, &cur_bg, cur_flags, cur_sel);
+            flush(
+                &mut html,
+                &cur_text,
+                &cur_fg,
+                &cur_bg,
+                cur_flags,
+                cur_overlay,
+            );
             cur_text.clear();
         }
 
         cur_fg = cell.fg.clone();
         cur_bg = cell.bg.clone();
         cur_flags = cell.flags;
-        cur_sel = in_sel;
+        cur_overlay = overlay;
         cur_text.push(cell.character);
     }
 
-    flush(&mut html, &cur_text, &cur_fg, &cur_bg, cur_flags, cur_sel);
+    flush(
+        &mut html,
+        &cur_text,
+        &cur_fg,
+        &cur_bg,
+        cur_flags,
+        cur_overlay,
+    );
 
     // Insert suggestion right after the cursor content
     if let Some(sug) = suggestion {
