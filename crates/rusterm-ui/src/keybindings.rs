@@ -104,14 +104,16 @@ mod tests {
     }
 
     #[test]
-    fn unsafe_chords_are_not_application_shortcuts() {
-        let chord = KeyChord {
-            key: "w".to_string(),
-            primary: true,
-            alt: false,
-            shift: false,
-        };
-        assert!(!chord.is_safe_application_shortcut());
+    fn plain_terminal_control_chords_are_not_application_shortcuts() {
+        let keybindings = Keybindings::default();
+        for key in ["a", "e", "r", "w", "x", "z"] {
+            let keyboard_key = Key::Character(key.into());
+            assert_eq!(
+                action_for_event(&keybindings, &keyboard_key, true, false, false, false),
+                None,
+                "Ctrl+{key} must remain available to the focused terminal"
+            );
+        }
     }
 
     #[test]

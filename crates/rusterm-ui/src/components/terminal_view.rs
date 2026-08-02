@@ -209,6 +209,122 @@ fn code_to_char(code: &Code) -> u8 {
     }
 }
 
+fn terminal_key_bytes(
+    key: &Key,
+    code: &Code,
+    ctrl: bool,
+    alt: bool,
+    shift: bool,
+    app_cursor: bool,
+) -> Vec<u8> {
+    let modifier = match (ctrl, alt, shift) {
+        (false, false, false) => None,
+        (false, false, true) => Some(2),
+        (false, true, false) => Some(3),
+        (false, true, true) => Some(4),
+        (true, false, false) => Some(5),
+        (true, false, true) => Some(6),
+        (true, true, false) => Some(7),
+        (true, true, true) => Some(8),
+    };
+
+    if matches!(key, Key::Unidentified) {
+        let numpad_navigation = match code {
+            Code::Numpad8 => Some(cursor_key_seq(1, b'A', app_cursor, modifier)),
+            Code::Numpad2 => Some(cursor_key_seq(1, b'B', app_cursor, modifier)),
+            Code::Numpad6 => Some(cursor_key_seq(1, b'C', app_cursor, modifier)),
+            Code::Numpad4 => Some(cursor_key_seq(1, b'D', app_cursor, modifier)),
+            Code::Numpad7 => Some(csi_seq(1, modifier, b'H')),
+            Code::Numpad1 => Some(csi_seq(1, modifier, b'F')),
+            Code::Numpad0 => Some(csi_seq(2, modifier, b'~')),
+            Code::NumpadDecimal => Some(csi_seq(3, modifier, b'~')),
+            Code::Numpad9 => Some(csi_seq(5, modifier, b'~')),
+            Code::Numpad3 => Some(csi_seq(6, modifier, b'~')),
+            _ => None,
+        };
+        if let Some(data) = numpad_navigation {
+            return data;
+        }
+    }
+
+    match key {
+        Key::ArrowUp => cursor_key_seq(1, b'A', app_cursor, modifier),
+        Key::ArrowDown => cursor_key_seq(1, b'B', app_cursor, modifier),
+        Key::ArrowRight => cursor_key_seq(1, b'C', app_cursor, modifier),
+        Key::ArrowLeft => cursor_key_seq(1, b'D', app_cursor, modifier),
+
+        Key::Home => csi_seq(1, modifier, b'H'),
+        Key::End => csi_seq(1, modifier, b'F'),
+        Key::Insert => csi_seq(2, modifier, b'~'),
+        Key::Delete => csi_seq(3, modifier, b'~'),
+        Key::PageUp => csi_seq(5, modifier, b'~'),
+        Key::PageDown => csi_seq(6, modifier, b'~'),
+
+        Key::F1 => cursor_key_seq(1, b'P', app_cursor, modifier),
+        Key::F2 => cursor_key_seq(1, b'Q', app_cursor, modifier),
+        Key::F3 => cursor_key_seq(1, b'R', app_cursor, modifier),
+        Key::F4 => cursor_key_seq(1, b'S', app_cursor, modifier),
+
+        Key::F5 => csi_seq(15, modifier, b'~'),
+        Key::F6 => csi_seq(17, modifier, b'~'),
+        Key::F7 => csi_seq(18, modifier, b'~'),
+        Key::F8 => csi_seq(19, modifier, b'~'),
+        Key::F9 => csi_seq(20, modifier, b'~'),
+        Key::F10 => csi_seq(21, modifier, b'~'),
+        Key::F11 => csi_seq(23, modifier, b'~'),
+        Key::F12 => csi_seq(24, modifier, b'~'),
+
+        Key::Character(s) if ctrl && !alt && !shift => ctrl_char(s),
+        Key::Character(s) if alt && !ctrl => {
+            let mut buf = vec![0x1b];
+            buf.extend_from_slice(s.as_bytes());
+            buf
+        }
+        Key::Character(s) if ctrl && shift && !alt => {
+            let c = s.chars().next().unwrap_or('A');
+            if c.is_ascii_alphabetic() {
+                csi_seq(1, Some(6), c as u8)
+            } else {
+                csi_seq(1, Some(6), code_to_char(code))
+            }
+        }
+        Key::Character(s) if ctrl && alt && !shift => {
+            let ctrl_ch = ctrl_char(s);
+            if !ctrl_ch.is_empty() && ctrl_ch[0] != 0x1b {
+                let mut buf = vec![0x1b];
+                buf.extend_from_slice(&ctrl_ch);
+                buf
+            } else {
+                vec![]
+            }
+        }
+
+        Key::Enter => {
+            if alt {
+                vec![0x1b, 0x0d]
+            } else {
+                vec![0x0d]
+            }
+        }
+        Key::Backspace => {
+            if alt {
+                vec![0x1b, 0x7f]
+            } else {
+                vec![0x7f]
+            }
+        }
+        Key::Tab => vec![0x09],
+        Key::Escape => vec![0x1b],
+
+        Key::Character(s) => s.as_bytes().to_vec(),
+        _ => vec![],
+    }
+}
+
+fn accepts_inline_suggestion(key: &Key) -> bool {
+    matches!(key, Key::End | Key::Tab)
+}
+
 /// What the OneKey autofill popup should do with a key while it is visible.
 /// Extracted as a pure function so the routing — especially "typing dismisses
 /// the popup and falls through to the PTY" — is unit-testable.
@@ -976,6 +1092,10 @@ pub fn TerminalView(
             return;
         }
         e.prevent_default();
+        // A focused terminal owns non-Command keyboard input. Prevent the root
+        // application handler from also acting on bytes already sent to the PTY
+        // (notably Ctrl+W, which would otherwise delete a word and close a pane).
+        e.stop_propagation();
 
         // Disconnected session: Enter reconnects, everything else is ignored
         // (there's no live PTY to send to).
@@ -1102,21 +1222,16 @@ pub fn TerminalView(
             }
         }
 
-        // ── Auto-completion: accept inline suggestion with End/Ctrl+E/Tab ──
+        // ── Auto-completion: accept inline suggestion with End/Tab ──
         //
         // ArrowRight is intentionally excluded — in a terminal, Right moves
         // the cursor forward within the command line. If an inline ghost-text
         // suggestion were accepted on Right, the user could never move the
         // cursor rightward without accidentally swallowing the suggestion.
-        // End, Tab, and Ctrl+E remain as accept keys (they naturally land at
-        // end-of-line or are explicit "accept" affordances).
+        // End and Tab remain explicit acceptance keys. Ctrl+E must reach the
+        // PTY because readline and shells use it to move to end-of-line.
         if current_suggestion.is_some() {
-            let is_accept = match &key {
-                Key::End => true,
-                Key::Tab => true,
-                Key::Character(s) if ctrl && !alt && !shift && s.eq_ignore_ascii_case("e") => true,
-                _ => false,
-            };
+            let is_accept = accepts_inline_suggestion(&key);
             if is_accept {
                 if let Some(ref sug) = current_suggestion {
                     on_input.call(sug.as_bytes().to_vec());
@@ -1151,90 +1266,7 @@ pub fn TerminalView(
         let is_enter = !ctrl && !alt && matches!(key, Key::Enter);
         let app_cursor = render_output.mode_cursor_keys;
 
-        let modifier: Option<u8> = match (ctrl, alt, shift) {
-            (false, false, false) => None,
-            (false, false, true) => Some(2),
-            (false, true, false) => Some(3),
-            (false, true, true) => Some(4),
-            (true, false, false) => Some(5),
-            (true, false, true) => Some(6),
-            (true, true, false) => Some(7),
-            (true, true, true) => Some(8),
-        };
-
-        let data: Vec<u8> = match key {
-            Key::ArrowUp => cursor_key_seq(1, b'A', app_cursor, modifier),
-            Key::ArrowDown => cursor_key_seq(1, b'B', app_cursor, modifier),
-            Key::ArrowRight => cursor_key_seq(1, b'C', app_cursor, modifier),
-            Key::ArrowLeft => cursor_key_seq(1, b'D', app_cursor, modifier),
-
-            Key::Home => csi_seq(1, modifier, b'H'),
-            Key::End => csi_seq(1, modifier, b'F'),
-            Key::Insert => csi_seq(2, modifier, b'~'),
-            Key::Delete => csi_seq(3, modifier, b'~'),
-            Key::PageUp => csi_seq(5, modifier, b'~'),
-            Key::PageDown => csi_seq(6, modifier, b'~'),
-
-            Key::F1 => cursor_key_seq(1, b'P', app_cursor, modifier),
-            Key::F2 => cursor_key_seq(1, b'Q', app_cursor, modifier),
-            Key::F3 => cursor_key_seq(1, b'R', app_cursor, modifier),
-            Key::F4 => cursor_key_seq(1, b'S', app_cursor, modifier),
-
-            Key::F5 => csi_seq(15, modifier, b'~'),
-            Key::F6 => csi_seq(17, modifier, b'~'),
-            Key::F7 => csi_seq(18, modifier, b'~'),
-            Key::F8 => csi_seq(19, modifier, b'~'),
-            Key::F9 => csi_seq(20, modifier, b'~'),
-            Key::F10 => csi_seq(21, modifier, b'~'),
-            Key::F11 => csi_seq(23, modifier, b'~'),
-            Key::F12 => csi_seq(24, modifier, b'~'),
-
-            Key::Character(ref s) if ctrl && !alt && !shift => ctrl_char(s),
-            Key::Character(ref s) if alt && !ctrl => {
-                let mut buf = vec![0x1b];
-                buf.extend_from_slice(s.as_bytes());
-                buf
-            }
-            Key::Character(ref s) if ctrl && shift && !alt => {
-                let c = s.chars().next().unwrap_or('A');
-                if c.is_ascii_alphabetic() {
-                    csi_seq(1, Some(6), c as u8)
-                } else {
-                    let base = code_to_char(&code);
-                    csi_seq(1, Some(6), base)
-                }
-            }
-            Key::Character(ref s) if ctrl && alt && !shift => {
-                let ctrl_ch = ctrl_char(s);
-                if !ctrl_ch.is_empty() && ctrl_ch[0] != 0x1b {
-                    let mut buf = vec![0x1b];
-                    buf.extend_from_slice(&ctrl_ch);
-                    buf
-                } else {
-                    vec![]
-                }
-            }
-
-            Key::Enter => {
-                if alt {
-                    vec![0x1b, 0x0d]
-                } else {
-                    vec![0x0d]
-                }
-            }
-            Key::Backspace => {
-                if alt {
-                    vec![0x1b, 0x7f]
-                } else {
-                    vec![0x7f]
-                }
-            }
-            Key::Tab => vec![0x09],
-            Key::Escape => vec![0x1b],
-
-            Key::Character(ref s) => s.as_bytes().to_vec(),
-            _ => vec![],
-        };
+        let data = terminal_key_bytes(&key, &code, ctrl, alt, shift, app_cursor);
 
         if !data.is_empty() {
             if is_enter {
@@ -2214,11 +2246,12 @@ pub fn TerminalView(
 mod tests {
     use super::{
         ClipboardCopyOutcome, CopyShortcut, OneKeyKeyAction, TerminalOverlayKeyAction,
-        TextSelection, cell_style, color_to_css, copy_text_to_clipboard, cursor_key_seq,
-        event_cell_from_coords, onekey_popup_key_action, scroll_thumb_geometry,
-        terminal_overlay_key_action, terminal_selection_text, word_range_in_row,
+        TextSelection, accepts_inline_suggestion, cell_style, color_to_css, copy_text_to_clipboard,
+        cursor_key_seq, event_cell_from_coords, onekey_popup_key_action, scroll_thumb_geometry,
+        terminal_key_bytes, terminal_overlay_key_action, terminal_selection_text,
+        word_range_in_row,
     };
-    use dioxus::prelude::Key;
+    use dioxus::prelude::{Code, Key};
     use rusterm_core::terminal::{CellColor, RenderCell, RenderRow};
 
     #[test]
@@ -2562,6 +2595,75 @@ mod tests {
         assert_eq!(cursor_key_seq(1, b'D', false, None), b"\x1b[D");
         assert_eq!(cursor_key_seq(1, b'D', true, None), b"\x1bOD");
         assert_eq!(cursor_key_seq(1, b'D', false, Some(2)), b"\x1b[1;2D");
+    }
+
+    #[test]
+    fn numpad_navigation_falls_back_to_physical_code_when_key_is_unidentified() {
+        for (code, expected) in [
+            (Code::Numpad8, b"\x1b[A".as_slice()),
+            (Code::Numpad2, b"\x1b[B".as_slice()),
+            (Code::Numpad6, b"\x1b[C".as_slice()),
+            (Code::Numpad4, b"\x1b[D".as_slice()),
+        ] {
+            assert_eq!(
+                terminal_key_bytes(&Key::Unidentified, &code, false, false, false, false),
+                expected,
+                "{code:?} must navigate when NumLock-off key is unidentified"
+            );
+        }
+    }
+
+    #[test]
+    fn numpad_digits_remain_digits_when_num_lock_is_on() {
+        assert_eq!(
+            terminal_key_bytes(
+                &Key::Character("4".into()),
+                &Code::Numpad4,
+                false,
+                false,
+                false,
+                false,
+            ),
+            b"4"
+        );
+    }
+
+    #[test]
+    fn linux_readline_control_keys_encode_as_control_bytes() {
+        for (text, code, expected) in [
+            ("a", Code::KeyA, 0x01),
+            ("e", Code::KeyE, 0x05),
+            ("r", Code::KeyR, 0x12),
+            ("w", Code::KeyW, 0x17),
+            ("x", Code::KeyX, 0x18),
+            ("z", Code::KeyZ, 0x1a),
+            ("[", Code::BracketLeft, 0x1b),
+            ("\\", Code::Backslash, 0x1c),
+            ("]", Code::BracketRight, 0x1d),
+            ("^", Code::Digit6, 0x1e),
+            ("_", Code::Minus, 0x1f),
+            (" ", Code::Space, 0x00),
+        ] {
+            assert_eq!(
+                terminal_key_bytes(
+                    &Key::Character(text.into()),
+                    &code,
+                    true,
+                    false,
+                    false,
+                    false,
+                ),
+                vec![expected],
+                "Ctrl+{text:?} must reach the PTY"
+            );
+        }
+    }
+
+    #[test]
+    fn ctrl_e_is_reserved_for_readline_not_inline_suggestion_acceptance() {
+        assert!(!accepts_inline_suggestion(&Key::Character("e".into())));
+        assert!(accepts_inline_suggestion(&Key::End));
+        assert!(accepts_inline_suggestion(&Key::Tab));
     }
 
     #[test]

@@ -586,18 +586,7 @@ return (async () => {
         ),
       "suggestion delete button did not render",
     );
-    for (const type of ["pointerdown", "mousedown", "mouseup", "click"]) {
-      const EventCtor = type === "pointerdown" ? PointerEvent : MouseEvent;
-      deleteSuggestionButton.dispatchEvent(
-        new EventCtor(type, {
-          button: 0,
-          buttons: type === "pointerdown" || type === "mousedown" ? 1 : 0,
-          bubbles: true,
-          cancelable: true,
-          composed: true,
-        }),
-      );
-    }
+    deleteSuggestionButton.click();
     await waitFor(
       () =>
         ![...document.querySelectorAll(".sug-row")].some((row) =>
