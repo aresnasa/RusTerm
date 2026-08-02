@@ -662,10 +662,10 @@ mod tests {
 
     // ── User/skill blocklist integration ───────────────────────────────────
 
-    fn validator_with_extra(extra: &[((&str, &str), &str)]) -> CommandValidator {
-        // extra: ((regex, reason), source) — source is "user" or "skill:<name>"
+    fn validator_with_extra(extra: &[(&str, &str, &'static str)]) -> CommandValidator {
+        // extra: (regex, reason, source) — source is "user" or "skill".
         let mut patterns = Vec::new();
-        for ((regex, reason), source) in extra {
+        for (regex, reason, source) in extra {
             patterns.push(crate::command_guard::CompiledPattern {
                 regex: Regex::new(regex).unwrap(),
                 reason: reason.to_string(),
