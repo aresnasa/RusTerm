@@ -5,12 +5,16 @@
 //!   1. Toggle / configure the relay (bind addr, port, accounts) without
 //!      opening a modal.
 //!   2. Auto-generate ready-to-paste `curl` commands that execute a chosen
-//!      command on one or more connected SSH sessions through the relay, using
-//!      HTTP BasicAuth through exported runtime environment variables.
+//!      command **or multi-line script** on one or more connected SSH sessions
+//!      through the relay, using HTTP BasicAuth through exported runtime
+//!      environment variables.
 //!
-//! Each generated curl targets `POST /api/v1/exec` with a JSON body of
-//! `{ "host_id": "<id-or-name>", "command": "<cmd>", "elevated": <bool> }`,
-//! preserving the relay's single-host request, authorization, and audit semantics.
+//! Each generated curl targets `POST /api/v1/exec` with a JSON body carrying
+//! exactly one of `{ "command": ... }`, `{ "script": ... }`, or
+//! `{ "script_base64": ... }` (mutually exclusive). Scripts pass through the
+//! relay's hard-floor validator (`validate_script`), the dcg destructive-command
+//! guard when installed, and a static sandbox pre-flight (`sh -n` + dcg) before
+//! reaching the SSH executor.
 
 use dioxus::prelude::*;
 use rusterm_relay::{RelayAccount, hash_password};
@@ -1016,14 +1020,21 @@ mod tests {
             "script mode must emit a script field: {curl}"
         );
         assert!(
-            !curl.contains(r#""command\":""#),
+            !curl.contains(r#""command":""#),
             "script mode must not emit a command field: {curl}"
         );
-        // Newlines in the script are JSON-escaped as \n so the --data arg
-        // stays a single shell-quoted string.
+        // Newlines in the script are JSON-escaped as the two-character
+        // sequence \n so the --data arg stays a single shell-quoted string.
+        // serde_json does not escape `/`, so the shebang line stays as `#!`.
         assert!(
-            curl.contains(r#""script":"#!\/bin\/sh\\necho hi\\n""#),
-            "script newlines must be JSON-escaped: {curl}"
+            curl.contains(r##""script":"#!"##),
+            "script must start with the shebang: {curl}"
+        );
+        // The literal two-character backslash-n sequence must appear
+        // (JSON-escaped newline). serde_json escapes newline as \n.
+        assert!(
+            curl.contains(r##"echo hi\n""##),
+            "script newline must be JSON-escaped as backslash-n: {curl}"
         );
     }
 
@@ -1041,7 +1052,7 @@ mod tests {
             "base64 mode must emit a script_base64 field: {curl}"
         );
         assert!(
-            !curl.contains(r#""command\":""#) && !curl.contains(r#""script\":""#),
+            !curl.contains(r#""command":""#) && !curl.contains(r#""script":""#),
             "base64 mode must not emit command or script fields: {curl}"
         );
     }

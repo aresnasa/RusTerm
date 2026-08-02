@@ -27,16 +27,15 @@ fn expect_mode_key(onekey_id: &str, step_index: usize) -> String {
 }
 
 fn localized_step_label(label: &str) -> String {
-    match label.trim() {
+    match label {
         "Username" => crate::i18n::t("onekey.credential_username"),
         "Password" => crate::i18n::t("onekey.credential_password"),
         "Token" => crate::i18n::t("onekey.credential_token"),
-        label => label.to_string(),
+        _ => label.to_string(),
     }
 }
 
 fn stable_step_label(label: &str) -> String {
-    let label = label.trim();
     if label == crate::i18n::t("onekey.credential_username") {
         "Username".to_string()
     } else if label == crate::i18n::t("onekey.credential_password") {
