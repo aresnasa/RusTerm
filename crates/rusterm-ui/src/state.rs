@@ -539,6 +539,9 @@ pub struct OneKeyPopupState {
     pub connection_id: Option<String>,
     /// SHA-256 of the normalized current prompt. Prompt text is never persisted.
     pub prompt_fingerprint: Option<String>,
+    /// Whether this concrete prompt is a sudo password request. Used only to
+    /// preserve the existing host-bound relay elevation lease on auto-submit.
+    pub is_sudo_password: bool,
     /// Matching entries (one per OneKey whose step matched), each carrying the
     /// send value of the matched step.
     pub matches: Vec<OneKeyMatch>,

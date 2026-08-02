@@ -6911,7 +6911,11 @@ mod session_startup_tests {
     fn focus_change_hides_non_password_popups_but_keeps_password_prompts() {
         let username_popup = OneKeyPopupState {
             visible: true,
+            connection_id: None,
+            prompt_fingerprint: None,
             matches: vec![OneKeyMatch {
+                onekey_id: "account-id".to_string(),
+                step_index: 0,
                 name: "account".to_string(),
                 label: "Username".to_string(),
                 send: "user".to_string(),
@@ -6922,7 +6926,11 @@ mod session_startup_tests {
         };
         let password_popup = OneKeyPopupState {
             visible: true,
+            connection_id: None,
+            prompt_fingerprint: None,
             matches: vec![OneKeyMatch {
+                onekey_id: "account-id".to_string(),
+                step_index: 0,
                 name: "account".to_string(),
                 label: "Password".to_string(),
                 send: "secret".to_string(),
@@ -13813,7 +13821,11 @@ mod onekey_tests {
             session_id.to_string(),
             OneKeyPopupState {
                 visible: true,
+                connection_id: None,
+                prompt_fingerprint: None,
                 matches: vec![OneKeyMatch {
+                    onekey_id: "saved-account-id".to_string(),
+                    step_index: 0,
                     name: "saved account".to_string(),
                     label: "sudo Password".to_string(),
                     send: "credential".to_string(),
