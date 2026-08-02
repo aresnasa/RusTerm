@@ -237,6 +237,7 @@ fn sudo_authorization_failed(result: &ExecResult) -> bool {
         "incorrect password",
         "sorry, try again",
         "authentication failure",
+        "interactive authentication is required",
         "a terminal is required",
         "no tty present",
         "must have a tty",
@@ -495,6 +496,14 @@ mod tests {
             timed_out: false,
         };
         assert!(sudo_authorization_failed(&auth_failure));
+
+        let interactive_auth_failure = ExecResult {
+            exit_code: Some(1),
+            stdout: Vec::new(),
+            stderr: b"sudo: interactive authentication is required\n".to_vec(),
+            timed_out: false,
+        };
+        assert!(sudo_authorization_failed(&interactive_auth_failure));
     }
 
     fn key(connection_id: &str, host: &str) -> SudoCredentialKey {
