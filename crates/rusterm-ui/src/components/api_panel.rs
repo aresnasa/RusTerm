@@ -811,7 +811,7 @@ mod tests {
             "http://127.0.0.1:8080",
             "alice",
             &["prod-web".to_string()],
-            "uname -a",
+            &CurlPayload::Command("uname -a".to_string()),
             true,
         );
         assert!(
@@ -855,7 +855,7 @@ mod tests {
             "http://127.0.0.1:8080",
             "alice",
             &["host-a".to_string(), "host-b".to_string()],
-            "uptime",
+            &CurlPayload::Command("uptime".to_string()),
             false,
         );
 
@@ -881,7 +881,7 @@ mod tests {
             "http://127.0.0.1:8080",
             "alice",
             &sessions,
-            "docker ps",
+            &CurlPayload::Command("docker ps".to_string()),
             true,
             crate::i18n::Language::En,
         )
@@ -890,7 +890,7 @@ mod tests {
             "http://127.0.0.1:8080",
             "alice",
             &sessions,
-            "docker ps",
+            &CurlPayload::Command("docker ps".to_string()),
             true,
             crate::i18n::Language::Zh,
         )
@@ -920,7 +920,7 @@ mod tests {
             "http://x",
             "u",
             &["h".to_string()],
-            r#"echo "hi" \n"#,
+            &CurlPayload::Command(r#"echo "hi" \n"#.to_string()),
             false,
         );
         assert!(
@@ -935,7 +935,7 @@ mod tests {
             "http://repeat.example",
             "repeat",
             &["repeat".to_string()],
-            "repeat",
+            &CurlPayload::Command("repeat".to_string()),
             true,
         );
         let marked = format!(
@@ -956,7 +956,7 @@ mod tests {
             "http://x",
             "u",
             &["h".to_string()],
-            r#"echo "hi" 'there' \n"#,
+            &CurlPayload::Command(r#"echo "hi" 'there' \n"#.to_string()),
             false,
         );
 
@@ -970,7 +970,13 @@ mod tests {
 
     #[test]
     fn curl_preview_handles_an_empty_command() {
-        let preview = gen_curl_preview("http://x", "u", &["h".to_string()], "", false);
+        let preview = gen_curl_preview(
+            "http://x",
+            "u",
+            &["h".to_string()],
+            &CurlPayload::Command(String::new()),
+            false,
+        );
 
         assert!(preview.command.is_empty());
         assert!(
@@ -981,7 +987,13 @@ mod tests {
 
     #[test]
     fn curl_handles_missing_session_with_placeholder() {
-        let curl = gen_curl("http://x", "u", &[], "ls", false);
+        let curl = gen_curl(
+            "http://x",
+            "u",
+            &[],
+            &CurlPayload::Command("ls".to_string()),
+            false,
+        );
         assert!(
             curl.contains("HOST"),
             "missing-session should use HOST placeholder: {curl}"
