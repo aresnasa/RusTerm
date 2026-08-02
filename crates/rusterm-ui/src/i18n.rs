@@ -580,7 +580,9 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         "transfers.endpoint_local" => ("Local: {path}", "本地：{path}"),
         "transfers.endpoint_remote" => ("Remote: {path}", "远程：{path}"),
         "transfers.from" => ("From {source}", "来源：{source}"),
-        "transfers.no_finished_hint" => ("No finished transfers to clear", "没有可清除的已完成传输"),
+        "transfers.no_finished_hint" => {
+            ("No finished transfers to clear", "没有可清除的已完成传输")
+        }
         "transfers.source_title" => ("Source: {source}", "来源：{source}"),
         "transfers.status_cancelled" => ("Cancelled", "已取消"),
         "transfers.status_completed" => ("Completed", "已完成"),
@@ -604,7 +606,9 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         "tunnels.invalid_remote_port" => ("Invalid remote port", "远程端口无效"),
         "tunnels.listen_addr_port" => ("Listen address and port", "监听地址和端口"),
         "tunnels.listen_port_zero" => ("Listen port cannot be 0", "监听端口不能为 0"),
-        "tunnels.manager_uninitialized" => ("Tunnel manager is not initialized", "隧道管理器尚未初始化"),
+        "tunnels.manager_uninitialized" => {
+            ("Tunnel manager is not initialized", "隧道管理器尚未初始化")
+        }
         "tunnels.name" => ("Name", "名称"),
         "tunnels.name_required" => ("Tunnel name is required", "隧道名称不能为空"),
         "tunnels.new_tunnel" => ("New tunnel", "新建隧道"),
@@ -619,7 +623,10 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
             "Active for {minutes}m {seconds}s",
             "已运行 {minutes} 分 {seconds} 秒",
         ),
-        "tunnels.state_connecting" => ("Connecting (attempt {attempt})", "正在连接（第 {attempt} 次）"),
+        "tunnels.state_connecting" => (
+            "Connecting (attempt {attempt})",
+            "正在连接（第 {attempt} 次）",
+        ),
         "tunnels.state_failed" => ("Failed: {error}", "失败：{error}"),
         "tunnels.state_reconnecting" => (
             "Reconnecting (attempt {attempt}, in {delay_ms} ms): {error}",
@@ -649,6 +656,251 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
             "Edit the command between the markers; the curl script updates automatically.",
             "编辑标记之间的命令；curl 脚本会自动更新。",
         ),
+
+        // ── common / connection / sidebar additions ───────────────────
+        "common.active" => ("Active", "活动"),
+        "common.focused" => ("Focused", "已聚焦"),
+        "connection.copy_name" => ("{name} copy", "{name} 副本"),
+        "connection.delete_body" => (
+            "Delete connection \"{name}\"? This cannot be undone.",
+            "是否删除连接“{name}”？此操作无法撤销。",
+        ),
+        "connection.delete_title" => ("Delete connection", "删除连接"),
+        "connections.add_group" => ("Add group", "添加分组"),
+        "connections.all_hidden_hint" => (
+            "All matching connections are hidden",
+            "所有匹配的连接均已隐藏",
+        ),
+        "connections.configure_onekeys" => ("Configure OneKey", "配置 OneKey"),
+        "connections.connect" => ("Connect", "连接"),
+        "connections.copy" => ("Copy", "复制"),
+        "connections.create" => ("Create connection", "新建连接"),
+        "connections.create_group" => ("Create group", "新建分组"),
+        "connections.delete" => ("Delete connection", "删除连接"),
+        "connections.delete_group_hint" => ("Delete this group", "删除此分组"),
+        "connections.edit" => ("Edit", "编辑"),
+        "connections.empty_hint" => ("No saved connections", "没有已保存的连接"),
+        "connections.group_name_placeholder" => ("Group name", "分组名称"),
+        "connections.hide_from_sidebar" => ("Hide from sidebar", "从侧栏隐藏"),
+        "connections.hide_hidden_again" => ("Hide hidden connections", "再次隐藏已隐藏的连接"),
+        "connections.kind_serial" => ("Serial", "串口"),
+        "connections.kind_shell" => ("Local shell", "本地终端"),
+        "connections.kind_ssh" => ("SSH", "SSH"),
+        "connections.kind_tcp" => ("TCP", "TCP"),
+        "connections.kind_telnet" => ("Telnet", "Telnet"),
+        "connections.move_to_group" => ("Move to group", "移动到分组"),
+        "connections.no_matches" => ("No matching connections", "没有匹配的连接"),
+        "connections.onekey_enabled" => ("OneKey enabled", "已启用 OneKey"),
+        "connections.resize_sidebar" => ("Drag to resize the sidebar", "拖动以调整侧栏宽度"),
+        "connections.search_placeholder" => ("Search connections…", "搜索连接…"),
+        "connections.show_hidden" => ("Show hidden connections", "显示已隐藏的连接"),
+        "connections.show_in_sidebar" => ("Show in sidebar", "在侧栏显示"),
+        "connections.title" => ("Connections", "连接"),
+        "connections.ungrouped" => ("Ungrouped", "未分组"),
+        "connections.ungrouped_count" => ("Ungrouped ({count})", "未分组（{count}）"),
+        "dock.drag_panel" => ("Drag {panel} panel", "拖动{panel}面板"),
+        "dock.hide_bottom" => ("Hide bottom dock", "隐藏底部面板"),
+        "dock.hide_left" => ("Hide left dock", "隐藏左侧面板"),
+        "dock.hide_right" => ("Hide right dock", "隐藏右侧面板"),
+
+        // ── history / layout additions ─────────────────────────────────
+        "history.current_session_only" => ("Current session only", "仅当前会话"),
+        "history.current_session_only_named" => {
+            ("Current session only: {name}", "仅当前会话：{name}")
+        }
+        "history.cwd_meta" => ("{cwd}", "{cwd}"),
+        "history.cwd_tooltip" => ("Working directory: {cwd}", "工作目录：{cwd}"),
+        "history.description" => (
+            "Search commands recorded from terminal sessions",
+            "搜索终端会话中记录的命令",
+        ),
+        "history.double_click_to_run" => ("Double-click to run", "双击运行"),
+        "history.host_meta" => ("{hostname}", "{hostname}"),
+        "history.host_tooltip" => ("Host: {hostname}", "主机：{hostname}"),
+        "history.load_error" => (
+            "Failed to load history: {error}",
+            "加载历史记录失败：{error}",
+        ),
+        "history.load_more" => ("Load more", "加载更多"),
+        "history.loading" => ("Loading history…", "正在加载历史记录…"),
+        "history.loading_more" => ("Loading more…", "正在加载更多…"),
+        "history.no_focused_session" => ("No focused session", "没有聚焦的会话"),
+        "history.no_matches" => ("No matching commands", "没有匹配的命令"),
+        "history.search_placeholder" => ("Search command history…", "搜索命令历史…"),
+        "history.time_tooltip" => ("Executed at {time}", "执行时间：{time}"),
+        "history.title" => ("History", "历史记录"),
+        "layout.compare" => ("Compare", "比对"),
+        "layout.compare_tooltip" => ("Compare pane output", "比对窗格输出"),
+        "layout.comparison_diff_rows" => ("{count} different rows", "{count} 行不同"),
+        "layout.comparison_identical" => ("Outputs are identical", "输出完全相同"),
+        "layout.comparison_on" => ("Comparison on", "比对已开启"),
+        "layout.distribute" => ("Distribute", "均分"),
+        "layout.distribute_tooltip" => ("Distribute panes evenly", "均匀分布窗格"),
+        "layout.pane" => ("pane", "个窗格"),
+        "layout.pane_count_tooltip" => ("Current pane layout", "当前窗格布局"),
+        "layout.panes" => ("panes", "个窗格"),
+        "layout.resize_left_right_split" => (
+            "Drag to resize the left/right split",
+            "拖动以调整左右分割比例",
+        ),
+        "layout.resize_top_bottom_split" => (
+            "Drag to resize the top/bottom split",
+            "拖动以调整上下分割比例",
+        ),
+        "layout.split" => ("Split", "分屏"),
+        "layout.split_tooltip" => ("Toggle split layout", "切换分屏布局"),
+        "layout.summary" => ("Layout: {count} {panes}", "布局：{count} {panes}"),
+        "layout.summary_tab_tiled" => (
+            "Layout: {count} {panes} (tabs)",
+            "布局：{count} {panes}（标签平铺）",
+        ),
+        "layout.zoom_tooltip" => ("Zoom the focused pane", "缩放聚焦窗格"),
+        "master_password.error" => ("Master password error: {error}", "主密码错误：{error}"),
+        "master_password.invalid" => ("Invalid master password", "主密码无效"),
+        "onekey.credential" => ("Credential", "凭据"),
+        "onekey.credential_password" => ("Password", "密码"),
+        "onekey.credential_token" => ("Token", "令牌"),
+        "onekey.credential_username" => ("Username", "用户名"),
+        "onekey.saved_credential" => ("Saved {credential}", "已保存的{credential}"),
+
+        // ── relay.* — REST API relay configuration ─────────────────────
+        "relay.account_required_before_start" => (
+            "Add at least one account before starting the relay",
+            "启动中转前请至少添加一个账号",
+        ),
+        "relay.add_account" => ("Add account", "添加账号"),
+        "relay.add_update_account" => ("Add or update account", "添加或更新账号"),
+        "relay.all_commands_validated" => ("All commands (validated)", "所有命令（需校验）"),
+        "relay.allowed_commands_help" => (
+            "Allowed command regexes (comma-separated)",
+            "允许的命令正则表达式（逗号分隔）",
+        ),
+        "relay.allowed_hosts_help" => ("Allowed hosts (comma-separated)", "允许的主机（逗号分隔）"),
+        "relay.audit_log" => ("Audit log: {path}", "审计日志：{path}"),
+        "relay.commands" => ("Commands: {commands}", "命令：{commands}"),
+        "relay.confirm_public_bind" => (
+            "I understand; allow public binding",
+            "我已了解，允许公开监听",
+        ),
+        "relay.confirm_public_bind_before_start" => (
+            "Confirm public binding before starting the relay",
+            "启动中转前请确认公开监听",
+        ),
+        "relay.hashing_failed" => ("Password hashing failed: {error}", "密码哈希失败：{error}"),
+        "relay.hosts" => ("Hosts: {hosts}", "主机：{hosts}"),
+        "relay.invalid_bind_addr" => ("Invalid bind address: {value}", "监听地址无效：{value}"),
+        "relay.invalid_regex_indices" => (
+            "Invalid command regex at index/indices {indices}",
+            "以下索引处的命令正则无效：{indices}",
+        ),
+        "relay.password_hash_note" => ("Password (stored as a hash)", "密码（以哈希形式存储）"),
+        "relay.password_required" => ("Password is required", "密码不能为空"),
+        "relay.public_bind_warning" => (
+            "This address exposes the relay beyond this computer",
+            "此地址会将中转服务暴露到本机之外",
+        ),
+        "relay.readonly_help" => ("Read-only account", "只读账号"),
+        "relay.save_config" => ("Save configuration", "保存配置"),
+        "relay.server" => ("Server", "服务器"),
+        "relay.username_required" => ("Username is required", "用户名不能为空"),
+
+        // ── remote_files.* — remote file manager and SFTP ──────────────
+        "remote_files.apply" => ("Apply", "应用"),
+        "remote_files.applying_operation" => ("Applying operation…", "正在执行操作…"),
+        "remote_files.choosing_download_destination" => {
+            ("Choose a download destination…", "请选择下载位置…")
+        }
+        "remote_files.choosing_local_file" => ("Choose a local file…", "请选择本地文件…"),
+        "remote_files.connect_ssh_hint" => (
+            "Connect an SSH session to browse remote files",
+            "连接 SSH 会话以浏览远程文件",
+        ),
+        "remote_files.connections" => ("Connections", "连接"),
+        "remote_files.create_directory_failed" => (
+            "Failed to create directory: {error}",
+            "创建目录失败：{error}",
+        ),
+        "remote_files.created_directory" => ("Created directory {name}", "已创建目录 {name}"),
+        "remote_files.delete_directory_confirmation" => (
+            "Delete empty directory \"{name}\"?",
+            "是否删除空目录“{name}”？",
+        ),
+        "remote_files.delete_empty_directory_failed" => (
+            "Failed to delete empty directory: {error}",
+            "删除空目录失败：{error}",
+        ),
+        "remote_files.delete_entry_failed" => {
+            ("Failed to delete entry: {error}", "删除项目失败：{error}")
+        }
+        "remote_files.delete_file_confirmation" => {
+            ("Delete file \"{name}\"?", "是否删除文件“{name}”？")
+        }
+        "remote_files.delete_symlink_confirmation" => (
+            "Delete symbolic link \"{name}\"?",
+            "是否删除符号链接“{name}”？",
+        ),
+        "remote_files.deleted" => ("Deleted {name}", "已删除 {name}"),
+        "remote_files.dialog_create_title" => ("Create folder", "新建文件夹"),
+        "remote_files.dialog_delete_title" => ("Delete remote entry", "删除远程项目"),
+        "remote_files.dialog_rename_title" => ("Rename remote entry", "重命名远程项目"),
+        "remote_files.download" => ("Download", "下载"),
+        "remote_files.download_cancelled" => ("Download cancelled", "已取消下载"),
+        "remote_files.download_queued" => ("Queued download: {name}", "已加入下载队列：{name}"),
+        "remote_files.empty_directory" => ("This directory is empty", "此目录为空"),
+        "remote_files.file_type_directory" => ("Directory", "目录"),
+        "remote_files.file_type_file" => ("File", "文件"),
+        "remote_files.file_type_other" => ("Other", "其他"),
+        "remote_files.file_type_symlink" => ("Symbolic link", "符号链接"),
+        "remote_files.go" => ("Go", "转到"),
+        "remote_files.invalid_utf8_filename" => (
+            "The selected filename is not valid UTF-8",
+            "所选文件名不是有效的 UTF-8",
+        ),
+        "remote_files.list_failed" => {
+            ("Failed to list directory: {error}", "列出目录失败：{error}")
+        }
+        "remote_files.loading" => ("Loading remote files…", "正在加载远程文件…"),
+        "remote_files.name_dot" => ("Name cannot be . or ..", "名称不能是 . 或 .."),
+        "remote_files.name_empty" => ("Name cannot be empty", "名称不能为空"),
+        "remote_files.name_slash" => ("Name cannot contain /", "名称不能包含 /"),
+        "remote_files.new_folder" => ("New folder", "新建文件夹"),
+        "remote_files.no_ssh_sessions" => ("No connected SSH sessions", "没有已连接的 SSH 会话"),
+        "remote_files.open_directory_hint" => ("Open directory", "打开目录"),
+        "remote_files.open_local_manager" => ("Open file manager", "打开文件管理器"),
+        "remote_files.open_sftp_failed" => {
+            ("Failed to open SFTP: {error}", "打开 SFTP 失败：{error}")
+        }
+        "remote_files.parent_directory" => ("Parent directory", "上级目录"),
+        "remote_files.path_absolute" => ("Path must be absolute", "路径必须是绝对路径"),
+        "remote_files.read_local_metadata_failed" => (
+            "Failed to read local file metadata: {error}",
+            "读取本地文件元数据失败：{error}",
+        ),
+        "remote_files.refresh" => ("Refresh", "刷新"),
+        "remote_files.rename" => ("Rename", "重命名"),
+        "remote_files.rename_failed" => {
+            ("Failed to rename entry: {error}", "重命名项目失败：{error}")
+        }
+        "remote_files.renamed_to" => ("Renamed to {name}", "已重命名为 {name}"),
+        "remote_files.resize_hint" => (
+            "Drag to resize the file manager",
+            "拖动以调整文件管理器宽度",
+        ),
+        "remote_files.select_regular_file" => ("Select a regular file", "请选择普通文件"),
+        "remote_files.ssh_disconnected_during_sftp" => (
+            "SSH session disconnected while opening SFTP",
+            "打开 SFTP 时 SSH 会话已断开",
+        ),
+        "remote_files.ssh_session_disconnected" => {
+            ("SSH session is disconnected", "SSH 会话已断开")
+        }
+        "remote_files.title" => ("Remote files", "远程文件"),
+        "remote_files.unsupported_delete" => {
+            ("This entry type cannot be deleted", "无法删除此类型的项目")
+        }
+        "remote_files.upload" => ("Upload", "上传"),
+        "remote_files.upload_cancelled" => ("Upload cancelled", "已取消上传"),
+        "remote_files.upload_queued" => ("Queued upload: {name}", "已加入上传队列：{name}"),
 
         // ── shadow.* — shadow sandbox dialog ─────────────────────────────
         // (Keys filled in by the shadow_sandbox_dialog conversion.)
@@ -832,8 +1084,14 @@ mod tests {
                 .unwrap_or_else(|| panic!("English translation missing for {key}"));
             let zh = translate(&key, Language::Zh)
                 .unwrap_or_else(|| panic!("Chinese translation missing for {key}"));
-            assert!(!en.trim().is_empty(), "English translation is empty for {key}");
-            assert!(!zh.trim().is_empty(), "Chinese translation is empty for {key}");
+            assert!(
+                !en.trim().is_empty(),
+                "English translation is empty for {key}"
+            );
+            assert!(
+                !zh.trim().is_empty(),
+                "Chinese translation is empty for {key}"
+            );
             assert_eq!(
                 placeholders(en),
                 placeholders(zh),
