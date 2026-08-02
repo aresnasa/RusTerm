@@ -6291,7 +6291,7 @@ fn onekey_popup_for_output(
     let mut matches = Vec::new();
     let mut matched_expect = None;
     for onekey in &onekeys {
-        let Some(step) = first_matching_step(onekey, last_line) else {
+        let Some((step_index, step)) = matching_step_with_index(onekey, last_line) else {
             continue;
         };
         if matched_expect.is_none() {
@@ -6309,6 +6309,8 @@ fn onekey_popup_for_output(
             continue;
         }
         matches.push(OneKeyMatch {
+            onekey_id: onekey.id.clone(),
+            step_index,
             name: onekey.name.clone(),
             label: onekey_step_label(step),
             send: step.send.clone(),
@@ -6321,6 +6323,11 @@ fn onekey_popup_for_output(
 
     Ok(OneKeyPopupState {
         visible: true,
+        connection_id: state
+            .session_configs
+            .get(session_id)
+            .map(|config| config.id.clone()),
+        prompt_fingerprint: Some(onekey_prompt_fingerprint(last_line)),
         matches,
         selected: 0,
         matched_expect,
