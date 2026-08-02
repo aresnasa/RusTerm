@@ -80,8 +80,16 @@ fn read_connections() -> Vec<ConnectionConfig> {
 }
 
 // ── Short-lived sudo credential lease ───────────────────────────────────
-
-const SUDO_CREDENTIAL_TTL: Duration = Duration::from_secs(15 * 60);
+//
+// The lease TTL is a local upper bound, not a mirror of the remote sudo
+// `timestamp_timeout`. A longer window (30 min) accommodates hosts whose
+// sudoers raise the timeout above the 15-min distro default, and the lease
+// is *refreshed* on every successful API use (see [`SudoCredentialCache::touch`])
+// so that frequent API calls keep it alive far beyond the initial write.
+// The remote sudo timestamp is the real authority: if it expires, the
+// submitted password is rejected and [`SudoCredentialCache::clear_key`] drops
+// the lease.
+const SUDO_CREDENTIAL_TTL: Duration = Duration::from_secs(30 * 60);
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct SudoCredentialKey {
@@ -102,6 +110,18 @@ struct SudoCredentialCache {
     entries: RwLock<HashMap<SudoCredentialKey, CachedSudoCredential>>,
 }
 
+/// Outcome of a sudo credential lookup, distinguishing the three failure
+/// modes the elevated executor must report differently.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SudoCredentialLookup {
+    /// A live lease was found and the credential is returned.
+    Hit(Zeroizing<String>),
+    /// A lease existed but the TTL elapsed; it has been evicted.
+    Expired,
+    /// No lease was ever cached for this host key.
+    Missing,
+}
+
 impl SudoCredentialCache {
     fn cache(
         &self,
@@ -110,41 +130,120 @@ impl SudoCredentialCache {
         value: String,
         now: Instant,
     ) {
+        let expires_at = now + SUDO_CREDENTIAL_TTL;
+        tracing::info!(
+            "[SUDO-LEASE] write connection_id={} host={} port={} user={} session={} expires_in_secs={}",
+            key.connection_id,
+            key.host,
+            key.port,
+            key.username,
+            source_session_id,
+            SUDO_CREDENTIAL_TTL.as_secs()
+        );
         if let Ok(mut entries) = self.entries.write() {
             entries.insert(
                 key,
                 CachedSudoCredential {
                     value: Zeroizing::new(value),
                     source_session_id,
-                    expires_at: now + SUDO_CREDENTIAL_TTL,
+                    expires_at,
                 },
             );
         }
     }
 
+    #[cfg(test)]
     fn get(&self, key: &SudoCredentialKey, now: Instant) -> Option<Zeroizing<String>> {
-        let mut entries = self.entries.write().ok()?;
-        if entries
-            .get(key)
-            .is_some_and(|entry| entry.expires_at <= now)
-        {
-            entries.remove(key);
-            return None;
+        match self.get_with_status(key, now) {
+            SudoCredentialLookup::Hit(v) => Some(v),
+            SudoCredentialLookup::Expired | SudoCredentialLookup::Missing => None,
         }
-        entries
-            .get(key)
-            .map(|entry| Zeroizing::new(entry.value.to_string()))
+    }
+
+    fn get_with_status(&self, key: &SudoCredentialKey, now: Instant) -> SudoCredentialLookup {
+        let mut entries = match self.entries.write() {
+            Ok(g) => g,
+            Err(_) => return SudoCredentialLookup::Missing,
+        };
+        let Some(entry) = entries.get(key) else {
+            return SudoCredentialLookup::Missing;
+        };
+        if entry.expires_at <= now {
+            tracing::info!(
+                "[SUDO-LEASE] miss expired connection_id={} host={} port={} user={} session={}",
+                key.connection_id,
+                key.host,
+                key.port,
+                key.username,
+                entry.source_session_id
+            );
+            entries.remove(key);
+            return SudoCredentialLookup::Expired;
+        }
+        tracing::info!(
+            "[SUDO-LEASE] hit connection_id={} host={} port={} user={} session={}",
+            key.connection_id,
+            key.host,
+            key.port,
+            key.username,
+            entry.source_session_id
+        );
+        SudoCredentialLookup::Hit(Zeroizing::new(entry.value.to_string()))
+    }
+
+    /// Refresh the lease TTL after the elevated executor successfully used
+    /// the cached credential. Without this, a long-lived API workflow that
+    /// makes calls every few minutes would still see the lease expire 15
+    /// minutes after the *initial* OneKey submission, even though the remote
+    /// sudo timestamp is being kept alive by each successful `sudo -S`.
+    fn touch(&self, key: &SudoCredentialKey, now: Instant) {
+        let expires_at = now + SUDO_CREDENTIAL_TTL;
+        let mut entries = match self.entries.write() {
+            Ok(g) => g,
+            Err(_) => return,
+        };
+        if let Some(entry) = entries.get_mut(key) {
+            entry.expires_at = expires_at;
+            tracing::info!(
+                "[SUDO-LEASE] refresh connection_id={} host={} port={} user={} session={} expires_in_secs={}",
+                key.connection_id,
+                key.host,
+                key.port,
+                key.username,
+                entry.source_session_id,
+                SUDO_CREDENTIAL_TTL.as_secs()
+            );
+        }
     }
 
     fn clear_for_session(&self, source_session_id: &str) {
         if let Ok(mut entries) = self.entries.write() {
+            let before = entries.len();
             entries.retain(|_, entry| entry.source_session_id != source_session_id);
+            let removed = before - entries.len();
+            if removed > 0 {
+                tracing::info!(
+                    "[SUDO-LEASE] clear_for_session session={} removed={}",
+                    source_session_id,
+                    removed
+                );
+            }
         }
     }
 
     fn clear_key(&self, key: &SudoCredentialKey) {
+        let mut removed = false;
         if let Ok(mut entries) = self.entries.write() {
-            entries.remove(key);
+            removed = entries.remove(key).is_some();
+        }
+        if removed {
+            tracing::info!(
+                "[SUDO-LEASE] clear_key connection_id={} host={} port={} user={}",
+                key.connection_id,
+                key.host,
+                key.port,
+                key.username
+            );
         }
     }
 }
@@ -415,12 +514,21 @@ impl RelayExecutor for AppRelayExecutor {
             if !sudo_authorization_failed(&first) {
                 first
             } else {
-                let Some(credential) = sudo_credentials().get(&credential_key, Instant::now())
-                else {
-                    let _ = handle.disconnect().await;
-                    return Err(ExecutorError::ElevationRequired(crate::i18n::t(
-                        "relay.sudo_authorization_unavailable",
-                    )));
+                let lookup = sudo_credentials().get_with_status(&credential_key, Instant::now());
+                let credential = match lookup {
+                    SudoCredentialLookup::Hit(value) => value,
+                    SudoCredentialLookup::Expired => {
+                        let _ = handle.disconnect().await;
+                        return Err(ExecutorError::ElevationRequired(crate::i18n::t(
+                            "relay.sudo_authorization_expired",
+                        )));
+                    }
+                    SudoCredentialLookup::Missing => {
+                        let _ = handle.disconnect().await;
+                        return Err(ExecutorError::ElevationRequired(crate::i18n::t(
+                            "relay.sudo_authorization_unavailable",
+                        )));
+                    }
                 };
                 let stdin = Zeroizing::new(format!("{}\n", credential.as_str()));
                 let password_command = sudo_command(command, true);
@@ -435,6 +543,11 @@ impl RelayExecutor for AppRelayExecutor {
                         "relay.sudo_authorization_rejected",
                     )));
                 }
+                // The remote sudo timestamp was just refreshed by this
+                // successful `sudo -S`; mirror that by refreshing the local
+                // lease too, so subsequent API calls within the new window
+                // don't need to re-prompt the user.
+                sudo_credentials().touch(&credential_key, Instant::now());
                 second
             }
         } else {
@@ -689,5 +802,231 @@ mod tests {
                 )
                 .is_none()
         );
+    }
+
+    /// Reproduces the user's 2026-08-02 incident: OneKey auto-submitted a
+    /// remembered sudo password at 15:28, the API tried to use it at 15:46
+    /// (18 minutes later), and got `elevation_required`. The local lease
+    /// TTL was 15 minutes and there was no refresh-on-use, so the lease had
+    /// expired ~3 minutes before the API call.
+    ///
+    /// This test pins the *failure* mode (expired → `Expired` status) so the
+    /// fix below has a red signal to turn green.
+    #[test]
+    fn sudo_lease_expires_after_ttl_when_never_refreshed() {
+        let cache = SudoCredentialCache::default();
+        let now = Instant::now();
+        let host = key("connection-1", "bidbot-prod");
+        cache.cache(
+            host.clone(),
+            "session-04a5aa98".to_string(),
+            "p@ssw0rd".to_string(),
+            now,
+        );
+
+        // Within the window: hit.
+        assert!(matches!(
+            cache.get_with_status(&host, now + Duration::from_secs(60)),
+            SudoCredentialLookup::Hit(_)
+        ));
+
+        // One nanosecond before the TTL boundary: still alive (the eviction
+        // predicate is `expires_at <= now`, so the boundary itself is the
+        // first expired instant).
+        assert!(matches!(
+            cache.get_with_status(&host, now + SUDO_CREDENTIAL_TTL - Duration::from_nanos(1)),
+            SudoCredentialLookup::Hit(_)
+        ));
+
+        // Exactly at the TTL boundary with no intervening refresh: expired
+        // and evicted. This is the 15:46 API failure (the lease was written
+        // at 15:28 with a 15-min TTL, so at 15:43:08 it expired; the API
+        // call at 15:46 found nothing).
+        assert_eq!(
+            cache.get_with_status(&host, now + SUDO_CREDENTIAL_TTL),
+            SudoCredentialLookup::Expired
+        );
+        // Subsequent lookups report Missing (the entry was evicted).
+        assert_eq!(
+            cache.get_with_status(&host, now + SUDO_CREDENTIAL_TTL + Duration::from_millis(2)),
+            SudoCredentialLookup::Missing
+        );
+    }
+
+    /// Pins the fix: when the elevated executor successfully uses a cached
+    /// credential, it calls `touch` to refresh the TTL. A long-lived API
+    /// workflow that makes calls every few minutes keeps the lease alive
+    /// far beyond the initial write's expiry, mirroring the remote sudo
+    /// timestamp that each successful `sudo -S` refreshes.
+    #[test]
+    fn sudo_lease_is_refreshed_on_successful_use_via_touch() {
+        let cache = SudoCredentialCache::default();
+        let now = Instant::now();
+        let host = key("connection-1", "bidbot-prod");
+        cache.cache(
+            host.clone(),
+            "session-04a5aa98".to_string(),
+            "p@ssw0rd".to_string(),
+            now,
+        );
+
+        // Simulate the API using the credential at t = TTL - 1 min (just
+        // before the initial expiry). The executor calls `touch` on success.
+        let first_use = now + SUDO_CREDENTIAL_TTL - Duration::from_secs(60);
+        assert!(matches!(
+            cache.get_with_status(&host, first_use),
+            SudoCredentialLookup::Hit(_)
+        ));
+        cache.touch(&host, first_use);
+
+        // Without touch, the lease would expire at `now + TTL`. With touch,
+        // the new expiry is `first_use + TTL`. A lookup at `now + TTL +
+        // 30s` (past the original expiry, within the refreshed one) must
+        // still hit.
+        let after_original_expiry = now + SUDO_CREDENTIAL_TTL + Duration::from_secs(30);
+        assert!(matches!(
+            cache.get_with_status(&host, after_original_expiry),
+            SudoCredentialLookup::Hit(_)
+        ));
+
+        // A second successful use refreshes again.
+        let second_use = first_use + SUDO_CREDENTIAL_TTL - Duration::from_secs(60);
+        assert!(matches!(
+            cache.get_with_status(&host, second_use),
+            SudoCredentialLookup::Hit(_)
+        ));
+        cache.touch(&host, second_use);
+
+        // Past the *first* refreshed expiry, within the second refreshed one.
+        let past_first_refresh = first_use + SUDO_CREDENTIAL_TTL + Duration::from_secs(30);
+        assert!(past_first_refresh < second_use + SUDO_CREDENTIAL_TTL);
+        assert!(matches!(
+            cache.get_with_status(&host, past_first_refresh),
+            SudoCredentialLookup::Hit(_)
+        ));
+    }
+
+    /// `touch` on a non-existent key is a no-op (defensive: the executor
+    /// only calls touch after a hit, but a stray call must not panic or
+    /// insert an empty entry).
+    #[test]
+    fn sudo_lease_touch_on_missing_key_is_a_noop() {
+        let cache = SudoCredentialCache::default();
+        let now = Instant::now();
+        let host = key("connection-1", "ghost");
+        cache.touch(&host, now);
+        assert_eq!(
+            cache.get_with_status(&host, now),
+            SudoCredentialLookup::Missing
+        );
+    }
+
+    /// Bridges the OneKey submission path to the elevated executor lookup
+    /// path. `cache_sudo_credential` is called with the *saved*
+    /// `ConnectionConfig` stored in `session_configs[session_id]`; the
+    /// executor derives its lookup key from `read_connections()`, which is
+    /// the same saved `ConnectionConfig` mirrored into the process
+    /// registry. Both paths must derive the same `SudoCredentialKey`, or
+    /// the API will report `elevation_required` even when the user just ran
+    /// sudo in their terminal.
+    ///
+    /// This test pins that the key derivation is identical for a given saved
+    /// SSH connection, regardless of which entry point computes it.
+    #[test]
+    fn sudo_credential_key_is_identical_for_onekey_cache_and_executor_lookup() {
+        let saved = ConnectionConfig {
+            id: "42725271-d0cb-4118-98c3-2198e6b3c654".to_string(),
+            name: "bidbot-prod".to_string(),
+            kind: ConnectionKind::Ssh(SshConfig {
+                host: "bidbot.example.com".to_string(),
+                port: 22,
+                username: "aresnasa".to_string(),
+                auth: rusterm_core::config::SshAuth::Agent,
+                terminal_type: "xterm-256color".to_string(),
+                proxy: None,
+                proxy_jump: None,
+                keepalive_interval: None,
+                host_key_policy: rusterm_core::config::default_host_key_policy(),
+            }),
+            group: None,
+            tags: Vec::new(),
+            onekey: true,
+            login_script: None,
+        };
+
+        // OneKey submission path: `cache_sudo_credential(connection, session_id, value)`.
+        // We can't call the free fn here because it writes to the process-wide
+        // static cache; instead, derive the key the same way it does and write
+        // to a local cache, then derive the *same* key the executor would and
+        // read it back.
+        let cache = SudoCredentialCache::default();
+        let now = Instant::now();
+        let write_key = sudo_credential_key(&saved).expect("SSH connection yields a key");
+        cache.cache(
+            write_key.clone(),
+            "runtime-session-04a5aa98".to_string(),
+            "p@ssw0rd".to_string(),
+            now,
+        );
+
+        // Executor lookup path: `read_connections()` returns the same saved
+        // config; the executor derives the key with the same function.
+        let lookup_key = sudo_credential_key(&saved).expect("key derivation is deterministic");
+        assert_eq!(write_key, lookup_key);
+        assert!(matches!(
+            cache.get_with_status(&lookup_key, now + Duration::from_secs(60)),
+            SudoCredentialLookup::Hit(_)
+        ));
+    }
+
+    /// End-to-end cache test through the public `cache_sudo_credential`
+    /// entry point (the one `apply_onekey_popup` and `on_onekey_select`
+    /// call after a sudo OneKey submission). Verifies that a credential
+    /// written via the public API is immediately retrievable with the key
+    /// the executor derives from the same saved connection — closing the
+    /// loop between the OneKey submission path and the elevated executor
+    /// lookup path.
+    #[test]
+    fn cache_sudo_credential_public_api_round_trips_through_executor_lookup() {
+        // Unique connection id so this test can't collide with the
+        // process-wide static cache used by other tests.
+        let saved = ConnectionConfig {
+            id: "round-trip-9c4e".to_string(),
+            name: "round-trip-host".to_string(),
+            kind: ConnectionKind::Ssh(SshConfig {
+                host: "round-trip.example".to_string(),
+                port: 2222,
+                username: "rtuser".to_string(),
+                auth: rusterm_core::config::SshAuth::Agent,
+                terminal_type: "xterm-256color".to_string(),
+                proxy: None,
+                proxy_jump: None,
+                keepalive_interval: None,
+                host_key_policy: rusterm_core::config::default_host_key_policy(),
+            }),
+            group: None,
+            tags: Vec::new(),
+            onekey: true,
+            login_script: None,
+        };
+
+        // Clean up any prior entry for this key (idempotent across re-runs).
+        let key = sudo_credential_key(&saved).expect("SSH connection yields a key");
+        sudo_credentials().clear_key(&key);
+
+        // OneKey submission path writes via the public entry point.
+        cache_sudo_credential(&saved, "rt-session", "rt-secret");
+
+        // Executor lookup path derives the same key and finds the credential.
+        let now = Instant::now();
+        match sudo_credentials().get_with_status(&key, now) {
+            SudoCredentialLookup::Hit(value) => {
+                assert_eq!(value.as_str(), "rt-secret");
+            }
+            other => panic!("expected Hit, got {:?}", other),
+        }
+
+        // Cleanup: remove the entry so it doesn't leak to other tests.
+        sudo_credentials().clear_key(&key);
     }
 }

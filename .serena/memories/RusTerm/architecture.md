@@ -437,3 +437,58 @@ The `drag_over_pane` signal is shared between `single_pane_with_drop` and `multi
 - Wire `high_failure_commands` into the suggestion query to downgrade/remove risky suggestions (the SQLite `HAVING` clause already filters fully-failed commands; this would additionally suppress commands with low success rate but ≥1 success).
 - Native Gist upload via `reqwest` (the handoff suggested it; v1 ships file export only to keep the dependency surface unchanged and to avoid auto-transmission).
 - A dedicated analytics panel UI (the `behavior_summary` API has been ready since 2026-07-18; no panel exists yet).
+
+## Sudo credential lease refresh-on-use fix (2026-08-02)
+
+**Bug**: API requests with `elevated:true` returned `elevation_required` even though the user had just run `sudo` in a OneKey-enabled SSH session. Diagnosed via `relay-audit.jsonl` + `rusterm.log.2026-08-02`:
+- 15:18:18 UTC (23:18 Beijing) — OneKey auto-submitted remembered sudo password → `cache_sudo_credential` wrote the lease with `SUDO_CREDENTIAL_TTL = 15 min` (expires 15:33:18).
+- 15:28:08 UTC — second OneKey auto-submit refreshed the lease (expires 15:43:08).
+- 15:46:56 UTC (23:46 Beijing) — API `exec` for `build.sh health` failed with `elevation_required` — the lease had expired ~3 min earlier.
+
+**Root cause**: the lease TTL was a fixed 15 minutes with **no refresh-on-use**. `SudoCredentialCache::get` returned the credential without extending `expires_at`. So even if the API used the credential every 5 minutes, the lease still died 15 minutes after the *initial* OneKey submission. The user's 18-minute gap between `sudo` and the API call exceeded the 15-min window.
+
+**Fix** (3 layers, all in `crates/rusterm-ui/src/relay_tunnel.rs`):
+1. **`SudoCredentialCache::touch(key, now)`** — NEW method that refreshes `expires_at = now + SUDO_CREDENTIAL_TTL` on an existing entry. Called by the elevated executor after a successful `sudo -S` (i.e. the remote accepted the password and refreshed its own sudo timestamp). This keeps the local lease alive as long as the API keeps using it, mirroring the remote sudo timestamp.
+2. **`SudoCredentialCache::get_with_status(key, now) -> SudoCredentialLookup`** — NEW method returning `Hit(Zeroizing<String>)` | `Expired` | `Missing`. The executor now distinguishes the two failure modes:
+   - `Expired` → returns `relay.sudo_authorization_expired` ("...已过期...再次运行一次 sudo") — tells the user the lease *was* cached but timed out.
+   - `Missing` → returns `relay.sudo_authorization_unavailable` (the original "run sudo once" message) — tells the user no lease was ever cached for this host.
+   The old `get()` method is kept (`#[cfg(test)]`) for the existing host-bound test; production code uses `get_with_status`.
+3. **`SUDO_CREDENTIAL_TTL` raised from 15 min to 30 min** — accommodates hosts whose sudoers raise `timestamp_timeout` above the 15-min distro default. The refresh-on-use is the primary mechanism; the longer TTL is a safety margin for the gap between the initial OneKey submission and the first API call.
+
+**Observability** (all `tracing::info!` with `[SUDO-LEASE]` prefix, no secrets logged):
+- `[SUDO-LEASE] write connection_id=... host=... port=... user=... session=... expires_in_secs=...` — on `cache()`.
+- `[SUDO-LEASE] hit connection_id=... ... session=...` — on successful `get_with_status`.
+- `[SUDO-LEASE] miss expired connection_id=... ... session=...` — on expired eviction.
+- `[SUDO-LEASE] refresh connection_id=... ... session=... expires_in_secs=...` — on `touch()`.
+- `[SUDO-LEASE] clear_for_session session=... removed=N` / `[SUDO-LEASE] clear_key connection_id=... ...` — on eviction.
+These let future diagnosis distinguish "cache never written" (no `write` log) from "cache expired" (`miss expired` log) from "cache cleared by repeated-prompt rejection" (`clear_for_session` log) — the three hypotheses from the original incident.
+
+**Executor flow** (`AppRelayExecutor::exec` elevated branch):
+1. `sudo -n <cmd>` (non-interactive) — if it succeeds, use it (no lease needed; remote sudo timestamp already valid for this tty).
+2. If `sudo -n` fails with auth-required → `get_with_status`:
+   - `Expired` → return `ElevationRequired(sudo_authorization_expired)`.
+   - `Missing` → return `ElevationRequired(sudo_authorization_unavailable)`.
+   - `Hit(credential)` → `sudo -S <cmd>` with credential on stdin.
+3. If `sudo -S` fails with auth-required → `clear_key` (password wrong/expired on remote) → return `ElevationRequired(sudo_authorization_rejected)`.
+4. If `sudo -S` succeeds → **`touch(credential_key, now)`** (refresh local lease to match the remote sudo timestamp that was just refreshed) → return result.
+
+**Key derivation is correct**: `sudo_credential_key(connection)` uses `connection.id` (the saved connection UUID), `ssh.host`, `ssh.port`, `ssh.username`. The OneKey submission path (`apply_onekey_popup` L6634 + `render_terminal_pane` L2420) passes `state.session_configs[session_id]` (the saved `ConnectionConfig`), and the API executor derives the key from `read_connections()` (the same saved configs mirrored into `CONNECTION_REGISTRY`). Both see the same `connection.id`, so the keys match. The `sudo_credential_key_is_identical_for_onekey_cache_and_executor_lookup` test pins this.
+
+**Tests** (5 new in `relay_tunnel::tests`, all passing):
+- `sudo_lease_expires_after_ttl_when_never_refreshed` — reproduces the incident: lease written, never refreshed, `get_with_status` at TTL boundary returns `Expired`, subsequent lookups return `Missing`.
+- `sudo_lease_is_refreshed_on_successful_use_via_touch` — pins the fix: `touch` before the initial expiry extends the lease; a second `touch` extends it further; lookups past the original expiry but within the refreshed window still `Hit`.
+- `sudo_lease_touch_on_missing_key_is_a_noop` — defensive: `touch` on a non-existent key doesn't panic or insert.
+- `sudo_credential_key_is_identical_for_onekey_cache_and_executor_lookup` — pins that the OneKey write path and the executor lookup path derive the same key for a given saved SSH connection.
+- `cache_sudo_credential_public_api_round_trips_through_executor_lookup` — end-to-end through the public `cache_sudo_credential` entry point (what `apply_onekey_popup` calls) → `get_with_status` (what the executor calls).
+
+**i18n** (`crates/rusterm-ui/src/i18n.rs`): added `relay.sudo_authorization_expired` key (EN + 中文) distinguishing "expired" from "unavailable".
+
+**TSM AdjustCapsLockLEDForKeyTransitionHandling**: this macOS system log line appeared in the user's terminal output alongside the 403 error but is **unrelated** — it's a macOS input-method/keyboard system message, not a RusTerm or sudo issue. Do not chase it as a root cause for elevation failures.
+
+**Workspace test totals after this fix**: rusterm-ui 601 (was 596), relay 106, workspace all green. `cargo fmt` clean, no new clippy warnings.
+
+**Why the fix is safe**:
+- The credential value is never changed by `touch` — only `expires_at` is extended. The `Zeroizing<String>` still gets cleared on `clear_key`/`clear_for_session`/eviction.
+- `touch` is only called after the remote *accepted* the password (`sudo_authorization_failed(&second)` is false). If the remote rejects it, `clear_key` drops the lease immediately. So a stale/wrong password can't be kept alive by `touch`.
+- The 30-min TTL + refresh-on-use still respects the remote sudo authority: if the remote sudo timestamp expires (configurable via `timestamp_timeout`), the next `sudo -S` will fail with auth-required → `clear_key` → `sudo_authorization_rejected`. The user must re-run sudo in their terminal.
+- Host/port/user isolation is unchanged: `SudoCredentialKey` still binds to `connection_id + host + port + username`. Editing a connection to a different host still produces a different key (pinned by the existing `sudo_credentials_are_host_bound_expiring_and_revocable_by_session` test).

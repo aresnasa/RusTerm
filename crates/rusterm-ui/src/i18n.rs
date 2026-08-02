@@ -1206,6 +1206,10 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
             "The reusable sudo credential was rejected or sudo policy denied this command. Re-authorize sudo in the target RusTerm session.",
             "可复用的 sudo 凭据被拒绝，或 sudo 策略拒绝了此命令。请在目标 RusTerm 会话中重新授权 sudo。",
         ),
+        "relay.sudo_authorization_expired" => (
+            "The reusable sudo authorization for this host has expired (the local lease elapses 30 minutes after the last sudo submission or successful API use). Run sudo once more in its RusTerm session with OneKey enabled, then retry.",
+            "此主机可复用的 sudo 授权已过期（本地租约在上一次提交 sudo 或成功 API 调用后 30 分钟失效）。请在其已启用 OneKey 的 RusTerm 会话中再次运行一次 sudo，然后重试。",
+        ),
         "relay.start_timeout_or_runtime_wedged" => (
             "Relay start timed out or runtime is wedged: {error}",
             "中转启动超时或运行时卡死：{error}",
