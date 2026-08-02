@@ -6328,6 +6328,7 @@ fn onekey_popup_for_output(
             .get(session_id)
             .map(|config| config.id.clone()),
         prompt_fingerprint: Some(onekey_prompt_fingerprint(last_line)),
+        is_sudo_password: is_sudo_password_prompt(last_line),
         matches,
         selected: 0,
         matched_expect,
