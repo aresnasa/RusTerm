@@ -17,7 +17,7 @@ pub struct DockDropTarget {
 #[derive(Clone, Debug, PartialEq)]
 pub struct DockDragState {
     pub panel: PanelId,
-    pub label: &'static str,
+    pub label: String,
     pub start_x: f64,
     pub start_y: f64,
     pub cur_x: f64,
@@ -26,16 +26,24 @@ pub struct DockDragState {
     pub target: Option<DockDropTarget>,
 }
 
-pub fn panel_label(panel: PanelId) -> &'static str {
+pub fn panel_label(panel: PanelId) -> String {
     match panel {
-        PanelId::Connections => "Connections",
-        PanelId::RemoteFiles => "Remote files",
-        PanelId::Sessions => "Sessions",
-        PanelId::History => "History",
-        PanelId::Send => "Send",
-        PanelId::EmbeddedShell => "Shell",
-        PanelId::Transfers => "Transfers",
-        PanelId::Relay => "API",
+        PanelId::Connections => crate::i18n::t("connections.title"),
+        PanelId::RemoteFiles => crate::i18n::t("remote_files.title"),
+        PanelId::Sessions => crate::i18n::t("sessions.title"),
+        PanelId::History => crate::i18n::t("history.title"),
+        PanelId::Send => crate::i18n::t("send.tab_title"),
+        PanelId::EmbeddedShell => crate::i18n::t("shell.tab_title"),
+        PanelId::Transfers => crate::i18n::t("transfers.tab_title"),
+        PanelId::Relay => crate::i18n::t("api.tab_title"),
+    }
+}
+
+fn hide_dock_label(zone: DockZone) -> String {
+    match zone {
+        DockZone::Left => crate::i18n::t("dock.hide_left"),
+        DockZone::Right => crate::i18n::t("dock.hide_right"),
+        DockZone::Bottom => crate::i18n::t("dock.hide_bottom"),
     }
 }
 
@@ -356,6 +364,7 @@ pub fn DockZoneView(
     on_extent_change: EventHandler<(DockZone, u16)>,
     on_drag_start: EventHandler<(PanelId, f64, f64)>,
 ) -> Element {
+    let _lang = crate::i18n::LANGUAGE();
     if !stack.visible || stack.panels.is_empty() {
         return rsx! {};
     }
@@ -454,7 +463,7 @@ pub fn DockZoneView(
                     button {
                         class: if stack.active == Some(panel) { "dock-tab active" } else { "dock-tab" },
                         "data-rusterm-dock-tab-index": "{index}",
-                        title: "Drag to reorder or move {panel_label(panel)}",
+                        title: crate::i18n::tf("dock.drag_panel", &[("panel", &panel_label(panel))]),
                         onclick: move |_| on_activate.call(panel),
                         onmousedown: move |event: MouseEvent| {
                             if event.trigger_button() == Some(MouseButton::Primary) {
@@ -472,7 +481,7 @@ pub fn DockZoneView(
                 }
                 button {
                     class: "dock-close",
-                    title: "Hide {zone_value} dock",
+                    title: hide_dock_label(zone),
                     onclick: move |_| on_hide.call(zone),
                     "×"
                 }
@@ -530,6 +539,7 @@ pub fn DockZoneView(
 
 #[component]
 pub fn DockHiddenDropTargets(layout: DockLayout, drag: Option<DockDragState>) -> Element {
+    let _lang = crate::i18n::LANGUAGE();
     let dragging = drag.as_ref().is_some_and(|drag| drag.dragging);
     if !dragging {
         return rsx! {};
@@ -568,6 +578,7 @@ pub fn DockHiddenDropTargets(layout: DockLayout, drag: Option<DockDragState>) ->
 
 #[component]
 pub fn DockDragGhost(drag: Option<DockDragState>) -> Element {
+    let _lang = crate::i18n::LANGUAGE();
     let Some(drag) = drag.filter(|drag| drag.dragging) else {
         return rsx! {};
     };
