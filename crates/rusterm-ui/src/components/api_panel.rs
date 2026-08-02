@@ -1000,6 +1000,88 @@ mod tests {
         );
     }
 
+    // ── Script / base64 mode (issue 73) ───────────────────────────────────
+
+    #[test]
+    fn curl_script_mode_emits_script_field() {
+        let curl = gen_curl(
+            "http://x",
+            "u",
+            &["h".to_string()],
+            &CurlPayload::Script("#!/bin/sh\necho hi\n".to_string()),
+            false,
+        );
+        assert!(
+            curl.contains(r#""script":""#),
+            "script mode must emit a script field: {curl}"
+        );
+        assert!(
+            !curl.contains(r#""command\":""#),
+            "script mode must not emit a command field: {curl}"
+        );
+        // Newlines in the script are JSON-escaped as \n so the --data arg
+        // stays a single shell-quoted string.
+        assert!(
+            curl.contains(r#""script":"#!\/bin\/sh\\necho hi\\n""#),
+            "script newlines must be JSON-escaped: {curl}"
+        );
+    }
+
+    #[test]
+    fn curl_script_base64_mode_emits_script_base64_field() {
+        let curl = gen_curl(
+            "http://x",
+            "u",
+            &["h".to_string()],
+            &CurlPayload::ScriptBase64("IyEvYmluL3NoCmVjaG8gaGkK".to_string()),
+            false,
+        );
+        assert!(
+            curl.contains(r#""script_base64":"IyEvYmluL3NoCmVjaG8gaGkK""#),
+            "base64 mode must emit a script_base64 field: {curl}"
+        );
+        assert!(
+            !curl.contains(r#""command\":""#) && !curl.contains(r#""script\":""#),
+            "base64 mode must not emit command or script fields: {curl}"
+        );
+    }
+
+    #[test]
+    fn curl_script_mode_highlights_script_value() {
+        let preview = gen_curl_preview(
+            "http://x",
+            "u",
+            &["h".to_string()],
+            &CurlPayload::Script("echo hello".to_string()),
+            false,
+        );
+        let marked = format!(
+            "{}<mark>{}</mark>{}",
+            preview.before_command, preview.command, preview.after_command
+        );
+        assert_eq!(marked.matches("<mark>").count(), 1);
+        assert!(
+            marked.contains(r#""script":"<mark>echo hello</mark>""#),
+            "highlight must wrap the script field value: {marked}"
+        );
+    }
+
+    #[test]
+    fn curl_script_mode_supports_multiple_hosts() {
+        let curl = gen_curl(
+            "http://x",
+            "u",
+            &["host-a".to_string(), "host-b".to_string()],
+            &CurlPayload::Script("uptime\n".to_string()),
+            false,
+        );
+        assert_eq!(curl.matches("rusterm_exec '").count(), 2, "{curl}");
+        assert!(curl.contains(r#"host_id":"host-a"#), "{curl}");
+        assert!(curl.contains(r#"host_id":"host-b"#), "{curl}");
+        // Both hosts carry the script field.
+        assert_eq!(curl.matches(r#""script":""#).count(), 2, "{curl}");
+    }
+
     #[test]
     fn base_url_prefers_running_url() {
         assert_eq!(
