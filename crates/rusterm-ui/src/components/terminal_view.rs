@@ -1181,6 +1181,8 @@ pub fn TerminalView(
     let closure_suggestion_corrections = current_suggestion_corrections.clone();
     let sid_for_keydown_log = session_id.clone();
     let sid_for_copy = session_id.clone();
+    let search_input_id = format!("terminal-search-{session_id}");
+    let search_input_id_for_keydown = search_input_id.clone();
     let copy_rows = render_output.rows.clone();
     let handle_keydown = move |e: KeyboardEvent| {
         let key = e.key();
