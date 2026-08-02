@@ -551,7 +551,7 @@ mod tests {
         let curl = gen_curl(
             "http://127.0.0.1:8080",
             "alice",
-            &Some("prod-web".to_string()),
+            &["prod-web".to_string()],
             "uname -a",
             true,
         );
@@ -595,7 +595,7 @@ mod tests {
         let curl = gen_curl(
             "http://127.0.0.1:8080",
             "alice",
-            &Some("prod-web".to_string()),
+            &["prod-web".to_string()],
             "docker ps",
             true,
         );
@@ -618,7 +618,7 @@ mod tests {
         let curl = gen_curl(
             "http://x",
             "u",
-            &Some("h".to_string()),
+            &["h".to_string()],
             r#"echo "hi" \n"#,
             false,
         );
@@ -633,7 +633,7 @@ mod tests {
         let preview = gen_curl_preview(
             "http://repeat.example",
             "repeat",
-            &Some("repeat".to_string()),
+            &["repeat".to_string()],
             "repeat",
             true,
         );
@@ -654,7 +654,7 @@ mod tests {
         let preview = gen_curl_preview(
             "http://x",
             "u",
-            &Some("h".to_string()),
+            &["h".to_string()],
             r#"echo "hi" 'there' \n"#,
             false,
         );
@@ -669,7 +669,7 @@ mod tests {
 
     #[test]
     fn curl_preview_handles_an_empty_command() {
-        let preview = gen_curl_preview("http://x", "u", &Some("h".to_string()), "", false);
+        let preview = gen_curl_preview("http://x", "u", &["h".to_string()], "", false);
 
         assert!(preview.command.is_empty());
         assert!(
@@ -680,7 +680,7 @@ mod tests {
 
     #[test]
     fn curl_handles_missing_session_with_placeholder() {
-        let curl = gen_curl("http://x", "u", &None, "ls", false);
+        let curl = gen_curl("http://x", "u", &[], "ls", false);
         assert!(
             curl.contains("HOST"),
             "missing-session should use HOST placeholder: {curl}"

@@ -510,6 +510,146 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
             "结果授权已失效：{error}",
         ),
 
+        // ── send.* — additional send-panel state ───────────────────────
+        "send.no_target" => ("No target", "无目标"),
+
+        // ── session.* — connection lifecycle messages ─────────────────
+        "session.connecting_to" => ("Connecting to {name}…", "正在连接到 {name}…"),
+        "session.connection_failed" => ("Connection failed: {error}", "连接失败：{error}"),
+        "session.connection_type_not_supported" => (
+            "This connection type does not support reconnecting",
+            "此连接类型不支持重新连接",
+        ),
+        "session.press_enter_to_reconnect" => ("Press Enter to reconnect", "按 Enter 重新连接"),
+        "session.reconnecting" => ("Reconnecting…", "正在重新连接…"),
+        "session.shell_failed" => ("Failed to start shell: {error}", "启动 shell 失败：{error}"),
+        "session.starting_shell" => ("Starting local shell…", "正在启动本地终端…"),
+
+        // ── sessions.* — sessions panel ────────────────────────────────
+        "sessions.empty_pane" => ("Empty pane", "空白窗格"),
+        "sessions.no_open_workspaces" => ("No open workspaces", "没有打开的工作区"),
+        "sessions.open_count" => ("{count} open session(s)", "{count} 个打开的会话"),
+        "sessions.pane_label" => ("Pane {index}", "窗格 {index}"),
+        "sessions.select" => ("Select session {name}", "选择会话 {name}"),
+        "sessions.status_connected" => ("Connected", "已连接"),
+        "sessions.status_disconnected" => ("Disconnected", "已断开"),
+        "sessions.status_reconnecting" => ("Reconnecting", "正在重新连接"),
+        "sessions.title" => ("Sessions", "会话"),
+        "sessions.workspace_label" => ("Workspace {index}: {label}", "工作区 {index}：{label}"),
+
+        // ── shell.* — local-shell session names ────────────────────────
+        "shell.bottom_session_name" => ("Bottom shell", "底部终端"),
+        "shell.local_session_name" => ("Local shell", "本地终端"),
+
+        // ── status.* — status bar controls ─────────────────────────────
+        "status.ai" => ("AI", "AI"),
+        "status.bottom" => ("Bottom", "底部"),
+        "status.left" => ("Left", "左侧"),
+        "status.llm_opt_in" => ("LLM opt-in", "LLM 已选择加入"),
+        "status.local" => ("Local", "本地"),
+        "status.local_tooltip" => ("Open a local shell", "打开本地终端"),
+        "status.logging" => ("Logging", "正在记录日志"),
+        "status.onekeys" => ("OneKeys", "OneKeys"),
+        "status.relay" => ("Relay", "中转"),
+        "status.relay_tooltip" => ("Configure the REST API relay", "配置 REST API 中转"),
+        "status.right" => ("Right", "右侧"),
+        "status.sessions" => ("{count} sessions", "{count} 个会话"),
+        "status.toggle_bottom_dock" => ("Toggle bottom dock", "切换底部面板"),
+        "status.toggle_left_dock" => ("Toggle left dock", "切换左侧面板"),
+        "status.toggle_right_dock" => ("Toggle right dock", "切换右侧面板"),
+        "status.tunnels" => ("Tunnels", "隧道"),
+        "status.tunnels_tooltip" => ("Manage SSH tunnels", "管理 SSH 隧道"),
+
+        // ── transfer.* / transfers.* — SFTP transfer queue ─────────────
+        "transfer.local_remote_endpoints_required" => (
+            "A transfer requires one local and one remote endpoint",
+            "传输必须包含一个本地端点和一个远程端点",
+        ),
+        "transfer.ssh_disconnected_while_opening_sftp" => (
+            "SSH session disconnected while opening SFTP",
+            "打开 SFTP 时 SSH 会话已断开",
+        ),
+        "transfer.ssh_session_not_connected" => ("SSH session is not connected", "SSH 会话未连接"),
+        "transfers.clear_finished" => ("Clear finished", "清除已完成"),
+        "transfers.clear_finished_hint" => ("Clear finished transfers", "清除已完成的传输"),
+        "transfers.destination_title" => ("Destination: {destination}", "目标：{destination}"),
+        "transfers.direction_download" => ("Download", "下载"),
+        "transfers.direction_transfer" => ("Transfer", "传输"),
+        "transfers.direction_upload" => ("Upload", "上传"),
+        "transfers.empty_state" => ("No transfers", "没有传输任务"),
+        "transfers.endpoint_local" => ("Local: {path}", "本地：{path}"),
+        "transfers.endpoint_remote" => ("Remote: {path}", "远程：{path}"),
+        "transfers.from" => ("From {source}", "来源：{source}"),
+        "transfers.no_finished_hint" => ("No finished transfers to clear", "没有可清除的已完成传输"),
+        "transfers.source_title" => ("Source: {source}", "来源：{source}"),
+        "transfers.status_cancelled" => ("Cancelled", "已取消"),
+        "transfers.status_completed" => ("Completed", "已完成"),
+        "transfers.status_failed" => ("Failed", "失败"),
+        "transfers.status_failed_reason" => ("Failed: {reason}", "失败：{reason}"),
+        "transfers.status_queued" => ("Queued", "等待中"),
+        "transfers.status_running" => ("Transferring", "传输中"),
+        "transfers.to" => ("To {destination}", "目标：{destination}"),
+        "transfers.unnamed_file" => ("Unnamed file", "未命名文件"),
+
+        // ── tunnels.* — SSH tunnel manager ─────────────────────────────
+        "tunnels.auto_reconnect" => ("Reconnect automatically", "自动重新连接"),
+        "tunnels.auto_start" => ("Start automatically", "自动启动"),
+        "tunnels.check_port" => ("Check port", "检查端口"),
+        "tunnels.connection_required" => ("Select an SSH connection", "请选择 SSH 连接"),
+        "tunnels.edit" => ("Edit", "编辑"),
+        "tunnels.edit_tunnel" => ("Edit tunnel", "编辑隧道"),
+        "tunnels.empty" => ("No tunnels configured", "尚未配置隧道"),
+        "tunnels.invalid_listen_address" => ("Invalid listen address", "监听地址无效"),
+        "tunnels.invalid_listen_port" => ("Invalid listen port", "监听端口无效"),
+        "tunnels.invalid_remote_port" => ("Invalid remote port", "远程端口无效"),
+        "tunnels.listen_addr_port" => ("Listen address and port", "监听地址和端口"),
+        "tunnels.listen_port_zero" => ("Listen port cannot be 0", "监听端口不能为 0"),
+        "tunnels.manager_uninitialized" => ("Tunnel manager is not initialized", "隧道管理器尚未初始化"),
+        "tunnels.name" => ("Name", "名称"),
+        "tunnels.name_required" => ("Tunnel name is required", "隧道名称不能为空"),
+        "tunnels.new_tunnel" => ("New tunnel", "新建隧道"),
+        "tunnels.new_tunnel_button" => ("New tunnel", "新建隧道"),
+        "tunnels.port_in_use" => ("Port is already in use", "端口已被占用"),
+        "tunnels.remote_host_port" => ("Remote host and port", "远程主机和端口"),
+        "tunnels.remote_host_required" => ("Remote host is required", "远程主机不能为空"),
+        "tunnels.save_and_start" => ("Save and start", "保存并启动"),
+        "tunnels.ssh_connection" => ("SSH connection", "SSH 连接"),
+        "tunnels.start" => ("Start", "启动"),
+        "tunnels.state_active" => (
+            "Active for {minutes}m {seconds}s",
+            "已运行 {minutes} 分 {seconds} 秒",
+        ),
+        "tunnels.state_connecting" => ("Connecting (attempt {attempt})", "正在连接（第 {attempt} 次）"),
+        "tunnels.state_failed" => ("Failed: {error}", "失败：{error}"),
+        "tunnels.state_reconnecting" => (
+            "Reconnecting (attempt {attempt}, in {delay_ms} ms): {error}",
+            "正在重新连接（第 {attempt} 次，{delay_ms} 毫秒后）：{error}",
+        ),
+        "tunnels.state_stopped" => ("Stopped", "已停止"),
+        "tunnels.stop" => ("Stop", "停止"),
+        "tunnels.suggest_free_ports" => ("Suggest free ports", "推荐可用端口"),
+        "tunnels.title" => ("SSH tunnels", "SSH 隧道"),
+        "tunnels.type" => ("Type", "类型"),
+        "tunnels.type_dynamic_socks" => ("Dynamic SOCKS5 (-D)", "动态 SOCKS5（-D）"),
+        "tunnels.type_local_forward" => ("Local TCP forward (-L)", "本地 TCP 转发（-L）"),
+        "tunnels.unknown_kind" => ("Unknown tunnel type: {kind}", "未知隧道类型：{kind}"),
+
+        // ── welcome.* — empty workspace ────────────────────────────────
+        "welcome.create_connection" => ("Create a connection", "新建连接"),
+
+        // ── api.* — keys reserved for the endpoint/curl UI follow-up ───
+        "api.endpoints" => ("Endpoints", "端点"),
+        "api.endpoint_reference" => (
+            "GET  {url}/api/v1/health      # liveness, no auth\nGET  {url}/api/v1/hosts        # list hosts (BasicAuth)\nPOST {url}/api/v1/exec         # { host_id, command, elevated?, timeout_ms? }\nPOST {url}/api/v1/parse-curl   # parse a pasted curl into JSON",
+            "GET  {url}/api/v1/health      # 存活检查，无需鉴权\nGET  {url}/api/v1/hosts        # 列出主机（BasicAuth）\nPOST {url}/api/v1/exec         # { host_id, command, elevated?, timeout_ms? }\nPOST {url}/api/v1/parse-curl   # 将粘贴的 curl 解析为 JSON",
+        ),
+        "api.password_prompt" => ("printf \"API password: \"", "printf \"API 密码：\""),
+        "api.command_marker_title" => ("Remote command", "远程命令"),
+        "api.command_marker_help" => (
+            "Edit the command between the markers; the curl script updates automatically.",
+            "编辑标记之间的命令；curl 脚本会自动更新。",
+        ),
+
         // ── shadow.* — shadow sandbox dialog ─────────────────────────────
         // (Keys filled in by the shadow_sandbox_dialog conversion.)
 
@@ -536,6 +676,119 @@ fn interpolate(template: &str, args: &[(&str, &dyn std::fmt::Display)]) -> Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::BTreeSet;
+    use std::path::Path;
+
+    const DYNAMIC_SOURCE_KEYS: &[&str] = &[
+        "layout.summary",
+        "layout.summary_tab_tiled",
+        "relay.account_required_before_start",
+        "relay.confirm_public_bind_before_start",
+        "relay.password_required",
+        "relay.username_required",
+        "remote_files.applying_operation",
+        "remote_files.choosing_download_destination",
+        "remote_files.choosing_local_file",
+        "remote_files.download_cancelled",
+        "remote_files.file_type_directory",
+        "remote_files.file_type_file",
+        "remote_files.file_type_other",
+        "remote_files.file_type_symlink",
+        "remote_files.invalid_utf8_filename",
+        "remote_files.name_dot",
+        "remote_files.name_empty",
+        "remote_files.name_slash",
+        "remote_files.path_absolute",
+        "remote_files.select_regular_file",
+        "remote_files.ssh_disconnected_during_sftp",
+        "remote_files.ssh_session_disconnected",
+        "remote_files.unsupported_delete",
+        "remote_files.upload_cancelled",
+        "tunnels.connection_required",
+        "tunnels.invalid_listen_address",
+        "tunnels.invalid_listen_port",
+        "tunnels.invalid_remote_port",
+        "tunnels.listen_port_zero",
+        "tunnels.name_required",
+        "tunnels.remote_host_required",
+    ];
+
+    fn catalog_keys() -> BTreeSet<String> {
+        include_str!("i18n.rs")
+            .lines()
+            .filter_map(|line| {
+                line.trim_start()
+                    .strip_prefix('"')?
+                    .split_once("\" =>")
+                    .map(|(key, _)| key.to_string())
+            })
+            .collect()
+    }
+
+    fn collect_rust_sources(directory: &Path, sources: &mut Vec<String>) {
+        for entry in std::fs::read_dir(directory).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                collect_rust_sources(&path, sources);
+            } else if path.extension().is_some_and(|extension| extension == "rs")
+                && path.file_name().is_some_and(|name| name != "i18n.rs")
+            {
+                sources.push(std::fs::read_to_string(path).unwrap());
+            }
+        }
+    }
+
+    fn literal_keys_after(source: &str, marker: &str) -> Vec<String> {
+        let mut keys = Vec::new();
+        let mut remaining = source;
+        while let Some(index) = remaining.find(marker) {
+            remaining = &remaining[index + marker.len()..];
+            let argument = remaining.trim_start();
+            if let Some(quoted) = argument.strip_prefix('"')
+                && let Some(end) = quoted.find('"')
+            {
+                keys.push(quoted[..end].to_string());
+            }
+        }
+        keys
+    }
+
+    fn source_translation_keys() -> BTreeSet<String> {
+        let mut sources = Vec::new();
+        collect_rust_sources(
+            &Path::new(env!("CARGO_MANIFEST_DIR")).join("src"),
+            &mut sources,
+        );
+
+        let mut keys = BTreeSet::new();
+        for source in sources {
+            keys.extend(literal_keys_after(&source, "crate::i18n::t("));
+            keys.extend(literal_keys_after(&source, "crate::i18n::tf("));
+        }
+        keys.extend(DYNAMIC_SOURCE_KEYS.iter().map(|key| (*key).to_string()));
+        keys
+    }
+
+    fn placeholders(text: &str) -> BTreeSet<String> {
+        let mut placeholders = BTreeSet::new();
+        let mut remaining = text;
+        while let Some(open) = remaining.find('{') {
+            let after_open = &remaining[open + 1..];
+            let Some(close) = after_open.find('}') else {
+                break;
+            };
+            let name = &after_open[..close];
+            if !name.is_empty()
+                && name
+                    .chars()
+                    .all(|character| character.is_ascii_alphanumeric() || character == '_')
+            {
+                placeholders.insert(name.to_string());
+            }
+            remaining = &after_open[close + 1..];
+        }
+        placeholders
+    }
 
     #[test]
     fn known_key_returns_translation_for_each_language() {
@@ -556,24 +809,51 @@ mod tests {
     }
 
     #[test]
-    fn every_key_has_non_empty_en_and_zh() {
-        // Smoke-test a representative sample. A full parity check would need
-        // a key list; the per-arm structure (two adjacent arms) makes a
-        // mismatch a review-time concern.
-        for key in [
-            "common.cancel",
-            "settings.language",
-            "send.placeholder",
-            "layout.empty_pane",
-        ] {
-            assert!(
-                translate(key, Language::En).is_some(),
-                "en missing for {key}"
+    fn every_source_key_has_non_empty_en_and_zh() {
+        for key in source_translation_keys() {
+            for language in [Language::En, Language::Zh] {
+                let translation = translate(&key, language)
+                    .unwrap_or_else(|| panic!("{language:?} translation missing for {key}"));
+                assert!(
+                    !translation.trim().is_empty(),
+                    "{language:?} translation is empty for {key}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_catalog_entry_is_bilingual_with_matching_placeholders() {
+        let keys = catalog_keys();
+        assert!(!keys.is_empty());
+
+        for key in keys {
+            let en = translate(&key, Language::En)
+                .unwrap_or_else(|| panic!("English translation missing for {key}"));
+            let zh = translate(&key, Language::Zh)
+                .unwrap_or_else(|| panic!("Chinese translation missing for {key}"));
+            assert!(!en.trim().is_empty(), "English translation is empty for {key}");
+            assert!(!zh.trim().is_empty(), "Chinese translation is empty for {key}");
+            assert_eq!(
+                placeholders(en),
+                placeholders(zh),
+                "placeholder mismatch for {key}"
             );
-            assert!(
-                translate(key, Language::Zh).is_some(),
-                "zh missing for {key}"
-            );
+        }
+    }
+
+    #[test]
+    fn reserved_api_shell_text_meets_contract() {
+        let prompt = translate("api.password_prompt", Language::En).unwrap();
+        assert!(!prompt.contains('\''));
+
+        for language in [Language::En, Language::Zh] {
+            let reference = translate("api.endpoint_reference", language).unwrap();
+            assert_eq!(reference.lines().count(), 4);
+            assert!(reference.contains("{url}"));
+            for field in ["host_id", "command", "elevated?", "timeout_ms?"] {
+                assert!(reference.contains(field));
+            }
         }
     }
 

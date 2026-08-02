@@ -7634,14 +7634,18 @@ mod session_startup_tests {
 
     #[test]
     fn build_connection_from_form_serial_falls_back_to_defaults_for_invalid_values() {
-        // Garbage line-settings should fall back to conventional values
-        // (115200 8N1) rather than panicking or producing an unusable config.
+        // Non-numeric / empty line-settings should fall back to conventional
+        // values (115200 8N1) rather than panicking or producing zeroed
+        // fields. Note: `data_bits` and `stop_bits` are `u8`, so out-of-range
+        // values like 99 actually parse fine and are only rejected later by
+        // `serialport` when the device is opened — we only test the fallback
+        // path for genuinely unparseable inputs here.
         let mut form = ssh_form_with_protocol("serial");
         form.serial_port = "/dev/ttyS0".to_string();
         form.baud_rate = "not-a-number".to_string();
-        form.data_bits = "99".to_string();
+        form.data_bits = "abc".to_string();
         form.parity = String::new();
-        form.stop_bits = "99".to_string();
+        form.stop_bits = "xyz".to_string();
         form.flow_control = String::new();
         let (kind, _, _) = build_connection_from_form(&form);
         let ConnectionKind::Serial(serial) = kind else {
