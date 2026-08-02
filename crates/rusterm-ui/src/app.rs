@@ -119,6 +119,61 @@ fn save_workspace_preferences(state: &Signal<AppState>) {
 /// misconfigured expect from silently hanging the session initialization.
 const LOGIN_SCRIPT_EXPECT_TIMEOUT_SECS: u64 = 30;
 
+/// Upper bound on the coalesced byte payload fed to `process_and_render` in a
+/// single event-loop tick.
+///
+/// When a remote command produces enormous output (e.g. `tree`/`ls` on a
+/// directory tree with millions of entries), the SSH/PTY reader delivers many
+/// small `SessionEvent::Output` chunks in rapid succession. Processing and
+/// rendering each chunk individually is the bottleneck: VTE parsing + a full
+/// `render_with_scroll` allocation per chunk overwhelms the event loop, the
+/// unbounded MPSC channel between reader and consumer grows without limit, and
+/// the session's memory footprint climbs until the process is killed.
+///
+/// Instead of one `process_and_render` per chunk, the event loop drains all
+/// immediately-available `Output` events for the same session, concatenates
+/// them into a single buffer (capped at this size), and processes+renders
+/// once. This cuts the per-chunk overhead by 1/N and — crucially — lets the
+/// consumer keep up with the producer so the channel stays drained and SSH
+/// flow control never needs to kick in.
+///
+/// 1 MiB is large enough to amortise the per-call cost across many chunks yet
+/// small enough that a single `process` call stays in the sub-10 ms range even
+/// on a pathologically slow machine (VTE parsing is ~500 MB/s on the bench).
+const MAX_OUTPUT_BATCH_BYTES: usize = 1 * 1024 * 1024;
+
+/// Drains all immediately-available `SessionEvent::Output` events for
+/// `session_id` from `rx`, concatenating their payloads into `batch` (which
+/// already holds the first event's data). Stops when:
+///   - `batch` reaches [`MAX_OUTPUT_BATCH_BYTES`], or
+///   - a non-`Output` event or an `Output` for a different session is peeked,
+///     or
+///   - the channel is empty.
+///
+/// The peeked non-batch event (if any) is returned so the caller can process
+/// it on the next loop iteration instead of dropping it.
+///
+/// This is the core of the output-coalescing optimisation: turning N tiny
+/// `process_and_render` calls into one, which keeps the event loop ahead of the
+/// producer and prevents the unbounded channel from growing without limit.
+fn drain_output_batch(
+    rx: &mut tokio::sync::mpsc::UnboundedReceiver<SessionEvent>,
+    session_id: &str,
+    batch: &mut Vec<u8>,
+) -> Option<SessionEvent> {
+    while batch.len() < MAX_OUTPUT_BATCH_BYTES {
+        match rx.try_recv() {
+            Ok(SessionEvent::Output(id, data)) if id == session_id => {
+                batch.extend_from_slice(&data);
+            }
+            // Anything else (Disconnected, Error, Output for another session,
+            // ...) is requeued for the next loop iteration.
+            other => return other.ok(),
+        }
+    }
+    None
+}
+
 /// One discrete action the login-script driver queues for the PTY. Emitted by
 /// `login_script_evaluate` and consumed by `drive_login_script`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9048,9 +9103,33 @@ fn start_ssh_connection(
                     });
                 }
 
-                while let Some(event) = event_rx.recv().await {
+                // `pending_event` holds an event that was peeked off the
+                // channel by `drain_output_batch` but didn't belong to the
+                // current batch (a non-Output event or Output for a different
+                // session). It's processed first on the next loop iteration so
+                // nothing is dropped.
+                let mut pending_event: Option<SessionEvent> = None;
+                loop {
+                    let event = match pending_event.take() {
+                        Some(ev) => ev,
+                        None => match event_rx.recv().await {
+                            Some(ev) => ev,
+                            None => break,
+                        },
+                    };
                     match event {
-                        SessionEvent::Output(id, data) => {
+                        SessionEvent::Output(id, mut data) => {
+                            // Coalesce all immediately-available Output events
+                            // for the same session into one batch, then process
+                            // + render once. This is the key optimisation that
+                            // keeps the event loop ahead of the producer when a
+                            // command like `tree`/`ls` on a huge tree floods
+                            // the channel with thousands of small chunks per
+                            // second. Without it each chunk triggers a full VTE
+                            // parse + render allocation, the consumer falls
+                            // behind, and the unbounded channel grows without
+                            // limit — eventually OOMing the session.
+                            pending_event = drain_output_batch(&mut event_rx, &id, &mut data);
                             // Reset the SSH login-output debounce before any
                             // capture filtering; hidden history-import output is
                             // still remote activity and must postpone injection.
@@ -9621,9 +9700,18 @@ fn start_shell_connection(
             let _session_guard = session;
 
             spawn(async move {
-                while let Some(event) = event_rx.recv().await {
+                let mut pending_event: Option<SessionEvent> = None;
+                loop {
+                    let event = match pending_event.take() {
+                        Some(ev) => ev,
+                        None => match event_rx.recv().await {
+                            Some(ev) => ev,
+                            None => break,
+                        },
+                    };
                     match event {
-                        SessionEvent::Output(id, data) => {
+                        SessionEvent::Output(id, mut data) => {
+                            pending_event = drain_output_batch(&mut event_rx, &id, &mut data);
                             let data = shell_integration_echo_filter.lock().filter(&data);
                             if data.is_empty() {
                                 continue;
@@ -10057,9 +10145,18 @@ fn start_serial_connection(
                 // Standard event-receive loop: forward SessionEvent::Output
                 // to the terminal model. Disconnected / Error events flip
                 // the connection state and render a reconnect hint.
-                while let Some(event) = event_rx.recv().await {
+                let mut pending_event: Option<SessionEvent> = None;
+                loop {
+                    let event = match pending_event.take() {
+                        Some(ev) => ev,
+                        None => match event_rx.recv().await {
+                            Some(ev) => ev,
+                            None => break,
+                        },
+                    };
                     match event {
-                        SessionEvent::Output(id, data) => {
+                        SessionEvent::Output(id, mut data) => {
+                            pending_event = drain_output_batch(&mut event_rx, &id, &mut data);
                             {
                                 let logs = state.read().session_logs.clone();
                                 if let Some(log) = logs.get(&id) {
@@ -10187,9 +10284,18 @@ fn start_telnet_connection(
                 }
                 let _session_guard = session;
 
-                while let Some(event) = event_rx.recv().await {
+                let mut pending_event: Option<SessionEvent> = None;
+                loop {
+                    let event = match pending_event.take() {
+                        Some(ev) => ev,
+                        None => match event_rx.recv().await {
+                            Some(ev) => ev,
+                            None => break,
+                        },
+                    };
                     match event {
-                        SessionEvent::Output(id, data) => {
+                        SessionEvent::Output(id, mut data) => {
+                            pending_event = drain_output_batch(&mut event_rx, &id, &mut data);
                             {
                                 let logs = state.read().session_logs.clone();
                                 if let Some(log) = logs.get(&id) {
