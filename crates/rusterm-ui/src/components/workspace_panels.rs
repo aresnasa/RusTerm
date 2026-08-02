@@ -121,7 +121,7 @@ pub fn BottomToolPanel(
                     // Anchor to both edges of the real dock container. When the
                     // user resizes the bottom dock, CSS constrains this picker
                     // to the remaining content area and its list scrolls.
-                    style: "position:absolute;right:8px;top:31px;bottom:8px;z-index:120;width:min(320px,calc(100% - 16px));max-height:240px;min-height:0;display:flex;flex-direction:column;background:var(--skin-bg);border:1px solid var(--skin-border);border-radius:5px;box-shadow:0 8px 24px rgba(0,0,0,.4);overflow:hidden;";
+                    style: "position:absolute;right:8px;top:31px;bottom:8px;z-index:120;width:min(320px,calc(100% - 16px));max-height:240px;min-height:0;display:flex;flex-direction:column;background:var(--skin-bg);border:1px solid var(--skin-border);border-radius:5px;box-shadow:0 8px 24px rgba(0,0,0,.4);overflow:hidden;",
                     onclick: move |event: MouseEvent| event.stop_propagation(),
                     div {
                         style: "display:flex;align-items:center;flex-wrap:wrap;gap:6px;padding:7px;border-bottom:1px solid var(--skin-border);",
