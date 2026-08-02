@@ -23,7 +23,9 @@ use tokio::sync::oneshot;
 use crate::audit::{AuditAction, AuditEntry, AuditLog, AuditOutcome, now_iso};
 use crate::auth::{RateLimiter, authenticate, parse_basic_auth};
 use crate::config::RelayConfig;
-use crate::executor::{ExecOutcome, ExecutorError, HostInfo, NullExecutor, RelayExecutor};
+#[cfg(test)]
+use crate::executor::NullExecutor;
+use crate::executor::{ExecOutcome, ExecutorError, HostInfo, RelayExecutor};
 use crate::validator::{CommandValidator, compile_allowlist};
 
 /// Shared per-process state handed to every handler.
@@ -463,6 +465,8 @@ mod tests {
 
     fn test_config() -> RelayConfig {
         let mut cfg = RelayConfig::default();
+        // Port 0 → kernel assigns a free port; tests can run in parallel.
+        cfg.port = 0;
         cfg.accounts.push(RelayAccount {
             username: "ops".into(),
             password_hash: hash_password("pw").unwrap(),

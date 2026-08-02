@@ -67,14 +67,7 @@ impl AuditOutcome {
 /// with the rest), falling back to the config dir when the logger isn't
 /// initialized yet (unit tests).
 fn resolve_audit_path() -> PathBuf {
-    rusterm_core::logging::log_dir()
-        .unwrap_or_else(|| {
-            rusterm_core::paths::resolve_config_file_path(AUDIT_FILE_NAME)
-                .ok()
-                .and_then(|p| p.parent().map(|d| d.to_path_buf()))
-                .unwrap_or_else(|| PathBuf::from("."))
-        })
-        .join(AUDIT_FILE_NAME)
+    rusterm_core::logging::log_dir().join(AUDIT_FILE_NAME)
 }
 
 /// Synchronously append entries. Held behind a mutex so concurrent request

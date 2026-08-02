@@ -128,6 +128,14 @@ impl CommandValidator {
                 r"\b(?:insmod|rmmod|modprobe\s+-r)\b",
                 "kernel module load/unload",
             ),
+            // Dangerous verbs hidden inside command substitution —
+            // `$(rm -rf /)`, "`rm -rf /`". The terminal checker's `\brm`
+            // pattern does not fire after `$(` because there is no word
+            // boundary between `(` and `rm`'s `r` when preceded by `$`/`(`.
+            (
+                r"[$`][({ ]*(?:sudo[ 	]+)?(?:rm[ 	]+-[a-zA-Z]*[rf]|dd[ 	]|mkfs|shutdown|reboot|halt|poweroff)",
+                "dangerous command inside command substitution",
+            ),
         ];
         let api_patterns: Vec<(Regex, &'static str)> = api_raw
             .iter()
@@ -188,7 +196,7 @@ impl CommandValidator {
         }
         if command
             .chars()
-            .any(|c| (c.is_control() && c != '\t' && c != '\n' && c != '\r'))
+            .any(|c| c.is_control() && c != '\t' && c != '\n' && c != '\r')
         {
             return Err(ValidationError::ControlChars);
         }
