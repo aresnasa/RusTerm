@@ -2203,21 +2203,26 @@ pub fn TerminalView(
 
             let sm = search_matches();
             let sidx = search_match_index();
-            let is_current_match = sm.get(sidx).map(|(r, _)| *r == row_idx).unwrap_or(false);
-            let is_search_match = sm.iter().any(|(r, _)| *r == row_idx);
+            let show_search_highlights = search_visible() || search_highlight_pinned();
+            let search_ranges: Vec<(usize, usize, bool)> = if show_search_highlights {
+                sm.iter()
+                    .enumerate()
+                    .filter(|(_, found)| found.row == row_idx)
+                    .map(|(index, found)| {
+                        (found.start_col, found.end_col, index == sidx)
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
 
-            // Comparison-mode diff highlight takes priority over search-match
-            // backgrounds (a diff row is more important to notice than a
-            // search hit). Search highlights still apply to non-diff rows.
+            // Diff status remains a row-level background; exact search spans
+            // are rendered above it so both signals stay visible.
             let is_diff_row = row_diffs.as_ref().and_then(|d| d.get(row_idx))
                 == Some(&crate::comparison::RowDiff::Different);
 
             let row_bg = if is_diff_row {
                 crate::comparison::DIFF_ROW_BG
-            } else if is_current_match {
-                "background:rgba(122,162,247,0.2);"
-            } else if is_search_match {
-                "background:rgba(122,162,247,0.08);"
             } else {
                 ""
             };
@@ -2228,6 +2233,7 @@ pub fn TerminalView(
                 &render_output.cursor_color,
                 sug,
                 sel_for_row(row_idx),
+                &search_ranges,
             );
 
             let mut html = String::with_capacity(content_html.len() + 80);
