@@ -77,18 +77,18 @@ async fn sftp_client(mut state: Signal<AppState>, session_id: &str) -> Result<Sf
         .ssh_sessions
         .get(session_id)
         .cloned()
-        .ok_or_else(|| "SSH session is no longer connected".to_string())?;
+        .ok_or_else(|| crate::i18n::t("remote_files.ssh_session_disconnected"))?;
     let opened = ssh_session
         .open_sftp()
         .await
-        .map_err(|error| format!("Unable to open SFTP: {error}"))?;
+        .map_err(|error| crate::i18n::tf("remote_files.open_sftp_failed", &[("error", &error)]))?;
 
     let mut app = state.write();
     if let Some(existing) = app.sftp_clients.get(session_id).cloned() {
         return Ok(existing);
     }
     if !app.ssh_sessions.contains_key(session_id) {
-        return Err("SSH session disconnected while SFTP was opening".to_string());
+        return Err(crate::i18n::t("remote_files.ssh_disconnected_during_sftp"));
     }
     app.sftp_clients
         .insert(session_id.to_string(), opened.clone());
@@ -104,7 +104,7 @@ async fn list_remote_directory(
     let mut entries = client
         .list(path)
         .await
-        .map_err(|error| format!("Unable to list remote directory: {error}"))?;
+        .map_err(|error| crate::i18n::tf("remote_files.list_failed", &[("error", &error)]))?;
     entries.retain(|entry| !matches!(entry.name.as_str(), "." | ".."));
     entries.sort_by(|left, right| {
         let left_is_directory = left.metadata.file_type == RemoteFileType::Directory;
@@ -126,7 +126,9 @@ async fn create_remote_directory(
         .await?
         .mkdir(path)
         .await
-        .map_err(|error| format!("Unable to create directory: {error}"))
+        .map_err(|error| {
+            crate::i18n::tf("remote_files.create_directory_failed", &[("error", &error)])
+        })
 }
 
 async fn rename_remote_entry(
@@ -139,7 +141,7 @@ async fn rename_remote_entry(
         .await?
         .rename(old_path, new_path)
         .await
-        .map_err(|error| format!("Unable to rename remote entry: {error}"))
+        .map_err(|error| crate::i18n::tf("remote_files.rename_failed", &[("error", &error)]))
 }
 
 async fn delete_remote_entry(
@@ -149,26 +151,29 @@ async fn delete_remote_entry(
 ) -> Result<(), String> {
     let client = sftp_client(state, &session_id).await?;
     match entry.metadata.file_type {
-        RemoteFileType::File | RemoteFileType::Symlink => client
-            .remove_file(entry.path)
-            .await
-            .map_err(|error| format!("Unable to delete remote entry: {error}")),
-        RemoteFileType::Directory => client
-            .remove_empty_dir(entry.path)
-            .await
-            .map_err(|error| format!("Unable to delete empty directory: {error}")),
-        RemoteFileType::Other => Err("This remote entry type cannot be deleted here".to_string()),
+        RemoteFileType::File | RemoteFileType::Symlink => {
+            client.remove_file(entry.path).await.map_err(|error| {
+                crate::i18n::tf("remote_files.delete_entry_failed", &[("error", &error)])
+            })
+        }
+        RemoteFileType::Directory => client.remove_empty_dir(entry.path).await.map_err(|error| {
+            crate::i18n::tf(
+                "remote_files.delete_empty_directory_failed",
+                &[("error", &error)],
+            )
+        }),
+        RemoteFileType::Other => Err(crate::i18n::t("remote_files.unsupported_delete")),
     }
 }
 
 fn validate_entry_name(name: &str) -> Result<&str, &'static str> {
     let name = name.trim();
     if name.is_empty() {
-        Err("Name cannot be empty")
+        Err("remote_files.name_empty")
     } else if matches!(name, "." | "..") {
-        Err("Name cannot be . or ..")
+        Err("remote_files.name_dot")
     } else if name.contains('/') {
-        Err("Name cannot contain /")
+        Err("remote_files.name_slash")
     } else {
         Ok(name)
     }
@@ -177,7 +182,7 @@ fn validate_entry_name(name: &str) -> Result<&str, &'static str> {
 fn normalize_posix_path(path: &str) -> Result<String, &'static str> {
     let path = path.trim();
     if !path.starts_with('/') {
-        return Err("Remote path must be absolute and start with /");
+        return Err("remote_files.path_absolute");
     }
 
     let mut components = Vec::new();
@@ -222,13 +227,14 @@ fn posix_parent(path: &str) -> Option<String> {
     }
 }
 
-fn file_type_label(file_type: RemoteFileType) -> &'static str {
-    match file_type {
-        RemoteFileType::File => "file",
-        RemoteFileType::Directory => "directory",
-        RemoteFileType::Symlink => "symlink",
-        RemoteFileType::Other => "other",
-    }
+fn file_type_label(file_type: RemoteFileType) -> String {
+    let key = match file_type {
+        RemoteFileType::File => "remote_files.file_type_file",
+        RemoteFileType::Directory => "remote_files.file_type_directory",
+        RemoteFileType::Symlink => "remote_files.file_type_symlink",
+        RemoteFileType::Other => "remote_files.file_type_other",
+    };
+    crate::i18n::t(key)
 }
 
 fn file_type_icon(file_type: RemoteFileType) -> &'static str {
@@ -268,6 +274,7 @@ pub fn RemoteFilesPanel(
     on_show_connections: EventHandler<()>,
     on_transfer: EventHandler<TransferRequest>,
 ) -> Element {
+    let _lang = crate::i18n::LANGUAGE();
     let initial_session = preferred_ssh_session(&state.read());
     let mut selected_session = use_signal(move || initial_session);
     let mut current_path = use_signal(|| "/".to_string());
@@ -391,14 +398,14 @@ pub fn RemoteFilesPanel(
                     button {
                         class: "remote-files-tab",
                         onclick: move |_| on_show_connections.call(()),
-                        "Connections"
+                        { crate::i18n::t("remote_files.connections") }
                     }
-                    button { class: "remote-files-tab active", "Remote files" }
+                    button { class: "remote-files-tab active", { crate::i18n::t("remote_files.title") } }
                 }
                 button {
                     class: "remote-files-button",
                     style: "margin-left:auto;margin-right:5px;border:0;background:transparent;font-size:14px;",
-                    title: "Refresh remote directory",
+                    title: crate::i18n::t("remote_files.refresh"),
                     disabled: !has_session || loading(),
                     onclick: move |_| refresh_epoch.set(refresh_epoch().wrapping_add(1)),
                     "↻"
@@ -420,7 +427,7 @@ pub fn RemoteFilesPanel(
                         action_error.set(None);
                     },
                     if session_options_empty {
-                        option { value: "", "No connected SSH sessions" }
+                        option { value: "", { crate::i18n::t("remote_files.no_ssh_sessions") } }
                     }
                     for session in session_options {
                         option { key: "{session.id}", value: "{session.id}", "{session.label}" }
@@ -432,7 +439,7 @@ pub fn RemoteFilesPanel(
                 style: "display:flex;align-items:center;gap:5px;padding:7px;border-bottom:1px solid var(--skin-border);",
                 button {
                     class: "remote-files-button",
-                    title: "Parent directory",
+                    title: crate::i18n::t("remote_files.parent_directory"),
                     disabled: posix_parent(&current_path()).is_none() || loading() || action_busy(),
                     onclick: move |_| {
                         if let Some(parent) = posix_parent(&current_path()) {
