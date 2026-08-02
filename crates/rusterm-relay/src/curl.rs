@@ -304,9 +304,10 @@ mod tests {
 
     #[test]
     fn parse_long_equals_forms() {
-        let parsed =
-            parse_curl("curl --request=PUT --header=X-Test: 1 --user=bob:pw --data k=v https://x")
-                .unwrap();
+        let parsed = parse_curl(
+            "curl --request=PUT '--header=X-Test: 1' --user=bob:pw --data k=v https://x",
+        )
+        .unwrap();
         assert_eq!(parsed.method, "PUT");
         assert_eq!(
             parsed.headers,
