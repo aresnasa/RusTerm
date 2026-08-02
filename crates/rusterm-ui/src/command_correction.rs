@@ -3,6 +3,9 @@
 //! Only the executable token is compared. Suggestions replace the current
 //! input line and are never executed automatically.
 
+use std::collections::HashMap;
+use std::time::{Duration, Instant};
+
 /// Minimum number of local observations before a learned-only correction is
 /// shown. Static well-known commands remain available immediately.
 pub const MIN_LEARNED_OBSERVATIONS: u64 = 2;
@@ -129,6 +132,31 @@ pub fn suggest_corrections(input: &str, learned: &[(String, u64)]) -> Vec<Correc
     candidates
 }
 
+pub fn remember_failed_command(
+    failures: &mut HashMap<String, (String, Instant)>,
+    session_id: &str,
+    command: &str,
+) {
+    failures.insert(
+        session_id.to_string(),
+        (command.to_string(), Instant::now()),
+    );
+}
+
+/// Consume the pending failure for this session and return its command only
+/// when the successful command is a timely, high-confidence correction.
+pub fn take_correction_for_success(
+    failures: &mut HashMap<String, (String, Instant)>,
+    session_id: &str,
+    successful: &str,
+) -> Option<String> {
+    failures.remove(session_id).and_then(|(failed, failed_at)| {
+        (failed_at.elapsed() <= Duration::from_secs(120)
+            && is_likely_correction(&failed, successful))
+        .then_some(failed)
+    })
+}
+
 /// Bytes sent to the PTY when the user accepts a correction. DEL removes the
 /// currently typed line and the replacement is inserted without Enter.
 pub fn replacement_input(current: &str, correction: &str) -> Vec<u8> {
@@ -239,6 +267,43 @@ mod tests {
             candidates
                 .iter()
                 .any(|candidate| candidate.command == "git status")
+        );
+    }
+
+    #[test]
+    fn failed_command_learning_stays_within_the_same_session() {
+        let mut failures = HashMap::new();
+        remember_failed_command(&mut failures, "session-a", "dockre ps");
+
+        assert_eq!(
+            take_correction_for_success(&mut failures, "session-b", "docker ps"),
+            None
+        );
+        assert_eq!(
+            take_correction_for_success(&mut failures, "session-a", "docker ps"),
+            Some("dockre ps".to_string())
+        );
+    }
+
+    #[test]
+    fn unrelated_success_does_not_learn_and_consumes_pending_failure() {
+        let mut failures = HashMap::new();
+        remember_failed_command(&mut failures, "session-a", "dockre ps");
+        assert_eq!(
+            take_correction_for_success(&mut failures, "session-a", "git status"),
+            None
+        );
+        assert!(!failures.contains_key("session-a"));
+    }
+
+    #[test]
+    fn newer_failure_replaces_older_failure_in_the_same_session() {
+        let mut failures = HashMap::new();
+        remember_failed_command(&mut failures, "session-a", "gti status");
+        remember_failed_command(&mut failures, "session-a", "dockre ps");
+        assert_eq!(
+            take_correction_for_success(&mut failures, "session-a", "docker ps"),
+            Some("dockre ps".to_string())
         );
     }
 
