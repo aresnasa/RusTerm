@@ -7563,6 +7563,178 @@ mod session_startup_tests {
         assert_eq!(actual.pixel_width, expected.pixel_width);
         assert_eq!(actual.pixel_height, expected.pixel_height);
     }
+
+    // ── build_connection_from_form / rebuild_connection for telnet & serial ──
+    //
+    // These cover the protocol-tab dispatch added when the dialog gained
+    // the SSH/Telnet/Serial tabs. They verify that form fields round-trip
+    // into the right `ConnectionKind` and that edit-mode preserves the
+    // kind the user picked (not the original kind).
+
+    fn ssh_form_with_protocol(protocol: &str) -> NewConnectionForm {
+        let mut form = NewConnectionForm {
+            name: "test".to_string(),
+            host: "host.example".to_string(),
+            port: "22".to_string(),
+            username: "root".to_string(),
+            auth_type: "agent".to_string(),
+            terminal_type: "xterm-256color".to_string(),
+            ..Default::default()
+        };
+        form.protocol = protocol.to_string();
+        form
+    }
+
+    #[test]
+    fn build_connection_from_form_ssh_returns_ssh_kind_and_session_type() {
+        let form = ssh_form_with_protocol("ssh");
+        let (kind, session_type, hostname) = build_connection_from_form(&form);
+        assert!(matches!(kind, ConnectionKind::Ssh(_)));
+        assert_eq!(session_type, SessionType::Ssh);
+        assert_eq!(hostname.as_deref(), Some("host.example"));
+    }
+
+    #[test]
+    fn build_connection_from_form_telnet_applies_default_port_23() {
+        // Empty port should fall back to telnet's default 23.
+        let mut form = ssh_form_with_protocol("telnet");
+        form.port = String::new();
+        let (kind, session_type, hostname) = build_connection_from_form(&form);
+        let ConnectionKind::Telnet(telnet) = kind else {
+            panic!("expected Telnet kind, got {:?}", kind);
+        };
+        assert_eq!(telnet.host, "host.example");
+        assert_eq!(telnet.port, 23);
+        assert_eq!(session_type, SessionType::Telnet);
+        assert_eq!(hostname.as_deref(), Some("host.example:23"));
+    }
+
+    #[test]
+    fn build_connection_from_form_serial_uses_form_line_settings() {
+        let mut form = ssh_form_with_protocol("serial");
+        form.serial_port = "/dev/ttyUSB0".to_string();
+        form.baud_rate = "9600".to_string();
+        form.data_bits = "7".to_string();
+        form.parity = "even".to_string();
+        form.stop_bits = "2".to_string();
+        form.flow_control = "hardware".to_string();
+        let (kind, session_type, hostname) = build_connection_from_form(&form);
+        let ConnectionKind::Serial(serial) = kind else {
+            panic!("expected Serial kind, got {:?}", kind);
+        };
+        assert_eq!(serial.port, "/dev/ttyUSB0");
+        assert_eq!(serial.baud_rate, 9600);
+        assert_eq!(serial.data_bits, 7);
+        assert_eq!(serial.parity, "even");
+        assert_eq!(serial.stop_bits, 2);
+        assert_eq!(serial.flow_control, "hardware");
+        assert_eq!(session_type, SessionType::Serial);
+        assert_eq!(hostname.as_deref(), Some("/dev/ttyUSB0"));
+    }
+
+    #[test]
+    fn build_connection_from_form_serial_falls_back_to_defaults_for_invalid_values() {
+        // Garbage line-settings should fall back to conventional values
+        // (115200 8N1) rather than panicking or producing an unusable config.
+        let mut form = ssh_form_with_protocol("serial");
+        form.serial_port = "/dev/ttyS0".to_string();
+        form.baud_rate = "not-a-number".to_string();
+        form.data_bits = "99".to_string();
+        form.parity = String::new();
+        form.stop_bits = "99".to_string();
+        form.flow_control = String::new();
+        let (kind, _, _) = build_connection_from_form(&form);
+        let ConnectionKind::Serial(serial) = kind else {
+            panic!("expected Serial kind");
+        };
+        assert_eq!(serial.baud_rate, 115200);
+        assert_eq!(serial.data_bits, 8);
+        assert_eq!(serial.parity, "none");
+        assert_eq!(serial.stop_bits, 1);
+        assert_eq!(serial.flow_control, "none");
+    }
+
+    #[test]
+    fn rebuild_connection_preserves_serial_kind_on_edit() {
+        // Editing a serial connection should keep it serial; the form's
+        // serial fields should round-trip into the rebuilt config.
+        let original = ConnectionConfig {
+            id: "serial-edit".to_string(),
+            name: "Console".to_string(),
+            kind: ConnectionKind::Serial(SerialConfig {
+                port: "/dev/ttyUSB0".to_string(),
+                baud_rate: 9600,
+                data_bits: 8,
+                parity: "none".to_string(),
+                stop_bits: 1,
+                flow_control: "none".to_string(),
+            }),
+            group: None,
+            tags: vec![],
+            onekey: false,
+            login_script: None,
+        };
+        let mut form = ssh_form_with_protocol("serial");
+        form.serial_port = "/dev/ttyUSB1".to_string();
+        form.baud_rate = "115200".to_string();
+        let rebuilt = rebuild_connection(&original, &form);
+        let ConnectionKind::Serial(serial) = &rebuilt.kind else {
+            panic!("expected Serial kind after rebuild, got {:?}", rebuilt.kind);
+        };
+        assert_eq!(serial.port, "/dev/ttyUSB1");
+        assert_eq!(serial.baud_rate, 115200);
+        assert_eq!(rebuilt.id, original.id, "id must be preserved on edit");
+    }
+
+    #[test]
+    fn rebuild_connection_preserves_telnet_kind_on_edit() {
+        let original = ConnectionConfig {
+            id: "telnet-edit".to_string(),
+            name: "Router".to_string(),
+            kind: ConnectionKind::Telnet(TelnetConfig {
+                host: "router.old".to_string(),
+                port: 23,
+            }),
+            group: None,
+            tags: vec![],
+            onekey: false,
+            login_script: None,
+        };
+        let mut form = ssh_form_with_protocol("telnet");
+        form.host = "router.new".to_string();
+        form.port = "2323".to_string();
+        let rebuilt = rebuild_connection(&original, &form);
+        let ConnectionKind::Telnet(telnet) = &rebuilt.kind else {
+            panic!("expected Telnet kind after rebuild, got {:?}", rebuilt.kind);
+        };
+        assert_eq!(telnet.host, "router.new");
+        assert_eq!(telnet.port, 2323);
+    }
+
+    #[test]
+    fn rebuild_connection_preserves_shell_kind_unchanged() {
+        // Shell/Tcp don't have a dialog tab — the whole kind is preserved
+        // on edit, even if the form's protocol field says "ssh".
+        let original = ConnectionConfig {
+            id: "shell-1".to_string(),
+            name: "Local".to_string(),
+            kind: ConnectionKind::Shell(ShellConfig {
+                command: Some("/bin/zsh".to_string()),
+                args: vec!["-l".to_string()],
+                env: vec![],
+                working_dir: None,
+            }),
+            group: None,
+            tags: vec![],
+            onekey: false,
+            login_script: None,
+        };
+        let form = ssh_form_with_protocol("ssh");
+        let rebuilt = rebuild_connection(&original, &form);
+        // Kind must be preserved as Shell — the form's protocol tab is
+        // ignored for kinds the dialog doesn't model.
+        assert!(matches!(rebuilt.kind, ConnectionKind::Shell(_)));
+    }
 }
 
 fn start_ssh_connection(
