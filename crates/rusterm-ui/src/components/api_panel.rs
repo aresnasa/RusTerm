@@ -69,6 +69,9 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
     };
     let runtime = state.read().relay_runtime.clone();
     let url = base_url(&started_url(), &bind_addr_str, config.read().port);
+    // Clone for the copy-button move closure (which would otherwise move `url`
+    // out of the render scope before the endpoint reference can read it).
+    let url_for_copy = url.clone();
 
     // Connected SSH sessions → (name, label) pairs for the curl builder.
     // The relay's exec endpoint accepts either the connection id or its name
@@ -372,8 +375,10 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
                     div { class: "api-row", style: "margin-top:8px;",
                         button {
                             class: "api-btn primary",
+                            // Clone into the move closure so `url` itself isn't
+                            // moved out of the render scope.
                             onclick: move |_| {
-                                let curl = gen_curl(&url, &default_user, &selected_session(), &curl_command());
+                                let curl = gen_curl(&url_for_copy, &default_user, &selected_session(), &curl_command());
                                 let _ = dioxus::document::eval(&format!(
                                     "navigator.clipboard.writeText({})",
                                     serde_json::to_string(&curl).unwrap_or_default()
