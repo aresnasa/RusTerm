@@ -9176,6 +9176,96 @@ fn build_ssh_auth(form: &NewConnectionForm) -> SshAuth {
     }
 }
 
+/// Build the SSH-specific `SshConfig` from a form. Shared between `on_create`
+/// (new connection) and `rebuild_connection` (edit). Factored out so both
+/// paths construct identical configs from the same form fields.
+fn build_ssh_config_from_form(form: &NewConnectionForm) -> SshConfig {
+    let port: u16 = form.port.parse().unwrap_or(22);
+    let auth = build_ssh_auth(form);
+    let terminal_type = if form.terminal_type.is_empty() {
+        "xterm-256color".to_string()
+    } else {
+        form.terminal_type.clone()
+    };
+    SshConfig {
+        host: form.host.clone(),
+        port,
+        username: form.username.clone(),
+        auth,
+        terminal_type,
+        proxy: build_proxy_config(form),
+        proxy_jump: None,
+        keepalive_interval: None,
+        host_key_policy: rusterm_core::config::default_host_key_policy(),
+    }
+}
+
+/// Build a `TelnetConfig` from a form, applying the telnet default port (23)
+/// when the user hasn't typed one.
+fn build_telnet_config_from_form(form: &NewConnectionForm) -> TelnetConfig {
+    let port: u16 = form.port.parse().unwrap_or(23);
+    TelnetConfig {
+        host: form.host.clone(),
+        port,
+    }
+}
+
+/// Build a `SerialConfig` from a form. Falls back to conventional line
+/// settings when a field is empty or unparseable so the connection is
+/// always usable.
+fn build_serial_config_from_form(form: &NewConnectionForm) -> SerialConfig {
+    SerialConfig {
+        port: form.serial_port.clone(),
+        baud_rate: form.baud_rate.parse().unwrap_or(115200),
+        data_bits: form.data_bits.parse().unwrap_or(8),
+        parity: if form.parity.is_empty() {
+            "none".to_string()
+        } else {
+            form.parity.clone()
+        },
+        stop_bits: form.stop_bits.parse().unwrap_or(1),
+        flow_control: if form.flow_control.is_empty() {
+            "none".to_string()
+        } else {
+            form.flow_control.clone()
+        },
+    }
+}
+
+/// Build the appropriate `ConnectionKind` for the form's active protocol
+/// tab. Returns `(kind, session_type, hostname_for_tab)` so callers can
+/// populate `SessionTab.hostname` uniformly without re-matching on the
+/// kind.
+fn build_connection_from_form(
+    form: &NewConnectionForm,
+) -> (ConnectionKind, SessionType, Option<String>) {
+    match form.protocol.as_str() {
+        "telnet" => {
+            let telnet = build_telnet_config_from_form(form);
+            let hostname = format!("{}:{}", telnet.host, telnet.port);
+            (
+                ConnectionKind::Telnet(telnet),
+                SessionType::Telnet,
+                Some(hostname),
+            )
+        }
+        "serial" => {
+            let serial = build_serial_config_from_form(form);
+            let hostname = Some(serial.port.clone());
+            (
+                ConnectionKind::Serial(serial),
+                SessionType::Serial,
+                hostname,
+            )
+        }
+        _ => {
+            let ssh = build_ssh_config_from_form(form);
+            let hostname = Some(ssh.host.clone());
+            (ConnectionKind::Ssh(ssh), SessionType::Ssh, hostname)
+        }
+    }
+}
+
 /// Convert the proxy fields into a per-connection proxy configuration.
 /// Unknown proxy types mean direct connection; known types use their conventional
 /// port when the form leaves the port empty or contains an invalid value.
