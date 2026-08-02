@@ -25,3 +25,4 @@ async-trait.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["full"] }
+url = "2"
