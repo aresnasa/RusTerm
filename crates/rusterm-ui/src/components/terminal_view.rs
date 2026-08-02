@@ -1896,7 +1896,11 @@ pub fn TerminalView(
         let mods = e.modifiers();
         let shift = mods.shift();
 
-        if down_reporting && !shift {
+        if app_owns_mouse(
+            render_output.mode_mouse_reporting,
+            render_output.scrollback_offset,
+            shift,
+        ) {
             // App owns the mouse (vim `set mouse=a`, htop, tmux): forward a
             // press report and arm release tracking. Motion (1002) is only
             // reported for the primary button, but EVERY pressed button must
@@ -2000,8 +2004,10 @@ pub fn TerminalView(
                     up_sgr,
                 ));
                 last_motion_cell.set(None);
+                return;
             }
-            return;
+            // No app-owned press was armed: this was Shift-forced local
+            // selection, so continue into the local mouseup path below.
         }
 
         if !selecting() {
@@ -2032,10 +2038,9 @@ pub fn TerminalView(
     // both the app and the terminal try to own the click. Shift forces local
     // word selection even under app reporting (same override as single-click
     // drag selection).
-    let dbl_reporting = down_reporting;
-    let dbl_sgr = render_output.mode_mouse_sgr;
+    let dbl_reporting = render_output.mode_mouse_reporting;
+    let dbl_scrollback_offset = render_output.scrollback_offset;
     let dbl_rows = render_output.rows.clone();
-    let dbl_on_input = on_input;
     let on_double_click = move |e: MouseEvent| {
         if current_disconnected {
             return;
@@ -2043,23 +2048,10 @@ pub fn TerminalView(
         let mods = e.modifiers();
         let shift = mods.shift();
 
-        if dbl_reporting && !shift {
-            // App owns the mouse: forward as a press report (xterm sends the
-            // second click of a double-click as another press). The app does
-            // its own word selection.
-            let Some((row, col)) = event_cell(&e) else {
-                return;
-            };
-            dbl_on_input.call(encode_mouse_report(
-                MouseReportKind::Press,
-                0,
-                col,
-                row,
-                shift,
-                mods.alt(),
-                mods.ctrl(),
-                dbl_sgr,
-            ));
+        if app_owns_mouse(dbl_reporting, dbl_scrollback_offset, shift) {
+            // Both ordinary mousedown events have already been forwarded to the
+            // application. The synthetic `dblclick` notification must not emit
+            // a third press report; it only suppresses local word selection.
             return;
         }
 
