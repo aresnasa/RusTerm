@@ -36,8 +36,9 @@ pub fn OneKeyPopup(
             style: "
                 position: absolute;
                 left: 0; right: 0;
-                top: var(--suggestion-top, 2em);
-                max-height: calc(100% - var(--suggestion-top, 2em));
+                top: var(--suggestion-popup-top, var(--suggestion-top, 2em));
+                bottom: var(--suggestion-popup-bottom, auto);
+                max-height: var(--suggestion-popup-max-height, calc(100% - var(--suggestion-top, 2em)));
                 overflow-y: auto;
                 background: #16161e;
                 border: 1px solid #2a2b3d;

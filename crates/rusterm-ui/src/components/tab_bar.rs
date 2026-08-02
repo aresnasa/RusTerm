@@ -289,6 +289,7 @@ mod tests {
             version: 0,
             suggestion: None,
             suggestions: Vec::new(),
+            suggestion_corrections: std::collections::HashSet::new(),
             suggestion_selected: 0,
             suggestion_visible: false,
             command_history: Vec::new(),

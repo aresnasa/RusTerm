@@ -110,50 +110,6 @@ impl SshClient {
         Self { config, event_tx }
     }
 
-    /// Drive a keyboard-interactive auth exchange to completion using `password`
-    /// as the answer to every prompt. This is the standard "PAM password via
-    /// keyboard-interactive" pattern: the server sends one prompt (e.g.
-    /// "Password: ") and we reply with the password. Loops because some servers
-    /// send multiple (empty) prompts before the real one.
-    async fn auth_keyboard_interactive(
-        handle: &mut client::Handle<Handler>,
-        username: &str,
-        password: &str,
-    ) -> anyhow::Result<client::AuthResult> {
-        use client::KeyboardInteractiveAuthResponse;
-        let mut response = handle
-            .authenticate_keyboard_interactive_start(username, None::<String>)
-            .await?;
-        loop {
-            match response {
-                KeyboardInteractiveAuthResponse::Success => {
-                    return Ok(client::AuthResult::Success);
-                }
-                KeyboardInteractiveAuthResponse::Failure { .. } => {
-                    // AuthResult::Failure carries (remaining_methods, partial_success);
-                    // synthesize one so the caller's `matches!(.., Success)` check
-                    // fails the same way as a plain password-auth failure.
-                    return Ok(client::AuthResult::Failure {
-                        remaining_methods: russh::MethodSet::empty(),
-                        partial_success: false,
-                    });
-                }
-                KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => {
-                    // Reply with the password for every prompt the server sends.
-                    // Most PAM keyboard-interactive flows use a single "Password:"
-                    // prompt, but some servers (e.g. Google's) send a second OTP
-                    // prompt we cannot answer — sending the password there is
-                    // harmless and lets the server reject it explicitly.
-                    let answers: Vec<String> =
-                        prompts.iter().map(|_p| password.to_string()).collect();
-                    response = handle
-                        .authenticate_keyboard_interactive_respond(answers)
-                        .await?;
-                }
-            }
-        }
-    }
-
     pub async fn connect(
         &self,
         session_id: SessionId,
@@ -161,109 +117,7 @@ impl SshClient {
     ) -> anyhow::Result<(Session, SshSession)> {
         let config = Arc::new(client::Config::default());
 
-        // Derive the host-key verification policy from the user's config.
-        // Unknown / empty values fall back to AcceptNew (TOFU) inside
-        // `HostKeyPolicy::parse`.
-        let policy = HostKeyPolicy::parse(&self.config.host_key_policy);
-        let handler = Handler::new(self.config.host.clone(), policy);
-
-        let stream = connect_transport(
-            &self.config.host,
-            self.config.port,
-            self.config.proxy.as_ref(),
-        )
-        .await?;
-        let mut handle = client::connect_stream(config, stream, handler).await?;
-
-        match &self.config.auth {
-            SshAuth::Password { password } => {
-                let result = handle
-                    .authenticate_password(&self.config.username, password.as_str())
-                    .await?;
-                if !matches!(result, client::AuthResult::Success) {
-                    // Some servers (notably jump hosts / bastions and PAM-configured
-                    // Linux boxes) reject "password" auth but accept the same
-                    // credential via "keyboard-interactive". Try it as a fallback
-                    // before giving up — this is what OpenSSH's ssh client does too.
-                    tracing::info!(
-                        "[SSH] password auth returned {:?}, trying keyboard-interactive fallback for {}@{}",
-                        result,
-                        self.config.username,
-                        self.config.host
-                    );
-                    let ki_result = Self::auth_keyboard_interactive(
-                        &mut handle,
-                        &self.config.username,
-                        password,
-                    )
-                    .await?;
-                    if !matches!(ki_result, client::AuthResult::Success) {
-                        anyhow::bail!(
-                            "SSH authentication failed (tried password then keyboard-interactive)"
-                        );
-                    }
-                }
-            }
-            SshAuth::Key {
-                private_key_path,
-                passphrase,
-            } => {
-                let expanded_path = if private_key_path.starts_with("~/") {
-                    if let Some(home) = dirs::home_dir() {
-                        home.join(&private_key_path[2..])
-                            .to_string_lossy()
-                            .to_string()
-                    } else {
-                        private_key_path.clone()
-                    }
-                } else {
-                    private_key_path.clone()
-                };
-                let key_data = match std::fs::read_to_string(&expanded_path) {
-                    Ok(s) => s,
-                    Err(e) => {
-                        anyhow::bail!("Failed to read private key '{}': {}", expanded_path, e);
-                    }
-                };
-                let key = match russh::keys::ssh_key::PrivateKey::from_openssh(&key_data) {
-                    Ok(k) => k,
-                    Err(e) => {
-                        anyhow::bail!("Failed to parse private key '{}': {}", expanded_path, e);
-                    }
-                };
-                let key = if let Some(pass) = passphrase {
-                    match key.decrypt(pass.as_bytes()) {
-                        Ok(k) => k,
-                        Err(_) => {
-                            anyhow::bail!(
-                                "Failed to decrypt private key '{}' — wrong passphrase?",
-                                expanded_path
-                            );
-                        }
-                    }
-                } else {
-                    key
-                };
-
-                let best_rsa_hash = handle.best_supported_rsa_hash().await?;
-                let hash_alg = best_rsa_hash.flatten();
-
-                let key_with_alg = russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg);
-                let result = handle
-                    .authenticate_publickey(&self.config.username, key_with_alg)
-                    .await?;
-                if !matches!(result, client::AuthResult::Success) {
-                    anyhow::bail!(
-                        "SSH public-key authentication failed (result: {:?})",
-                        result
-                    );
-                }
-            }
-            SshAuth::Agent => {
-                anyhow::bail!("SSH agent auth not yet supported");
-            }
-        }
-
+        let handle = connect_authenticated(&self.config, config).await?;
         let handle = Arc::new(handle);
 
         let channel = handle.channel_open_session().await?;
@@ -462,6 +316,183 @@ impl SshClient {
 }
 
 type Handle = client::Handle<Handler>;
+
+/// Default keepalive interval for non-interactive connections (tunnels,
+/// relays). Keeps NAT/firewall state alive and lets russh detect dead
+/// connections by dropping the connection after `keepalive_max`
+/// unanswered keepalives.
+pub const DEFAULT_KEEPALIVE_INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+pub const DEFAULT_KEEPALIVE_MAX: usize = 3;
+
+/// Build a `russh::client::Config` with application-layer keepalives
+/// configured. Used by both interactive sessions and background
+/// (tunnel/relay) connections.
+pub fn client_config(
+    keepalive_interval: Option<std::time::Duration>,
+    keepalive_max: usize,
+) -> client::Config {
+    let mut config = client::Config::default();
+    config.keepalive_interval = keepalive_interval;
+    config.keepalive_max = keepalive_max;
+    config
+}
+
+/// Establish transport + SSH handshake + user authentication, returning a
+/// ready-to-use russh client handle. Shared by [`SshClient::connect`]
+/// (interactive PTY sessions) and background consumers (tunnels, REST
+/// relay) that only need exec/direct-tcpip channels.
+pub async fn connect_authenticated(
+    config: &SshConfig,
+    client_config: Arc<client::Config>,
+) -> anyhow::Result<client::Handle<Handler>> {
+    // Derive the host-key verification policy from the user's config.
+    // Unknown / empty values fall back to AcceptNew (TOFU) inside
+    // `HostKeyPolicy::parse`.
+    let policy = HostKeyPolicy::parse(&config.host_key_policy);
+    let handler = Handler::new(config.host.clone(), policy);
+
+    let stream = connect_transport(&config.host, config.port, config.proxy.as_ref()).await?;
+    let mut handle = client::connect_stream(client_config, stream, handler).await?;
+
+    authenticate(&mut handle, config).await?;
+    Ok(handle)
+}
+
+/// Authenticate a freshly-connected handle according to `config.auth`.
+/// Password auth falls back to keyboard-interactive (matches OpenSSH).
+async fn authenticate(
+    handle: &mut client::Handle<Handler>,
+    config: &SshConfig,
+) -> anyhow::Result<()> {
+    match &config.auth {
+        SshAuth::Password { password } => {
+            let result = handle
+                .authenticate_password(&config.username, password.as_str())
+                .await?;
+            if !matches!(result, client::AuthResult::Success) {
+                // Some servers (notably jump hosts / bastions and PAM-configured
+                // Linux boxes) reject "password" auth but accept the same
+                // credential via "keyboard-interactive". Try it as a fallback
+                // before giving up — this is what OpenSSH's ssh client does too.
+                tracing::info!(
+                    "[SSH] password auth returned {:?}, trying keyboard-interactive fallback for {}@{}",
+                    result,
+                    config.username,
+                    config.host
+                );
+                let ki_result =
+                    auth_keyboard_interactive(handle, &config.username, password).await?;
+                if !matches!(ki_result, client::AuthResult::Success) {
+                    anyhow::bail!(
+                        "SSH authentication failed (tried password then keyboard-interactive)"
+                    );
+                }
+            }
+        }
+        SshAuth::Key {
+            private_key_path,
+            passphrase,
+        } => {
+            let expanded_path = if private_key_path.starts_with("~/") {
+                if let Some(home) = dirs::home_dir() {
+                    home.join(&private_key_path[2..])
+                        .to_string_lossy()
+                        .to_string()
+                } else {
+                    private_key_path.clone()
+                }
+            } else {
+                private_key_path.clone()
+            };
+            let key_data = match std::fs::read_to_string(&expanded_path) {
+                Ok(s) => s,
+                Err(e) => {
+                    anyhow::bail!("Failed to read private key '{}': {}", expanded_path, e);
+                }
+            };
+            let key = match russh::keys::ssh_key::PrivateKey::from_openssh(&key_data) {
+                Ok(k) => k,
+                Err(e) => {
+                    anyhow::bail!("Failed to parse private key '{}': {}", expanded_path, e);
+                }
+            };
+            let key = if let Some(pass) = passphrase {
+                match key.decrypt(pass.as_bytes()) {
+                    Ok(k) => k,
+                    Err(_) => {
+                        anyhow::bail!(
+                            "Failed to decrypt private key '{}' — wrong passphrase?",
+                            expanded_path
+                        );
+                    }
+                }
+            } else {
+                key
+            };
+
+            let best_rsa_hash = handle.best_supported_rsa_hash().await?;
+            let hash_alg = best_rsa_hash.flatten();
+
+            let key_with_alg = russh::keys::PrivateKeyWithHashAlg::new(Arc::new(key), hash_alg);
+            let result = handle
+                .authenticate_publickey(&config.username, key_with_alg)
+                .await?;
+            if !matches!(result, client::AuthResult::Success) {
+                anyhow::bail!(
+                    "SSH public-key authentication failed (result: {:?})",
+                    result
+                );
+            }
+        }
+        SshAuth::Agent => {
+            anyhow::bail!("SSH agent auth not yet supported");
+        }
+    }
+    Ok(())
+}
+
+/// Drive a keyboard-interactive auth exchange to completion using `password`
+/// as the answer to every prompt. This is the standard "PAM password via
+/// keyboard-interactive" pattern: the server sends one prompt (e.g.
+/// "Password: ") and we reply with the password. Loops because some servers
+/// send multiple (empty) prompts before the real one.
+async fn auth_keyboard_interactive(
+    handle: &mut client::Handle<Handler>,
+    username: &str,
+    password: &str,
+) -> anyhow::Result<client::AuthResult> {
+    use client::KeyboardInteractiveAuthResponse;
+    let mut response = handle
+        .authenticate_keyboard_interactive_start(username, None::<String>)
+        .await?;
+    loop {
+        match response {
+            KeyboardInteractiveAuthResponse::Success => {
+                return Ok(client::AuthResult::Success);
+            }
+            KeyboardInteractiveAuthResponse::Failure { .. } => {
+                // AuthResult::Failure carries (remaining_methods, partial_success);
+                // synthesize one so the caller's `matches!(.., Success)` check
+                // fails the same way as a plain password-auth failure.
+                return Ok(client::AuthResult::Failure {
+                    remaining_methods: russh::MethodSet::empty(),
+                    partial_success: false,
+                });
+            }
+            KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => {
+                // Reply with the password for every prompt the server sends.
+                // Most PAM keyboard-interactive flows use a single "Password:"
+                // prompt, but some servers (e.g. Google's) send a second OTP
+                // prompt we cannot answer — sending the password there is
+                // harmless and lets the server reject it explicitly.
+                let answers: Vec<String> = prompts.iter().map(|_p| password.to_string()).collect();
+                response = handle
+                    .authenticate_keyboard_interactive_respond(answers)
+                    .await?;
+            }
+        }
+    }
+}
 
 #[derive(Debug, PartialEq, Eq)]
 enum SubsystemReplyAction {

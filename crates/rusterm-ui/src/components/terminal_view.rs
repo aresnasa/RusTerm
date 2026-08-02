@@ -852,6 +852,38 @@ fn row_to_html(
 
 // ── TerminalView component ─────────────────────────────────────────
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PopupDirection {
+    Above,
+    Below,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PopupLayout {
+    direction: PopupDirection,
+    max_height_px: u32,
+}
+
+/// Choose the cursor side that can fit the popup, falling back to the larger
+/// side and constraining the popup so its own scroll area handles overflow.
+fn popup_layout(space_above: f64, space_below: f64, desired_height: f64) -> PopupLayout {
+    let space_above = space_above.max(0.0);
+    let space_below = space_below.max(0.0);
+    let direction = if space_below >= desired_height || space_below >= space_above {
+        PopupDirection::Below
+    } else {
+        PopupDirection::Above
+    };
+    let available = match direction {
+        PopupDirection::Above => space_above,
+        PopupDirection::Below => space_below,
+    };
+    PopupLayout {
+        direction,
+        max_height_px: available.floor().max(1.0) as u32,
+    }
+}
+
 #[component]
 pub fn TerminalView(
     session_id: String,
@@ -859,6 +891,7 @@ pub fn TerminalView(
     version: u64,
     suggestion: Option<String>,
     suggestions: Vec<String>,
+    #[props(default)] suggestion_corrections: Vec<String>,
     suggestion_selected: usize,
     suggestion_visible: bool,
     #[props(default)] keybindings: Keybindings,
@@ -929,6 +962,7 @@ pub fn TerminalView(
 
     let current_suggestion = suggestion.clone();
     let current_suggestions = suggestions.clone();
+    let current_suggestion_corrections = suggestion_corrections.clone();
     let current_suggestion_visible = suggestion_visible;
     let current_suggestion_selected = suggestion_selected;
 
@@ -951,6 +985,7 @@ pub fn TerminalView(
     let current_disconnected = disconnected;
 
     let closure_suggestions = current_suggestions.clone();
+    let closure_suggestion_corrections = current_suggestion_corrections.clone();
     let sid_for_keydown_log = session_id.clone();
     let sid_for_copy = session_id.clone();
     let copy_rows = render_output.rows.clone();
@@ -1208,7 +1243,9 @@ pub fn TerminalView(
                 // "delete suggestion" / "remove autocomplete entry". Plain
                 // Delete is reserved for shell-side forward-delete.
                 Key::Delete if shift => {
-                    if let Some(cmd) = closure_suggestions.get(current_suggestion_selected) {
+                    if let Some(cmd) = closure_suggestions.get(current_suggestion_selected)
+                        && !closure_suggestion_corrections.contains(cmd)
+                    {
                         on_suggestion_delete.call(cmd.clone());
                     }
                     return;
@@ -1403,7 +1440,7 @@ pub fn TerminalView(
                 // output. Reading both children's bounding rects explicitly
                 // avoids that race.
                 let result = dioxus::document::eval(&format!(
-                    "return (function() {{ const el = document.getElementById('{measure_cid}'); if (!el) return 'no-el'; const rect = el.getBoundingClientRect(); if (rect.width <= 0 || rect.height <= 0) return 'zero'; const cs = getComputedStyle(el); const padH = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight); const padV = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom); const bw = parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth); const bh = parseFloat(cs.borderTopWidth) + parseFloat(cs.borderBottomWidth); const h = rect.height - padV - bh; if (h <= 0) return 'small'; const sd = document.getElementById('{scroll_cid}'); if (!sd) return 'no-scroll'; const sdRect = sd.getBoundingClientRect(); if (sdRect.width <= 0) return 'small'; let w = sdRect.width; if (sd.firstElementChild) {{ const gutterW = sd.firstElementChild.getBoundingClientRect().width; w = Math.max(0, sdRect.width - gutterW); }} if (w <= 0) return 'small'; const test = document.createElement('span'); test.textContent = 'M'; test.style.cssText = 'font-family:JetBrains Mono,Fira Code,Cascadia Code,monospace;font-size:13px;line-height:1.5;position:absolute;visibility:hidden;white-space:pre;'; document.body.appendChild(test); const tr = test.getBoundingClientRect(); document.body.removeChild(test); const cw = Math.max(1, tr.width); const ch = Math.max(1, tr.height); const cols = Math.max(1, Math.floor(w / cw)); const rows = Math.max(1, Math.floor(h / ch)); const cr_sug = el.querySelector('[data-cursor-row=\"1\"]'); if (cr_sug) {{ const tr_sug = el.getBoundingClientRect(); const cr_r_sug = cr_sug.getBoundingClientRect(); el.style.setProperty('--suggestion-bottom', (tr_sug.bottom - cr_r_sug.top) + 'px'); el.style.setProperty('--suggestion-top', (cr_r_sug.bottom - tr_sug.top) + 'px'); }} return cols + ',' + rows + ',' + cw.toFixed(2) + ',' + ch.toFixed(2); }})()"
+                    "return (function() {{ const el = document.getElementById('{measure_cid}'); if (!el) return 'no-el'; const rect = el.getBoundingClientRect(); if (rect.width <= 0 || rect.height <= 0) return 'zero'; const cs = getComputedStyle(el); const padH = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight); const padV = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom); const bw = parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth); const bh = parseFloat(cs.borderTopWidth) + parseFloat(cs.borderBottomWidth); const h = rect.height - padV - bh; if (h <= 0) return 'small'; const sd = document.getElementById('{scroll_cid}'); if (!sd) return 'no-scroll'; const sdRect = sd.getBoundingClientRect(); if (sdRect.width <= 0) return 'small'; let w = sdRect.width; if (sd.firstElementChild) {{ const gutterW = sd.firstElementChild.getBoundingClientRect().width; w = Math.max(0, sdRect.width - gutterW); }} if (w <= 0) return 'small'; const test = document.createElement('span'); test.textContent = 'M'; test.style.cssText = 'font-family:JetBrains Mono,Fira Code,Cascadia Code,monospace;font-size:13px;line-height:1.5;position:absolute;visibility:hidden;white-space:pre;'; document.body.appendChild(test); const tr = test.getBoundingClientRect(); document.body.removeChild(test); const cw = Math.max(1, tr.width); const ch = Math.max(1, tr.height); const cols = Math.max(1, Math.floor(w / cw)); const rows = Math.max(1, Math.floor(h / ch)); let popupAbove = -1; let popupBelow = -1; let popupDesired = -1; const cr_sug = el.querySelector('[data-cursor-row=\"1\"]'); if (cr_sug) {{ const tr_sug = el.getBoundingClientRect(); const cr_r_sug = cr_sug.getBoundingClientRect(); el.style.setProperty('--suggestion-bottom', (tr_sug.bottom - cr_r_sug.top) + 'px'); el.style.setProperty('--suggestion-top', (cr_r_sug.bottom - tr_sug.top) + 'px'); const popup = el.querySelector('[data-rusterm-terminal-popup=\"true\"]'); if (popup) {{ popupAbove = Math.max(0, cr_r_sug.top - tr_sug.top); popupBelow = Math.max(0, tr_sug.bottom - cr_r_sug.bottom); popupDesired = Math.max(1, popup.scrollHeight); }} }} return cols + ',' + rows + ',' + cw.toFixed(2) + ',' + ch.toFixed(2) + ',' + popupAbove.toFixed(2) + ',' + popupBelow.toFixed(2) + ',' + popupDesired.toFixed(2); }})()"
                 )).await;
                 if let Ok(value) = result {
                     if let Some(s) = value.as_str() {
@@ -1430,6 +1467,30 @@ pub fn TerminalView(
                                     let pw = (char_w * cols as f64).round() as u32;
                                     let ph = (char_h * rows as f64).round() as u32;
                                     on_resize_cb.call((cols, rows, pw, ph));
+                                }
+                                if let (Some(space_above), Some(space_below), Some(desired)) = (
+                                    parts.get(4).and_then(|value| value.parse::<f64>().ok()),
+                                    parts.get(5).and_then(|value| value.parse::<f64>().ok()),
+                                    parts.get(6).and_then(|value| value.parse::<f64>().ok()),
+                                ) && space_above >= 0.0
+                                    && space_below >= 0.0
+                                    && desired >= 0.0
+                                {
+                                    let layout = popup_layout(space_above, space_below, desired);
+                                    let (top, bottom) = match layout.direction {
+                                        PopupDirection::Above => {
+                                            ("auto", "var(--suggestion-bottom, 2em)")
+                                        }
+                                        PopupDirection::Below => {
+                                            ("var(--suggestion-top, 2em)", "auto")
+                                        }
+                                    };
+                                    let popup_cid = cid.clone();
+                                    let _ = dioxus::document::eval(&format!(
+                                        "(function() {{ const el = document.getElementById('{popup_cid}'); if (!el) return; el.style.setProperty('--suggestion-popup-top', '{top}'); el.style.setProperty('--suggestion-popup-bottom', '{bottom}'); el.style.setProperty('--suggestion-popup-max-height', '{}px'); }})()",
+                                        layout.max_height_px
+                                    ))
+                                    .await;
                                 }
                             }
                         }
@@ -2203,6 +2264,7 @@ pub fn TerminalView(
                     on_delete: move |cmd: String| {
                         on_suggestion_delete.call(cmd);
                     },
+                    correction_suggestions: current_suggestion_corrections.clone(),
                     max_rows: suggestion_max_rows,
                 }
             }
@@ -2245,14 +2307,39 @@ pub fn TerminalView(
 #[cfg(test)]
 mod tests {
     use super::{
-        ClipboardCopyOutcome, CopyShortcut, OneKeyKeyAction, TerminalOverlayKeyAction,
-        TextSelection, accepts_inline_suggestion, cell_style, color_to_css, copy_text_to_clipboard,
-        cursor_key_seq, event_cell_from_coords, onekey_popup_key_action, scroll_thumb_geometry,
-        terminal_key_bytes, terminal_overlay_key_action, terminal_selection_text,
-        word_range_in_row,
+        ClipboardCopyOutcome, CopyShortcut, OneKeyKeyAction, PopupDirection,
+        TerminalOverlayKeyAction, TextSelection, accepts_inline_suggestion, cell_style,
+        color_to_css, copy_text_to_clipboard, cursor_key_seq, event_cell_from_coords,
+        onekey_popup_key_action, popup_layout, scroll_thumb_geometry, terminal_key_bytes,
+        terminal_overlay_key_action, terminal_selection_text, word_range_in_row,
     };
     use dioxus::prelude::{Code, Key};
     use rusterm_core::terminal::{CellColor, RenderCell, RenderRow};
+
+    #[test]
+    fn popup_uses_space_below_when_it_fits() {
+        let layout = popup_layout(40.0, 160.0, 120.0);
+        assert_eq!(layout.direction, PopupDirection::Below);
+        assert_eq!(layout.max_height_px, 160);
+    }
+
+    #[test]
+    fn popup_flips_above_when_bottom_dock_reduces_space() {
+        let layout = popup_layout(180.0, 45.0, 120.0);
+        assert_eq!(layout.direction, PopupDirection::Above);
+        assert_eq!(layout.max_height_px, 180);
+    }
+
+    #[test]
+    fn popup_uses_larger_side_and_scrolls_when_neither_side_fits() {
+        let layout = popup_layout(70.0, 50.0, 140.0);
+        assert_eq!(layout.direction, PopupDirection::Above);
+        assert_eq!(layout.max_height_px, 70);
+
+        let resized = popup_layout(35.0, 90.0, 140.0);
+        assert_eq!(resized.direction, PopupDirection::Below);
+        assert_eq!(resized.max_height_px, 90);
+    }
 
     #[test]
     fn event_cell_maps_client_coords_to_grid() {

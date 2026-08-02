@@ -230,6 +230,10 @@ pub struct AppState {
     /// a typo the user just saw fail.
     #[serde(skip)]
     pub recent_failed_commands: HashSet<String>,
+    /// Most recent failed command per session. A later successful command in
+    /// the same session may confirm a local typo correction pair.
+    #[serde(skip)]
+    pub last_failed_command_by_session: HashMap<String, (String, std::time::Instant)>,
     /// OneKey library (ZOC-style Expect/Send), decrypted in memory after unlock.
     #[serde(skip)]
     pub onekeys: Vec<OneKey>,
@@ -539,6 +543,11 @@ pub struct SessionTab {
     /// Multiple suggestion candidates for the dropdown
     #[serde(skip)]
     pub suggestions: Vec<String>,
+    /// Commands in `suggestions` that are typo corrections rather than
+    /// ordinary history completions. Selecting one replaces the input line
+    /// without executing it; correction rows cannot be deleted as history.
+    #[serde(skip)]
+    pub suggestion_corrections: HashSet<String>,
     /// Dropdown selected index
     #[serde(skip)]
     pub suggestion_selected: usize,
@@ -599,6 +608,7 @@ impl Default for AppState {
             pending_exit_check: HashMap::new(),
             terminal_command_lines: HashMap::new(),
             recent_failed_commands: HashSet::new(),
+            last_failed_command_by_session: HashMap::new(),
             onekeys: Vec::new(),
             onekey_popups: HashMap::new(),
             onekey_submission_feedback: HashMap::new(),
@@ -2911,6 +2921,7 @@ mod tests {
                 version: 0,
                 suggestion: None,
                 suggestions: Vec::new(),
+                suggestion_corrections: HashSet::new(),
                 suggestion_selected: 0,
                 suggestion_visible: false,
                 command_history: Vec::new(),
@@ -4564,6 +4575,7 @@ mod tests {
             version: 0,
             suggestion: None,
             suggestions: Vec::new(),
+            suggestion_corrections: HashSet::new(),
             suggestion_selected: 0,
             suggestion_visible: false,
             command_history: Vec::new(),
@@ -5012,6 +5024,7 @@ mod tests {
             version: 0,
             suggestion: None,
             suggestions: Vec::new(),
+            suggestion_corrections: HashSet::new(),
             suggestion_selected: 0,
             suggestion_visible: false,
             command_history: Vec::new(),
@@ -5026,6 +5039,7 @@ mod tests {
             version: 0,
             suggestion: None,
             suggestions: Vec::new(),
+            suggestion_corrections: HashSet::new(),
             suggestion_selected: 0,
             suggestion_visible: false,
             command_history: Vec::new(),
@@ -5607,6 +5621,7 @@ mod tests {
             version: 0,
             suggestion: None,
             suggestions: Vec::new(),
+            suggestion_corrections: HashSet::new(),
             suggestion_selected: 0,
             suggestion_visible: false,
             command_history: Vec::new(),
@@ -5651,6 +5666,7 @@ mod tests {
             version: 0,
             suggestion: None,
             suggestions: Vec::new(),
+            suggestion_corrections: HashSet::new(),
             suggestion_selected: 0,
             suggestion_visible: false,
             command_history: Vec::new(),

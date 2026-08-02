@@ -1,0 +1,23 @@
+[package]
+name = "rusterm-tunnel"
+description = "SSH tunnel proxy supervisor: local forward + SOCKS5 with health checks and auto-reconnect"
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+rusterm-core.workspace = true
+rusterm-ssh.workspace = true
+
+tokio = { workspace = true, features = ["full"] }
+serde = { workspace = true, features = ["derive"] }
+serde_json.workspace = true
+chrono.workspace = true
+uuid.workspace = true
+tracing.workspace = true
+anyhow.workspace = true
+thiserror.workspace = true
+parking_lot.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }

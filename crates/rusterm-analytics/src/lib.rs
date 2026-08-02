@@ -92,6 +92,16 @@ pub struct PrefixSuccessRate {
     pub success_rate: f32,
 }
 
+/// A locally observed failed-command → successful-command correction pair.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandCorrection {
+    pub typo: String,
+    pub correction: String,
+    pub observations: u64,
+    /// UTC timestamp of the most recent observation (RFC3339).
+    pub last_seen: String,
+}
+
 /// Aggregated (hour_of_day, count) row from `usage_patterns_by_time_of_day()`.
 /// `hour` is in [0, 23] UTC.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -180,6 +190,16 @@ impl AnalyticsDB {
             );
             CREATE INDEX IF NOT EXISTS idx_commands_command ON commands(command);
             CREATE INDEX IF NOT EXISTS idx_commands_hostname ON commands(hostname);
+
+            CREATE TABLE IF NOT EXISTS command_corrections (
+                typo          VARCHAR NOT NULL,
+                correction    VARCHAR NOT NULL,
+                observations  BIGINT NOT NULL,
+                last_seen     VARCHAR NOT NULL,
+                PRIMARY KEY (typo, correction)
+            );
+            CREATE INDEX IF NOT EXISTS idx_command_corrections_typo
+                ON command_corrections(typo);
             ",
         )?;
         Ok(())
@@ -195,6 +215,52 @@ impl AnalyticsDB {
             duckdb::params![cmd.command, cmd.hostname, cmd.exit_code, cmd.created_at],
         )?;
         Ok(())
+    }
+
+    /// Increment a locally learned correction pair. Pairing is decided by the
+    /// UI, which has session boundaries and exit-code ordering; DuckDB only
+    /// persists aggregate observations.
+    pub fn record_command_correction(&self, typo: &str, correction: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        let last_seen = Utc::now().to_rfc3339();
+        let updated = conn.execute(
+            "UPDATE command_corrections
+             SET observations = observations + 1, last_seen = ?
+             WHERE typo = ? AND correction = ?",
+            duckdb::params![last_seen, typo, correction],
+        )?;
+        if updated == 0 {
+            conn.execute(
+                "INSERT INTO command_corrections
+                    (typo, correction, observations, last_seen)
+                 VALUES (?, ?, 1, ?)",
+                duckdb::params![typo, correction, last_seen],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Return learned corrections for an exact failed command, ranked by
+    /// repeated local observations and recency.
+    pub fn command_corrections_for(&self, typo: &str) -> Result<Vec<CommandCorrection>> {
+        let conn = self.conn.lock();
+        let mut statement = conn.prepare(
+            "SELECT typo, correction, observations, last_seen
+             FROM command_corrections
+             WHERE typo = ?
+             ORDER BY observations DESC, last_seen DESC, correction ASC",
+        )?;
+        let rows = statement
+            .query_map(duckdb::params![typo], |row| {
+                Ok(CommandCorrection {
+                    typo: row.get(0)?,
+                    correction: row.get(1)?,
+                    observations: row.get::<_, i64>(2)? as u64,
+                    last_seen: row.get(3)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
     }
 
     /// Total row count in the `commands` table. Used by tests and the
@@ -423,7 +489,7 @@ impl AnalyticsDB {
     /// analytics" UI action.
     pub fn clear(&self) -> Result<()> {
         let conn = self.conn.lock();
-        conn.execute("DELETE FROM commands", [])?;
+        conn.execute_batch("DELETE FROM commands; DELETE FROM command_corrections;")?;
         Ok(())
     }
 }
@@ -581,6 +647,23 @@ mod tests {
         assert!(summary.most_used_command.is_some());
     }
 
+    #[test]
+    fn correction_pairs_are_upserted_and_ranked_locally() {
+        let db = AnalyticsDB::open_in_memory().unwrap();
+        db.record_command_correction("dockre ps", "docker ps")
+            .unwrap();
+        db.record_command_correction("dockre ps", "docker ps")
+            .unwrap();
+        db.record_command_correction("dockre ps", "dockerd ps")
+            .unwrap();
+
+        let corrections = db.command_corrections_for("dockre ps").unwrap();
+        assert_eq!(corrections.len(), 2);
+        assert_eq!(corrections[0].correction, "docker ps");
+        assert_eq!(corrections[0].observations, 2);
+        assert_eq!(corrections[1].observations, 1);
+    }
+
     /// `clear` must wipe all rows. Used by tests and by a future "reset
     /// analytics" UI action.
     #[test]
@@ -589,7 +672,10 @@ mod tests {
         db.record_command(&cmd("ls", Some(0), "2026-07-18T10:00:00Z"))
             .unwrap();
         assert_eq!(db.total_commands().unwrap(), 1);
+        db.record_command_correction("gti status", "git status")
+            .unwrap();
         db.clear().unwrap();
         assert_eq!(db.total_commands().unwrap(), 0);
+        assert!(db.command_corrections_for("gti status").unwrap().is_empty());
     }
 }

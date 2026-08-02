@@ -1110,6 +1110,7 @@ fn render_terminal_pane(
                     version: tab.version,
                     suggestion: tab.suggestion.clone(),
                     suggestions: tab.suggestions.clone(),
+                    suggestion_corrections: tab.suggestion_corrections.iter().cloned().collect(),
                     suggestion_selected: tab.suggestion_selected,
                     suggestion_visible: tab.suggestion_visible,
                     keybindings,
@@ -1301,6 +1302,7 @@ fn render_terminal_pane(
                                     .map(|tab| {
                                         tab.suggestion = None;
                                         tab.suggestions = Vec::new();
+                                        tab.suggestion_corrections.clear();
                                         tab.suggestion_visible = false;
                                         tab.suggestion_selected = 0;
                                     });
@@ -1380,6 +1382,39 @@ fn render_terminal_pane(
                                 let mut all_suggestions: Vec<String> = Vec::new();
                                 let mut seen = std::collections::HashSet::new();
 
+                                // Typo corrections are local-only. The static
+                                // vocabulary works without DuckDB; learned rows
+                                // are exact failed-command matches ranked by
+                                // repeated observations.
+                                let analytics = state_for_cmd.read().analytics.clone();
+                                let learned = match analytics.command_corrections_for(&cmd_part) {
+                                    Ok(corrections) => corrections
+                                        .into_iter()
+                                        .map(|correction| {
+                                            (correction.correction, correction.observations)
+                                        })
+                                        .collect::<Vec<_>>(),
+                                    Err(error) => {
+                                        tracing::warn!(
+                                            "[CORRECTION] failed to query local corrections: {}",
+                                            error
+                                        );
+                                        Vec::new()
+                                    }
+                                };
+                                let correction_candidates =
+                                    crate::command_correction::suggest_corrections(
+                                        &cmd_part,
+                                        &learned,
+                                    );
+                                let mut correction_commands = std::collections::HashSet::new();
+                                for candidate in correction_candidates {
+                                    if seen.insert(candidate.command.to_lowercase()) {
+                                        correction_commands.insert(candidate.command.clone());
+                                        all_suggestions.push(candidate.command);
+                                    }
+                                }
+
                                 // TIMING WINDOW GUARD: snapshot the
                                 // recent-failed set BEFORE querying
                                 // either source. A command that just
@@ -1453,8 +1488,11 @@ fn render_terminal_pane(
                                     return;
                                 }
 
-                                // Truncate to the user's preferred count
+                                // Truncate to the user's preferred count and
+                                // discard correction metadata for hidden rows.
                                 all_suggestions.truncate(sug_count);
+                                correction_commands
+                                    .retain(|command| all_suggestions.contains(command));
 
                                 tracing::info!(
                                     "[SUGGESTION-QUERY] session={} cmd_part={:?} epoch={} current_epoch={} results={:?} recent_failed={:?}",
@@ -1472,13 +1510,16 @@ fn render_terminal_pane(
                                         .map(|tab| {
                                             tab.suggestion = None;
                                             tab.suggestions = Vec::new();
+                                            tab.suggestion_corrections.clear();
                                             tab.suggestion_visible = false;
                                             tab.suggestion_selected = 0;
                                         });
                                 } else {
                                     // First suggestion suffix is the inline ghost text
                                     let first = &all_suggestions[0];
-                                    let suffix = if first.len() > cmd_part.len() {
+                                    let suffix = if first.len() > cmd_part.len()
+                                        && first.starts_with(&cmd_part)
+                                    {
                                         first[cmd_part.len()..].to_string()
                                     } else {
                                         String::new()
@@ -1488,6 +1529,7 @@ fn render_terminal_pane(
                                         .map(|tab| {
                                             tab.suggestion = if suffix.is_empty() { None } else { Some(suffix) };
                                             tab.suggestions = all_suggestions;
+                                            tab.suggestion_corrections = correction_commands;
                                             tab.suggestion_visible = true;
                                             tab.suggestion_selected = 0;
                                         });
@@ -1537,24 +1579,35 @@ fn render_terminal_pane(
                         }
                     },
                     on_suggestion_accept: move |cmd: String| {
-                        // Accept: compute the suffix and send it
-                        let suffix = {
+                        let is_correction = state_for_cmd
+                            .read()
+                            .sessions
+                            .iter()
+                            .find(|tab| tab.id == sid_for_sug_accept)
+                            .is_some_and(|tab| tab.suggestion_corrections.contains(&cmd));
+                        // History suggestions append their suffix. Corrections
+                        // replace the current input using DEL bytes and insert
+                        // the corrected line without Enter, so the user still
+                        // reviews and explicitly executes it.
+                        let input = {
                             let terminals = state_for_cmd.read().terminals.clone();
                             if let Some(handle) = terminals.get(&sid_for_sug_accept) {
                                 let line = handle.lock().terminal.extract_current_line();
                                 let cmd_part = strip_prompt(line.trim());
-                                if cmd.starts_with(&cmd_part) && cmd_part.len() < cmd.len() {
-                                    cmd[cmd_part.len()..].to_string()
+                                if is_correction {
+                                    crate::command_correction::replacement_input(&cmd_part, &cmd)
+                                } else if cmd.starts_with(&cmd_part) && cmd_part.len() < cmd.len() {
+                                    cmd[cmd_part.len()..].as_bytes().to_vec()
                                 } else {
-                                    String::new()
+                                    Vec::new()
                                 }
                             } else {
-                                String::new()
+                                Vec::new()
                             }
                         };
-                        if !suffix.is_empty() {
+                        if !input.is_empty() {
                             if let Some(sender) = senders.read().get(&sid_for_sug_accept) {
-                                let _ = sender.send(suffix.as_bytes().to_vec());
+                                let _ = sender.send(input);
                             }
                         }
                         // Dismiss dropdown and clear suggestion
@@ -1564,6 +1617,7 @@ fn render_terminal_pane(
                                 tab.suggestion_visible = false;
                                 tab.suggestion = None;
                                 tab.suggestions = Vec::new();
+                                tab.suggestion_corrections.clear();
                                 tab.suggestion_selected = 0;
                             });
                     },
@@ -5451,6 +5505,7 @@ fn dismiss_terminal_popups_for_focus_change(state: &mut AppState, session_id: &s
         tab.suggestion_visible = false;
         tab.suggestion = None;
         tab.suggestions.clear();
+        tab.suggestion_corrections.clear();
         tab.suggestion_selected = 0;
     }
 
@@ -7652,150 +7707,164 @@ fn start_ssh_connection(
                                             .unwrap_or(0)
                                     );
                                 }
-                                let committed: Option<(String, String, Option<String>)> =
-                                    if let Some(rc) = exit_code {
-                                        let mut s = state.write();
-                                        let popped = s
-                                            .pending_exit_check
-                                            .get_mut(&id)
-                                            .and_then(|q| q.pop_front());
-                                        tracing::info!(
-                                            "[OUTPUT-SSH] rc={} popped={:?}",
-                                            rc,
-                                            popped.as_ref().map(|(c, _)| c.clone())
-                                        );
-                                        if rc == 0 {
-                                            // Successful: commit to history + DB (with
-                                            // exit_code=Some(0) so search_history's HAVING
-                                            // clause treats it as a known-good command).
-                                            if let Some((cmd, db_id)) = popped {
-                                                let hostname = s
-                                                    .sessions
-                                                    .iter()
-                                                    .find(|t| t.id == id)
-                                                    .and_then(|t| t.hostname.clone());
-                                                if let Some(tab) =
-                                                    s.sessions.iter_mut().find(|t| t.id == id)
-                                                {
-                                                    if tab.command_history.last() != Some(&cmd) {
-                                                        tab.command_history.push(cmd.clone());
-                                                    }
+                                let committed: Option<(
+                                    String,
+                                    String,
+                                    Option<String>,
+                                    Option<String>,
+                                )> = if let Some(rc) = exit_code {
+                                    let mut s = state.write();
+                                    let popped = s
+                                        .pending_exit_check
+                                        .get_mut(&id)
+                                        .and_then(|q| q.pop_front());
+                                    tracing::info!(
+                                        "[OUTPUT-SSH] rc={} popped={:?}",
+                                        rc,
+                                        popped.as_ref().map(|(c, _)| c.clone())
+                                    );
+                                    if rc == 0 {
+                                        // Successful: commit to history + DB (with
+                                        // exit_code=Some(0) so search_history's HAVING
+                                        // clause treats it as a known-good command).
+                                        if let Some((cmd, db_id)) = popped {
+                                            let learned_typo = s
+                                                    .last_failed_command_by_session
+                                                    .remove(&id)
+                                                    .and_then(|(failed, failed_at)| {
+                                                        (failed_at.elapsed() <= std::time::Duration::from_secs(120)
+                                                            && crate::command_correction::is_likely_correction(&failed, &cmd))
+                                                            .then_some(failed)
+                                                    });
+                                            let hostname = s
+                                                .sessions
+                                                .iter()
+                                                .find(|t| t.id == id)
+                                                .and_then(|t| t.hostname.clone());
+                                            if let Some(tab) =
+                                                s.sessions.iter_mut().find(|t| t.id == id)
+                                            {
+                                                if tab.command_history.last() != Some(&cmd) {
+                                                    tab.command_history.push(cmd.clone());
                                                 }
-                                                Some((cmd, db_id, hostname))
-                                            } else {
-                                                None
                                             }
+                                            Some((cmd, db_id, hostname, learned_typo))
                                         } else {
-                                            // Failed: mark the command as known-failed in
-                                            // the DB so it stops being suggested AND so
-                                            // that subsequent history imports skip it.
-                                            //
-                                            // Why `mark_command_failed` instead of
-                                            // `delete_history_by_command`: deletion
-                                            // would let the next history import (which
-                                            // reads `~/.bash_history`) re-introduce
-                                            // the failed command as `exit_code = NULL`,
-                                            // which the HAVING clause keeps ("unknown,
-                                            // assume success"). Marking it as failed
-                                            // leaves a durable non-zero exit_code row
-                                            // that the HAVING clause drops, and that
-                                            // `known_failed_commands` reports so
-                                            // imports can skip it. If the user later
-                                            // runs it successfully, deferred recording
-                                            // (rc==0 branch above) saves a success row
-                                            // and the HAVING clause re-enables it.
-                                            //
-                                            // TIMING WINDOW GUARD: `mark_command_failed`
-                                            // runs in a `spawn` below — between the
-                                            // `retain` (immediate) and the DB write
-                                            // (async), the DB still has the prior
-                                            // `exit_code = NULL` import row, which the
-                                            // HAVING clause keeps. To prevent the
-                                            // suggestion query from re-surfacing the
-                                            // just-failed command during that window,
-                                            // we ALSO insert the command into
-                                            // `recent_failed_commands` synchronously
-                                            // here. The suggestion query filters
-                                            // against this set; the spawn removes the
-                                            // entry once `mark_command_failed` commits
-                                            // (the DB HAVING then takes over).
-                                            if let Some((cmd, _db_id)) = popped {
-                                                if let Some(tab) =
-                                                    s.sessions.iter_mut().find(|t| t.id == id)
-                                                {
-                                                    tab.command_history.retain(|c| c != &cmd);
-                                                }
-                                                s.recent_failed_commands.insert(cmd.clone());
-                                                let cmd_for_mark = cmd.clone();
-                                                let rc_for_mark = rc;
-                                                let sid_log = id.clone();
-                                                // Drop the write lock BEFORE cloning `state`
-                                                // — `state.clone()` is an immutable borrow,
-                                                // which conflicts with the mutable borrow
-                                                // held by `s` (from `state.write()`).
-                                                drop(s);
-                                                let mut state_for_mark = state.clone();
-                                                spawn(async move {
-                                                    let db_path = dirs::data_dir()
-                                                        .unwrap_or_default()
-                                                        .join("rusterm")
-                                                        .join("rusterm.db");
-                                                    let mark_ok = if let Ok(db) =
-                                                        rusterm_db::Database::open(Some(db_path))
-                                                            .await
-                                                    {
-                                                        match db
-                                                            .mark_command_failed(
-                                                                &cmd_for_mark,
-                                                                rc_for_mark,
-                                                            )
-                                                            .await
-                                                        {
-                                                            Ok(()) => {
-                                                                tracing::info!(
-                                                                    "[SSH] marked command as \
-                                                                     failed in history DB: \
-                                                                     {:?} rc={} (session={})",
-                                                                    cmd_for_mark,
-                                                                    rc_for_mark,
-                                                                    &sid_log
-                                                                        [..sid_log.len().min(8)],
-                                                                );
-                                                                true
-                                                            }
-                                                            Err(e) => {
-                                                                tracing::warn!(
-                                                                    "Failed to mark command as \
-                                                                     failed in history DB: {}",
-                                                                    e
-                                                                );
-                                                                false
-                                                            }
-                                                        }
-                                                    } else {
-                                                        false
-                                                    };
-                                                    // Only unblock suggestions for this
-                                                    // command once the DB actually has the
-                                                    // failure marker. If the write failed,
-                                                    // leave it in the set for the rest of
-                                                    // the session — better to over-filter
-                                                    // (never suggest a known-failed command)
-                                                    // than to let a typo re-surface because
-                                                    // the DB still has a NULL import row.
-                                                    if mark_ok {
-                                                        state_for_mark
-                                                            .write()
-                                                            .recent_failed_commands
-                                                            .remove(&cmd_for_mark);
-                                                    }
-                                                });
-                                            }
                                             None
                                         }
                                     } else {
+                                        // Failed: mark the command as known-failed in
+                                        // the DB so it stops being suggested AND so
+                                        // that subsequent history imports skip it.
+                                        //
+                                        // Why `mark_command_failed` instead of
+                                        // `delete_history_by_command`: deletion
+                                        // would let the next history import (which
+                                        // reads `~/.bash_history`) re-introduce
+                                        // the failed command as `exit_code = NULL`,
+                                        // which the HAVING clause keeps ("unknown,
+                                        // assume success"). Marking it as failed
+                                        // leaves a durable non-zero exit_code row
+                                        // that the HAVING clause drops, and that
+                                        // `known_failed_commands` reports so
+                                        // imports can skip it. If the user later
+                                        // runs it successfully, deferred recording
+                                        // (rc==0 branch above) saves a success row
+                                        // and the HAVING clause re-enables it.
+                                        //
+                                        // TIMING WINDOW GUARD: `mark_command_failed`
+                                        // runs in a `spawn` below — between the
+                                        // `retain` (immediate) and the DB write
+                                        // (async), the DB still has the prior
+                                        // `exit_code = NULL` import row, which the
+                                        // HAVING clause keeps. To prevent the
+                                        // suggestion query from re-surfacing the
+                                        // just-failed command during that window,
+                                        // we ALSO insert the command into
+                                        // `recent_failed_commands` synchronously
+                                        // here. The suggestion query filters
+                                        // against this set; the spawn removes the
+                                        // entry once `mark_command_failed` commits
+                                        // (the DB HAVING then takes over).
+                                        if let Some((cmd, _db_id)) = popped {
+                                            s.last_failed_command_by_session.insert(
+                                                id.clone(),
+                                                (cmd.clone(), std::time::Instant::now()),
+                                            );
+                                            if let Some(tab) =
+                                                s.sessions.iter_mut().find(|t| t.id == id)
+                                            {
+                                                tab.command_history.retain(|c| c != &cmd);
+                                            }
+                                            s.recent_failed_commands.insert(cmd.clone());
+                                            let cmd_for_mark = cmd.clone();
+                                            let rc_for_mark = rc;
+                                            let sid_log = id.clone();
+                                            // Drop the write lock BEFORE cloning `state`
+                                            // — `state.clone()` is an immutable borrow,
+                                            // which conflicts with the mutable borrow
+                                            // held by `s` (from `state.write()`).
+                                            drop(s);
+                                            let mut state_for_mark = state.clone();
+                                            spawn(async move {
+                                                let db_path = dirs::data_dir()
+                                                    .unwrap_or_default()
+                                                    .join("rusterm")
+                                                    .join("rusterm.db");
+                                                let mark_ok = if let Ok(db) =
+                                                    rusterm_db::Database::open(Some(db_path)).await
+                                                {
+                                                    match db
+                                                        .mark_command_failed(
+                                                            &cmd_for_mark,
+                                                            rc_for_mark,
+                                                        )
+                                                        .await
+                                                    {
+                                                        Ok(()) => {
+                                                            tracing::info!(
+                                                                "[SSH] marked command as \
+                                                                     failed in history DB: \
+                                                                     {:?} rc={} (session={})",
+                                                                cmd_for_mark,
+                                                                rc_for_mark,
+                                                                &sid_log[..sid_log.len().min(8)],
+                                                            );
+                                                            true
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::warn!(
+                                                                "Failed to mark command as \
+                                                                     failed in history DB: {}",
+                                                                e
+                                                            );
+                                                            false
+                                                        }
+                                                    }
+                                                } else {
+                                                    false
+                                                };
+                                                // Only unblock suggestions for this
+                                                // command once the DB actually has the
+                                                // failure marker. If the write failed,
+                                                // leave it in the set for the rest of
+                                                // the session — better to over-filter
+                                                // (never suggest a known-failed command)
+                                                // than to let a typo re-surface because
+                                                // the DB still has a NULL import row.
+                                                if mark_ok {
+                                                    state_for_mark
+                                                        .write()
+                                                        .recent_failed_commands
+                                                        .remove(&cmd_for_mark);
+                                                }
+                                            });
+                                        }
                                         None
-                                    };
+                                    }
+                                } else {
+                                    None
+                                };
                                 {
                                     let mut s = state.write();
                                     if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
@@ -7813,7 +7882,7 @@ fn start_ssh_connection(
                                         }
                                     }
                                 }
-                                if let Some((cmd, db_id, hostname)) = committed {
+                                if let Some((cmd, db_id, hostname, learned_typo)) = committed {
                                     let sid = id.clone();
                                     // Clone for the analytics record (the original `cmd` is
                                     // moved into the DB entry below). When the `analytics`
@@ -7821,6 +7890,22 @@ fn start_ssh_connection(
                                     // cfg-gated out entirely.
                                     let _analytics_cmd = cmd.clone();
                                     let _analytics_host = hostname.clone();
+                                    if let Some(typo) = learned_typo {
+                                        let analytics_handle = state.read().analytics.clone();
+                                        let correction = cmd.clone();
+                                        spawn(async move {
+                                            if let Err(error) = analytics_handle
+                                                .record_command_correction(&typo, &correction)
+                                            {
+                                                tracing::warn!(
+                                                    "[CORRECTION] failed to record {:?} -> {:?}: {}",
+                                                    typo,
+                                                    correction,
+                                                    error
+                                                );
+                                            }
+                                        });
+                                    }
                                     let analytics_created = chrono::Utc::now().to_rfc3339();
                                     let analytics_created_for_db = analytics_created.clone();
                                     spawn(async move {
@@ -8153,120 +8238,134 @@ fn start_shell_connection(
                                             .unwrap_or(0)
                                     );
                                 }
-                                let committed: Option<(String, String, Option<String>)> =
-                                    if let Some(rc) = exit_code {
-                                        let mut s = state.write();
-                                        let popped = s
-                                            .pending_exit_check
-                                            .get_mut(&id)
-                                            .and_then(|q| q.pop_front());
-                                        tracing::info!(
-                                            "[OUTPUT-LOCAL] rc={} popped={:?}",
-                                            rc,
-                                            popped.as_ref().map(|(c, _)| c.clone())
-                                        );
-                                        if rc == 0 {
-                                            // Successful: commit to history + DB (with
-                                            // exit_code=Some(0) so search_history's HAVING
-                                            // clause treats it as a known-good command).
-                                            if let Some((cmd, db_id)) = popped {
-                                                let hostname = s
-                                                    .sessions
-                                                    .iter()
-                                                    .find(|t| t.id == id)
-                                                    .and_then(|t| t.hostname.clone());
-                                                if let Some(tab) =
-                                                    s.sessions.iter_mut().find(|t| t.id == id)
-                                                {
-                                                    if tab.command_history.last() != Some(&cmd) {
-                                                        tab.command_history.push(cmd.clone());
-                                                    }
+                                let committed: Option<(
+                                    String,
+                                    String,
+                                    Option<String>,
+                                    Option<String>,
+                                )> = if let Some(rc) = exit_code {
+                                    let mut s = state.write();
+                                    let popped = s
+                                        .pending_exit_check
+                                        .get_mut(&id)
+                                        .and_then(|q| q.pop_front());
+                                    tracing::info!(
+                                        "[OUTPUT-LOCAL] rc={} popped={:?}",
+                                        rc,
+                                        popped.as_ref().map(|(c, _)| c.clone())
+                                    );
+                                    if rc == 0 {
+                                        // Successful: commit to history + DB (with
+                                        // exit_code=Some(0) so search_history's HAVING
+                                        // clause treats it as a known-good command).
+                                        if let Some((cmd, db_id)) = popped {
+                                            let learned_typo = s
+                                                    .last_failed_command_by_session
+                                                    .remove(&id)
+                                                    .and_then(|(failed, failed_at)| {
+                                                        (failed_at.elapsed() <= std::time::Duration::from_secs(120)
+                                                            && crate::command_correction::is_likely_correction(&failed, &cmd))
+                                                            .then_some(failed)
+                                                    });
+                                            let hostname = s
+                                                .sessions
+                                                .iter()
+                                                .find(|t| t.id == id)
+                                                .and_then(|t| t.hostname.clone());
+                                            if let Some(tab) =
+                                                s.sessions.iter_mut().find(|t| t.id == id)
+                                            {
+                                                if tab.command_history.last() != Some(&cmd) {
+                                                    tab.command_history.push(cmd.clone());
                                                 }
-                                                Some((cmd, db_id, hostname))
-                                            } else {
-                                                None
                                             }
+                                            Some((cmd, db_id, hostname, learned_typo))
                                         } else {
-                                            // Failed: mark the command as known-failed in
-                                            // the DB so it stops being suggested AND so
-                                            // that subsequent history imports skip it.
-                                            // See the SSH branch for the full rationale
-                                            // (mark_command_failed vs delete_history_by_command).
-                                            //
-                                            // TIMING WINDOW GUARD: same as the SSH
-                                            // branch — insert into
-                                            // `recent_failed_commands` synchronously
-                                            // here so the suggestion query filters it
-                                            // out during the async `mark_command_failed`
-                                            // window (when the DB still has the prior
-                                            // NULL import row that HAVING would keep).
-                                            // The spawn removes the entry once the DB
-                                            // write commits.
-                                            if let Some((cmd, _db_id)) = popped {
-                                                if let Some(tab) =
-                                                    s.sessions.iter_mut().find(|t| t.id == id)
-                                                {
-                                                    tab.command_history.retain(|c| c != &cmd);
-                                                }
-                                                s.recent_failed_commands.insert(cmd.clone());
-                                                let cmd_for_mark = cmd.clone();
-                                                let rc_for_mark = rc;
-                                                let sid_log = id.clone();
-                                                drop(s);
-                                                let mut state_for_mark = state.clone();
-                                                spawn(async move {
-                                                    let db_path = dirs::data_dir()
-                                                        .unwrap_or_default()
-                                                        .join("rusterm")
-                                                        .join("rusterm.db");
-                                                    let mark_ok = if let Ok(db) =
-                                                        rusterm_db::Database::open(Some(db_path))
-                                                            .await
-                                                    {
-                                                        match db
-                                                            .mark_command_failed(
-                                                                &cmd_for_mark,
-                                                                rc_for_mark,
-                                                            )
-                                                            .await
-                                                        {
-                                                            Ok(()) => {
-                                                                tracing::info!(
-                                                                    "[LOCAL] marked command as \
-                                                                     failed in history DB: \
-                                                                     {:?} rc={} (session={})",
-                                                                    cmd_for_mark,
-                                                                    rc_for_mark,
-                                                                    &sid_log
-                                                                        [..sid_log.len().min(8)],
-                                                                );
-                                                                true
-                                                            }
-                                                            Err(e) => {
-                                                                tracing::warn!(
-                                                                    "Failed to mark command as \
-                                                                     failed in history DB: {}",
-                                                                    e
-                                                                );
-                                                                false
-                                                            }
-                                                        }
-                                                    } else {
-                                                        false
-                                                    };
-                                                    if mark_ok {
-                                                        state_for_mark
-                                                            .write()
-                                                            .recent_failed_commands
-                                                            .remove(&cmd_for_mark);
-                                                    }
-                                                });
-                                            }
                                             None
                                         }
                                     } else {
+                                        // Failed: mark the command as known-failed in
+                                        // the DB so it stops being suggested AND so
+                                        // that subsequent history imports skip it.
+                                        // See the SSH branch for the full rationale
+                                        // (mark_command_failed vs delete_history_by_command).
+                                        //
+                                        // TIMING WINDOW GUARD: same as the SSH
+                                        // branch — insert into
+                                        // `recent_failed_commands` synchronously
+                                        // here so the suggestion query filters it
+                                        // out during the async `mark_command_failed`
+                                        // window (when the DB still has the prior
+                                        // NULL import row that HAVING would keep).
+                                        // The spawn removes the entry once the DB
+                                        // write commits.
+                                        if let Some((cmd, _db_id)) = popped {
+                                            s.last_failed_command_by_session.insert(
+                                                id.clone(),
+                                                (cmd.clone(), std::time::Instant::now()),
+                                            );
+                                            if let Some(tab) =
+                                                s.sessions.iter_mut().find(|t| t.id == id)
+                                            {
+                                                tab.command_history.retain(|c| c != &cmd);
+                                            }
+                                            s.recent_failed_commands.insert(cmd.clone());
+                                            let cmd_for_mark = cmd.clone();
+                                            let rc_for_mark = rc;
+                                            let sid_log = id.clone();
+                                            drop(s);
+                                            let mut state_for_mark = state.clone();
+                                            spawn(async move {
+                                                let db_path = dirs::data_dir()
+                                                    .unwrap_or_default()
+                                                    .join("rusterm")
+                                                    .join("rusterm.db");
+                                                let mark_ok = if let Ok(db) =
+                                                    rusterm_db::Database::open(Some(db_path)).await
+                                                {
+                                                    match db
+                                                        .mark_command_failed(
+                                                            &cmd_for_mark,
+                                                            rc_for_mark,
+                                                        )
+                                                        .await
+                                                    {
+                                                        Ok(()) => {
+                                                            tracing::info!(
+                                                                "[LOCAL] marked command as \
+                                                                     failed in history DB: \
+                                                                     {:?} rc={} (session={})",
+                                                                cmd_for_mark,
+                                                                rc_for_mark,
+                                                                &sid_log[..sid_log.len().min(8)],
+                                                            );
+                                                            true
+                                                        }
+                                                        Err(e) => {
+                                                            tracing::warn!(
+                                                                "Failed to mark command as \
+                                                                     failed in history DB: {}",
+                                                                e
+                                                            );
+                                                            false
+                                                        }
+                                                    }
+                                                } else {
+                                                    false
+                                                };
+                                                if mark_ok {
+                                                    state_for_mark
+                                                        .write()
+                                                        .recent_failed_commands
+                                                        .remove(&cmd_for_mark);
+                                                }
+                                            });
+                                        }
                                         None
-                                    };
+                                    }
+                                } else {
+                                    None
+                                };
                                 {
                                     let mut s = state.write();
                                     if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
@@ -8284,7 +8383,7 @@ fn start_shell_connection(
                                         }
                                     }
                                 }
-                                if let Some((cmd, db_id, hostname)) = committed {
+                                if let Some((cmd, db_id, hostname, learned_typo)) = committed {
                                     let sid = id.clone();
                                     // Clone for the analytics record (the original `cmd` is
                                     // moved into the DB entry below). When the `analytics`
@@ -8292,6 +8391,22 @@ fn start_shell_connection(
                                     // cfg-gated out entirely.
                                     let _analytics_cmd = cmd.clone();
                                     let _analytics_host = hostname.clone();
+                                    if let Some(typo) = learned_typo {
+                                        let analytics_handle = state.read().analytics.clone();
+                                        let correction = cmd.clone();
+                                        spawn(async move {
+                                            if let Err(error) = analytics_handle
+                                                .record_command_correction(&typo, &correction)
+                                            {
+                                                tracing::warn!(
+                                                    "[CORRECTION] failed to record {:?} -> {:?}: {}",
+                                                    typo,
+                                                    correction,
+                                                    error
+                                                );
+                                            }
+                                        });
+                                    }
                                     let analytics_created = chrono::Utc::now().to_rfc3339();
                                     let analytics_created_for_db = analytics_created.clone();
                                     spawn(async move {
@@ -8598,6 +8713,7 @@ fn create_local_shell_session(state: &mut Signal<AppState>, embedded: bool) -> S
             version: 1,
             suggestion: None,
             suggestions: Vec::new(),
+            suggestion_corrections: std::collections::HashSet::new(),
             suggestion_selected: 0,
             suggestion_visible: false,
             command_history: Vec::new(),
@@ -8732,6 +8848,7 @@ fn restore_sessions(
                     version: 1,
                     suggestion: None,
                     suggestions: Vec::new(),
+                    suggestion_corrections: std::collections::HashSet::new(),
                     suggestion_selected: 0,
                     suggestion_visible: false,
                     command_history: ps.command_history_tail.clone(),
@@ -9322,6 +9439,7 @@ fn open_connection(
                 version: 0,
                 suggestion: None,
                 suggestions: Vec::new(),
+                suggestion_corrections: std::collections::HashSet::new(),
                 suggestion_selected: 0,
                 suggestion_visible: false,
                 command_history: Vec::new(),
@@ -9350,6 +9468,7 @@ fn open_connection(
                 version: 1,
                 suggestion: None,
                 suggestions: Vec::new(),
+                suggestion_corrections: std::collections::HashSet::new(),
                 suggestion_selected: 0,
                 suggestion_visible: false,
                 command_history: Vec::new(),
@@ -9373,6 +9492,7 @@ fn open_connection(
                     version: 1,
                     suggestion: None,
                     suggestions: Vec::new(),
+                    suggestion_corrections: std::collections::HashSet::new(),
                     suggestion_selected: 0,
                     suggestion_visible: false,
                     command_history: Vec::new(),
@@ -11409,6 +11529,7 @@ pub fn App() -> Element {
                         version: 1,
                         suggestion: None,
                         suggestions: Vec::new(),
+                        suggestion_corrections: std::collections::HashSet::new(),
                         suggestion_selected: 0,
                         suggestion_visible: false,
                         command_history: Vec::new(),

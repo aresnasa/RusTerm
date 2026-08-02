@@ -41,6 +41,10 @@ pub fn SuggestionPopup(
     on_select: EventHandler<String>,
     on_dismiss: EventHandler<()>,
     on_delete: EventHandler<String>,
+    /// Suggestions that correct a typo rather than complete command history.
+    /// Correction rows are labelled and cannot be removed from history.
+    #[props(default)]
+    correction_suggestions: Vec<String>,
     /// Maximum number of rows to display. Defaults to [`MAX_VISIBLE_ROWS`] (3)
     /// when not specified. The caller passes the user's configured value
     /// (3, 5, or 10) from `AppState::suggestion_count`.
@@ -60,6 +64,9 @@ pub fn SuggestionPopup(
     };
     let visible: Vec<&String> = suggestions.iter().take(limit).collect();
     let current_selected = selected_index.min(visible.len().saturating_sub(1));
+    let has_corrections = visible
+        .iter()
+        .any(|command| correction_suggestions.contains(command));
 
     rsx! {
         div {
@@ -67,8 +74,9 @@ pub fn SuggestionPopup(
             style: "
                 position: absolute;
                 left: 0; right: 0;
-                top: var(--suggestion-top, 2em);
-                max-height: calc(100% - var(--suggestion-top, 2em));
+                top: var(--suggestion-popup-top, var(--suggestion-top, 2em));
+                bottom: var(--suggestion-popup-bottom, auto);
+                max-height: var(--suggestion-popup-max-height, calc(100% - var(--suggestion-top, 2em)));
                 overflow-y: auto;
                 background: #16161e;
                 border: 1px solid #2a2b3d;
@@ -107,6 +115,7 @@ pub fn SuggestionPopup(
                     } else {
                         "border-left:2px solid transparent;"
                     };
+                    let is_correction = correction_suggestions.contains(*cmd);
                     let cmd_for_select = (*cmd).clone();
                     let cmd_for_delete = (*cmd).clone();
                     // × button color:
@@ -121,9 +130,19 @@ pub fn SuggestionPopup(
                             style: "display:flex;align-items:center;padding:3px 12px;{left_border}background:{bg};color:{fg};cursor:pointer;white-space:pre;overflow:hidden;",
                             onclick: move |_| on_select.call(cmd_for_select.clone()),
                             span {
-                                style: "flex:1;overflow:hidden;text-overflow:ellipsis;",
-                                "{cmd}"
+                                style: "flex:1;display:flex;gap:8px;min-width:0;overflow:hidden;",
+                                if is_correction {
+                                    span {
+                                        style: "flex-shrink:0;color:#9ece6a;font-size:11px;",
+                                        "纠正 ·"
+                                    }
+                                }
+                                span {
+                                    style: "min-width:0;overflow:hidden;text-overflow:ellipsis;",
+                                    "{cmd}"
+                                }
                             }
+                            if !is_correction {
                             button {
                                 class: "sug-del",
                                 r#type: "button",
@@ -162,6 +181,7 @@ pub fn SuggestionPopup(
                                 },
                                 "×"
                             }
+                            }
                         }
                     }
                 }
@@ -179,7 +199,11 @@ pub fn SuggestionPopup(
                     font-size:11px;
                     background:#1a1b26;
                 ",
-                "Shift+Del or click × to remove"
+                if has_corrections {
+                    "纠正项：Tab 仅替换，不执行 · 历史项：× 删除"
+                } else {
+                    "Shift+Del or click × to remove"
+                }
             }
             // Hover rule for the × button on non-selected rows. Selected rows
             // always show the × (handled inline above). The actual CSS rules

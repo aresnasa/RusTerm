@@ -1,5 +1,6 @@
 pub mod analytics;
 pub mod app;
+pub mod command_correction;
 pub mod comparison;
 pub mod components;
 pub mod keybindings;

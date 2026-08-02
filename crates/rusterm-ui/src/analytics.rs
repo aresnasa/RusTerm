@@ -12,6 +12,12 @@
 //! results / no-ops, so the app code can call into this module
 //! unconditionally without `#[cfg]` guards at every call site.
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LearnedCorrection {
+    pub correction: String,
+    pub observations: u64,
+}
+
 #[cfg(feature = "analytics")]
 pub mod enabled {
     use std::sync::Arc;
@@ -22,6 +28,8 @@ pub mod enabled {
         AnalyticsCommand, AnalyticsDB, BehaviorSummary, CategoryCount, HourlyUsage,
         PrefixSuccessRate,
     };
+
+    use super::LearnedCorrection;
 
     /// Lazily-initialized analytics DB handle. Stored in `AppState` so the
     /// connection persists across renders. Wrapped in `Option` because we
@@ -95,6 +103,31 @@ pub mod enabled {
             Ok(())
         }
 
+        pub fn record_command_correction(&self, typo: &str, correction: &str) -> Result<()> {
+            self.ensure_open()?;
+            let guard = self.inner.lock();
+            if let Some(db) = guard.as_ref() {
+                db.record_command_correction(typo, correction)?;
+            }
+            Ok(())
+        }
+
+        pub fn command_corrections_for(&self, typo: &str) -> Result<Vec<LearnedCorrection>> {
+            self.ensure_open()?;
+            let guard = self.inner.lock();
+            let corrections = guard
+                .as_ref()
+                .context("analytics db not open")?
+                .command_corrections_for(typo)?;
+            Ok(corrections
+                .into_iter()
+                .map(|correction| LearnedCorrection {
+                    correction: correction.correction,
+                    observations: correction.observations,
+                })
+                .collect())
+        }
+
         pub fn classify(&self) -> Result<Vec<CategoryCount>> {
             self.ensure_open()?;
             let guard = self.inner.lock();
@@ -138,6 +171,8 @@ pub mod enabled {
 
 #[cfg(not(feature = "analytics"))]
 pub mod disabled {
+    use super::LearnedCorrection;
+
     /// Stub `AnalyticsHandle` for when the `analytics` feature is off.
     /// All methods are no-ops or return empty results — the app can call
     /// into this unconditionally without `#[cfg]` guards at every call site.
@@ -164,6 +199,38 @@ pub mod disabled {
         }
         pub fn record_command<T>(&self, _cmd: &T) -> anyhow::Result<()> {
             Ok(())
+        }
+        pub fn record_command_correction(
+            &self,
+            _typo: &str,
+            _correction: &str,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+        pub fn command_corrections_for(
+            &self,
+            _typo: &str,
+        ) -> anyhow::Result<Vec<LearnedCorrection>> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn correction_learning_is_a_safe_noop_without_analytics() {
+            let handle = AnalyticsHandle::new();
+            handle
+                .record_command_correction("dockre ps", "docker ps")
+                .unwrap();
+            assert!(
+                handle
+                    .command_corrections_for("dockre ps")
+                    .unwrap()
+                    .is_empty()
+            );
         }
     }
 }

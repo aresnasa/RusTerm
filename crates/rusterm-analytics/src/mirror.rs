@@ -34,7 +34,9 @@ pub async fn mirror_from_sqlite(
         .context("fetching all history from sqlite for mirror")?;
 
     // Wipe the DuckDB table first so the result is a consistent snapshot.
-    analytics.clear().context("clearing analytics table before mirror")?;
+    analytics
+        .clear()
+        .context("clearing analytics table before mirror")?;
 
     // Bulk-insert into DuckDB. We don't use DuckDB's Appender API here
     // because it's harder to make panic-safe across the iteration; the
@@ -73,9 +75,7 @@ mod tests {
         // Set up a temporary SQLite DB with a few rows
         let tmp = tempfile::tempdir().unwrap();
         let sqlite_path = tmp.path().join("test.db");
-        let sqlite_db = rusterm_db::Database::open(Some(sqlite_path))
-            .await
-            .unwrap();
+        let sqlite_db = rusterm_db::Database::open(Some(sqlite_path)).await.unwrap();
 
         let entries = vec![
             rusterm_db::HistoryEntry {
@@ -111,7 +111,10 @@ mod tests {
         let summary = analytics.behavior_summary().unwrap();
         assert_eq!(summary.total_commands, 2);
         assert_eq!(summary.known_failed_commands, 1);
-        assert_eq!(summary.most_used_category, Some(crate::CommandCategory::Git));
+        assert_eq!(
+            summary.most_used_category,
+            Some(crate::CommandCategory::Git)
+        );
     }
 
     #[tokio::test]
@@ -119,9 +122,7 @@ mod tests {
         // First mirror with one row
         let tmp = tempfile::tempdir().unwrap();
         let sqlite_path = tmp.path().join("test.db");
-        let sqlite_db = rusterm_db::Database::open(Some(sqlite_path))
-            .await
-            .unwrap();
+        let sqlite_db = rusterm_db::Database::open(Some(sqlite_path)).await.unwrap();
         sqlite_db
             .save_history_batch(vec![rusterm_db::HistoryEntry {
                 id: uuid::Uuid::new_v4().to_string(),
