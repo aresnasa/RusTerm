@@ -211,7 +211,7 @@ pub mod enabled {
 /// success rates, and typo→correction pairs. Raw command text, hostnames,
 /// timestamps, session ids and any line flagged by `sanitize_command` are
 /// excluded.
-#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct UsageHabitsReport {
     pub generated_at: chrono::DateTime<chrono::Utc>,
     pub total_commands: u64,
