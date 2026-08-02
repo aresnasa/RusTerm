@@ -31,6 +31,22 @@ pub enum AuditAction {
     ExecRejected,
     ExecFailed,
     ParseCurl,
+    /// A multi-line `script` (or `script_base64`) request was accepted and
+    /// forwarded to the executor. Distinct from `ExecAccepted` so operators
+    /// can filter script traffic from single-command traffic in the audit
+    /// log.
+    ScriptAccepted,
+    /// A `script` / `script_base64` request was rejected by the validator
+    /// (hard floor, injection pattern, allowlist, read-only flag) before
+    /// reaching the sandbox or executor.
+    ScriptRejected,
+    /// The sandbox pre-flight (`sandbox::preflight`) rejected the script —
+    /// syntax error or dcg deny. The script never reached the executor.
+    SandboxFailed,
+    /// `dcg` blocked the script. Recorded separately from `SandboxFailed`
+    /// so operators can see dcg-specific denials even when the syntax check
+    /// passed.
+    DcgBlocked,
 }
 
 #[derive(Debug, Clone, Serialize)]

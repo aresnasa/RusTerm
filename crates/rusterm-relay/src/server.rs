@@ -259,7 +259,19 @@ async fn list_hosts(
 #[derive(Debug, Deserialize)]
 struct ExecRequest {
     host_id: String,
-    command: String,
+    /// Single-line command. Mutually exclusive with `script` and
+    /// `script_base64` — exactly one of the three must be present.
+    #[serde(default)]
+    command: Option<String>,
+    /// Multi-line script, validated by
+    /// [`CommandValidator::validate_script`] and pre-flighted by
+    /// [`crate::sandbox::preflight`] before reaching the executor.
+    #[serde(default)]
+    script: Option<String>,
+    /// Base64-encoded script. Decoded to UTF-8 before validation. Accepts
+    /// standard and URL-safe alphabets, with or without padding.
+    #[serde(default)]
+    script_base64: Option<String>,
     /// Execute through sudo. False by default for backward compatibility and
     /// to avoid silently elevating every API command.
     #[serde(default)]
@@ -267,6 +279,80 @@ struct ExecRequest {
     /// Per-request deadline in milliseconds. Capped by the relay's
     /// `request_timeout_ms`.
     timeout_ms: Option<u64>,
+}
+
+impl ExecRequest {
+    /// Resolve the request into exactly one command/script string.
+    ///
+    /// Returns:
+    /// - `Ok((payload, is_script))` — `payload` is the command or decoded
+    ///   script to forward; `is_script` flags whether the script pipeline
+    ///   (validate_script + sandbox) should run.
+    /// - `Err(ResolveError)` — the client sent zero or more than one of
+    ///   `command`/`script`/`script_base64`, or the base64 was invalid.
+    fn resolve_payload(&self) -> Result<(String, bool), ResolveError> {
+        let present = [
+            self.command.is_some(),
+            self.script.is_some(),
+            self.script_base64.is_some(),
+        ];
+        let count = present.iter().filter(|&&b| b).count();
+        if count == 0 {
+            return Err(ResolveError::MissingPayload);
+        }
+        if count > 1 {
+            return Err(ResolveError::MultiplePayloads);
+        }
+        if let Some(cmd) = &self.command {
+            return Ok((cmd.clone(), false));
+        }
+        if let Some(script) = &self.script {
+            return Ok((script.clone(), true));
+        }
+        // script_base64 is the only remaining option.
+        let encoded = self.script_base64.as_ref().expect("checked count above");
+        let decoded =
+            crate::validator::decode_script_base64(encoded).map_err(ResolveError::Base64Invalid)?;
+        Ok((decoded, true))
+    }
+}
+
+/// Error resolving an [`ExecRequest`] into a single payload. Mapped to HTTP
+/// 400 with a structured `code` field so clients can distinguish the cases.
+enum ResolveError {
+    MissingPayload,
+    MultiplePayloads,
+    Base64Invalid(crate::validator::ScriptError),
+}
+
+impl ResolveError {
+    fn code(&self) -> &'static str {
+        match self {
+            ResolveError::MissingPayload => "missing_payload",
+            ResolveError::MultiplePayloads => "multiple_payloads",
+            ResolveError::Base64Invalid(_) => "base64_invalid",
+        }
+    }
+}
+
+impl std::fmt::Display for ResolveError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ResolveError::MissingPayload => {
+                write!(
+                    f,
+                    "request must include one of command, script, script_base64"
+                )
+            }
+            ResolveError::MultiplePayloads => {
+                write!(
+                    f,
+                    "command, script, and script_base64 are mutually exclusive"
+                )
+            }
+            ResolveError::Base64Invalid(e) => write!(f, "{e}"),
+        }
+    }
 }
 
 #[derive(Serialize)]

@@ -23,7 +23,13 @@
 //!
 //! - `GET  /api/v1/health`     — liveness, no auth
 //! - `GET  /api/v1/hosts`      — hosts visible to the account
-//! - `POST /api/v1/exec`       — `{host_id, command, elevated?, timeout_ms?}` → result
+//! - `POST /api/v1/exec`       — `{host_id, command, elevated?, timeout_ms?}`
+//!   or `{host_id, script, elevated?, timeout_ms?}` or
+//!   `{host_id, script_base64, elevated?, timeout_ms?}` → result.
+//!   `command`, `script`, and `script_base64` are mutually exclusive.
+//!   Scripts pass through [`validator::CommandValidator::validate_script`]
+//!   (hard floor + injection patterns + dcg) and [`sandbox::preflight`]
+//!   before reaching the executor.
 //! - `POST /api/v1/parse-curl` — parse a pasted curl command into JSON
 
 pub mod audit;
@@ -31,18 +37,25 @@ pub mod auth;
 pub mod command_guard;
 pub mod config;
 pub mod curl;
+pub mod dcg;
 pub mod executor;
+pub mod sandbox;
 pub mod server;
 pub mod validator;
 
 pub use audit::{AuditAction, AuditEntry, AuditLog, AuditOutcome};
 pub use auth::{RateLimiter, authenticate, parse_basic_auth};
 pub use command_guard::{
-    BlocklistConfig, BlocklistLoadError, BlocklistPattern, CompiledPattern,
-    LoadedBlocklist, SkillBlocklist, BLOCKLIST_CONFIG_FILE,
+    BLOCKLIST_CONFIG_FILE, BlocklistConfig, BlocklistLoadError, BlocklistPattern, CompiledPattern,
+    LoadedBlocklist, SkillBlocklist,
 };
 pub use config::{DEFAULT_PORT, RelayAccount, RelayConfig, hash_password, verify_password};
 pub use curl::{CurlParseError, ParsedCurl, parse_curl};
+pub use dcg::{DcgVerdict, probe as probe_dcg};
 pub use executor::{ExecOutcome, ExecutorError, HostInfo, NullExecutor, RelayExecutor};
+pub use sandbox::{SandboxVerdict, preflight as sandbox_preflight};
 pub use server::{RelayHandle, run};
-pub use validator::{CommandValidator, ValidationError, compile_allowlist};
+pub use validator::{
+    CommandValidator, MAX_SCRIPT_LEN, MAX_SCRIPT_LINES, ScriptError, ValidationError,
+    compile_allowlist, decode_script_base64,
+};

