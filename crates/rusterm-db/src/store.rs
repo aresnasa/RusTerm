@@ -4,7 +4,10 @@ use std::sync::Arc;
 use rusqlite::params;
 use tokio_rusqlite::Connection;
 
-use crate::history::{HistoryCursor, HistoryEntry, HistoryPage};
+use crate::history::{
+    HistoryCursor, HistoryEntry, HistoryPage, RelayHistoryCursor, RelayHistoryEntry,
+    RelayHistoryPage,
+};
 use crate::schema::INIT_SQL;
 
 #[derive(Clone)]
@@ -560,6 +563,138 @@ impl Database {
             .map_err(|e| anyhow::anyhow!("Search error: {:?}", e))
     }
 
+    /// Insert one relay command-history row. Called from the relay `exec`
+    /// handler after a command has been dispatched (success or failure) so
+    /// the user can later retrieve and re-run it via `GET /api/v1/history`.
+    /// `exit_code`/`duration_ms` are `None` only when the command never ran
+    /// (rejected pre-exec); `timed_out` mirrors the executor outcome.
+    pub async fn save_relay_history(&self, entry: RelayHistoryEntry) -> anyhow::Result<()> {
+        let id = entry.id;
+        let account = entry.account;
+        let host_id = entry.host_id;
+        let command = entry.command;
+        let elevated = entry.elevated as i32;
+        let exit_code = entry.exit_code;
+        let duration_ms = entry.duration_ms;
+        let timed_out = entry.timed_out as i32;
+        let created_at = entry.created_at;
+
+        self.conn
+            .lock()
+            .await
+            .call::<_, (), rusqlite::Error>(move |conn| {
+                conn.execute(
+                    "INSERT INTO relay_history
+                     (id, account, host_id, command, elevated, exit_code, duration_ms, timed_out, created_at)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    params![id, account, host_id, command, elevated, exit_code, duration_ms, timed_out, created_at],
+                )?;
+                Ok(())
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Relay history save error: {:?}", e))?;
+        Ok(())
+    }
+
+    /// Return one page of relay history in reverse chronological order.
+    ///
+    /// Filters are all optional: `account` scopes to one API user, `host_id`
+    /// scopes to one target, `query` does a case-insensitive substring match
+    /// on `command`. The `(created_at, id)` cursor matches the complete sort
+    /// key, so entries with identical timestamps remain stable across page
+    /// boundaries. `limit` is clamped to `[1, 500]`.
+    pub async fn list_relay_history(
+        &self,
+        account: Option<&str>,
+        host_id: Option<&str>,
+        query: Option<&str>,
+        before: Option<&RelayHistoryCursor>,
+        limit: usize,
+    ) -> anyhow::Result<RelayHistoryPage> {
+        const MAX_PAGE_SIZE: usize = 500;
+
+        let account = account.map(str::to_owned);
+        let host_id = host_id.map(str::to_owned);
+        let query = query.map(str::to_owned);
+        let before_created_at = before.map(|c| c.created_at.clone());
+        let before_id = before.map(|c| c.id.clone());
+        let limit = limit.clamp(1, MAX_PAGE_SIZE);
+        let fetch_limit = (limit + 1) as i64;
+
+        self.conn
+            .lock()
+            .await
+            .call::<_, RelayHistoryPage, rusqlite::Error>(move |conn| {
+                let mut stmt = conn.prepare(
+                    "SELECT id, account, host_id, command, elevated, exit_code, duration_ms, timed_out, created_at
+                     FROM relay_history
+                     WHERE (?1 IS NULL OR account = ?1)
+                       AND (?2 IS NULL OR host_id = ?2)
+                       AND (?3 IS NULL OR instr(LOWER(command), LOWER(?3)) > 0)
+                       AND (?4 IS NULL
+                            OR created_at < ?4
+                            OR (created_at = ?4 AND id < ?5))
+                     ORDER BY created_at DESC, id DESC
+                     LIMIT ?6",
+                )?;
+
+                let mut entries = stmt
+                    .query_map(
+                        params![account, host_id, query, before_created_at, before_id, fetch_limit],
+                        |row| {
+                            Ok(RelayHistoryEntry {
+                                id: row.get(0)?,
+                                account: row.get(1)?,
+                                host_id: row.get(2)?,
+                                command: row.get(3)?,
+                                elevated: row.get::<_, i32>(4)? != 0,
+                                exit_code: row.get(5)?,
+                                duration_ms: row.get(6)?,
+                                timed_out: row.get::<_, i32>(7)? != 0,
+                                created_at: row.get(8)?,
+                            })
+                        },
+                    )?
+                    .collect::<rusqlite::Result<Vec<_>>>()?;
+
+                let has_more = entries.len() > limit;
+                if has_more {
+                    entries.truncate(limit);
+                }
+                let next_cursor = has_more.then(|| {
+                    let last = entries.last().expect("clamped page limit is non-zero");
+                    RelayHistoryCursor {
+                        created_at: last.created_at.clone(),
+                        id: last.id.clone(),
+                    }
+                });
+
+                Ok(RelayHistoryPage {
+                    entries,
+                    next_cursor,
+                })
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Relay history page query error: {:?}", e))
+    }
+
+    /// Delete a single relay history row by id. Returns whether a row was
+    /// actually removed (false = unknown id). Used by
+    /// `DELETE /api/v1/history/{id}`.
+    pub async fn delete_relay_history(&self, id: &str) -> anyhow::Result<bool> {
+        let id = id.to_string();
+        let removed = self
+            .conn
+            .lock()
+            .await
+            .call::<_, usize, rusqlite::Error>(move |conn| {
+                Ok(conn.execute("DELETE FROM relay_history WHERE id = ?1", params![id])?)
+            })
+            .await
+            .map_err(|e| anyhow::anyhow!("Relay history delete error: {:?}", e))?;
+        Ok(removed > 0)
+    }
+
     // --- Session Log ---
 
     pub async fn append_session_log(&self, session_id: &str, data: &[u8]) -> anyhow::Result<()> {
@@ -642,6 +777,138 @@ mod tests {
         let path = dir.path().join("test.db");
         let db = Database::open(Some(path)).await.unwrap();
         (db, dir)
+    }
+
+    fn relay_entry(id: &str, account: &str, host: &str, cmd: &str, ts: &str) -> RelayHistoryEntry {
+        RelayHistoryEntry {
+            id: id.to_string(),
+            account: account.to_string(),
+            host_id: host.to_string(),
+            command: cmd.to_string(),
+            elevated: false,
+            exit_code: Some(0),
+            duration_ms: Some(12),
+            timed_out: false,
+            created_at: ts.to_string(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_relay_history_save_list_delete_roundtrip() {
+        let (db, _dir) = test_db().await;
+
+        db.save_relay_history(relay_entry(
+            "r1",
+            "ops",
+            "h1",
+            "uptime",
+            "2024-01-01T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+        db.save_relay_history(relay_entry(
+            "r2",
+            "ops",
+            "h1",
+            "docker ps",
+            "2024-01-02T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+        db.save_relay_history(relay_entry(
+            "r3",
+            "dev",
+            "h2",
+            "uptime",
+            "2024-01-03T00:00:00Z",
+        ))
+        .await
+        .unwrap();
+
+        // Newest first.
+        let page = db
+            .list_relay_history(None, None, None, None, 50)
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 3);
+        assert_eq!(page.entries[0].id, "r3");
+        assert_eq!(page.entries[1].id, "r2");
+        assert_eq!(page.entries[2].id, "r1");
+        assert!(page.next_cursor.is_none());
+
+        // Filter by account.
+        let page = db
+            .list_relay_history(Some("ops"), None, None, None, 50)
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 2);
+        assert!(page.entries.iter().all(|e| e.account == "ops"));
+
+        // Filter by host.
+        let page = db
+            .list_relay_history(None, Some("h2"), None, None, 50)
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].id, "r3");
+
+        // Filter by command substring (case-insensitive).
+        let page = db
+            .list_relay_history(None, None, Some("DOCKER"), None, 50)
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].id, "r2");
+
+        // Delete one row.
+        assert!(db.delete_relay_history("r2").await.unwrap());
+        assert!(!db.delete_relay_history("r2").await.unwrap()); // already gone
+        let page = db
+            .list_relay_history(None, None, None, None, 50)
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_relay_history_paginates_with_cursor() {
+        let (db, _dir) = test_db().await;
+        // Insert 5 entries with distinct timestamps.
+        for i in 0..5 {
+            let ts = format!("2024-01-{:02}T00:00:00Z", i + 1);
+            db.save_relay_history(relay_entry(&format!("e{i}"), "ops", "h1", "uptime", &ts))
+                .await
+                .unwrap();
+        }
+
+        // Page size 2 → first page = newest two (e4, e3), with a cursor.
+        let page = db
+            .list_relay_history(None, None, None, None, 2)
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 2);
+        assert_eq!(page.entries[0].id, "e4");
+        assert_eq!(page.entries[1].id, "e3");
+        let cursor = page.next_cursor.expect("more pages exist");
+
+        // Second page from the cursor → e2, e1, still more to go (e0 left).
+        let page = db
+            .list_relay_history(None, None, None, Some(&cursor), 2)
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 2);
+        assert_eq!(page.entries[0].id, "e2");
+        assert_eq!(page.entries[1].id, "e1");
+        let cursor = page.next_cursor.expect("one more page");
+
+        // Third page → final entry e0, no more.
+        let page = db
+            .list_relay_history(None, None, None, Some(&cursor), 2)
+            .await
+            .unwrap();
+        assert_eq!(page.entries.len(), 1);
+        assert_eq!(page.entries[0].id, "e0");
+        assert!(page.next_cursor.is_none());
     }
 
     #[tokio::test]

@@ -14,8 +14,10 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 
 use rusterm_core::config::{ConnectionConfig, ConnectionKind, SshConfig};
+use rusterm_db::{Database, RelayHistoryEntry};
 use rusterm_relay::{
-    ExecOutcome, ExecutorError, HostInfo, RelayExecutor, RelayHandle, run as run_relay,
+    ExecOutcome, ExecutorError, HistoryCursor, HistoryPage, HistoryQuery, HostInfo, RelayExecutor,
+    RelayHandle, RelayHistoryRecord, RelayHistoryStore, run as run_relay,
 };
 use rusterm_ssh::{DirectConnectOptions, ExecResult, connect_direct};
 use rusterm_tunnel::{TunnelConnector, TunnelManager};
@@ -250,6 +252,117 @@ fn sudo_authorization_failed(result: &ExecResult) -> bool {
     .any(|needle| stderr.contains(needle))
 }
 
+// ── Relay command-history store ─────────────────────────────────────────────
+//
+// Persists every command dispatched by the relay into the same SQLite DB
+// the rest of the app uses (`rusterm.db` under the data dir). Like
+// `AppRelayExecutor`, the DB is opened on demand per call — matching the
+// app's existing pattern (see `app.rs` history lookups) and avoiding a
+// long-lived shared handle whose lifecycle would need wiring through
+// `AppState`. Each `Database::open` is cheap (file + schema check), and the
+// relay is rate-limited so per-call opens are bounded.
+
+/// Resolve the shared SQLite path used everywhere else in the app. Returns
+/// `None` only when the platform has no data dir (extremely rare); callers
+/// fall back to the in-memory `NullHistoryStore` in that case.
+fn shared_db_path() -> Option<std::path::PathBuf> {
+    let dir = dirs::data_dir().unwrap_or_else(|| std::path::PathBuf::from("."));
+    Some(dir.join("rusterm").join("rusterm.db"))
+}
+
+async fn open_db() -> Option<Database> {
+    let path = shared_db_path()?;
+    match Database::open(Some(path)).await {
+        Ok(db) => Some(db),
+        Err(e) => {
+            tracing::warn!("[relay] failed to open history DB: {e:#}");
+            None
+        }
+    }
+}
+
+/// `RelayHistoryStore` backed by `rusterm_db::Database`. Records land in the
+/// `relay_history` table (added in `rusterm-db`'s schema) and are queryable
+/// via `GET /api/v1/history`.
+#[derive(Debug, Default)]
+pub struct AppRelayHistoryStore;
+
+#[async_trait]
+impl RelayHistoryStore for AppRelayHistoryStore {
+    async fn record(&self, record: RelayHistoryRecord) -> anyhow::Result<()> {
+        let db = open_db()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("history DB unavailable"))?;
+        db.save_relay_history(RelayHistoryEntry {
+            id: record.id,
+            account: record.account,
+            host_id: record.host_id,
+            command: record.command,
+            elevated: record.elevated,
+            exit_code: record.exit_code,
+            duration_ms: record.duration_ms.map(|d| d as i64),
+            timed_out: record.timed_out,
+            created_at: record.created_at,
+        })
+        .await
+    }
+
+    async fn list(
+        &self,
+        query: &HistoryQuery,
+        before: Option<&HistoryCursor>,
+    ) -> anyhow::Result<HistoryPage> {
+        let db = open_db()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("history DB unavailable"))?;
+        let page = db
+            .list_relay_history(
+                query.account.as_deref(),
+                query.host_id.as_deref(),
+                query.query.as_deref(),
+                before
+                    .map(|c| rusterm_db::RelayHistoryCursor {
+                        created_at: c.created_at.clone(),
+                        id: c.id.clone(),
+                    })
+                    .as_ref(),
+                query.limit.unwrap_or(50),
+            )
+            .await?;
+        Ok(HistoryPage {
+            entries: page
+                .entries
+                .into_iter()
+                .map(|e| RelayHistoryRecord {
+                    id: e.id,
+                    account: e.account,
+                    host_id: e.host_id,
+                    command: e.command,
+                    elevated: e.elevated,
+                    exit_code: e.exit_code,
+                    duration_ms: e.duration_ms.map(|d| d as u64),
+                    timed_out: e.timed_out,
+                    created_at: e.created_at,
+                    // `success` isn't stored separately in the DB; derive it
+                    // from exit_code so the listing flags failures correctly.
+                    success: e.exit_code == Some(0),
+                })
+                .collect(),
+            next_cursor: page.next_cursor.map(|c| HistoryCursor {
+                created_at: c.created_at,
+                id: c.id,
+            }),
+        })
+    }
+
+    async fn delete(&self, id: &str) -> anyhow::Result<bool> {
+        let db = open_db()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("history DB unavailable"))?;
+        db.delete_relay_history(id).await
+    }
+}
+
 /// Runs validated relay commands against saved SSH hosts. One fresh SSH
 /// connection per request: simple, honest about cost, and naturally
 /// rebound after remote host changes — the rate limiter keeps the cost of
@@ -421,10 +534,20 @@ pub fn start_relay(
         return Ok(());
     }
     let executor: Arc<dyn RelayExecutor> = Arc::new(AppRelayExecutor);
+    // Persist executed commands so they can be retrieved via
+    // `GET /api/v1/history` and re-run. Falls back to a no-op store when the
+    // data dir can't be resolved (degraded mode) so the relay still starts.
+    let history: Arc<dyn RelayHistoryStore> = match shared_db_path() {
+        Some(_) => Arc::new(AppRelayHistoryStore),
+        None => {
+            tracing::warn!("[relay] no data dir available; command history disabled");
+            Arc::new(rusterm_relay::NullHistoryStore)
+        }
+    };
     let handle = runtime_handle();
     let (result_tx, result_rx) = std::sync::mpsc::channel::<anyhow::Result<RelayHandle>>();
     handle.spawn(async move {
-        let _ = result_tx.send(run_relay(config, executor).await);
+        let _ = result_tx.send(run_relay(config, executor, history).await);
     });
     // Bind is effectively instant; wait on the channel with a generous
     // deadline so a wedged runtime can't freeze the UI thread.

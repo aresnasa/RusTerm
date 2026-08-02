@@ -12,10 +12,10 @@ use std::net::{IpAddr, SocketAddr};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use axum::extract::{ConnectInfo, State};
+use axum::extract::{ConnectInfo, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode, header};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 use serde::{Deserialize, Serialize};
 use tokio::sync::oneshot;
@@ -27,6 +27,11 @@ use crate::config::RelayConfig;
 #[cfg(test)]
 use crate::executor::NullExecutor;
 use crate::executor::{ExecOutcome, ExecutorError, HostInfo, RelayExecutor};
+use crate::history::{
+    HistoryCursor, HistoryQuery, RelayHistoryRecord, RelayHistoryStore, new_record_id,
+};
+#[cfg(test)]
+use crate::history::{NullHistoryStore, RecordingHistoryStore};
 use crate::validator::{CommandValidator, ValidationError, compile_allowlist};
 
 /// Shared per-process state handed to every handler.
@@ -37,6 +42,7 @@ struct AppState {
     validator: Arc<CommandValidator>,
     limiter: RateLimiter,
     audit: Arc<AuditLog>,
+    history: Arc<dyn RelayHistoryStore>,
 }
 
 /// Handle returned by [`run`]. Dropping it does NOT stop the server — call
@@ -79,6 +85,7 @@ impl RelayHandle {
 pub async fn run(
     config: RelayConfig,
     executor: Arc<dyn RelayExecutor>,
+    history: Arc<dyn RelayHistoryStore>,
 ) -> anyhow::Result<RelayHandle> {
     let bind = SocketAddr::new(config.bind_addr, config.port);
     let listener = tokio::net::TcpListener::bind(bind)
@@ -116,6 +123,7 @@ pub async fn run(
         validator,
         limiter: RateLimiter::new(),
         audit: Arc::new(AuditLog::new()),
+        history,
     };
 
     let app = router(state);
@@ -147,6 +155,8 @@ fn router(state: AppState) -> Router {
         .route("/api/v1/health", get(health))
         .route("/api/v1/hosts", get(list_hosts))
         .route("/api/v1/exec", post(exec))
+        .route("/api/v1/history", get(list_history))
+        .route("/api/v1/history/{id}", delete(delete_history))
         .route("/api/v1/parse-curl", post(parse_curl_handler))
         .with_state(state)
 }
@@ -616,6 +626,16 @@ async fn exec(
                 command: Some(payload.clone()),
                 outcome: AuditOutcome::ok(exit_code, duration_ms),
             });
+            record_history(
+                &state,
+                &account.username,
+                &host.id,
+                &payload,
+                body.elevated,
+                exit_code.map(|c| c as i32),
+                Some(duration_ms),
+                timed_out,
+            );
             Json(ExecResponse {
                 exit_code,
                 stdout,
@@ -641,6 +661,19 @@ async fn exec(
                         duration_ms: Some(started.elapsed().as_millis() as u64),
                     },
                 });
+                // The command was dispatched but couldn't run (needed sudo,
+                // none cached). Record it as a non-success so the user can
+                // see and retry — but with no exit_code, since nothing ran.
+                record_history(
+                    &state,
+                    &account.username,
+                    &host.id,
+                    &payload,
+                    body.elevated,
+                    None,
+                    Some(started.elapsed().as_millis() as u64),
+                    false,
+                );
                 return error_response_with_code(
                     StatusCode::FORBIDDEN,
                     message,
@@ -667,6 +700,18 @@ async fn exec(
                     duration_ms: Some(started.elapsed().as_millis() as u64),
                 },
             });
+            // Reached the executor but failed (connect/exec error). Record
+            // with no exit_code so the failure is visible and retryable.
+            record_history(
+                &state,
+                &account.username,
+                &host.id,
+                &payload,
+                body.elevated,
+                None,
+                Some(started.elapsed().as_millis() as u64),
+                false,
+            );
             error_response(status, msg)
         }
     }
@@ -676,6 +721,151 @@ async fn exec(
 /// invalid). Used to pick the right audit action for resolve errors.
 fn is_script_field_set(body: &ExecRequest) -> bool {
     body.script.is_some() || body.script_base64.is_some()
+}
+
+/// Best-effort history recording. A storage failure must never break command
+/// execution, so errors are logged but not propagated. Runs the DB call on a
+/// detached task so the response isn't delayed by the write — history is a
+/// side effect of execution, not part of its result.
+#[allow(clippy::too_many_arguments)]
+fn record_history(
+    state: &AppState,
+    account: &str,
+    host_id: &str,
+    command: &str,
+    elevated: bool,
+    exit_code: Option<i32>,
+    duration_ms: Option<u64>,
+    timed_out: bool,
+) {
+    let record = RelayHistoryRecord {
+        id: new_record_id(),
+        account: account.to_string(),
+        host_id: host_id.to_string(),
+        command: command.to_string(),
+        elevated,
+        exit_code,
+        duration_ms,
+        timed_out,
+        created_at: now_iso(),
+        success: exit_code == Some(0),
+    };
+    let store = state.history.clone();
+    tokio::spawn(async move {
+        if let Err(e) = store.record(record).await {
+            tracing::warn!("[relay] failed to record command history: {e:#}");
+        }
+    });
+}
+
+// ── history endpoints ─────────────────────────────────────────────────────
+
+/// `GET /api/v1/history` — list previously-executed commands, newest first.
+///
+/// Query params (all optional):
+/// - `account` — scope to one API user
+/// - `host_id` — scope to one target host
+/// - `query`   — case-insensitive substring match on `command`
+/// - `limit`   — max entries (default 50, clamped to `[1, 500]`)
+/// - `cursor`  — opaque pagination cursor from a prior `next_cursor`
+///
+/// A non-admin account is always scoped to its own history regardless of the
+/// `account` query param (enforced below). Admins (empty `allowed_hosts`) may
+/// query any account.
+async fn list_history(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Query(params): Query<HistoryListParams>,
+) -> Response {
+    let account = match require_account(&state, &headers, addr.ip()) {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+
+    // A non-admin account can only see its own history. Admins (whose
+    // `allowed_hosts` is empty, meaning "all hosts") may pass any account.
+    let is_admin = account.allowed_hosts.is_empty();
+    let scoped_account = if is_admin {
+        params.account
+    } else {
+        Some(account.username.clone())
+    };
+
+    let query = HistoryQuery {
+        account: scoped_account,
+        host_id: params.host_id,
+        query: params.query,
+        limit: params.limit,
+    };
+    let before = params.cursor.as_ref();
+    match state.history.list(&query, before).await {
+        Ok(page) => Json(page).into_response(),
+        Err(e) => {
+            tracing::warn!("[relay] history list failed: {e:#}");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "history query failed")
+        }
+    }
+}
+
+/// Query params for [`list_history`]. `cursor` is the JSON-encoded
+/// `HistoryCursor` returned as `next_cursor`.
+#[derive(Debug, Deserialize)]
+struct HistoryListParams {
+    #[serde(default)]
+    account: Option<String>,
+    #[serde(default)]
+    host_id: Option<String>,
+    #[serde(default)]
+    query: Option<String>,
+    #[serde(default)]
+    limit: Option<usize>,
+    #[serde(default)]
+    cursor: Option<HistoryCursor>,
+}
+
+/// `DELETE /api/v1/history/{id}` — remove one history entry. Only the entry's
+/// owner (or an admin) may delete it.
+async fn delete_history(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Path(id): Path<String>,
+) -> Response {
+    let account = match require_account(&state, &headers, addr.ip()) {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    let is_admin = account.allowed_hosts.is_empty();
+
+    // For a non-admin, first fetch the page containing the entry to verify
+    // ownership. We don't have a single-fetch endpoint, so scope the listing
+    // to the caller's account and search for the id. This is cheap because
+    // history pages are small and the caller is the owner of most rows.
+    if !is_admin {
+        let query = HistoryQuery {
+            account: Some(account.username.clone()),
+            host_id: None,
+            query: Some(id.clone()),
+            limit: Some(500),
+        };
+        let owned = state.history.list(&query, None).await;
+        let owns = owned
+            .map(|p| p.entries.iter().any(|e| e.id == id))
+            .unwrap_or(false);
+        if !owns {
+            return error_response(StatusCode::NOT_FOUND, "history entry not found");
+        }
+    }
+
+    match state.history.delete(&id).await {
+        Ok(true) => StatusCode::NO_CONTENT.into_response(),
+        Ok(false) => error_response(StatusCode::NOT_FOUND, "history entry not found"),
+        Err(e) => {
+            tracing::warn!("[relay] history delete failed: {e:#}");
+            error_response(StatusCode::INTERNAL_SERVER_ERROR, "history delete failed")
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -779,7 +969,9 @@ mod tests {
     #[tokio::test]
     async fn health_needs_no_auth() {
         let executor: Arc<dyn RelayExecutor> = Arc::new(NullExecutor);
-        let handle = run(test_config(), executor).await.unwrap();
+        let handle = run(test_config(), executor, Arc::new(NullHistoryStore))
+            .await
+            .unwrap();
         let url = format!("{}/api/v1/health", handle.url());
         let body: serde_json::Value = reqwest_get(&url, None).await;
         assert_eq!(body["status"], "ok");
@@ -789,7 +981,9 @@ mod tests {
     #[tokio::test]
     async fn hosts_requires_auth() {
         let executor: Arc<dyn RelayExecutor> = Arc::new(NullExecutor);
-        let handle = run(test_config(), executor).await.unwrap();
+        let handle = run(test_config(), executor, Arc::new(NullHistoryStore))
+            .await
+            .unwrap();
         let url = format!("{}/api/v1/hosts", handle.url());
         let (status, _) = reqwest_get_status(&url, None).await;
         assert_eq!(status, 401);
@@ -804,7 +998,9 @@ mod tests {
     #[tokio::test]
     async fn exec_rejects_dangerous_and_unknown_hosts() {
         let executor: Arc<dyn RelayExecutor> = Arc::new(NullExecutor);
-        let handle = run(test_config(), executor).await.unwrap();
+        let handle = run(test_config(), executor, Arc::new(NullHistoryStore))
+            .await
+            .unwrap();
         let base = handle.url();
 
         // Dangerous command → 403 even before host lookup.
@@ -819,7 +1015,9 @@ mod tests {
     #[tokio::test]
     async fn exec_forwards_explicit_elevation_request() {
         let executor = Arc::new(RecordingExecutor::default());
-        let handle = run(test_config(), executor.clone()).await.unwrap();
+        let handle = run(test_config(), executor.clone(), Arc::new(NullHistoryStore))
+            .await
+            .unwrap();
         let (status, _) = post_json(
             &format!("{}/api/v1/exec", handle.url()),
             Some(("ops", "pw")),
@@ -841,7 +1039,9 @@ mod tests {
             fail_elevation: true,
             ..Default::default()
         });
-        let handle = run(test_config(), executor).await.unwrap();
+        let handle = run(test_config(), executor, Arc::new(NullHistoryStore))
+            .await
+            .unwrap();
         let (status, body) = post_json(
             &format!("{}/api/v1/exec", handle.url()),
             Some(("ops", "pw")),
@@ -861,7 +1061,9 @@ mod tests {
     #[tokio::test]
     async fn exec_defaults_to_non_elevated_for_legacy_clients() {
         let executor = Arc::new(RecordingExecutor::default());
-        let handle = run(test_config(), executor.clone()).await.unwrap();
+        let handle = run(test_config(), executor.clone(), Arc::new(NullHistoryStore))
+            .await
+            .unwrap();
         let (status, _) = post_json(
             &format!("{}/api/v1/exec", handle.url()),
             Some(("ops", "pw")),
@@ -879,7 +1081,9 @@ mod tests {
     #[tokio::test]
     async fn parse_curl_roundtrip() {
         let executor: Arc<dyn RelayExecutor> = Arc::new(NullExecutor);
-        let handle = run(test_config(), executor).await.unwrap();
+        let handle = run(test_config(), executor, Arc::new(NullHistoryStore))
+            .await
+            .unwrap();
         let url = format!("{}/api/v1/parse-curl", handle.url());
         let (status, body) = post_json(
             &url,
@@ -907,7 +1111,13 @@ mod tests {
         let parsed = url::Url::parse(url).unwrap();
         let host = parsed.host_str().unwrap().to_string();
         let port = parsed.port().unwrap();
-        let path = parsed.path();
+        // Include the query string (e.g. `?query=docker`) so filtered GETs
+        // reach the handler instead of being silently dropped.
+        let path = if let Some(q) = parsed.query() {
+            format!("{}?{q}", parsed.path())
+        } else {
+            parsed.path().to_string()
+        };
         let mut stream = tokio::net::TcpStream::connect((host.as_str(), port))
             .await
             .unwrap();
@@ -985,7 +1195,9 @@ mod tests {
     #[tokio::test]
     async fn missing_payload_returns_400() {
         let executor: Arc<dyn RelayExecutor> = Arc::new(NullExecutor);
-        let handle = run(test_config(), executor).await.unwrap();
+        let handle = run(test_config(), executor, Arc::new(NullHistoryStore))
+            .await
+            .unwrap();
         let (status, body) = post_json(
             &format!("{}/api/v1/exec", handle.url()),
             Some(("ops", "pw")),
@@ -1000,7 +1212,9 @@ mod tests {
     #[tokio::test]
     async fn multiple_payloads_returns_400() {
         let executor: Arc<dyn RelayExecutor> = Arc::new(NullExecutor);
-        let handle = run(test_config(), executor).await.unwrap();
+        let handle = run(test_config(), executor, Arc::new(NullHistoryStore))
+            .await
+            .unwrap();
         let (status, body) = post_json(
             &format!("{}/api/v1/exec", handle.url()),
             Some(("ops", "pw")),
@@ -1019,7 +1233,9 @@ mod tests {
     #[tokio::test]
     async fn base64_invalid_returns_400() {
         let executor: Arc<dyn RelayExecutor> = Arc::new(NullExecutor);
-        let handle = run(test_config(), executor).await.unwrap();
+        let handle = run(test_config(), executor, Arc::new(NullHistoryStore))
+            .await
+            .unwrap();
         let (status, body) = post_json(
             &format!("{}/api/v1/exec", handle.url()),
             Some(("ops", "pw")),
@@ -1037,7 +1253,9 @@ mod tests {
     #[tokio::test]
     async fn script_with_dangerous_line_returns_403() {
         let executor: Arc<dyn RelayExecutor> = Arc::new(NullExecutor);
-        let handle = run(test_config(), executor).await.unwrap();
+        let handle = run(test_config(), executor, Arc::new(NullHistoryStore))
+            .await
+            .unwrap();
         // Line 2 is `rm -rf /` — the hard floor must reject the whole script.
         let (status, _) = post_json(
             &format!("{}/api/v1/exec", handle.url()),
@@ -1055,7 +1273,9 @@ mod tests {
     #[tokio::test]
     async fn script_with_syntax_error_returns_403_sandbox_failed() {
         let executor = Arc::new(RecordingExecutor::default());
-        let handle = run(test_config(), executor).await.unwrap();
+        let handle = run(test_config(), executor, Arc::new(NullHistoryStore))
+            .await
+            .unwrap();
         // `if true; then echo broken` (no `fi`) — passes the hard floor
         // (each line is individually benign) but fails `sh -n` syntax check
         // in the sandbox pre-flight.
@@ -1079,7 +1299,9 @@ mod tests {
     async fn base64_encoded_benign_script_runs() {
         use base64::Engine;
         let executor = Arc::new(RecordingExecutor::default());
-        let handle = run(test_config(), executor).await.unwrap();
+        let handle = run(test_config(), executor, Arc::new(NullHistoryStore))
+            .await
+            .unwrap();
         let script = "#!/bin/sh\nset -e\necho hello\nuptime\n";
         let encoded = base64::engine::general_purpose::STANDARD.encode(script);
         let (status, body) = post_json(
@@ -1105,7 +1327,9 @@ mod tests {
     async fn command_still_works_backward_compatible() {
         // The legacy `command` field must keep working exactly as before.
         let executor = Arc::new(RecordingExecutor::default());
-        let handle = run(test_config(), executor.clone()).await.unwrap();
+        let handle = run(test_config(), executor, Arc::new(NullHistoryStore))
+            .await
+            .unwrap();
         let (status, _) = post_json(
             &format!("{}/api/v1/exec", handle.url()),
             Some(("ops", "pw")),
@@ -1116,6 +1340,123 @@ mod tests {
         )
         .await;
         assert_eq!(status, 200);
+        handle.shutdown().await;
+    }
+
+    // ── history persistence ─────────────────────────────────────────────────
+    //
+    // `record_history` writes via a detached `tokio::spawn`, so the POST
+    // returns before the row is guaranteed to be persisted. These tests give
+    // the spawned task a brief window before asserting.
+
+    /// Wait until `pred` returns true, polling every 5ms up to ~1s. Used to
+    /// observe the async history write without a fixed sleep.
+    async fn wait_until<F: Fn() -> bool>(pred: F) {
+        for _ in 0..200 {
+            if pred() {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+        // Final check panics with a useful message if still false.
+        assert!(pred(), "condition never became true within ~1s");
+    }
+
+    #[tokio::test]
+    async fn exec_records_history_and_list_returns_it() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let history = Arc::new(RecordingHistoryStore::new());
+        let handle = run(
+            test_config(),
+            executor.clone(),
+            history.clone() as Arc<dyn RelayHistoryStore>,
+        )
+        .await
+        .unwrap();
+        let base = handle.url();
+
+        let status = post_exec(&base, "ops", "pw", "host-1", "uptime", None).await;
+        assert_eq!(status, 200);
+
+        // The recording happens on a detached task; wait for it.
+        let history_clone = history.clone();
+        wait_until(move || history_clone.len() == 1).await;
+
+        // GET /history should return the recorded command, newest first.
+        let (status, body) =
+            reqwest_get_status(&format!("{base}/api/v1/history"), Some(("ops", "pw"))).await;
+        assert_eq!(status, 200);
+        let entries = body["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["command"], "uptime");
+        assert_eq!(entries[0]["host_id"], "host-1");
+        assert_eq!(entries[0]["account"], "ops");
+        assert_eq!(entries[0]["exit_code"], 0);
+        assert_eq!(entries[0]["success"], true);
+        assert_eq!(entries[0]["elevated"], false);
+        let id = entries[0]["id"].as_str().unwrap().to_string();
+
+        // DELETE /history/{id} removes it.
+        let (status, _) = raw_request(
+            &format!("{base}/api/v1/history/{id}"),
+            "DELETE",
+            Some(("ops", "pw")),
+            None,
+        )
+        .await;
+        assert_eq!(status, 204);
+
+        // Subsequent GET shows an empty list.
+        let (status, body) =
+            reqwest_get_status(&format!("{base}/api/v1/history"), Some(("ops", "pw"))).await;
+        assert_eq!(status, 200);
+        assert!(body["entries"].as_array().unwrap().is_empty());
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn history_query_filters_by_command_substring() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let history = Arc::new(RecordingHistoryStore::new());
+        let handle = run(
+            test_config(),
+            executor.clone(),
+            history.clone() as Arc<dyn RelayHistoryStore>,
+        )
+        .await
+        .unwrap();
+        let base = handle.url();
+
+        post_exec(&base, "ops", "pw", "host-1", "docker ps", None).await;
+        post_exec(&base, "ops", "pw", "host-1", "uptime", None).await;
+
+        let history_clone = history.clone();
+        wait_until(move || history_clone.len() == 2).await;
+
+        // Filter by substring "docker".
+        let (status, body) = reqwest_get_status(
+            &format!("{base}/api/v1/history?query=docker"),
+            Some(("ops", "pw")),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let entries = body["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["command"], "docker ps");
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn history_requires_auth() {
+        let executor: Arc<dyn RelayExecutor> = Arc::new(NullExecutor);
+        let handle = run(test_config(), executor, Arc::new(NullHistoryStore))
+            .await
+            .unwrap();
+        let (status, _) =
+            reqwest_get_status(&format!("{}/api/v1/history", handle.url()), None).await;
+        assert_eq!(status, 401);
         handle.shutdown().await;
     }
 }

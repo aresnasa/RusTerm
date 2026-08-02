@@ -5965,8 +5965,14 @@ enum CredentialKind {
 
 fn is_sudo_password_prompt(text: &str) -> bool {
     let plain = strip_ansi(text);
-    plain.to_ascii_lowercase().contains("sudo")
-        && credential_kind(&plain) == Some(CredentialKind::Password)
+    let lower = plain.to_ascii_lowercase();
+    if credential_kind(&plain) != Some(CredentialKind::Password)
+        || (lower.contains("password for") && lower.contains("http"))
+    {
+        return false;
+    }
+    let trimmed = lower.trim_start();
+    trimmed.starts_with("[sudo") || trimmed.starts_with("sudo ") || lower.contains("sudo password")
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -6209,11 +6215,14 @@ fn first_matching_step<'a>(ok: &'a OneKey, line: &str) -> Option<&'a OneKeyStep>
 }
 
 fn onekey_prompt_is_safe_to_remember(prompt: &str) -> bool {
-    let lower = strip_ansi(prompt).trim().to_lowercase();
-    !matches!(
-        lower.as_str(),
-        "password:" | "password" | "passwd:" | "passwd" | "passphrase:" | "passphrase"
-    )
+    let plain = strip_ansi(prompt);
+    let lower = plain.trim().to_lowercase();
+    is_sudo_password_prompt(&plain)
+        || ((lower.contains("password for") || lower.contains("username for"))
+            && lower.contains("http"))
+        || (lower.contains("passphrase") && lower.contains("key"))
+        || (lower.contains('@')
+            && matches!(credential_kind(&plain), Some(CredentialKind::Password)))
 }
 
 fn onekey_prompt_fingerprint(prompt: &str) -> String {
@@ -6342,7 +6351,21 @@ fn onekey_popup_for_output(
                 first_matching_step(ok, last_line)
                     .is_some_and(|step| step.expect == *cooldown_expect)
             });
-            if same_prompt {
+            // Residual terminal text arrives with unrelated/empty data. A real
+            // retry carries the prompt again in the fresh output chunk and must
+            // bypass cooldown so the remembered credential is invalidated now,
+            // even if the remote rejects it in under three seconds.
+            let raw = strip_ansi(&String::from_utf8_lossy(data));
+            let fresh_line = raw
+                .lines()
+                .rev()
+                .find(|line| !line.trim().is_empty())
+                .unwrap_or("");
+            let fresh_same_prompt = state.onekeys.iter().any(|ok| {
+                first_matching_step(ok, fresh_line)
+                    .is_some_and(|step| step.expect == *cooldown_expect)
+            });
+            if same_prompt && !fresh_same_prompt {
                 return Err(ONEKEY_SKIP_COOLDOWN);
             }
         }
@@ -7501,16 +7524,8 @@ mod session_startup_tests {
         let senders = HashMap::from([(session_id.to_string(), sender)]);
         check_onekey_match_with_senders_in_state(&mut state, &senders, session_id, prompt);
         assert_eq!(receiver.try_recv().unwrap(), b"preferred-secret\r");
-        state.onekey_submission_cooldown.insert(
-            session_id.to_string(),
-            (
-                expect.to_string(),
-                std::time::Instant::now()
-                    - ONEKEY_SUBMISSION_COOLDOWN
-                    - std::time::Duration::from_secs(1),
-            ),
-        );
-
+        // A fresh repeated prompt is a real rejection even inside the residual
+        // text cooldown; no later output is required to reopen the chooser.
         check_onekey_match_with_senders_in_state(&mut state, &senders, session_id, prompt);
 
         assert!(state.onekey_preferences.is_empty());
@@ -14284,8 +14299,8 @@ fn looks_like_command(s: &str) -> bool {
 mod onekey_tests {
     use super::{
         CredentialKind, credential_kind, first_matching_step, is_sudo_password_prompt,
-        onekey_prompt_fingerprint, onekey_step_label, onekey_submission_bytes,
-        send_onekey_submission, strip_ansi, take_onekey_selection,
+        onekey_prompt_fingerprint, onekey_prompt_is_safe_to_remember, onekey_step_label,
+        onekey_submission_bytes, send_onekey_submission, strip_ansi, take_onekey_selection,
     };
     use crate::state::{OneKeyMatch, OneKeyPopupState};
     use regex::Regex;
@@ -14496,7 +14511,25 @@ mod onekey_tests {
         assert!(is_sudo_password_prompt("[sudo] password for alice: "));
         assert!(is_sudo_password_prompt("[sudo: authenticate] Password: "));
         assert!(!is_sudo_password_prompt("Password for git@example.com: "));
+        assert!(!is_sudo_password_prompt(
+            "Password for 'https://alice@sudo.example.com/team/sudo-tools': "
+        ));
         assert!(!is_sudo_password_prompt("sudo command completed"));
+    }
+
+    #[test]
+    fn only_contextual_credential_prompts_are_safe_to_remember() {
+        for ambiguous in ["Password:", "Enter password:", "Password >", "PIN:"] {
+            assert!(!onekey_prompt_is_safe_to_remember(ambiguous));
+        }
+        for contextual in [
+            "[sudo] password for alice:",
+            "Password for 'https://alice@git.example.com':",
+            "root@host's password:",
+            "Enter passphrase for key '/home/alice/.ssh/id_ed25519':",
+        ] {
+            assert!(onekey_prompt_is_safe_to_remember(contextual));
+        }
     }
 
     #[test]

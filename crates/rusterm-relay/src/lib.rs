@@ -29,7 +29,16 @@
 //!   `command`, `script`, and `script_base64` are mutually exclusive.
 //!   Scripts pass through [`validator::CommandValidator::validate_script`]
 //!   (hard floor + injection patterns + dcg) and [`sandbox::preflight`]
-//!   before reaching the executor.
+//!   before reaching the executor. Every dispatched command (success or
+//!   executor-level failure) is recorded to the account's command history
+//!   (see [`history::RelayHistoryStore`]) so it can be retrieved and re-run.
+//! - `GET  /api/v1/history`    — list previously-executed commands, newest
+//!   first. Query params (all optional): `account`, `host_id`, `query`
+//!   (command substring), `limit` (default 50, clamped `[1,500]`), `cursor`
+//!   (opaque, from a prior response's `next_cursor`). Non-admin accounts are
+//!   always scoped to their own history.
+//! - `DELETE /api/v1/history/{id}` — remove one history entry (owner or admin
+//!   only).
 //! - `POST /api/v1/parse-curl` — parse a pasted curl command into JSON
 
 pub mod audit;
@@ -39,6 +48,7 @@ pub mod config;
 pub mod curl;
 pub mod dcg;
 pub mod executor;
+pub mod history;
 pub mod sandbox;
 pub mod server;
 pub mod validator;
@@ -53,6 +63,11 @@ pub use config::{DEFAULT_PORT, RelayAccount, RelayConfig, hash_password, verify_
 pub use curl::{CurlParseError, ParsedCurl, parse_curl};
 pub use dcg::{DcgVerdict, probe as probe_dcg};
 pub use executor::{ExecOutcome, ExecutorError, HostInfo, NullExecutor, RelayExecutor};
+pub use history::{
+    HistoryCursor, HistoryPage, HistoryQuery, NullHistoryStore, RecordingHistoryStore,
+    RelayHistoryRecord, RelayHistoryStore, new_record_id as new_history_id,
+    now_iso as now_history_iso,
+};
 pub use sandbox::{SandboxVerdict, preflight as sandbox_preflight};
 pub use server::{RelayHandle, run};
 pub use validator::{
