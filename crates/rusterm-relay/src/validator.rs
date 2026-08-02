@@ -742,8 +742,8 @@ mod tests {
     #[test]
     fn extra_pattern_count_reports_loaded_patterns() {
         let v = validator_with_extra(&[
-            ((r"\bnc\s+-e", "nc"), "user"),
-            ((r"\bDROP\s+DATABASE", "drop"), "skill:db"),
+            (r"\bnc\s+-e", "nc", "user"),
+            (r"\bDROP\s+DATABASE", "drop", "skill"),
         ]);
         assert_eq!(v.extra_pattern_count(), 2);
     }
