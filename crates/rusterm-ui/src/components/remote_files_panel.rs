@@ -77,7 +77,7 @@ async fn sftp_client(mut state: Signal<AppState>, session_id: &str) -> Result<Sf
         .ssh_sessions
         .get(session_id)
         .cloned()
-        .ok_or_else(|| crate::i18n::t("remote_files.ssh_session_disconnected"))?;
+        .ok_or_else(|| "remote_files.ssh_session_disconnected".to_string())?;
     let opened = ssh_session
         .open_sftp()
         .await
@@ -88,7 +88,7 @@ async fn sftp_client(mut state: Signal<AppState>, session_id: &str) -> Result<Sf
         return Ok(existing);
     }
     if !app.ssh_sessions.contains_key(session_id) {
-        return Err(crate::i18n::t("remote_files.ssh_disconnected_during_sftp"));
+        return Err("remote_files.ssh_disconnected_during_sftp".to_string());
     }
     app.sftp_clients
         .insert(session_id.to_string(), opened.clone());
@@ -162,7 +162,7 @@ async fn delete_remote_entry(
                 &[("error", &error)],
             )
         }),
-        RemoteFileType::Other => Err(crate::i18n::t("remote_files.unsupported_delete")),
+        RemoteFileType::Other => Err("remote_files.unsupported_delete".to_string()),
     }
 }
 
