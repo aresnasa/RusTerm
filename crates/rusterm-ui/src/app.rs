@@ -2352,7 +2352,7 @@ fn render_terminal_pane(
                                 index,
                             )
                         };
-                        let Some((send, matched_expect)) = selection else {
+                        let Some(selection) = selection else {
                             tracing::warn!(
                                 "[ONEKEY-SELECT] session={} ignored invalid selection index={}",
                                 &sid_for_ok_sel[..sid_for_ok_sel.len().min(8)],
@@ -2368,7 +2368,11 @@ fn render_terminal_pane(
 
                         let submission_result = {
                             let senders = senders.read();
-                            send_onekey_submission(&senders, &sid_for_ok_sel, &send)
+                            send_onekey_submission(
+                                &senders,
+                                &sid_for_ok_sel,
+                                &selection.credential,
+                            )
                         };
                         match submission_result {
                             Ok(()) => {
@@ -2377,13 +2381,26 @@ fn render_terminal_pane(
                                     app.onekey_submission_feedback.insert(
                                         sid_for_ok_sel.clone(),
                                         OneKeySubmissionFeedback::Submitted {
-                                            matched_expect: matched_expect.clone(),
+                                            matched_expect: selection.matched_expect.clone(),
                                         },
                                     );
                                     app.onekey_submission_cooldown.insert(
                                         sid_for_ok_sel.clone(),
-                                        (matched_expect, std::time::Instant::now()),
+                                        (
+                                            selection.matched_expect.clone(),
+                                            std::time::Instant::now(),
+                                        ),
                                     );
+                                    if let Some(preference) = selection.preference.clone() {
+                                        remember_onekey_preference(&mut app, preference.clone());
+                                        app.onekey_preference_attempts.insert(
+                                            sid_for_ok_sel.clone(),
+                                            OneKeyPreferenceAttempt {
+                                                preference,
+                                                matched_expect: selection.matched_expect.clone(),
+                                            },
+                                        );
+                                    }
                                     app.session_configs.get(&sid_for_ok_sel).cloned()
                                 };
                                 if is_sudo_prompt {
@@ -2391,7 +2408,7 @@ fn render_terminal_pane(
                                         crate::relay_tunnel::cache_sudo_credential(
                                             &connection,
                                             &sid_for_ok_sel,
-                                            &send,
+                                            &selection.credential,
                                         );
                                     }
                                 }
