@@ -65,3 +65,8 @@
 65. 打开的会话需要保存状态（如果命令行退出或者执行完成，成功/错误都需要有提示，绿色成功，红色失败）![](image_2.png)
 66. 继续强化send 和 shell，支持基于历史记录的补全，根据 duckdb 中用户常用的命令进行补全。
 67. 启动会话后的 restful api 接口也需要在底部能够配置，然后自动化的调用 rusterm 执行相关命令（通过 curl+basicauth 才能执行）
+68. ![](image_3.png)改造restful api 的权限，如果用户已经执行了 sudo 权限，需要能够自动传递给 api 不用每次都让用户重复执行，导致❯ curl -X POST 'http://127.0.0.1:8877/api/v1/exec' \
+  -u 'aresnasa:密码' \
+  -H 'Content-Type: application/json' \
+  -d '{"host_id":"bidbot-prod","command":"docker ps"}'
+{"exit_code":null,"stdout":"","stderr":"permission denied while trying to connect to the docker API at unix:///var/run/docker.sock\n","timed_out":false,"duration_ms":865}权限不足，改造一下，然后改造一下复制命令，这里可以先根据用户配置的账号和密码做 export 申明，然后再输出 curl 命令，做运行时的命令，这样更加方便，改造下
