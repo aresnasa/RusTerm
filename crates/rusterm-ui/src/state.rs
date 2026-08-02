@@ -566,6 +566,25 @@ mod onekey_match_tests {
     }
 }
 
+/// Runtime status of the last command executed in a session, used to
+/// render a colored badge in the terminal pane's top bar (Task #65).
+/// `Idle` is the default for newly-opened sessions (no command has
+/// finished yet). This is `#[serde(skip)]` on `SessionTab` because it is
+/// ephemeral UI state, not something to persist across restarts.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub enum CommandStatus {
+    /// No command has completed yet (or the status was cleared).
+    #[default]
+    Idle,
+    /// The last command exited with code 0.
+    Success,
+    /// The last command exited with a non-zero code.
+    Failed(i32),
+    /// The session channel dropped before the command reported an exit
+    /// code. `reason` is the human-readable disconnect cause.
+    Disconnected(String),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionTab {
     pub id: String,
@@ -606,6 +625,12 @@ pub struct SessionTab {
     /// loop alongside `render_output` / `version`.
     #[serde(skip)]
     pub cwd: Option<String>,
+    /// Runtime status of the last finished command (or disconnect). Drives
+    /// the colored badge in the terminal pane top bar. Updated whenever the
+    /// shell reports an exit code (OSC 133;D, zsh/bash only) or when the
+    /// session channel drops. Not persisted across restarts.
+    #[serde(skip)]
+    pub last_command_status: CommandStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2972,6 +2997,7 @@ mod tests {
                 command_history: Vec::new(),
                 hostname: Some(name.to_string()),
                 cwd: None,
+                last_command_status: CommandStatus::default(),
             });
         }
         state
@@ -4627,6 +4653,7 @@ mod tests {
             command_history: Vec::new(),
             hostname: None,
             cwd: None,
+            last_command_status: CommandStatus::default(),
         });
         // Place beta in alpha's layout pane 1.
         apply_layout_preset(&mut state, LayoutPreset::Split2H);
@@ -5076,6 +5103,7 @@ mod tests {
             command_history: Vec::new(),
             hostname: Some("gamma".to_string()),
             cwd: None,
+            last_command_status: CommandStatus::default(),
         });
         state.sessions.push(SessionTab {
             id: "delta".to_string(),
@@ -5091,6 +5119,7 @@ mod tests {
             command_history: Vec::new(),
             hostname: Some("delta".to_string()),
             cwd: None,
+            last_command_status: CommandStatus::default(),
         });
 
         // Re-apply Grid4 — now all 4 sessions should be in the layout.
@@ -5673,6 +5702,7 @@ mod tests {
             command_history: Vec::new(),
             hostname: Some("newhost".to_string()),
             cwd: None,
+            last_command_status: CommandStatus::default(),
         });
         assert!(set_pane_session_for_layout(
             &mut state,
@@ -5718,6 +5748,7 @@ mod tests {
             command_history: Vec::new(),
             hostname: Some("newhost".to_string()),
             cwd: None,
+            last_command_status: CommandStatus::default(),
         });
         assert!(set_pane_session_for_active(
             &mut state,

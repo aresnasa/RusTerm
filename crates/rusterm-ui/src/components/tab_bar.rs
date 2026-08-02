@@ -257,6 +257,7 @@ pub fn TabBar(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::state::CommandStatus;
 
     #[test]
     fn focused_tab_uses_complete_inset_outline() {
@@ -295,6 +296,7 @@ mod tests {
             command_history: Vec::new(),
             hostname: None,
             cwd: None,
+            last_command_status: CommandStatus::default(),
         }
     }
 

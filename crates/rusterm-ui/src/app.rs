@@ -47,7 +47,7 @@ use crate::keybindings::action_for_event;
 use crate::layout::{PaneLayout, SplitAxis, SplitDirection};
 use crate::skin::css_variables;
 use crate::state::{
-    AppState, Modal, OneKeyMatch, OneKeyPopupState, OneKeySubmissionFeedback,
+    AppState, CommandStatus, Modal, OneKeyMatch, OneKeyPopupState, OneKeySubmissionFeedback,
     PendingCommandPayload, PendingDangerousCommand, SessionConnectionState, SessionTab,
     TabDropOutcome, TerminalEntry, UnlockState, activate_session, append_pane_to_active,
     available_send_targets, begin_floating_pane_move, clear_terminal_command_lines, close_pane,
@@ -1294,6 +1294,87 @@ fn scroll_terminal_sessions(
     }
 }
 
+/// Render the colored command-status badge for the terminal pane top bar
+/// (Task #65).
+///
+/// Returns an `Element` that floats in the top-right corner of the terminal
+/// pane. `Idle` renders nothing (no badge for a freshly-opened session or
+/// before the first command finishes). The badge uses inline styles so it
+/// doesn't depend on skin CSS variables being loaded — green for success,
+/// red for failure/disconnect.
+///
+/// This is a pure render function (no state mutation), extracted so the
+/// `render_terminal_pane` body stays focused on wiring up TerminalView's
+/// event handlers.
+fn render_command_status_badge(status: &CommandStatus) -> Element {
+    match status {
+        CommandStatus::Idle => rsx! {},
+        CommandStatus::Success => rsx! {
+            span {
+                style: "
+                    position: absolute;
+                    top: 4px;
+                    right: 8px;
+                    z-index: 8;
+                    background: rgba(76, 175, 80, 0.9);
+                    color: #ffffff;
+                    font-size: 11px;
+                    font-family: 'JetBrains Mono', monospace;
+                    padding: 2px 8px;
+                    border-radius: 3px;
+                    pointer-events: none;
+                    user-select: none;
+                    white-space: nowrap;
+                ",
+                "✓ 成功"
+            }
+        },
+        CommandStatus::Failed(rc) => {
+            let label = format!("✗ 失败 (exit {rc})");
+            rsx! {
+                span {
+                    style: "
+                        position: absolute;
+                        top: 4px;
+                        right: 8px;
+                        z-index: 8;
+                        background: rgba(244, 67, 54, 0.9);
+                        color: #ffffff;
+                        font-size: 11px;
+                        font-family: 'JetBrains Mono', monospace;
+                        padding: 2px 8px;
+                        border-radius: 3px;
+                        pointer-events: none;
+                        user-select: none;
+                        white-space: nowrap;
+                    ",
+                    "{label}"
+                }
+            }
+        }
+        CommandStatus::Disconnected(_) => rsx! {
+            span {
+                style: "
+                    position: absolute;
+                    top: 4px;
+                    right: 8px;
+                    z-index: 8;
+                    background: rgba(244, 67, 54, 0.9);
+                    color: #ffffff;
+                    font-size: 11px;
+                    font-family: 'JetBrains Mono', monospace;
+                    padding: 2px 8px;
+                    border-radius: 3px;
+                    pointer-events: none;
+                    user-select: none;
+                    white-space: nowrap;
+                ",
+                "⚠ 断开"
+            }
+        },
+    }
+}
+
 /// Render a single TerminalView for the session identified by `session_id`.
 ///
 /// This is the shared rendering helper used by both the single-pane path
@@ -1375,11 +1456,18 @@ fn render_terminal_pane(
                 Some(SessionConnectionState::Disconnected | SessionConnectionState::Reconnecting)
             );
             let keybindings = state.read().keybindings.clone();
+            // Task #65: snapshot the last command status so we can render a
+            // colored badge (green ✓ / red ✗ / red ⚠) in the terminal pane
+            // top bar. Cloned because `CommandStatus` is `Clone` and the
+            // read lock must release before the rsx! render.
+            let last_command_status = tab.last_command_status.clone();
             rsx! {
-                TerminalView {
-                    session_id: tab.id.clone(),
-                    render_output: tab.render_output.clone(),
-                    version: tab.version,
+                div {
+                    style: "position: relative; width: 100%; height: 100%;",
+                    TerminalView {
+                        session_id: tab.id.clone(),
+                        render_output: tab.render_output.clone(),
+                        version: tab.version,
                     suggestion: tab.suggestion.clone(),
                     suggestions: tab.suggestions.clone(),
                     suggestion_corrections: tab.suggestion_corrections.iter().cloned().collect(),
@@ -2214,6 +2302,12 @@ fn render_terminal_pane(
                     },
                     row_diffs: row_diffs.clone(),
                     suggestion_max_rows: state.read().suggestion_count as usize,
+                }
+                // Task #65: colored status badge overlay (top-right corner).
+                // Renders on top of the terminal output without injecting ANSI
+                // into the PTY stream. z-index is below the search bar (10) and
+                // popups so they stay interactive.
+                {render_command_status_badge(&last_command_status)}
                 }
             }
         }
@@ -7266,20 +7360,6 @@ mod session_startup_tests {
     }
 }
 
-/// Format a colored status line for command-completion feedback (Task #65).
-///
-/// Returns a green `✓ 命令成功 (exit 0)` for success (rc==0) and a red
-/// `✗ 命令失败 (exit {rc})` for failure (rc!=0). Wrapped in ANSI SGR codes
-/// so the terminal model renders it in color. Extracted as a pure function
-/// so it can be unit-tested without a terminal handle.
-fn format_command_status_line(rc: i32) -> String {
-    if rc == 0 {
-        "\r\n\x1b[32m✓ 命令成功 (exit 0)\x1b[0m\r\n".to_string()
-    } else {
-        format!("\r\n\x1b[31m✗ 命令失败 (exit {})\x1b[0m\r\n", rc)
-    }
-}
-
 /// Format a red disconnection notice for session loss (Task #65).
 ///
 /// Used by both SSH and local-shell `SessionEvent::Disconnected` handlers.
@@ -8273,21 +8353,23 @@ fn start_ssh_connection(
                                         });
                                     }
                                 }
-                                // Task #65: colored command-completion
-                                // feedback. OSC 133;D (zsh/bash) gave us
-                                // the exit code; surface it as green ✓ / red
-                                // ✗ right after the command's output.
-                                // Re-rendering updates render_output so the
-                                // line is visible at once. fish/nu/pwsh don't
-                                // report exit codes, so this is a no-op there.
+                                // Task #65: surface the command's exit code as a
+                                // colored badge in the terminal pane top bar
+                                // (NOT as an injected ANSI line — the user
+                                // explicitly rejected terminal-output injection).
+                                // OSC 133;D (zsh/bash) gave us the exit code;
+                                // we store it on the SessionTab so the top-bar
+                                // renderer can show green ✓ / red ✗. fish/nu/pwsh
+                                // don't report exit codes, so this is a no-op
+                                // there.
                                 if let Some(rc) = exit_code {
-                                    let status_line = format_command_status_line(rc);
-                                    let new_render =
-                                        handle.lock().process_and_render(status_line.as_bytes());
                                     let mut s = state.write();
                                     if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
-                                        tab.render_output = new_render;
-                                        tab.version += 1;
+                                        tab.last_command_status = if rc == 0 {
+                                            CommandStatus::Success
+                                        } else {
+                                            CommandStatus::Failed(rc)
+                                        };
                                     }
                                 }
                             }
@@ -8333,6 +8415,11 @@ fn start_ssh_connection(
                                 if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
                                     tab.render_output = render_result;
                                     tab.version += 1;
+                                    // Task #65: show a red "disconnected" badge in
+                                    // the top bar so the user sees the session is
+                                    // down without scanning the terminal output.
+                                    tab.last_command_status =
+                                        CommandStatus::Disconnected(reason.clone());
                                 }
                             }
                         }
@@ -8789,17 +8876,18 @@ fn start_shell_connection(
                                         });
                                     }
                                 }
-                                // Task #65: colored command-completion
-                                // feedback (local shell path). Mirrors the
-                                // SSH branch — see there for rationale.
+                                // Task #65: surface the command's exit code as a
+                                // colored badge in the terminal pane top bar
+                                // (local shell path). Mirrors the SSH branch —
+                                // see there for rationale.
                                 if let Some(rc) = exit_code {
-                                    let status_line = format_command_status_line(rc);
-                                    let new_render =
-                                        handle.lock().process_and_render(status_line.as_bytes());
                                     let mut s = state.write();
                                     if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
-                                        tab.render_output = new_render;
-                                        tab.version += 1;
+                                        tab.last_command_status = if rc == 0 {
+                                            CommandStatus::Success
+                                        } else {
+                                            CommandStatus::Failed(rc)
+                                        };
                                     }
                                 }
                             }
@@ -8827,6 +8915,11 @@ fn start_shell_connection(
                                 if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
                                     tab.render_output = render_result;
                                     tab.version += 1;
+                                    // Task #65: show a red "disconnected" badge in
+                                    // the top bar so the user sees the session is
+                                    // down without scanning the terminal output.
+                                    tab.last_command_status =
+                                        CommandStatus::Disconnected(reason.clone());
                                 }
                             }
                         }
@@ -9055,6 +9148,7 @@ fn create_local_shell_session(state: &mut Signal<AppState>, embedded: bool) -> S
             command_history: Vec::new(),
             hostname: Some("local".to_string()),
             cwd: None,
+            last_command_status: CommandStatus::default(),
         });
         if embedded {
             app.bottom_shell_session_id = Some(session_id.clone());
@@ -9191,6 +9285,7 @@ fn restore_sessions(
                     command_history: ps.command_history_tail.clone(),
                     hostname: Some("local".to_string()),
                     cwd: None,
+                    last_command_status: CommandStatus::default(),
                 });
                 // Each restored session becomes its own top-level workspace
                 // tab (one session per tab — Plan B's default layout for
@@ -9783,6 +9878,7 @@ fn open_connection(
                 command_history: Vec::new(),
                 hostname: Some(ssh_config.host.clone()),
                 cwd: None,
+                last_command_status: CommandStatus::default(),
             });
             let assigned = assign_opened_session(&mut state.write(), target.as_ref(), &tab_id);
             start_ssh_connection(state, input_senders, tab_id.clone(), ssh_config.clone());
@@ -9812,6 +9908,7 @@ fn open_connection(
                 command_history: Vec::new(),
                 hostname: Some("local".to_string()),
                 cwd: None,
+                last_command_status: CommandStatus::default(),
             });
             let assigned = assign_opened_session(&mut state.write(), target.as_ref(), &tab_id);
             start_shell_connection(state, input_senders, tab_id.clone(), shell_config.clone());
@@ -9836,6 +9933,7 @@ fn open_connection(
                     command_history: Vec::new(),
                     hostname: None,
                     cwd: None,
+                    last_command_status: CommandStatus::default(),
                 });
                 assign_opened_session(&mut state.write(), target.as_ref(), &tab_id)
             } else {
@@ -11993,6 +12091,7 @@ pub fn App() -> Element {
                         command_history: Vec::new(),
                         hostname: Some(ssh_config.host.clone()),
                         cwd: None,
+                        last_command_status: CommandStatus::default(),
                     });
                     // New top-level workspace tab.
                     push_workspace_tab(&mut s, &config.id);
@@ -14600,80 +14699,8 @@ mod tab_drag_tests {
 
 #[cfg(test)]
 mod command_status_tests {
-    use super::{format_command_status_line, format_disconnected_line};
-
-    #[test]
-    fn success_is_green_with_check_mark() {
-        let line = format_command_status_line(0);
-        // Green SGR = \x1b[32m, reset = \x1b[0m
-        assert!(line.contains("\x1b[32m"), "missing green SGR: {:?}", line);
-        assert!(line.contains("\x1b[0m"), "missing reset SGR: {:?}", line);
-        assert!(line.contains('✓'), "missing check mark: {:?}", line);
-        assert!(line.contains("exit 0"), "missing exit code: {:?}", line);
-        // Must NOT use red
-        assert!(
-            !line.contains("\x1b[31m"),
-            "success must not be red: {:?}",
-            line
-        );
-        // Must NOT show failure marker
-        assert!(
-            !line.contains('✗'),
-            "success must not have cross: {:?}",
-            line
-        );
-    }
-
-    #[test]
-    fn failure_is_red_with_cross_and_code() {
-        let line = format_command_status_line(1);
-        assert!(line.contains("\x1b[31m"), "missing red SGR: {:?}", line);
-        assert!(line.contains("\x1b[0m"), "missing reset SGR: {:?}", line);
-        assert!(line.contains('✗'), "missing cross mark: {:?}", line);
-        assert!(line.contains("exit 1"), "missing exit code: {:?}", line);
-        assert!(
-            !line.contains("\x1b[32m"),
-            "failure must not be green: {:?}",
-            line
-        );
-        assert!(
-            !line.contains('✓'),
-            "failure must not have check: {:?}",
-            line
-        );
-    }
-
-    #[test]
-    fn failure_includes_arbitrary_exit_code() {
-        assert!(format_command_status_line(127).contains("exit 127"));
-        assert!(format_command_status_line(255).contains("exit 255"));
-        assert!(format_command_status_line(-1).contains("exit -1"));
-    }
-
-    #[test]
-    fn status_line_is_crlq_framed() {
-        // Both success and failure lines start and end with CRLF so they
-        // sit on their own line in the terminal, between the command's
-        // output and the next prompt.
-        let ok = format_command_status_line(0);
-        let err = format_command_status_line(2);
-        assert!(
-            ok.starts_with("\r\n"),
-            "success must start with CRLF: {:?}",
-            ok
-        );
-        assert!(ok.ends_with("\r\n"), "success must end with CRLF: {:?}", ok);
-        assert!(
-            err.starts_with("\r\n"),
-            "failure must start with CRLF: {:?}",
-            err
-        );
-        assert!(
-            err.ends_with("\r\n"),
-            "failure must end with CRLF: {:?}",
-            err
-        );
-    }
+    use super::format_disconnected_line;
+    use crate::state::CommandStatus;
 
     #[test]
     fn disconnected_is_red_and_mentions_reconnect() {
@@ -14697,5 +14724,28 @@ mod command_status_tests {
             "disconnect must not be green: {:?}",
             line
         );
+    }
+
+    #[test]
+    fn command_status_default_is_idle() {
+        // New sessions start Idle so the top bar shows no badge until the
+        // first command finishes.
+        assert_eq!(CommandStatus::default(), CommandStatus::Idle);
+    }
+
+    #[test]
+    fn command_status_failed_carries_exit_code() {
+        match CommandStatus::Failed(127) {
+            CommandStatus::Failed(rc) => assert_eq!(rc, 127),
+            other => panic!("expected Failed(127), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn command_status_disconnected_carries_reason() {
+        match CommandStatus::Disconnected("timeout".to_string()) {
+            CommandStatus::Disconnected(reason) => assert_eq!(reason, "timeout"),
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
     }
 }
