@@ -6774,4 +6774,6 @@ pub enum Modal {
     Settings,
     AiSuggest,
     OneKeyManager,
+    Tunnels,
+    Relay,
 }

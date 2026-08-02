@@ -1182,6 +1182,13 @@ pub struct PersistedConfig {
     /// Night remains the default.
     #[serde(default)]
     pub skin: SkinSettings,
+    /// Whether the app collects local usage-habit statistics (command names,
+    /// success/failure rates, per-hour activity, typo→correction pairs) into
+    /// the DuckDB analytics store. Default FALSE — data collection is opt-in
+    /// for privacy. Credentials and secret material are sanitized before
+    /// anything is stored, regardless of this flag.
+    #[serde(default)]
+    pub collect_usage_habits: bool,
 }
 
 /// Default for `PersistedConfig::confirm_close_on_exit`. Kept as a function
@@ -1355,6 +1362,7 @@ mod tests {
             group: Some("Production".to_string()),
             tags: vec!["linux".to_string(), "prod".to_string()],
             onekey: true,
+            login_script: Some("expect Password:\nsend hunter2\n".to_string()),
         };
 
         let json = serde_json::to_string(&config).unwrap();
@@ -1410,6 +1418,7 @@ mod tests {
             group: None,
             tags: vec![],
             onekey: false,
+            login_script: None,
         };
 
         let toml_str = toml::to_string(&config).unwrap();
@@ -1684,6 +1693,71 @@ mod tests {
     }
 
     #[test]
+    fn login_script_defaults_to_none_for_legacy_persisted_connection() {
+        // Legacy settings.json connections predate the login_script field and
+        // must deserialize with `login_script: None`.
+        let json = r#"{
+            "id":"c1",
+            "name":"Router",
+            "kind":{"Serial":{"port":"/dev/ttyUSB0","baud_rate":115200,"data_bits":8,"parity":"none","stop_bits":1,"flow_control":"none"}},
+            "group":null,
+            "tags":[],
+            "onekey":false
+        }"#;
+
+        let conn: PersistedConnection = serde_json::from_str(json).unwrap();
+        assert_eq!(conn.login_script, None);
+
+        let json = serde_json::to_string(&serde_json::json!({
+            "id": "c1",
+            "name": "Router",
+            "kind": {"Serial": {"port": "/dev/ttyUSB0", "baud_rate": 115200, "data_bits": 8, "parity": "none", "stop_bits": 1, "flow_control": "none"}},
+            "group": null,
+            "tags": [],
+            "onekey": false,
+            "login_script": "expect Password:\nsend hunter2\n"
+        }))
+        .unwrap();
+        let conn: PersistedConnection = serde_json::from_str(&json).unwrap();
+        assert_eq!(
+            conn.login_script,
+            Some("expect Password:\nsend hunter2\n".to_string())
+        );
+    }
+
+    #[test]
+    fn login_script_roundtrips_on_connection_config() {
+        let mut conn = ConnectionConfig {
+            id: "c1".to_string(),
+            name: "Router".to_string(),
+            kind: ConnectionKind::Serial(SerialConfig {
+                port: "/dev/ttyUSB0".to_string(),
+                baud_rate: 115200,
+                data_bits: 8,
+                parity: "none".to_string(),
+                stop_bits: 1,
+                flow_control: "none".to_string(),
+            }),
+            group: None,
+            tags: vec![],
+            onekey: false,
+            login_script: Some("expect Password:\nsend hunter2\n".to_string()),
+        };
+
+        let json = serde_json::to_string(&conn).unwrap();
+        let parsed: ConnectionConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, conn);
+
+        // Legacy ConnectionConfig JSON (no login_script key) must still load.
+        conn.login_script = None;
+        let parsed: ConnectionConfig = serde_json::from_str(
+            r#"{"id":"c1","name":"Router","kind":{"Serial":{"port":"/dev/ttyUSB0","baud_rate":115200,"data_bits":8,"parity":"none","stop_bits":1,"flow_control":"none"}},"group":null,"tags":[],"onekey":false}"#,
+        )
+        .unwrap();
+        assert_eq!(parsed, conn);
+    }
+
+    #[test]
     fn suggestion_settings_default_for_legacy_settings() {
         // A legacy settings.json that predates the suggestion fields should
         // deserialize with sensible defaults (enabled=true, count=3).
@@ -1793,6 +1867,24 @@ mod tests {
         let parsed: PersistedConfig = serde_json::from_str(&json).unwrap();
         assert!(!parsed.suggestion_enabled);
         assert_eq!(parsed.suggestion_count, 10);
+    }
+
+    #[test]
+    fn collect_usage_habits_defaults_off_for_legacy_settings() {
+        // A legacy settings.json that predates the usage-habits field must
+        // deserialize with collection DISABLED (privacy-safe opt-in default).
+        let config: PersistedConfig =
+            serde_json::from_str(r#"{"version":1,"connections":[]}"#).unwrap();
+        assert!(!config.collect_usage_habits);
+
+        // And an explicit true must round-trip.
+        let json = serde_json::to_string(&PersistedConfig {
+            collect_usage_habits: true,
+            ..config
+        })
+        .unwrap();
+        let parsed: PersistedConfig = serde_json::from_str(&json).unwrap();
+        assert!(parsed.collect_usage_habits);
     }
 
     #[test]

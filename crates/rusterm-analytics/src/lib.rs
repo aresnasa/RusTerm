@@ -61,6 +61,36 @@ pub use classify::{CommandCategory, classify_commands};
 pub use mirror::mirror_from_sqlite;
 pub use sanitize::{contains_sensitive_material, sanitize_command};
 
+/// Aggregated success/failure counts for one full command line, used to
+/// rank habits and to downgrade risky suggestions.
+///
+/// Executions whose exit code is unknown (NULL) are *observations* of the
+/// command but count as neither success nor failure.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct CommandRanking {
+    pub command: String,
+    pub successes: u64,
+    pub failures: u64,
+}
+
+impl CommandRanking {
+    /// Observations with a known outcome: successes + failures.
+    pub fn total(&self) -> u64 {
+        self.successes + self.failures
+    }
+
+    /// successes / (successes + failures); 0.0 when there are no
+    /// observations with a known outcome.
+    pub fn success_rate(&self) -> f64 {
+        let total = self.total();
+        if total == 0 {
+            0.0
+        } else {
+            self.successes as f64 / total as f64
+        }
+    }
+}
+
 /// One row in the analytics-optimized `commands` table.
 ///
 /// Mirrors a subset of `rusterm_db::HistoryEntry` — only the columns analytics
@@ -211,10 +241,15 @@ impl AnalyticsDB {
     /// from the runtime path (each successful command is recorded here too,
     /// so the analytics DB stays current without a full re-mirror).
     pub fn record_command(&self, cmd: &AnalyticsCommand) -> Result<()> {
+        // Defense in depth: never persist credential material. Lines
+        // dominated by secrets (e.g. PEM private keys) are dropped silently.
+        let Some(command) = sanitize::sanitize_command(&cmd.command) else {
+            return Ok(());
+        };
         let conn = self.conn.lock();
         conn.execute(
             "INSERT INTO commands (command, hostname, exit_code, created_at) VALUES (?, ?, ?, ?)",
-            duckdb::params![cmd.command, cmd.hostname, cmd.exit_code, cmd.created_at],
+            duckdb::params![command, cmd.hostname, cmd.exit_code, cmd.created_at],
         )?;
         Ok(())
     }
@@ -223,6 +258,14 @@ impl AnalyticsDB {
     /// UI, which has session boundaries and exit-code ordering; DuckDB only
     /// persists aggregate observations.
     pub fn record_command_correction(&self, typo: &str, correction: &str) -> Result<()> {
+        // Defense in depth: never persist credential material, in either
+        // side of the learned pair.
+        let (Some(typo), Some(correction)) = (
+            sanitize::sanitize_command(typo),
+            sanitize::sanitize_command(correction),
+        ) else {
+            return Ok(());
+        };
         let conn = self.conn.lock();
         let last_seen = Utc::now().to_rfc3339();
         let updated = conn.execute(
@@ -394,6 +437,68 @@ impl AnalyticsDB {
                 count: count as u64,
             })
             .collect())
+    }
+
+    /// Per-full-command success/failure counts, ranking most-used first.
+    /// Commands with only NULL exit codes count as unknown (excluded from
+    /// both success and failure). Limit 0 means no limit.
+    pub fn command_rankings(&self, limit: u32) -> Result<Vec<CommandRanking>> {
+        let conn = self.conn.lock();
+        let limit_clause = if limit == 0 {
+            String::new()
+        } else {
+            format!("LIMIT {}", u64::from(limit))
+        };
+        let mut stmt = conn.prepare(&format!(
+            "SELECT
+                command,
+                SUM(CASE WHEN exit_code = 0 THEN 1 ELSE 0 END) AS ok,
+                SUM(CASE WHEN exit_code != 0 THEN 1 ELSE 0 END) AS fail
+             FROM commands
+             GROUP BY command
+             ORDER BY
+                SUM(CASE WHEN exit_code = 0 THEN 1 ELSE 0 END)
+                    + SUM(CASE WHEN exit_code != 0 THEN 1 ELSE 0 END) DESC,
+                command ASC
+             {limit_clause}"
+        ))?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(CommandRanking {
+                    command: row.get(0)?,
+                    successes: row.get::<_, i64>(1)? as u64,
+                    failures: row.get::<_, i64>(2)? as u64,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Commands the user frequently fails: total observations >=
+    /// min_observations AND failure share >= (1.0 - max_success_rate),
+    /// sorted worst (lowest success rate, then most failures) first.
+    /// Used to downgrade risky suggestions. Limit 0 means no limit.
+    pub fn high_failure_commands(
+        &self,
+        max_success_rate: f64,
+        min_observations: u64,
+        limit: u32,
+    ) -> Result<Vec<CommandRanking>> {
+        let mut risky: Vec<CommandRanking> = self
+            .command_rankings(0)?
+            .into_iter()
+            .filter(|r| r.total() >= min_observations && r.success_rate() <= max_success_rate)
+            .collect();
+        risky.sort_by(|a, b| {
+            a.success_rate()
+                .partial_cmp(&b.success_rate())
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.failures.cmp(&a.failures))
+        });
+        if limit > 0 {
+            risky.truncate(limit as usize);
+        }
+        Ok(risky)
     }
 
     /// High-level behavior summary. Aggregates several metrics in one call
@@ -664,6 +769,218 @@ mod tests {
         assert_eq!(corrections[0].correction, "docker ps");
         assert_eq!(corrections[0].observations, 2);
         assert_eq!(corrections[1].observations, 1);
+    }
+
+    /// Seed the ranking scenario: `git status` 3 ok, `dockre ps` 2 fail,
+    /// `docker ps` 5 ok + 1 fail.
+    fn seed_ranking_history(db: &AnalyticsDB) {
+        for c in [
+            cmd("git status", Some(0), "2026-07-18T10:00:00Z"),
+            cmd("git status", Some(0), "2026-07-18T10:01:00Z"),
+            cmd("git status", Some(0), "2026-07-18T10:02:00Z"),
+            cmd("dockre ps", Some(127), "2026-07-18T10:03:00Z"),
+            cmd("dockre ps", Some(127), "2026-07-18T10:04:00Z"),
+            cmd("docker ps", Some(0), "2026-07-18T10:05:00Z"),
+            cmd("docker ps", Some(0), "2026-07-18T10:06:00Z"),
+            cmd("docker ps", Some(0), "2026-07-18T10:07:00Z"),
+            cmd("docker ps", Some(0), "2026-07-18T10:08:00Z"),
+            cmd("docker ps", Some(0), "2026-07-18T10:09:00Z"),
+            cmd("docker ps", Some(1), "2026-07-18T10:10:00Z"),
+        ] {
+            db.record_command(&c).unwrap();
+        }
+    }
+
+    /// `command_rankings` must rank per-full-command success/failure counts,
+    /// most-used first.
+    #[test]
+    fn command_rankings_orders_most_used_first() {
+        let db = AnalyticsDB::open_in_memory().unwrap();
+        seed_ranking_history(&db);
+
+        let rankings = db.command_rankings(10).unwrap();
+        assert_eq!(rankings.len(), 3);
+
+        assert_eq!(rankings[0].command, "docker ps");
+        assert_eq!(rankings[0].successes, 5);
+        assert_eq!(rankings[0].failures, 1);
+        assert_eq!(rankings[0].total(), 6);
+        assert!(
+            (rankings[0].success_rate() - 5.0 / 6.0).abs() < 1e-9,
+            "docker ps success_rate must be 5/6, got {}",
+            rankings[0].success_rate()
+        );
+
+        assert_eq!(rankings[1].command, "git status");
+        assert_eq!(rankings[1].successes, 3);
+        assert_eq!(rankings[1].failures, 0);
+        assert_eq!(rankings[1].total(), 3);
+        assert_eq!(rankings[1].success_rate(), 1.0);
+
+        assert_eq!(rankings[2].command, "dockre ps");
+        assert_eq!(rankings[2].successes, 0);
+        assert_eq!(rankings[2].failures, 2);
+        assert_eq!(rankings[2].total(), 2);
+        assert_eq!(rankings[2].success_rate(), 0.0);
+    }
+
+    /// Limit 0 means no limit; otherwise at most `limit` rows.
+    #[test]
+    fn command_rankings_limit_zero_means_no_limit() {
+        let db = AnalyticsDB::open_in_memory().unwrap();
+        seed_ranking_history(&db);
+        assert_eq!(db.command_rankings(0).unwrap().len(), 3);
+        let top_two = db.command_rankings(2).unwrap();
+        assert_eq!(top_two.len(), 2);
+        assert_eq!(top_two[0].command, "docker ps");
+        assert_eq!(top_two[1].command, "git status");
+    }
+
+    /// `high_failure_commands` must surface frequently-failed commands and
+    /// exclude well-behaved ones, sorted worst-first.
+    #[test]
+    fn high_failure_commands_returns_frequent_failures_worst_first() {
+        let db = AnalyticsDB::open_in_memory().unwrap();
+        seed_ranking_history(&db);
+        // A second risky command: 1 ok, 3 fail -> success rate 0.25 <= 0.3.
+        for c in [
+            cmd("gti stauts", Some(0), "2026-07-18T11:00:00Z"),
+            cmd("gti stauts", Some(1), "2026-07-18T11:01:00Z"),
+            cmd("gti stauts", Some(1), "2026-07-18T11:02:00Z"),
+            cmd("gti stauts", Some(1), "2026-07-18T11:03:00Z"),
+        ] {
+            db.record_command(&c).unwrap();
+        }
+
+        let risky = db.high_failure_commands(0.3, 2, 10).unwrap();
+        let commands: Vec<&str> = risky.iter().map(|r| r.command.as_str()).collect();
+        assert!(
+            commands.contains(&"dockre ps"),
+            "dockre ps (0% success, 2 obs) must be flagged, got {commands:?}"
+        );
+        assert!(
+            commands.contains(&"gti stauts"),
+            "gti stauts (25% success, 4 obs) must be flagged, got {commands:?}"
+        );
+        assert!(
+            !commands.contains(&"docker ps"),
+            "docker ps (83% success) must NOT be flagged, got {commands:?}"
+        );
+        assert!(
+            !commands.contains(&"git status"),
+            "git status (100% success) must NOT be flagged, got {commands:?}"
+        );
+        // Worst (lowest success rate) first: dockre ps (0.0) before gti stauts (0.25).
+        assert_eq!(risky[0].command, "dockre ps");
+        assert_eq!(risky[1].command, "gti stauts");
+    }
+
+    /// `high_failure_commands` must respect the observation floor — a command
+    /// that failed once but has too few observations is not yet "frequently
+    /// failing".
+    #[test]
+    fn high_failure_commands_respects_min_observations() {
+        let db = AnalyticsDB::open_in_memory().unwrap();
+        db.record_command(&cmd("dockre ps", Some(127), "2026-07-18T10:00:00Z"))
+            .unwrap();
+        let risky = db.high_failure_commands(0.3, 2, 10).unwrap();
+        assert!(
+            risky.is_empty(),
+            "1 observation < min_observations=2 must not be flagged"
+        );
+    }
+
+    /// Rows with NULL exit codes are unknown: they must not count as success
+    /// or failure, and must not inflate a command's observation count.
+    #[test]
+    fn rankings_ignore_null_exit_codes() {
+        let db = AnalyticsDB::open_in_memory().unwrap();
+        seed_ranking_history(&db);
+        db.record_command(&cmd("mystery", None, "2026-07-18T12:00:00Z"))
+            .unwrap();
+        db.record_command(&cmd("git status", None, "2026-07-18T12:01:00Z"))
+            .unwrap();
+
+        let rankings = db.command_rankings(0).unwrap();
+        let git = rankings.iter().find(|r| r.command == "git status").unwrap();
+        assert_eq!(git.successes, 3, "NULL exit code must not count as success");
+        assert_eq!(git.failures, 0, "NULL exit code must not count as failure");
+        assert_eq!(git.total(), 3);
+
+        let mystery = rankings.iter().find(|r| r.command == "mystery").unwrap();
+        assert_eq!(mystery.successes, 0);
+        assert_eq!(mystery.failures, 0);
+        assert_eq!(mystery.total(), 0);
+        assert_eq!(mystery.success_rate(), 0.0);
+
+        // A NULL-only command has zero observations — it can't be flagged as
+        // frequently failing even though its success_rate() is 0.0.
+        let risky = db.high_failure_commands(0.3, 1, 10).unwrap();
+        assert!(
+            !risky.iter().any(|r| r.command == "mystery"),
+            "NULL-only command must be excluded from high_failure_commands"
+        );
+    }
+
+    /// Defense in depth: `record_command` must redact secret values before
+    /// they ever reach the DuckDB file.
+    #[test]
+    fn record_command_redacts_glued_mysql_password() {
+        let db = AnalyticsDB::open_in_memory().unwrap();
+        db.record_command(&cmd("mysql -psecret db", Some(0), "2026-07-18T10:00:00Z"))
+            .unwrap();
+        let summary = db.behavior_summary().unwrap();
+        assert_eq!(
+            summary.most_used_command.as_deref(),
+            Some("mysql -p*** db"),
+            "stored command must have the password redacted"
+        );
+    }
+
+    /// Defense in depth: a command line carrying PEM private key material
+    /// must be dropped entirely — never persisted.
+    #[test]
+    fn record_command_drops_pem_private_key() {
+        let db = AnalyticsDB::open_in_memory().unwrap();
+        db.record_command(&cmd("ls", Some(0), "2026-07-18T10:00:00Z"))
+            .unwrap();
+        let before = db.total_commands().unwrap();
+
+        let pem = "cat -----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBg==\n-----END PRIVATE KEY-----";
+        db.record_command(&cmd(pem, Some(0), "2026-07-18T10:01:00Z"))
+            .unwrap();
+        assert_eq!(
+            db.total_commands().unwrap(),
+            before,
+            "PEM-containing command must not be stored"
+        );
+    }
+
+    /// Correction pairs pass through the sanitizer too: secrets in either
+    /// side must be redacted, and PEM material must drop the pair.
+    #[test]
+    fn record_command_correction_is_sanitized() {
+        let db = AnalyticsDB::open_in_memory().unwrap();
+
+        // Redactable secret values are stored redacted.
+        db.record_command_correction("mysql -psecret db", "mysql -p*** db")
+            .unwrap();
+        let corrections = db.command_corrections_for("mysql -p*** db").unwrap();
+        assert_eq!(corrections.len(), 1);
+        assert_eq!(corrections[0].typo, "mysql -p*** db");
+        assert_eq!(corrections[0].correction, "mysql -p*** db");
+        assert!(
+            db.command_corrections_for("mysql -psecret db")
+                .unwrap()
+                .is_empty(),
+            "the raw secret must never be persisted as a typo key"
+        );
+
+        // PEM material in either side drops the whole pair.
+        let pem = "-----BEGIN PRIVATE KEY-----";
+        db.record_command_correction(pem, "docker ps").unwrap();
+        db.record_command_correction("dockre ps", pem).unwrap();
+        assert!(db.command_corrections_for("dockre ps").unwrap().is_empty());
     }
 
     /// `clear` must wipe all rows. Used by tests and by a future "reset

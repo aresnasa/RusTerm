@@ -5,6 +5,126 @@
 //! and every correction pair passes through [`sanitize_command`] before it is
 //! persisted; lines dominated by secret material are dropped entirely.
 
+use std::borrow::Cow;
+use std::sync::LazyLock;
+
+use regex::{Captures, Regex};
+
+/// PEM private key material. The whole line is dropped — there is no
+/// legitimate reason to keep any part of it in analytics.
+static PEM_PRIVATE_KEY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"-----BEGIN[A-Z0-9 ]*PRIVATE KEY-----").unwrap());
+
+/// AWS access key ids (`AKIA` + 16 uppercase alphanumeric chars).
+static AWS_ACCESS_KEY_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\bAKIA[0-9A-Z]{16}\b").unwrap());
+
+/// `Authorization:` headers — the value runs to the closing quote or EOL.
+static AUTH_HEADER_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r#"(?i)(Authorization:)[^'\"\r\n]*"#).unwrap());
+
+/// Credential-ish name fragment used by the env-assignment and long-flag
+/// patterns below (case-insensitive, plural-tolerant).
+const CRED_NAME: &str = r"(?:passwords?|passwds?|secrets?|tokens?|api[-_]?keys?|private[-_]?keys?)";
+
+/// Env-var style assignments: `NAME=value` where NAME contains a
+/// credential-ish word, e.g. `AWS_SECRET_ACCESS_KEY=...`, `MY_API_KEY=...`.
+static ENV_ASSIGNMENT_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r"(?i)\b([a-z0-9_]*{cred}[a-z0-9_]*)=[^\s]+",
+        cred = CRED_NAME
+    ))
+    .unwrap()
+});
+
+/// Long-flag with `=`: `--password=hunter2`.
+static LONG_FLAG_EQ_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r"(?i)(--[a-z0-9_-]*{cred}\b)=[^\s]*",
+        cred = CRED_NAME
+    ))
+    .unwrap()
+});
+
+/// Long-flag with a space-separated value: `--password hunter2`.
+static LONG_FLAG_SPACE_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(&format!(
+        r"(?i)(--[a-z0-9_-]*{cred}\b)(\s+)\S+",
+        cred = CRED_NAME
+    ))
+    .unwrap()
+});
+
+/// MySQL-family glued password flag: `-psecret` (value attached to `-p`).
+/// Only applied when the command's first token is a known secret-taking
+/// tool, so `git -p` / `ls -p` are never touched.
+static GLUED_DASH_P_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"(^|\s)-p[^\s]+").unwrap());
+
+/// Tools whose `-p` flag takes a password value.
+const SECRET_TAKING_TOOLS: [&str; 4] = ["mysql", "mysqldump", "psql", "mongo"];
+
+/// High-entropy bare tokens: 32+ hex chars or 40+ base64url chars. SSH
+/// *public* key blobs (`ssh-rsa AAA...`, `ssh-ed25519 AAA...`) are captured
+/// in group 1 and preserved verbatim — public keys are not secret.
+static SUSPICIOUS_TOKEN_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r"(?i)(ssh-(?:rsa|ed25519|ecdsa)[^\s]*\s+[^\s]+)|\b[0-9a-f]{32,}\b|\b[a-z0-9_-]{40,}\b",
+    )
+    .unwrap()
+});
+
+/// True if the text contains credential material that must never be
+/// persisted or exported.
+///
+/// Equivalent to "sanitize_command(text) != Some(text.to_string())" —
+/// either the line would be dropped entirely, or at least one value in it
+/// would be redacted.
+pub fn contains_sensitive_material(text: &str) -> bool {
+    match sanitize_command(text) {
+        None => true,
+        Some(redacted) => redacted != text,
+    }
+}
+
+/// Sanitize a command line for analytics storage:
+/// - returns None when the line is dominated by secret material (drop it entirely)
+/// - otherwise returns Some(line) with any secret VALUES redacted as `***`
+pub fn sanitize_command(text: &str) -> Option<String> {
+    if PEM_PRIVATE_KEY_RE.is_match(text) {
+        return None;
+    }
+    let mut out = AUTH_HEADER_RE.replace_all(text, "${1} ***").into_owned();
+    out = ENV_ASSIGNMENT_RE.replace_all(&out, "${1}=***").into_owned();
+    out = LONG_FLAG_EQ_RE.replace_all(&out, "${1}=***").into_owned();
+    out = LONG_FLAG_SPACE_RE
+        .replace_all(&out, "${1}${2}***")
+        .into_owned();
+    out = AWS_ACCESS_KEY_RE.replace_all(&out, "***").into_owned();
+    out = redact_secret_tool_password(&out).into_owned();
+    out = SUSPICIOUS_TOKEN_RE
+        .replace_all(&out, |caps: &Captures| {
+            if caps.get(1).is_some() {
+                caps[0].to_string() // ssh public key blob — not secret
+            } else {
+                "***".to_string()
+            }
+        })
+        .into_owned();
+    Some(out)
+}
+
+/// Redact `-p<value>` to `-p***`, but only for commands whose first token
+/// is a known secret-taking tool (mysql, mysqldump, psql, mongo).
+fn redact_secret_tool_password(line: &str) -> Cow<'_, str> {
+    let first = line.split_whitespace().next().unwrap_or("");
+    let binary = first.rsplit('/').next().unwrap_or(first);
+    if SECRET_TAKING_TOOLS.contains(&binary) {
+        GLUED_DASH_P_RE.replace_all(line, "${1}-p***")
+    } else {
+        Cow::Borrowed(line)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -91,7 +211,9 @@ mod tests {
             sanitize_command("mycli --password=hunter2 login"),
             Some("mycli --password=*** login".to_string())
         );
-        assert!(contains_sensitive_material("mycli --password=hunter2 login"));
+        assert!(contains_sensitive_material(
+            "mycli --password=hunter2 login"
+        ));
     }
 
     #[test]

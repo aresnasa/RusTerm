@@ -257,6 +257,7 @@ impl ConfigManager {
             workspace: existing.workspace,
             keybindings: existing.keybindings,
             skin: existing.skin,
+            collect_usage_habits: existing.collect_usage_habits,
         };
 
         let json =
@@ -290,6 +291,7 @@ impl ConfigManager {
             workspace: existing.workspace,
             keybindings: existing.keybindings,
             skin: existing.skin,
+            collect_usage_habits: existing.collect_usage_habits,
         };
 
         let json =
@@ -330,6 +332,7 @@ impl ConfigManager {
             workspace: existing.workspace,
             keybindings: existing.keybindings,
             skin: existing.skin,
+            collect_usage_habits: existing.collect_usage_habits,
         };
 
         let json =
@@ -367,6 +370,7 @@ impl ConfigManager {
             workspace: existing.workspace,
             keybindings: existing.keybindings,
             skin: existing.skin,
+            collect_usage_habits: existing.collect_usage_habits,
         };
 
         let json =
@@ -401,6 +405,7 @@ impl ConfigManager {
             workspace: existing.workspace,
             keybindings: keybindings.clone().normalized(),
             skin: existing.skin,
+            collect_usage_habits: existing.collect_usage_habits,
         };
         let json =
             serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
@@ -435,6 +440,7 @@ impl ConfigManager {
             workspace: existing.workspace,
             keybindings: existing.keybindings,
             skin: skin.clone().normalized(),
+            collect_usage_habits: existing.collect_usage_habits,
         };
         let json =
             serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
@@ -450,6 +456,36 @@ impl ConfigManager {
     pub fn load_suggestion_settings(&self) -> (bool, u8) {
         let cfg = self.read_persisted();
         (cfg.suggestion_enabled, cfg.suggestion_count)
+    }
+
+    /// Whether local usage-habit statistics collection is enabled. Default
+    /// false — the user must opt in via Settings → Usage habits.
+    pub fn load_usage_habits_enabled(&self) -> bool {
+        self.read_persisted().collect_usage_habits
+    }
+
+    /// Persist the usage-habits toggle. Preserves all other fields
+    /// (read-modify-write), mirroring `save_suggestion_settings`.
+    pub fn save_usage_habits_enabled(&self, enabled: bool) -> Result<()> {
+        let existing = self.read_persisted();
+        let persisted = PersistedConfig {
+            version: CONFIG_VERSION,
+            connections: existing.connections,
+            onekeys: existing.onekeys,
+            master_password_hash: self.master_password_hash.clone(),
+            restore_disabled: existing.restore_disabled,
+            confirm_close_on_exit: existing.confirm_close_on_exit,
+            comparison_diff_warning_enabled: existing.comparison_diff_warning_enabled,
+            focused_tab_appearance: existing.focused_tab_appearance,
+            suggestion_enabled: existing.suggestion_enabled,
+            suggestion_count: existing.suggestion_count,
+            sidebar: existing.sidebar,
+            workspace: existing.workspace,
+            keybindings: existing.keybindings,
+            skin: existing.skin,
+            collect_usage_habits: enabled,
+        };
+        self.write_persisted(persisted)
     }
 
     /// Persist the suggestion-popup settings to settings.json. Preserves all
@@ -477,6 +513,7 @@ impl ConfigManager {
             workspace: existing.workspace,
             keybindings: existing.keybindings,
             skin: existing.skin,
+            collect_usage_habits: existing.collect_usage_habits,
         };
 
         let json =
@@ -513,6 +550,7 @@ impl ConfigManager {
             workspace: existing.workspace,
             keybindings: existing.keybindings,
             skin: existing.skin,
+            collect_usage_habits: existing.collect_usage_habits,
         };
 
         let json =
@@ -547,6 +585,7 @@ impl ConfigManager {
             workspace: workspace.clone().normalized(),
             keybindings: existing.keybindings,
             skin: existing.skin,
+            collect_usage_habits: existing.collect_usage_habits,
         };
 
         let json =
@@ -623,6 +662,7 @@ impl ConfigManager {
             workspace: existing.workspace,
             keybindings: existing.keybindings,
             skin: existing.skin,
+            collect_usage_habits: existing.collect_usage_habits,
         };
 
         let json =
@@ -652,6 +692,7 @@ impl ConfigManager {
             workspace: WorkspacePreferences::default(),
             keybindings: Keybindings::default(),
             skin: SkinSettings::default(),
+            collect_usage_habits: false,
         };
 
         let mut persisted = if self.config_path.exists() {
@@ -687,6 +728,7 @@ impl ConfigManager {
             workspace: existing.workspace,
             keybindings: existing.keybindings,
             skin: existing.skin,
+            collect_usage_habits: existing.collect_usage_habits,
         };
 
         let json =
@@ -1362,6 +1404,7 @@ mod tests {
             group: Some("Production".to_string()),
             tags: vec!["linux".to_string()],
             onekey: true,
+            login_script: None,
         };
 
         cm.save_connections(&[conn.clone()]).unwrap();
@@ -1386,6 +1429,41 @@ mod tests {
             "Password should be encrypted, not plaintext in JSON"
         );
         assert!(json_content.contains("_encrypted"));
+    }
+
+    #[test]
+    fn login_script_survives_connection_save_load() {
+        let (cm, _dir) = test_config_manager();
+        let script = "expect [sudo] password for alice: $\nsend_onekey prod-sudo\nsend source /etc/profile.d/prod.sh\ndelay 250\n";
+        let conn = ConnectionConfig {
+            id: "login-script-1".to_string(),
+            name: "Scripted Host".to_string(),
+            kind: ConnectionKind::Shell(crate::config::ShellConfig {
+                command: Some("/bin/bash".to_string()),
+                args: vec![],
+                env: vec![],
+                working_dir: None,
+            }),
+            group: None,
+            tags: vec![],
+            onekey: false,
+            login_script: Some(script.to_string()),
+        };
+
+        cm.save_connections(&[conn.clone()]).unwrap();
+        let loaded = cm.load_connections().unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].login_script.as_deref(), Some(script));
+        // The persisted script text must still parse as a valid login script.
+        crate::parse_login_script(&loaded[0].login_script.clone().unwrap()).unwrap();
+
+        // An unset script must round-trip as None, not get synthesised._
+        let plain = ConnectionConfig {
+            login_script: None,
+            ..conn
+        };
+        cm.save_connections(&[plain]).unwrap();
+        assert_eq!(cm.load_connections().unwrap()[0].login_script, None);
     }
 
     #[test]
@@ -1415,6 +1493,7 @@ mod tests {
             group: None,
             tags: vec![],
             onekey: false,
+            login_script: None,
         };
 
         cm.save_connections(&[conn.clone()]).unwrap();
@@ -1448,6 +1527,7 @@ mod tests {
             group: None,
             tags: vec![],
             onekey: false,
+            login_script: None,
         };
 
         cm.save_connections(&[conn.clone()]).unwrap();
@@ -1488,6 +1568,7 @@ mod tests {
                 group: None,
                 tags: vec![],
                 onekey: false,
+                login_script: Some("expect $ \nsend stty -echo\n".to_string()),
             },
             ConnectionConfig {
                 id: "tcp-1".to_string(),
@@ -1499,6 +1580,7 @@ mod tests {
                 group: None,
                 tags: vec![],
                 onekey: false,
+                login_script: None,
             },
             ConnectionConfig {
                 id: "telnet-1".to_string(),
@@ -1510,6 +1592,7 @@ mod tests {
                 group: None,
                 tags: vec![],
                 onekey: false,
+                login_script: None,
             },
         ];
 
@@ -1519,6 +1602,11 @@ mod tests {
         assert_eq!(loaded[0].id, "serial-1");
         assert_eq!(loaded[1].id, "tcp-1");
         assert_eq!(loaded[2].id, "telnet-1");
+        assert_eq!(
+            loaded[0].login_script.as_deref(),
+            Some("expect $ \nsend stty -echo\n")
+        );
+        assert_eq!(loaded[1].login_script, None);
     }
 
     #[test]
@@ -1550,6 +1638,7 @@ mod tests {
             group: None,
             tags: vec![],
             onekey: false,
+            login_script: None,
         };
 
         cm.save_connections(&[conn]).unwrap();
@@ -1598,6 +1687,7 @@ mod tests {
             group: None,
             tags: vec![],
             onekey: false,
+            login_script: None,
         };
 
         cm.save_connections(&[conn]).unwrap();

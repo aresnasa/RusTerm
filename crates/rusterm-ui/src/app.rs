@@ -27,6 +27,7 @@ use crate::components::DockHiddenDropTargets;
 use crate::components::DockZoneView;
 use crate::components::MasterPasswordDialog;
 use crate::components::OneKeyManager;
+use crate::components::RelayPanel;
 use crate::components::RestoreSessionDialog;
 use crate::components::SettingsDialog;
 use crate::components::ShadowExecutionDialog;
@@ -34,6 +35,7 @@ use crate::components::ShadowResultDialog;
 use crate::components::Sidebar;
 use crate::components::TabBar;
 use crate::components::TerminalView;
+use crate::components::TunnelsPanel;
 use crate::components::connection_dialog::NewConnectionForm;
 use crate::components::dock::{
     DockDragState, adjusted_drop_index, dock_drag_threshold_exceeded, poll_dock_drag_state,
@@ -72,6 +74,9 @@ fn save_config(state: &Signal<AppState>) {
     if let Err(e) = cm.save_connections(&s.connections) {
         tracing::error!("Failed to save connections: {}", e);
     }
+    // Mirror into the process registry the relay/tunnel subsystems read
+    // (they can't hold Dioxus signals — !Sync).
+    crate::relay_tunnel::sync_connection_registry(s.connections.clone());
 }
 
 fn save_sidebar_preferences(state: &Signal<AppState>) {
@@ -230,6 +235,7 @@ fn render_workspace_dock_panel(
                             group: connection.group,
                             tags: connection.tags,
                             onekey: connection.onekey,
+                            login_script: connection.login_script,
                         });
                         save_config(&state);
                     }
@@ -8628,6 +8634,7 @@ fn rebuild_connection(original: &ConnectionConfig, form: &NewConnectionForm) -> 
         group: form.group_id.clone(),
         tags: original.tags.clone(),
         onekey: form.onekey,
+        login_script: original.login_script.clone(),
     }
 }
 
@@ -8701,6 +8708,7 @@ fn create_local_shell_session(state: &mut Signal<AppState>, embedded: bool) -> S
                 group: None,
                 tags: Vec::new(),
                 onekey: false,
+                login_script: None,
             },
         );
         app.sessions.push(SessionTab {
@@ -8835,6 +8843,7 @@ fn restore_sessions(
                         group: None,
                         tags: Vec::new(),
                         onekey: false,
+                        login_script: None,
                     },
                 );
                 let render_output = Default::default();
@@ -10502,6 +10511,41 @@ pub fn App() -> Element {
                                 s.unlock_state = UnlockState::Unlocked;
                                 s.master_password_error = None;
 
+                                // ── Feature #63 wiring ──────────────────
+                                // Mirror connections for relay/tunnel, load
+                                // relay.json, spin up the tunnel manager and
+                                // autostart what config asks for. All of this
+                                // is synchronous + fail-soft: a broken
+                                // relay.json never blocks the unlock path.
+                                crate::relay_tunnel::sync_connection_registry(
+                                    s.connections.clone(),
+                                );
+                                s.relay_config =
+                                    rusterm_relay::RelayConfig::load().unwrap_or_else(|e| {
+                                        tracing::warn!(
+                                            "[relay] failed to load relay.json (using defaults): {e:#}"
+                                        );
+                                        rusterm_relay::RelayConfig::default()
+                                    });
+                                let tunnel_manager = crate::relay_tunnel::init_tunnel_manager();
+                                tunnel_manager.autostart();
+                                s.tunnel_manager = Some(tunnel_manager);
+
+                                // Auto-start the relay if the user left it
+                                // enabled. Errors are non-fatal: surface them
+                                // via `relay_status_message` in the panel.
+                                if s.relay_config.enabled {
+                                    let cfg = s.relay_config.clone();
+                                    let runtime = s.relay_runtime.clone();
+                                    match crate::relay_tunnel::start_relay(cfg, runtime) {
+                                        Ok(()) => s.relay_status_message = None,
+                                        Err(e) => {
+                                            tracing::warn!("[relay] autostart failed: {e}");
+                                            s.relay_status_message = Some(e);
+                                        }
+                                    }
+                                }
+
                                 // Load saved session state (if any) and prepare
                                 // the restore-confirmation modal. We DON'T
                                 // restore here — the user gets to decide via the
@@ -11349,6 +11393,18 @@ pub fn App() -> Element {
                             "Settings"
                         }
                         span {
+                            style: "cursor: pointer; color: #7aa2f7;",
+                            title: "Manage SSH tunnels (local forward & SOCKS5 proxy)",
+                            onclick: move |_| modal.set(Modal::Tunnels),
+                            "Tunnels"
+                        }
+                        span {
+                            style: "cursor: pointer; color: #7aa2f7;",
+                            title: "Manage the REST API relay (BasicAuth, command relay)",
+                            onclick: move |_| modal.set(Modal::Relay),
+                            "Relay"
+                        }
+                        span {
                             style: "cursor: pointer; color: #9ece6a;",
                             onclick: move |_| open_local_terminal(state, input_senders),
                             title: "Open a local shell (zsh/bash)",
@@ -11497,6 +11553,7 @@ pub fn App() -> Element {
                     group: form.group_id.clone(),
                     tags: vec![],
                     onekey: form.onekey,
+                    login_script: None,
                 };
 
                 let tab_id = config.id.clone();
@@ -11674,6 +11731,22 @@ pub fn App() -> Element {
                         Err(e) => tracing::error!("Failed to save OneKeys: {}", e),
                     }
                 },
+            }
+        }
+
+        // SSH tunnel manager modal (feature #63)
+        if matches!(modal(), Modal::Tunnels) {
+            TunnelsPanel {
+                state,
+                on_close: move |_| modal.set(Modal::None),
+            }
+        }
+
+        // REST relay settings modal (feature #63)
+        if matches!(modal(), Modal::Relay) {
+            RelayPanel {
+                state,
+                on_close: move |_| modal.set(Modal::None),
             }
         }
 
