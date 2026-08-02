@@ -13877,7 +13877,10 @@ mod onekey_tests {
             expect: "password:".to_string(),
             send: "secret".to_string(),
         };
-        assert_eq!(onekey_step_label(&step), "Password");
+        assert_eq!(
+            onekey_step_label(&step),
+            crate::i18n::t("onekey.credential_password")
+        );
     }
 
     #[test]
