@@ -6,10 +6,10 @@
 //!      opening a modal.
 //!   2. Auto-generate ready-to-paste `curl` commands that execute a chosen
 //!      command on a chosen connected SSH session through the relay, using
-//!      HTTP BasicAuth (`-u USER:PASS`).
+//!      HTTP BasicAuth through exported runtime environment variables.
 //!
 //! The generated curl targets `POST /api/v1/exec` with a JSON body of
-//! `{ "host_id": "<id-or-name>", "command": "<cmd>", "timeout_ms": <ms> }`,
+//! `{ "host_id": "<id-or-name>", "command": "<cmd>", "elevated": <bool> }`,
 //! matching the relay's [`ExecRequest`](rusterm_relay::server) schema.
 
 use dioxus::prelude::*;
@@ -61,6 +61,7 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
 
     // curl-builder scratch state.
     let mut curl_command = use_signal(|| "uname -a".to_string());
+    let mut curl_elevated = use_signal(|| true);
     let mut copied = use_signal(|| false);
 
     let (enabled, bind_addr_str, port_str) = {
@@ -73,11 +74,9 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
     // out of the render scope before the endpoint reference can read it).
     let url_for_copy = url.clone();
 
-    // Connected SSH sessions → (name, label) pairs for the curl builder.
-    // The relay's exec endpoint accepts either the connection id or its name
-    // (server.rs matches `h.id == body.host_id || h.name == body.host_id`),
-    // so we use the session's `name` (which equals the connection name) as
-    // the host_id — it's human-readable in the generated curl.
+    // Connected SSH sessions → (saved connection id, label) pairs for the
+    // curl builder. IDs are unambiguous and are also the key used by the
+    // host-bound sudo credential lease; connection names may be duplicated.
     let sessions: Vec<(String, String)> = {
         let app = state.read();
         app.sessions
@@ -89,7 +88,12 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
                 } else {
                     tab.name.clone()
                 };
-                (tab.name.clone(), label)
+                let host_id = app
+                    .session_configs
+                    .get(&tab.id)
+                    .map(|config| config.id.clone())
+                    .unwrap_or_else(|| tab.name.clone());
+                (host_id, label)
             })
             .collect()
     };
@@ -368,9 +372,18 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
                             oninput: move |e| curl_command.set(e.value()),
                         }
                     }
+                    label {
+                        style: "display:flex;align-items:center;gap:6px;font-size:11px;color:#9aa5ce;margin-bottom:8px;cursor:pointer;",
+                        input {
+                            r#type: "checkbox",
+                            checked: curl_elevated(),
+                            onchange: move |e| curl_elevated.set(e.checked()),
+                        }
+                        { crate::i18n::t("api.elevated") }
+                    }
 
                     div { class: "api-code",
-                        { gen_curl(&url, &default_user, &selected_session(), &curl_command()) }
+                        { gen_curl(&url, &default_user, &selected_session(), &curl_command(), curl_elevated()) }
                     }
                     div { class: "api-row", style: "margin-top:8px;",
                         button {
@@ -378,7 +391,13 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
                             // Clone into the move closure so `url` itself isn't
                             // moved out of the render scope.
                             onclick: move |_| {
-                                let curl = gen_curl(&url_for_copy, &default_user, &selected_session(), &curl_command());
+                                let curl = gen_curl(
+                                    &url_for_copy,
+                                    &default_user,
+                                    &selected_session(),
+                                    &curl_command(),
+                                    curl_elevated(),
+                                );
                                 let _ = dioxus::document::eval(&format!(
                                     "navigator.clipboard.writeText({})",
                                     serde_json::to_string(&curl).unwrap_or_default()
@@ -400,7 +419,7 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
                     let endpoints = format!(
 "GET  {url}/api/v1/health      # liveness, no auth
 GET  {url}/api/v1/hosts        # list hosts (BasicAuth)
-POST {url}/api/v1/exec         # {{ host_id, command, timeout_ms? }}
+POST {url}/api/v1/exec         # {{ host_id, command, elevated?, timeout_ms? }}
 POST {url}/api/v1/parse-curl   # parse a pasted curl into JSON",
                         url = url.clone(),
                     );
@@ -413,32 +432,39 @@ POST {url}/api/v1/parse-curl   # parse a pasted curl into JSON",
     }
 }
 
-/// Build the curl command string for the current selection. The body JSON is
-/// constructed by hand so we control the exact escaping: the command text is
-/// embedded into a JSON string value (escaping `\` and `"`), and the whole
-/// body is wrapped in single quotes for the shell so the user can paste it
-/// verbatim. Embedded single quotes in the body are handled via the POSIX
-/// `'\''` idiom so the pasted curl is always shell-safe.
-fn gen_curl(url: &str, default_user: &str, session: &Option<String>, command: &str) -> String {
+/// Build a ready-to-run shell snippet. API credentials are exported once and
+/// reused by curl; the password is read with terminal echo disabled instead of
+/// being copied into the clipboard or shell history.
+fn gen_curl(
+    url: &str,
+    default_user: &str,
+    session: &Option<String>,
+    command: &str,
+    elevated: bool,
+) -> String {
     let host = session.clone().unwrap_or_else(|| "HOST".to_string());
-    // JSON-string-escape the host and command for the request body value.
-    let json_escape = |s: &str| s.replace('\\', "\\\\").replace('"', "\\\"");
-    let body = format!(
-        "{{\"host_id\":\"{}\",\"command\":\"{}\"}}",
-        json_escape(&host),
-        json_escape(command),
-    );
-    // Wrap the body in single quotes for the shell; escape any literal single
-    // quotes inside via the POSIX-safe `'\''` sequence.
-    let body_sq = format!("'{}'", body.replace('\'', "'\\\''"));
+    let body = serde_json::json!({
+        "host_id": host,
+        "command": command,
+        "elevated": elevated,
+    })
+    .to_string();
+    let shell_quote = |value: &str| format!("'{}'", value.replace('\'', "'\"'\"'"));
     format!(
-        "curl -X POST '{url}/api/v1/exec' \\
-  -u '{user}:PASS' \\
-  -H 'Content-Type: application/json' \\
-  -d {body}",
-        url = url.trim_end_matches('/'),
-        user = default_user,
-        body = body_sq,
+        "export RUSTERM_API_URL={url}\n\
+export RUSTERM_API_USER={user}\n\
+if [ -z \"${{RUSTERM_API_PASSWORD+x}}\" ]; then\n\
+  printf 'RusTerm API password: ' >&2\n\
+  stty -echo\n\
+  IFS= read -r RUSTERM_API_PASSWORD\n\
+  stty echo\n\
+  printf '\\n' >&2\n\
+  export RUSTERM_API_PASSWORD\n\
+fi\n\n\
+curl -X POST \"${{RUSTERM_API_URL}}/api/v1/exec\" \\\n  -u \"${{RUSTERM_API_USER}}:${{RUSTERM_API_PASSWORD}}\" \\\n  -H 'Content-Type: application/json' \\\n  -d {body}",
+        url = shell_quote(url.trim_end_matches('/')),
+        user = shell_quote(default_user),
+        body = shell_quote(&body),
     )
 }
 
@@ -453,14 +479,28 @@ mod tests {
             "alice",
             &Some("prod-web".to_string()),
             "uname -a",
+            true,
         );
         assert!(
-            curl.contains("http://127.0.0.1:8080/api/v1/exec"),
-            "missing endpoint: {curl}"
+            curl.contains("export RUSTERM_API_URL='http://127.0.0.1:8080'")
+                && curl.contains("\"${RUSTERM_API_URL}/api/v1/exec\""),
+            "missing endpoint export/use: {curl}"
         );
         assert!(
-            curl.contains("-u 'alice:PASS'"),
-            "missing basic-auth: {curl}"
+            curl.contains("export RUSTERM_API_USER='alice'"),
+            "missing configured user export: {curl}"
+        );
+        assert!(
+            curl.contains("-u \"${RUSTERM_API_USER}:${RUSTERM_API_PASSWORD}\""),
+            "missing environment-based basic-auth: {curl}"
+        );
+        assert!(
+            curl.contains("IFS= read -r RUSTERM_API_PASSWORD"),
+            "password should be read once at runtime: {curl}"
+        );
+        assert!(
+            !curl.contains(":PASS"),
+            "placeholder must be removed: {curl}"
         );
         assert!(
             curl.contains("host_id\":\"prod-web\""),
@@ -470,6 +510,10 @@ mod tests {
             curl.contains("command\":\"uname -a\""),
             "missing command: {curl}"
         );
+        assert!(
+            curl.contains("elevated\":true"),
+            "missing elevation flag: {curl}"
+        );
     }
 
     #[test]
@@ -478,7 +522,13 @@ mod tests {
         // the generated body stays valid JSON the relay can parse. The raw
         // command `echo "hi" \n` must become `echo \"hi\" \\n` in the
         // JSON value (quotes → \", backslash → \\).
-        let curl = gen_curl("http://x", "u", &Some("h".to_string()), r#"echo "hi" \n"#);
+        let curl = gen_curl(
+            "http://x",
+            "u",
+            &Some("h".to_string()),
+            r#"echo "hi" \n"#,
+            false,
+        );
         assert!(
             curl.contains(r#"command":"echo \"hi\" \\n""#),
             "bad escape: {curl}"
@@ -487,7 +537,7 @@ mod tests {
 
     #[test]
     fn curl_handles_missing_session_with_placeholder() {
-        let curl = gen_curl("http://x", "u", &None, "ls");
+        let curl = gen_curl("http://x", "u", &None, "ls", false);
         assert!(
             curl.contains("HOST"),
             "missing-session should use HOST placeholder: {curl}"

@@ -23,7 +23,7 @@
 //!
 //! - `GET  /api/v1/health`     — liveness, no auth
 //! - `GET  /api/v1/hosts`      — hosts visible to the account
-//! - `POST /api/v1/exec`       — `{host_id, command, timeout_ms?}` → result
+//! - `POST /api/v1/exec`       — `{host_id, command, elevated?, timeout_ms?}` → result
 //! - `POST /api/v1/parse-curl` — parse a pasted curl command into JSON
 
 pub mod audit;

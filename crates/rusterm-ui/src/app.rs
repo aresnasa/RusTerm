@@ -2315,6 +2315,19 @@ fn render_terminal_pane(
                         }
                     },
                     on_onekey_select: move |index: usize| {
+                        // Capture whether this credential is being submitted to
+                        // sudo before removing the popup. Only sudo prompts may
+                        // create a host-bound API elevation lease.
+                        let is_sudo_prompt = {
+                            let app = state_for_cmd.read();
+                            app.terminals
+                                .get(&sid_for_ok_sel)
+                                .map(|terminal| {
+                                    let line = terminal.lock().terminal.extract_current_line();
+                                    is_sudo_password_prompt(&line)
+                                })
+                                .unwrap_or(false)
+                        };
                         // Resolve the index against this session's current popup
                         // state rather than accepting plaintext back from the UI.
                         // Remove the popup in the same write so a duplicate click
@@ -2347,17 +2360,29 @@ fn render_terminal_pane(
                         };
                         match submission_result {
                             Ok(()) => {
-                                let mut app = state_for_cmd.write();
-                                app.onekey_submission_feedback.insert(
-                                    sid_for_ok_sel.clone(),
-                                    OneKeySubmissionFeedback::Submitted {
-                                        matched_expect: matched_expect.clone(),
-                                    },
-                                );
-                                app.onekey_submission_cooldown.insert(
-                                    sid_for_ok_sel.clone(),
-                                    (matched_expect, std::time::Instant::now()),
-                                );
+                                let connection = {
+                                    let mut app = state_for_cmd.write();
+                                    app.onekey_submission_feedback.insert(
+                                        sid_for_ok_sel.clone(),
+                                        OneKeySubmissionFeedback::Submitted {
+                                            matched_expect: matched_expect.clone(),
+                                        },
+                                    );
+                                    app.onekey_submission_cooldown.insert(
+                                        sid_for_ok_sel.clone(),
+                                        (matched_expect, std::time::Instant::now()),
+                                    );
+                                    app.session_configs.get(&sid_for_ok_sel).cloned()
+                                };
+                                if is_sudo_prompt {
+                                    if let Some(connection) = connection {
+                                        crate::relay_tunnel::cache_sudo_credential(
+                                            &connection,
+                                            &sid_for_ok_sel,
+                                            &send,
+                                        );
+                                    }
+                                }
                             }
                             Err(OneKeySubmissionSendError::ChannelClosed) => {
                                 let mut app = state_for_cmd.write();
@@ -5888,6 +5913,12 @@ enum CredentialKind {
     Username,
 }
 
+fn is_sudo_password_prompt(text: &str) -> bool {
+    let plain = strip_ansi(text);
+    plain.to_ascii_lowercase().contains("sudo")
+        && credential_kind(&plain) == Some(CredentialKind::Password)
+}
+
 /// Atomically resolve and remove one popup selection. Removing the popup in the
 /// same operation means duplicate click/keyboard callbacks cannot submit twice.
 fn take_onekey_selection(
@@ -6240,6 +6271,7 @@ fn note_onekey_prompt_after_submission(
     match popup.matched_expect.as_deref() {
         Some(current_expect) if current_expect == previous_expect => {
             if matches!(&previous, OneKeySubmissionFeedback::Submitted { .. }) {
+                crate::relay_tunnel::clear_sudo_credential_for_session(session_id);
                 tracing::info!(
                     "[ONEKEY-RESULT] session={} remote requested the same credential again",
                     &session_id[..session_id.len().min(8)]
@@ -12963,8 +12995,9 @@ fn looks_like_command(s: &str) -> bool {
 #[cfg(test)]
 mod onekey_tests {
     use super::{
-        CredentialKind, credential_kind, first_matching_step, onekey_step_label,
-        onekey_submission_bytes, send_onekey_submission, strip_ansi, take_onekey_selection,
+        CredentialKind, credential_kind, first_matching_step, is_sudo_password_prompt,
+        onekey_step_label, onekey_submission_bytes, send_onekey_submission, strip_ansi,
+        take_onekey_selection,
     };
     use crate::state::{OneKeyMatch, OneKeyPopupState};
     use regex::Regex;
@@ -13148,6 +13181,14 @@ mod onekey_tests {
 
         let step = first_matching_step(&ok, "root@host's password: ").unwrap();
         assert_eq!(step.send, "correct-password");
+    }
+
+    #[test]
+    fn only_sudo_password_prompts_create_elevation_leases() {
+        assert!(is_sudo_password_prompt("[sudo] password for alice: "));
+        assert!(is_sudo_password_prompt("[sudo: authenticate] Password: "));
+        assert!(!is_sudo_password_prompt("Password for git@example.com: "));
+        assert!(!is_sudo_password_prompt("sudo command completed"));
     }
 
     #[test]

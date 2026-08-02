@@ -7382,6 +7382,7 @@ dependencies = [
  "tracing",
  "uuid",
  "vte",
+ "zeroize",
 ]
 
 [[package]]

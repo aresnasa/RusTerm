@@ -286,10 +286,11 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
             "curl 示例 — 在你的会话上执行命令",
         ),
         "api.curl_hint" => (
-            "Pick a connected session and a command, then copy the curl. Replace USER:PASS with an account above.",
-            "选择一个已连接的会话和命令，然后复制 curl。将 USER:PASS 替换为上方账号。",
+            "The copied script exports the configured username and asks for the API password once per shell. It never places the password in shell history.",
+            "复制的脚本会导出已配置的用户名，并在每个 shell 中仅询问一次 API 密码；密码不会写入 shell 历史。",
         ),
         "api.command" => ("Command", "命令"),
+        "api.elevated" => ("Run with reusable sudo authorization", "复用 sudo 授权执行"),
         "api.session" => ("Session", "会话"),
         "api.copy" => ("Copy", "复制"),
         "api.copied" => ("Copied!", "已复制！"),

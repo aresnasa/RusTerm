@@ -35,6 +35,8 @@ pub enum ExecutorError {
     Connect(String),
     #[error("exec failed: {0}")]
     Exec(String),
+    #[error("elevation required: {0}")]
+    ElevationRequired(String),
 }
 
 /// Implemented by the app layer (`SshExecutor`) and by test doubles.
@@ -50,6 +52,7 @@ pub trait RelayExecutor: Send + Sync + std::fmt::Debug {
         &self,
         host_id: &str,
         command: &str,
+        elevated: bool,
         timeout: Duration,
     ) -> Result<ExecOutcome, ExecutorError>;
 }
@@ -70,6 +73,7 @@ impl RelayExecutor for NullExecutor {
         &self,
         host_id: &str,
         _command: &str,
+        _elevated: bool,
         _timeout: Duration,
     ) -> Result<ExecOutcome, ExecutorError> {
         Err(ExecutorError::UnknownHost(host_id.to_string()))

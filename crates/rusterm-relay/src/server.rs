@@ -126,10 +126,20 @@ fn router(state: AppState) -> Router {
 #[derive(Serialize)]
 struct ErrorBody<'a> {
     error: &'a str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    code: Option<&'a str>,
 }
 
 fn error_response(status: StatusCode, msg: &str) -> Response {
-    (status, Json(ErrorBody { error: msg })).into_response()
+    error_response_with_code(status, msg, None)
+}
+
+fn error_response_with_code<'a>(
+    status: StatusCode,
+    msg: &'a str,
+    code: Option<&'a str>,
+) -> Response {
+    (status, Json(ErrorBody { error: msg, code })).into_response()
 }
 
 fn unauthorized() -> Response {
@@ -138,6 +148,7 @@ fn unauthorized() -> Response {
         [(header::WWW_AUTHENTICATE, "Basic realm=\"rusterm-relay\"")],
         Json(ErrorBody {
             error: "authentication required",
+            code: None,
         }),
     )
         .into_response()
@@ -249,6 +260,10 @@ async fn list_hosts(
 struct ExecRequest {
     host_id: String,
     command: String,
+    /// Execute through sudo. False by default for backward compatibility and
+    /// to avoid silently elevating every API command.
+    #[serde(default)]
+    elevated: bool,
     /// Per-request deadline in milliseconds. Capped by the relay's
     /// `request_timeout_ms`.
     timeout_ms: Option<u64>,
@@ -368,7 +383,11 @@ async fn exec(
     });
 
     let started = Instant::now();
-    match state.executor.exec(&host.id, &body.command, timeout).await {
+    match state
+        .executor
+        .exec(&host.id, &body.command, body.elevated, timeout)
+        .await
+    {
         Ok(ExecOutcome {
             exit_code,
             stdout,
@@ -395,10 +414,32 @@ async fn exec(
             .into_response()
         }
         Err(err) => {
+            if let ExecutorError::ElevationRequired(message) = &err {
+                state.audit.log(AuditEntry {
+                    ts: now_iso(),
+                    account: account.username.clone(),
+                    client_ip: addr.ip().to_string(),
+                    action: AuditAction::ExecFailed,
+                    host_id: Some(host.id.clone()),
+                    command: Some(body.command.clone()),
+                    outcome: AuditOutcome {
+                        success: false,
+                        exit_code: None,
+                        reason: Some("elevation required".to_string()),
+                        duration_ms: Some(started.elapsed().as_millis() as u64),
+                    },
+                });
+                return error_response_with_code(
+                    StatusCode::FORBIDDEN,
+                    message,
+                    Some("elevation_required"),
+                );
+            }
             let (status, msg) = match &err {
                 ExecutorError::UnknownHost(_) => (StatusCode::NOT_FOUND, "unknown host_id"),
                 ExecutorError::Connect(_) => (StatusCode::BAD_GATEWAY, "SSH connect failed"),
                 ExecutorError::Exec(_) => (StatusCode::BAD_GATEWAY, "remote exec failed"),
+                ExecutorError::ElevationRequired(_) => unreachable!(),
             };
             state.audit.log(AuditEntry {
                 ts: now_iso(),
@@ -463,6 +504,48 @@ mod tests {
     use super::*;
     use crate::config::{RelayAccount, hash_password};
 
+    #[derive(Debug, Default)]
+    struct RecordingExecutor {
+        elevated: std::sync::atomic::AtomicBool,
+        fail_elevation: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl RelayExecutor for RecordingExecutor {
+        async fn list_hosts(&self) -> Vec<HostInfo> {
+            vec![HostInfo {
+                id: "host-1".to_string(),
+                name: "prod".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: 22,
+                username: "ops".to_string(),
+            }]
+        }
+
+        async fn exec(
+            &self,
+            _host_id: &str,
+            _command: &str,
+            elevated: bool,
+            _timeout: Duration,
+        ) -> Result<ExecOutcome, ExecutorError> {
+            self.elevated
+                .store(elevated, std::sync::atomic::Ordering::SeqCst);
+            if elevated && self.fail_elevation {
+                return Err(ExecutorError::ElevationRequired(
+                    "No reusable sudo authorization is available".to_string(),
+                ));
+            }
+            Ok(ExecOutcome {
+                exit_code: Some(0),
+                stdout: String::new(),
+                stderr: String::new(),
+                timed_out: false,
+                duration_ms: 1,
+            })
+        }
+    }
+
     fn test_config() -> RelayConfig {
         let mut cfg = RelayConfig::default();
         // Port 0 → kernel assigns a free port; tests can run in parallel.
@@ -512,6 +595,66 @@ mod tests {
         // Unknown host → the NullExecutor has no hosts.
         let status = post_exec(&base, "ops", "pw", "ghost", "uptime", None).await;
         assert_eq!(status, 404);
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn exec_forwards_explicit_elevation_request() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let handle = run(test_config(), executor.clone()).await.unwrap();
+        let (status, _) = post_json(
+            &format!("{}/api/v1/exec", handle.url()),
+            Some(("ops", "pw")),
+            &serde_json::json!({
+                "host_id": "host-1",
+                "command": "docker ps",
+                "elevated": true,
+            }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(executor.elevated.load(std::sync::atomic::Ordering::SeqCst));
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn elevation_failure_returns_structured_error() {
+        let executor = Arc::new(RecordingExecutor {
+            fail_elevation: true,
+            ..Default::default()
+        });
+        let handle = run(test_config(), executor).await.unwrap();
+        let (status, body) = post_json(
+            &format!("{}/api/v1/exec", handle.url()),
+            Some(("ops", "pw")),
+            &serde_json::json!({
+                "host_id": "host-1",
+                "command": "docker ps",
+                "elevated": true,
+            }),
+        )
+        .await;
+        assert_eq!(status, 403);
+        assert_eq!(body["code"], "elevation_required");
+        assert_eq!(body["error"], "No reusable sudo authorization is available");
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn exec_defaults_to_non_elevated_for_legacy_clients() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let handle = run(test_config(), executor.clone()).await.unwrap();
+        let (status, _) = post_json(
+            &format!("{}/api/v1/exec", handle.url()),
+            Some(("ops", "pw")),
+            &serde_json::json!({
+                "host_id": "host-1",
+                "command": "uptime",
+            }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert!(!executor.elevated.load(std::sync::atomic::Ordering::SeqCst));
         handle.shutdown().await;
     }
 

@@ -113,9 +113,32 @@ impl DirectHandle {
     /// exit status. Returns partial output with `timed_out: true` when the
     /// local timeout fires.
     pub async fn exec(&self, command: &str, timeout: Duration) -> anyhow::Result<ExecResult> {
+        self.exec_with_optional_stdin(command, None, timeout).await
+    }
+
+    /// Run a command while supplying private data on the SSH channel's stdin.
+    /// The input is never embedded in the remote command string, which keeps
+    /// credentials out of process listings, shell history, and command logs.
+    pub async fn exec_with_stdin(
+        &self,
+        command: &str,
+        stdin: &[u8],
+        timeout: Duration,
+    ) -> anyhow::Result<ExecResult> {
+        self.exec_with_optional_stdin(command, Some(stdin), timeout)
+            .await
+    }
+
+    async fn exec_with_optional_stdin(
+        &self,
+        command: &str,
+        stdin: Option<&[u8]>,
+        timeout: Duration,
+    ) -> anyhow::Result<ExecResult> {
         let mut result = ExecResult::default();
         let timed_out =
-            match tokio::time::timeout(timeout, self.exec_inner(command, &mut result)).await {
+            match tokio::time::timeout(timeout, self.exec_inner(command, stdin, &mut result)).await
+            {
                 Ok(inner) => {
                     inner?;
                     false
@@ -126,9 +149,18 @@ impl DirectHandle {
         Ok(result)
     }
 
-    async fn exec_inner(&self, command: &str, result: &mut ExecResult) -> anyhow::Result<()> {
+    async fn exec_inner(
+        &self,
+        command: &str,
+        stdin: Option<&[u8]>,
+        result: &mut ExecResult,
+    ) -> anyhow::Result<()> {
         let channel = self.handle.channel_open_session().await?;
         channel.exec(true, command).await?;
+        if let Some(stdin) = stdin {
+            channel.data(std::io::Cursor::new(stdin)).await?;
+            channel.eof().await?;
+        }
 
         let mut reader = channel;
         loop {

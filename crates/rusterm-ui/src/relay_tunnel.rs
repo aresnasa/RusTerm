@@ -7,8 +7,9 @@
 //! signal, and owns the process-level runtimes (relay handle, tunnel
 //! manager) the UI talks to.
 
+use std::collections::HashMap;
 use std::sync::{Arc, OnceLock, RwLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 
@@ -16,8 +17,9 @@ use rusterm_core::config::{ConnectionConfig, ConnectionKind, SshConfig};
 use rusterm_relay::{
     ExecOutcome, ExecutorError, HostInfo, RelayExecutor, RelayHandle, run as run_relay,
 };
-use rusterm_ssh::{DirectConnectOptions, connect_direct};
+use rusterm_ssh::{DirectConnectOptions, ExecResult, connect_direct};
 use rusterm_tunnel::{TunnelConnector, TunnelManager};
+use zeroize::Zeroizing;
 
 // ── Tokio runtime ────────────────────────────────────────────────────────
 
@@ -75,6 +77,119 @@ fn read_connections() -> Vec<ConnectionConfig> {
         .unwrap_or_default()
 }
 
+// ── Short-lived sudo credential lease ───────────────────────────────────
+
+const SUDO_CREDENTIAL_TTL: Duration = Duration::from_secs(15 * 60);
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct SudoCredentialKey {
+    connection_id: String,
+    host: String,
+    port: u16,
+    username: String,
+}
+
+struct CachedSudoCredential {
+    value: Zeroizing<String>,
+    source_session_id: String,
+    expires_at: Instant,
+}
+
+#[derive(Default)]
+struct SudoCredentialCache {
+    entries: RwLock<HashMap<SudoCredentialKey, CachedSudoCredential>>,
+}
+
+impl SudoCredentialCache {
+    fn cache(
+        &self,
+        key: SudoCredentialKey,
+        source_session_id: String,
+        value: String,
+        now: Instant,
+    ) {
+        if let Ok(mut entries) = self.entries.write() {
+            entries.insert(
+                key,
+                CachedSudoCredential {
+                    value: Zeroizing::new(value),
+                    source_session_id,
+                    expires_at: now + SUDO_CREDENTIAL_TTL,
+                },
+            );
+        }
+    }
+
+    fn get(&self, key: &SudoCredentialKey, now: Instant) -> Option<Zeroizing<String>> {
+        let mut entries = self.entries.write().ok()?;
+        if entries
+            .get(key)
+            .is_some_and(|entry| entry.expires_at <= now)
+        {
+            entries.remove(key);
+            return None;
+        }
+        entries
+            .get(key)
+            .map(|entry| Zeroizing::new(entry.value.to_string()))
+    }
+
+    fn clear_for_session(&self, source_session_id: &str) {
+        if let Ok(mut entries) = self.entries.write() {
+            entries.retain(|_, entry| entry.source_session_id != source_session_id);
+        }
+    }
+
+    fn clear_key(&self, key: &SudoCredentialKey) {
+        if let Ok(mut entries) = self.entries.write() {
+            entries.remove(key);
+        }
+    }
+}
+
+static SUDO_CREDENTIALS: OnceLock<SudoCredentialCache> = OnceLock::new();
+
+fn sudo_credentials() -> &'static SudoCredentialCache {
+    SUDO_CREDENTIALS.get_or_init(SudoCredentialCache::default)
+}
+
+fn sudo_credential_key(connection: &ConnectionConfig) -> Option<SudoCredentialKey> {
+    let ConnectionKind::Ssh(ssh) = &connection.kind else {
+        return None;
+    };
+    Some(SudoCredentialKey {
+        connection_id: connection.id.clone(),
+        host: ssh.host.clone(),
+        port: ssh.port,
+        username: ssh.username.clone(),
+    })
+}
+
+/// Cache the credential the user explicitly submitted to a sudo prompt. The
+/// lease is process-local, bound to the saved connection plus host identity,
+/// expires with the normal sudo window, and is zeroized when removed.
+pub(crate) fn cache_sudo_credential(
+    connection: &ConnectionConfig,
+    source_session_id: &str,
+    credential: &str,
+) {
+    let Some(key) = sudo_credential_key(connection) else {
+        return;
+    };
+    sudo_credentials().cache(
+        key,
+        source_session_id.to_string(),
+        credential.to_string(),
+        Instant::now(),
+    );
+}
+
+/// A repeated sudo password prompt means the submitted value was rejected.
+/// Revoke only the lease originating from that runtime session.
+pub(crate) fn clear_sudo_credential_for_session(source_session_id: &str) {
+    sudo_credentials().clear_for_session(source_session_id);
+}
+
 // ── SSH config helpers ───────────────────────────────────────────────────
 
 /// Extract the `SshConfig` of a saved connection, if it is one.
@@ -97,6 +212,43 @@ fn to_host_info(conn: &ConnectionConfig, ssh: &SshConfig) -> HostInfo {
 
 // ── Relay executor ───────────────────────────────────────────────────────
 
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn sudo_command(command: &str, read_password_from_stdin: bool) -> String {
+    let mode = if read_password_from_stdin {
+        "-S -p ''"
+    } else {
+        "-n"
+    };
+    format!("sudo {mode} -- sh -lc {}", shell_single_quote(command),)
+}
+
+fn sudo_authorization_failed(result: &ExecResult) -> bool {
+    if result.exit_code == Some(0) {
+        return false;
+    }
+    let stderr = result.stderr_string().to_ascii_lowercase();
+    [
+        "password is required",
+        "a password is required",
+        "no password was provided",
+        "incorrect password",
+        "sorry, try again",
+        "authentication failure",
+        "a terminal is required",
+        "no tty present",
+        "must have a tty",
+        "is not in the sudoers",
+        "may not run sudo",
+        "not allowed to execute",
+        "not permitted to execute",
+    ]
+    .iter()
+    .any(|needle| stderr.contains(needle))
+}
+
 /// Runs validated relay commands against saved SSH hosts. One fresh SSH
 /// connection per request: simple, honest about cost, and naturally
 /// rebound after remote host changes — the rate limiter keeps the cost of
@@ -117,14 +269,16 @@ impl RelayExecutor for AppRelayExecutor {
         &self,
         host_id: &str,
         command: &str,
+        elevated: bool,
         timeout: Duration,
     ) -> Result<ExecOutcome, ExecutorError> {
-        let ssh = read_connections()
+        let (credential_key, ssh) = read_connections()
             .into_iter()
             .find_map(|conn| {
                 if conn.id == host_id || conn.name == host_id {
+                    let key = sudo_credential_key(&conn)?;
                     match conn.kind {
-                        ConnectionKind::Ssh(ssh) => Some(ssh),
+                        ConnectionKind::Ssh(ssh) => Some((key, ssh)),
                         _ => None,
                     }
                 } else {
@@ -133,28 +287,49 @@ impl RelayExecutor for AppRelayExecutor {
             })
             .ok_or_else(|| ExecutorError::UnknownHost(host_id.to_string()))?;
 
-        let started = std::time::Instant::now();
+        let started = Instant::now();
         let handle = connect_direct(&ssh, DirectConnectOptions::default())
             .await
             .map_err(|e| ExecutorError::Connect(format!("{e:#}")))?;
 
-        let exec_future = handle.exec(command, timeout);
-        let result = match tokio::time::timeout(timeout, exec_future).await {
-            Ok(Ok(r)) => r,
-            Ok(Err(e)) => {
-                let _ = handle.disconnect().await;
-                return Err(ExecutorError::Exec(format!("{e:#}")));
+        let result = if elevated {
+            let non_interactive_command = sudo_command(command, false);
+            let first = handle
+                .exec(&non_interactive_command, timeout)
+                .await
+                .map_err(|e| ExecutorError::Exec(format!("{e:#}")))?;
+            if !sudo_authorization_failed(&first) {
+                first
+            } else {
+                let Some(credential) = sudo_credentials().get(&credential_key, Instant::now())
+                else {
+                    let _ = handle.disconnect().await;
+                    return Err(ExecutorError::ElevationRequired(
+                        "No reusable sudo authorization is available for this host. Run sudo once in its RusTerm session with OneKey enabled, then retry."
+                            .to_string(),
+                    ));
+                };
+                let stdin = Zeroizing::new(format!("{}\n", credential.as_str()));
+                let password_command = sudo_command(command, true);
+                let second = handle
+                    .exec_with_stdin(&password_command, stdin.as_bytes(), timeout)
+                    .await
+                    .map_err(|e| ExecutorError::Exec(format!("{e:#}")))?;
+                if sudo_authorization_failed(&second) {
+                    sudo_credentials().clear_key(&credential_key);
+                    let _ = handle.disconnect().await;
+                    return Err(ExecutorError::ElevationRequired(
+                        "The reusable sudo credential was rejected or sudo policy denied this command. Re-authorize sudo in the target RusTerm session."
+                            .to_string(),
+                    ));
+                }
+                second
             }
-            Err(_) => {
-                let _ = handle.disconnect().await;
-                return Ok(ExecOutcome {
-                    exit_code: None,
-                    stdout: String::new(),
-                    stderr: format!("local timeout after {timeout:?}"),
-                    timed_out: true,
-                    duration_ms: started.elapsed().as_millis() as u64,
-                });
-            }
+        } else {
+            handle
+                .exec(command, timeout)
+                .await
+                .map_err(|e| ExecutorError::Exec(format!("{e:#}")))?
         };
         let _ = handle.disconnect().await;
 
@@ -285,5 +460,101 @@ pub fn stop_relay(runtime: RelayRuntime) {
             handle.shutdown().await;
         });
         tracing::info!("[relay] stopped");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sudo_command_quotes_untrusted_command_without_embedding_a_password() {
+        let command = "printf '%s' \"$HOME\"";
+        let wrapped = sudo_command(command, true);
+        assert_eq!(
+            wrapped,
+            "sudo -S -p '' -- sh -lc 'printf '\"'\"'%s'\"'\"' \"$HOME\"'"
+        );
+        assert!(!wrapped.contains("secret"));
+    }
+
+    #[test]
+    fn sudo_failure_detection_does_not_treat_command_exit_one_as_auth_failure() {
+        let command_failure = ExecResult {
+            exit_code: Some(1),
+            stdout: Vec::new(),
+            stderr: b"application error".to_vec(),
+            timed_out: false,
+        };
+        assert!(!sudo_authorization_failed(&command_failure));
+
+        let auth_failure = ExecResult {
+            exit_code: Some(1),
+            stdout: Vec::new(),
+            stderr: b"sudo: a password is required".to_vec(),
+            timed_out: false,
+        };
+        assert!(sudo_authorization_failed(&auth_failure));
+    }
+
+    fn key(connection_id: &str, host: &str) -> SudoCredentialKey {
+        SudoCredentialKey {
+            connection_id: connection_id.to_string(),
+            host: host.to_string(),
+            port: 22,
+            username: "ops".to_string(),
+        }
+    }
+
+    #[test]
+    fn sudo_credentials_are_host_bound_expiring_and_revocable_by_session() {
+        let cache = SudoCredentialCache::default();
+        let now = Instant::now();
+        let host_a = key("connection-a", "host-a");
+        let host_b = key("connection-b", "host-b");
+        cache.cache(
+            host_a.clone(),
+            "session-a".to_string(),
+            "secret-a".to_string(),
+            now,
+        );
+        cache.cache(
+            host_b.clone(),
+            "session-b".to_string(),
+            "secret-b".to_string(),
+            now,
+        );
+
+        assert_eq!(
+            cache.get(&host_a, now).map(|value| value.to_string()),
+            Some("secret-a".to_string())
+        );
+        assert_eq!(
+            cache.get(&host_b, now).map(|value| value.to_string()),
+            Some("secret-b".to_string())
+        );
+        assert!(cache.get(&key("connection-c", "host-c"), now).is_none());
+        assert!(
+            cache
+                .get(&key("connection-a", "replacement-host"), now)
+                .is_none(),
+            "editing a connection to another host must not reuse its old credential"
+        );
+
+        cache.clear_for_session("session-a");
+        assert!(cache.get(&host_a, now).is_none());
+        assert_eq!(
+            cache.get(&host_b, now).map(|value| value.to_string()),
+            Some("secret-b".to_string())
+        );
+
+        assert!(
+            cache
+                .get(
+                    &host_b,
+                    now + SUDO_CREDENTIAL_TTL + Duration::from_millis(1)
+                )
+                .is_none()
+        );
     }
 }
