@@ -1774,31 +1774,20 @@ pub fn TerminalView(
     // 100ms. (A use_effect here would only run once on mount — version is a
     // plain prop, not a tracked Signal — leaving the value stale.)
 
-    // Recompute search matches
+    // Recompute exact cell ranges whenever the query or terminal output changes.
+    // The helper is Unicode/cell aware; never use UTF-8 byte offsets as columns.
     {
         let query = search_query();
         let _ = version;
-        if !query.is_empty() {
-            let q = query.to_lowercase();
-            let mut found = Vec::new();
-            for (row_idx, row) in render_output.rows.iter().enumerate() {
-                let line: String = row
-                    .cells
-                    .iter()
-                    .filter(|c| !c.wide_next)
-                    .map(|c| c.character)
-                    .collect();
-                let lower = line.to_lowercase();
-                let mut start = 0;
-                while let Some(pos) = lower[start..].find(&q) {
-                    found.push((row_idx, start + pos));
-                    start = start + pos + 1;
-                    if start >= lower.len() {
-                        break;
-                    }
-                }
-            }
+        let found = find_search_matches(&render_output.rows, &query);
+        if search_matches() != found {
+            let next_index = if found.is_empty() {
+                0
+            } else {
+                search_match_index().min(found.len() - 1)
+            };
             search_matches.set(found);
+            search_match_index.set(next_index);
         }
     }
 
@@ -1958,27 +1947,29 @@ pub fn TerminalView(
             return;
         }
 
-        // App-button-drag motion (1002): only while button 0 is held and the
-        // app asked for button-event motion tracking.
-        if move_reporting && move_button_motion {
-            if mouse_button_down().is_some() {
-                let Some((row, col)) = event_cell(&e) else {
-                    return;
-                };
-                if last_motion_cell() != Some((row, col)) {
-                    last_motion_cell.set(Some((row, col)));
-                    let mods = e.modifiers();
-                    move_on_input.call(encode_mouse_report(
-                        MouseReportKind::Motion,
-                        0,
-                        col,
-                        row,
-                        mods.shift(),
-                        mods.alt(),
-                        mods.ctrl(),
-                        move_sgr,
-                    ));
-                }
+        // Application motion reporting: 1002 reports only while a button is
+        // held; 1003 reports every cell transition and uses pseudo-button 3
+        // when no button is down.
+        let pressed_button = mouse_button_down();
+        let should_report_motion = move_reporting
+            && (move_any_motion || (move_button_motion && pressed_button.is_some()));
+        if should_report_motion {
+            let Some((row, col)) = event_cell(&e) else {
+                return;
+            };
+            if last_motion_cell() != Some((row, col)) {
+                last_motion_cell.set(Some((row, col)));
+                let mods = e.modifiers();
+                move_on_input.call(encode_mouse_report(
+                    MouseReportKind::Motion,
+                    pressed_button.unwrap_or(3),
+                    col,
+                    row,
+                    mods.shift(),
+                    mods.alt(),
+                    mods.ctrl(),
+                    move_sgr,
+                ));
             }
         }
     };
