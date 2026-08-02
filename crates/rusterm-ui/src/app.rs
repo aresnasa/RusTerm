@@ -7266,6 +7266,32 @@ mod session_startup_tests {
     }
 }
 
+/// Format a colored status line for command-completion feedback (Task #65).
+///
+/// Returns a green `✓ 命令成功 (exit 0)` for success (rc==0) and a red
+/// `✗ 命令失败 (exit {rc})` for failure (rc!=0). Wrapped in ANSI SGR codes
+/// so the terminal model renders it in color. Extracted as a pure function
+/// so it can be unit-tested without a terminal handle.
+fn format_command_status_line(rc: i32) -> String {
+    if rc == 0 {
+        "\r\n\x1b[32m✓ 命令成功 (exit 0)\x1b[0m\r\n".to_string()
+    } else {
+        format!("\r\n\x1b[31m✗ 命令失败 (exit {})\x1b[0m\r\n", rc)
+    }
+}
+
+/// Format a red disconnection notice for session loss (Task #65).
+///
+/// Used by both SSH and local-shell `SessionEvent::Disconnected` handlers.
+/// Red because a disconnect is always an abnormal terminal state from the
+/// user's perspective.
+fn format_disconnected_line(reason: &str) -> String {
+    format!(
+        "\r\n\x1b[31m--- 会话断开: {} ---\x1b[0m\r\n按 Enter 重新连接\r\n",
+        reason
+    )
+}
+
 fn start_ssh_connection(
     mut state: Signal<AppState>,
     mut input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
@@ -8247,9 +8273,25 @@ fn start_ssh_connection(
                                         });
                                     }
                                 }
+                                // Task #65: colored command-completion
+                                // feedback. OSC 133;D (zsh/bash) gave us
+                                // the exit code; surface it as green ✓ / red
+                                // ✗ right after the command's output.
+                                // Re-rendering updates render_output so the
+                                // line is visible at once. fish/nu/pwsh don't
+                                // report exit codes, so this is a no-op there.
+                                if let Some(rc) = exit_code {
+                                    let status_line = format_command_status_line(rc);
+                                    let new_render =
+                                        handle.lock().process_and_render(status_line.as_bytes());
+                                    let mut s = state.write();
+                                    if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
+                                        tab.render_output = new_render;
+                                        tab.version += 1;
+                                    }
+                                }
                             }
                             check_onekey_match(state, &id, &data);
-                            drive_login_script(state, input_senders, &id, &data);
                         }
                         SessionEvent::Disconnected(id, reason) => {
                             {
@@ -8277,10 +8319,7 @@ fn start_ssh_connection(
                             }
                             input_senders.write().remove(&id);
                             state.write().login_scripts.remove(&id);
-                            let msg = format!(
-                                "\r\n--- Disconnected: {} ---\r\nPress Enter to reconnect.\r\n",
-                                reason
-                            );
+                            let msg = format_disconnected_line(&reason);
                             let terminals = state.read().terminals.clone();
                             if let Some(handle) = terminals.get(&id) {
                                 let render_result =
@@ -8750,6 +8789,19 @@ fn start_shell_connection(
                                         });
                                     }
                                 }
+                                // Task #65: colored command-completion
+                                // feedback (local shell path). Mirrors the
+                                // SSH branch — see there for rationale.
+                                if let Some(rc) = exit_code {
+                                    let status_line = format_command_status_line(rc);
+                                    let new_render =
+                                        handle.lock().process_and_render(status_line.as_bytes());
+                                    let mut s = state.write();
+                                    if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
+                                        tab.render_output = new_render;
+                                        tab.version += 1;
+                                    }
+                                }
                             }
                             check_onekey_match(state, &id, &data);
                             drive_login_script(state, input_senders, &id, &data);
@@ -8761,10 +8813,7 @@ fn start_shell_connection(
                                 .fail_execution(&id, format!("会话断开：{reason}"));
                             input_senders.write().remove(&id);
                             state.write().login_scripts.remove(&id);
-                            let msg = format!(
-                                "\r\n--- Disconnected: {} ---\r\nPress Enter to reconnect.\r\n",
-                                reason
-                            );
+                            let msg = format_disconnected_line(&reason);
                             let terminals = state.read().terminals.clone();
                             if let Some(handle) = terminals.get(&id) {
                                 let render_result =
@@ -14546,5 +14595,107 @@ mod tab_drag_tests {
         assert!(!is_arrow_key_seq(&[0x0d]));
         assert!(!is_arrow_key_seq(b"ls"));
         assert!(!is_arrow_key_seq(&[]));
+    }
+}
+
+#[cfg(test)]
+mod command_status_tests {
+    use super::{format_command_status_line, format_disconnected_line};
+
+    #[test]
+    fn success_is_green_with_check_mark() {
+        let line = format_command_status_line(0);
+        // Green SGR = \x1b[32m, reset = \x1b[0m
+        assert!(line.contains("\x1b[32m"), "missing green SGR: {:?}", line);
+        assert!(line.contains("\x1b[0m"), "missing reset SGR: {:?}", line);
+        assert!(line.contains('✓'), "missing check mark: {:?}", line);
+        assert!(line.contains("exit 0"), "missing exit code: {:?}", line);
+        // Must NOT use red
+        assert!(
+            !line.contains("\x1b[31m"),
+            "success must not be red: {:?}",
+            line
+        );
+        // Must NOT show failure marker
+        assert!(
+            !line.contains('✗'),
+            "success must not have cross: {:?}",
+            line
+        );
+    }
+
+    #[test]
+    fn failure_is_red_with_cross_and_code() {
+        let line = format_command_status_line(1);
+        assert!(line.contains("\x1b[31m"), "missing red SGR: {:?}", line);
+        assert!(line.contains("\x1b[0m"), "missing reset SGR: {:?}", line);
+        assert!(line.contains('✗'), "missing cross mark: {:?}", line);
+        assert!(line.contains("exit 1"), "missing exit code: {:?}", line);
+        assert!(
+            !line.contains("\x1b[32m"),
+            "failure must not be green: {:?}",
+            line
+        );
+        assert!(
+            !line.contains('✓'),
+            "failure must not have check: {:?}",
+            line
+        );
+    }
+
+    #[test]
+    fn failure_includes_arbitrary_exit_code() {
+        assert!(format_command_status_line(127).contains("exit 127"));
+        assert!(format_command_status_line(255).contains("exit 255"));
+        assert!(format_command_status_line(-1).contains("exit -1"));
+    }
+
+    #[test]
+    fn status_line_is_crlq_framed() {
+        // Both success and failure lines start and end with CRLF so they
+        // sit on their own line in the terminal, between the command's
+        // output and the next prompt.
+        let ok = format_command_status_line(0);
+        let err = format_command_status_line(2);
+        assert!(
+            ok.starts_with("\r\n"),
+            "success must start with CRLF: {:?}",
+            ok
+        );
+        assert!(ok.ends_with("\r\n"), "success must end with CRLF: {:?}", ok);
+        assert!(
+            err.starts_with("\r\n"),
+            "failure must start with CRLF: {:?}",
+            err
+        );
+        assert!(
+            err.ends_with("\r\n"),
+            "failure must end with CRLF: {:?}",
+            err
+        );
+    }
+
+    #[test]
+    fn disconnected_is_red_and_mentions_reconnect() {
+        let line = format_disconnected_line("network error");
+        assert!(
+            line.contains("\x1b[31m"),
+            "disconnect must be red: {:?}",
+            line
+        );
+        assert!(line.contains("\x1b[0m"), "missing reset SGR: {:?}", line);
+        assert!(line.contains("network error"), "missing reason: {:?}", line);
+        assert!(
+            line.contains("会话断开"),
+            "missing Chinese label: {:?}",
+            line
+        );
+        // The reconnect hint must be present so the user knows what to do.
+        assert!(line.contains("Enter"), "missing reconnect hint: {:?}", line);
+        assert!(
+            !line.contains("\x1b[32m"),
+            "disconnect must not be green: {:?}",
+            line
+        );
     }
 }
