@@ -499,6 +499,59 @@ impl AnalyticsDB {
         Ok(rows)
     }
 
+    /// Prefix-filtered command rankings: the user's most-used commands whose
+    /// text starts with `prefix` (case-insensitive), ordered by total
+    /// observation count (successes + failures) descending. Used to drive
+    /// history-based completion in the Send panel and to strengthen terminal
+    /// suggestions with pure-frequency DuckDB data.
+    ///
+    /// A command is included even if some of its executions failed — the
+    /// caller (suggestion pipeline) decides whether to surface it, and
+    /// grouping by `command` means a single typo won't dominate the list.
+    /// `limit == 0` means no limit.
+    ///
+    /// The `starts_with` comparison is case-insensitive via `LOWER()`. The
+    /// `idx_commands_command` index doesn't help a `LOWER()`-wrapped filter,
+    /// but the analytics table is small (<100k rows) and DuckDB's vectorized
+    /// scan handles this in well under a millisecond, so no functional index
+    /// is warranted.
+    pub fn command_rankings_by_prefix(
+        &self,
+        prefix: &str,
+        limit: u32,
+    ) -> Result<Vec<CommandRanking>> {
+        let conn = self.conn.lock();
+        let limit_clause = if limit == 0 {
+            String::new()
+        } else {
+            format!("LIMIT {}", u64::from(limit))
+        };
+        let mut stmt = conn.prepare(&format!(
+            "SELECT
+                command,
+                SUM(CASE WHEN exit_code = 0 THEN 1 ELSE 0 END) AS ok,
+                SUM(CASE WHEN exit_code != 0 THEN 1 ELSE 0 END) AS fail
+             FROM commands
+             WHERE LOWER(command) LIKE LOWER(?) || '%'
+             GROUP BY command
+             ORDER BY
+                SUM(CASE WHEN exit_code = 0 THEN 1 ELSE 0 END)
+                    + SUM(CASE WHEN exit_code != 0 THEN 1 ELSE 0 END) DESC,
+                command ASC
+             {limit_clause}"
+        ))?;
+        let rows = stmt
+            .query_map(duckdb::params![prefix], |row| {
+                Ok(CommandRanking {
+                    command: row.get(0)?,
+                    successes: row.get::<_, i64>(1)? as u64,
+                    failures: row.get::<_, i64>(2)? as u64,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
     /// Commands the user frequently fails: total observations >=
     /// min_observations AND failure share >= (1.0 - max_success_rate),
     /// sorted worst (lowest success rate, then most failures) first.
@@ -859,6 +912,43 @@ mod tests {
         assert_eq!(top_two.len(), 2);
         assert_eq!(top_two[0].command, "docker ps");
         assert_eq!(top_two[1].command, "git status");
+    }
+
+    /// Prefix-filtered rankings: only commands starting with the prefix are
+    /// returned, still ordered by total observation count. This is the query
+    /// the Send panel and the strengthened terminal suggestions rely on.
+    #[test]
+    fn command_rankings_by_prefix_filters_and_orders_by_usage() {
+        let db = AnalyticsDB::open_in_memory().unwrap();
+        seed_ranking_history(&db);
+
+        // "d" matches both docker variants; docker ps (6 obs) beats dockre ps (2).
+        let d = db.command_rankings_by_prefix("d", 0).unwrap();
+        assert_eq!(d.len(), 2);
+        assert_eq!(d[0].command, "docker ps");
+        assert_eq!(d[0].total(), 6);
+        assert_eq!(d[1].command, "dockre ps");
+        assert_eq!(d[1].total(), 2);
+
+        // "docker" narrows to just docker ps.
+        let docker = db.command_rankings_by_prefix("docker", 0).unwrap();
+        assert_eq!(docker.len(), 1);
+        assert_eq!(docker[0].command, "docker ps");
+
+        // Case-insensitive: "GIT" matches "git status".
+        let git = db.command_rankings_by_prefix("GIT", 0).unwrap();
+        assert_eq!(git.len(), 1);
+        assert_eq!(git[0].command, "git status");
+
+        // No match.
+        assert!(
+            db.command_rankings_by_prefix("nonexistent", 0)
+                .unwrap()
+                .is_empty()
+        );
+
+        // Limit caps the result count.
+        assert_eq!(db.command_rankings_by_prefix("d", 1).unwrap().len(), 1);
     }
 
     /// `high_failure_commands` must surface frequently-failed commands and

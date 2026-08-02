@@ -1769,6 +1769,33 @@ fn render_terminal_pane(
                                     }
                                 }
 
+                                // 3. DuckDB (analytics) — pure-frequency ranking of the user's
+                                //    most-used commands by prefix. SQLite's frecency blends
+                                //    recency + frequency + success, which surfaces a one-off
+                                //    recent command above a frequently-used older one. DuckDB's
+                                //    mirror captures total usage across all time, so commands the
+                                //    user runs dozens of times (but maybe not today) get a chance
+                                //    to appear. Gated behind the `analytics` feature — when the
+                                //    feature is off, `command_rankings_by_prefix` is a no-op.
+                                #[cfg(feature = "analytics")]
+                                {
+                                    if let Ok(rankings) =
+                                        analytics.command_rankings_by_prefix(&cmd_part, sug_count * 2)
+                                    {
+                                        for ranking in rankings {
+                                            let cmd = ranking.command;
+                                            if cmd.to_lowercase().starts_with(&cmd_lower)
+                                                && cmd != cmd_part
+                                                && !seen.contains(cmd.to_lowercase().as_str())
+                                                && !recent_failed.contains(&cmd)
+                                            {
+                                                seen.insert(cmd.to_lowercase().clone());
+                                                all_suggestions.push(cmd);
+                                            }
+                                        }
+                                    }
+                                }
+
                                 // Check epoch again before writing results
                                 if state_for_cmd.read().suggestion_epoch != epoch {
                                     return;
