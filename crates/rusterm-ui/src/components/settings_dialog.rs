@@ -5,11 +5,52 @@ use rusterm_core::config::{KeybindingAction, Keybindings, Language, SkinKind, Sk
 
 use crate::keybindings::{event_chord, format_key_chord};
 
+#[derive(Clone, Copy, PartialEq)]
+enum KeybindingValidationError {
+    UnsafeShortcut,
+    Conflict(KeybindingAction),
+}
+
+const fn skin_kind_key(kind: SkinKind) -> &'static str {
+    match kind {
+        SkinKind::TokyoNight => "settings.skin_tokyo_night",
+        SkinKind::OneDark => "settings.skin_one_dark",
+        SkinKind::SolarizedDark => "settings.skin_solarized_dark",
+        SkinKind::Custom => "settings.skin_custom",
+    }
+}
+
+const fn keybinding_action_key(action: KeybindingAction) -> &'static str {
+    match action {
+        KeybindingAction::CloseFocusedPane => "settings.keybinding_close_focused_pane",
+        KeybindingAction::AppendPane => "settings.keybinding_append_pane",
+        KeybindingAction::ToggleComparison => "settings.keybinding_toggle_comparison",
+        KeybindingAction::TogglePaneZoom => "settings.keybinding_toggle_pane_zoom",
+    }
+}
+
+fn keybinding_error_text(error: KeybindingValidationError) -> String {
+    match error {
+        KeybindingValidationError::UnsafeShortcut => {
+            crate::i18n::t("settings.keybinding_error_unsafe")
+        }
+        KeybindingValidationError::Conflict(action) => {
+            let action = crate::i18n::t(keybinding_action_key(action));
+            crate::i18n::tf("settings.keybinding_error_conflict", &[("action", &action)])
+        }
+    }
+}
+
 #[component]
-fn SkinColorField(label: &'static str, value: String, on_change: EventHandler<String>) -> Element {
+fn SkinColorField(
+    field: &'static str,
+    label: String,
+    value: String,
+    on_change: EventHandler<String>,
+) -> Element {
     rsx! {
         div {
-            "data-rusterm-skin-color": "{label}",
+            "data-rusterm-skin-color": "{field}",
             style: "display:flex;align-items:center;justify-content:space-between;gap:12px;",
             label { style: "font-size:12px;color:var(--settings-text);", "{label}" }
             div {
@@ -86,7 +127,9 @@ pub fn SettingsDialog(
     let mut skin_draft = use_signal(|| skin.normalized());
     let skin_preview = skin_draft().palette();
     let mut capturing_keybinding: Signal<Option<KeybindingAction>> = use_signal(|| None);
-    let mut keybinding_error: Signal<Option<String>> = use_signal(|| None);
+    let mut keybinding_error: Signal<Option<KeybindingValidationError>> = use_signal(|| None);
+    // Subscribe explicitly so every translated label updates with the global language.
+    let _active_language = crate::i18n::LANGUAGE();
     // Current language code for the <select value=...> binding.
     let language_code = match language {
         Language::Zh => "zh",
@@ -102,7 +145,7 @@ pub fn SettingsDialog(
                 "data-rusterm-settings-panel": "true",
                 role: "dialog",
                 "aria-modal": "true",
-                "aria-label": "Settings",
+                "aria-label": crate::i18n::t("settings.title"),
                 style: "background:var(--settings-surface);border:1px solid var(--settings-border-strong);border-radius:10px;padding:24px;width:min(520px,100%);max-height:calc(100vh - 48px);box-sizing:border-box;overflow-y:auto;color:var(--settings-text);color-scheme:dark;accent-color:var(--settings-accent);opacity:1;box-shadow:0 20px 64px rgba(0,0,0,0.72);",
 
                 h3 { style: "margin: 0 0 6px; font-size: 16px;", { crate::i18n::t("settings.title") } }
@@ -136,7 +179,7 @@ pub fn SettingsDialog(
                 h3 { style: "margin: 0 0 6px; font-size: 16px;", { crate::i18n::t("settings.appearance") } }
                 p {
                     style: "margin: 0 0 20px; color: var(--settings-text-muted); font-size: 12px; line-height: 1.5;",
-                    "Customize the complete outline around the top tab for the focused pane."
+                    { crate::i18n::t("settings.appearance_help") }
                 }
 
                 div {
@@ -144,7 +187,7 @@ pub fn SettingsDialog(
 
                     div {
                         style: "display: flex; align-items: center; justify-content: space-between; gap: 16px;",
-                        label { style: "font-size: 12px; color: var(--settings-text);", "Outline color" }
+                        label { style: "font-size: 12px; color: var(--settings-text);", { crate::i18n::t("settings.outline_color") } }
                         div {
                             style: "display: flex; align-items: center; gap: 8px;",
                             input {
@@ -162,7 +205,7 @@ pub fn SettingsDialog(
 
                     div {
                         style: "display: flex; align-items: center; justify-content: space-between; gap: 16px;",
-                        label { style: "font-size: 12px; color: var(--settings-text);", "Outline width" }
+                        label { style: "font-size: 12px; color: var(--settings-text);", { crate::i18n::t("settings.outline_width") } }
                         div {
                             style: "display: flex; align-items: center; gap: 10px;",
                             input {
@@ -183,7 +226,7 @@ pub fn SettingsDialog(
 
                     div {
                         style: "display: flex; align-items: center; justify-content: space-between; gap: 16px;",
-                        label { style: "font-size: 12px; color: var(--settings-text);", "Corner radius" }
+                        label { style: "font-size: 12px; color: var(--settings-text);", { crate::i18n::t("settings.corner_radius") } }
                         div {
                             style: "display: flex; align-items: center; gap: 10px;",
                             input {
@@ -204,23 +247,23 @@ pub fn SettingsDialog(
 
                     div {
                         style: "background: var(--settings-bg); border: 1px solid var(--settings-border); border-radius: 6px; padding: 14px;",
-                        div { style: "margin-bottom: 10px; color: var(--settings-text-muted); font-size: 11px;", "Preview" }
+                        div { style: "margin-bottom: 10px; color: var(--settings-text-muted); font-size: 11px;", { crate::i18n::t("settings.preview") } }
                         div {
                             style: "height: 36px; display: flex; align-items: stretch; border-bottom: 1px solid var(--settings-border);",
                             div {
                                 style: "display: flex; align-items: center; gap: 6px; padding: 0 12px; color: var(--settings-text); background: var(--settings-surface); border-bottom: 2px solid var(--settings-accent); box-shadow: {preview_shadow}; border-radius: {preview_radius}; font-size: 12px;",
                                 span { style: "width: 6px; height: 6px; border-radius: 50%; background: var(--settings-accent);" }
-                                "Focused session"
+                                { crate::i18n::t("settings.focused_session") }
                             }
                         }
                     }
                 }
 
                 // ── Application skin ────────────────────────────────────────
-                h3 { style: "margin:24px 0 6px;font-size:16px;", "Application skin" }
+                h3 { style: "margin:24px 0 6px;font-size:16px;", { crate::i18n::t("settings.skin") } }
                 p {
                     style: "margin:0 0 12px;color:var(--settings-text-muted);font-size:12px;line-height:1.5;",
-                    "Choose a built-in skin or tune the Custom palette. This changes application chrome only; terminal ANSI and xterm colors remain independent."
+                    { crate::i18n::t("settings.skin_help") }
                 }
                 div {
                     style: "display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px;",
@@ -230,10 +273,11 @@ pub fn SettingsDialog(
                             let background = if selected { "var(--settings-accent)" } else { "var(--settings-bg)" };
                             let color = if selected { "var(--settings-bg)" } else { "var(--settings-text)" };
                             let border = if selected { "var(--settings-accent)" } else { "var(--settings-border-strong)" };
-                            let label = kind.label();
+                            let key = skin_kind_key(kind);
+                            let label = crate::i18n::t(key);
                             rsx! {
                                 button {
-                                    key: "skin-{label}",
+                                    key: "skin-{key}",
                                     style: "background:{background};color:{color};border:1px solid {border};border-radius:4px;padding:5px 9px;cursor:pointer;font-size:11px;",
                                     onclick: move |_| skin_draft.write().kind = kind,
                                     "{label}"
@@ -246,31 +290,31 @@ pub fn SettingsDialog(
                     style: "border:1px solid var(--settings-border);border-radius:6px;overflow:hidden;margin-bottom:12px;",
                     div {
                         style: "background:{skin_preview.background};color:{skin_preview.text};padding:10px;display:flex;align-items:center;justify-content:space-between;",
-                        span { style: "font-size:12px;font-weight:600;", "Skin preview" }
-                        span { style: "font-size:11px;color:{skin_preview.text_muted};", "{skin_draft().kind.label()}" }
+                        span { style: "font-size:12px;font-weight:600;", { crate::i18n::t("settings.skin_preview") } }
+                        span { style: "font-size:11px;color:{skin_preview.text_muted};", { crate::i18n::t(skin_kind_key(skin_draft().kind)) } }
                     }
                     div {
                         style: "background:{skin_preview.surface};color:{skin_preview.text};padding:9px;display:flex;align-items:center;gap:8px;",
                         span { style: "width:8px;height:8px;border-radius:50%;background:{skin_preview.success};" }
-                        span { style: "font-size:11px;", "Connected" }
-                        button { style: "margin-left:auto;background:{skin_preview.accent};color:{skin_preview.background};border:0;border-radius:3px;padding:3px 7px;font-size:10px;", "Action" }
+                        span { style: "font-size:11px;", { crate::i18n::t("settings.skin_preview_connected") } }
+                        button { style: "margin-left:auto;background:{skin_preview.accent};color:{skin_preview.background};border:0;border-radius:3px;padding:3px 7px;font-size:10px;", { crate::i18n::t("settings.skin_preview_action") } }
                     }
                 }
                 if skin_draft().kind == SkinKind::Custom {
                     div {
                         style: "display:flex;flex-direction:column;gap:8px;background:var(--settings-bg);border:1px solid var(--settings-border);border-radius:6px;padding:12px;margin-bottom:12px;",
-                        SkinColorField { label: "Background", value: skin_draft().custom.background.clone(), on_change: move |value| skin_draft.write().custom.background = value }
-                        SkinColorField { label: "Surface", value: skin_draft().custom.surface.clone(), on_change: move |value| skin_draft.write().custom.surface = value }
-                        SkinColorField { label: "Surface hover", value: skin_draft().custom.surface_hover.clone(), on_change: move |value| skin_draft.write().custom.surface_hover = value }
-                        SkinColorField { label: "Border", value: skin_draft().custom.border.clone(), on_change: move |value| skin_draft.write().custom.border = value }
-                        SkinColorField { label: "Strong border", value: skin_draft().custom.border_strong.clone(), on_change: move |value| skin_draft.write().custom.border_strong = value }
-                        SkinColorField { label: "Text", value: skin_draft().custom.text.clone(), on_change: move |value| skin_draft.write().custom.text = value }
-                        SkinColorField { label: "Muted text", value: skin_draft().custom.text_muted.clone(), on_change: move |value| skin_draft.write().custom.text_muted = value }
-                        SkinColorField { label: "Accent", value: skin_draft().custom.accent.clone(), on_change: move |value| skin_draft.write().custom.accent = value }
-                        SkinColorField { label: "Secondary accent", value: skin_draft().custom.accent_secondary.clone(), on_change: move |value| skin_draft.write().custom.accent_secondary = value }
-                        SkinColorField { label: "Success", value: skin_draft().custom.success.clone(), on_change: move |value| skin_draft.write().custom.success = value }
-                        SkinColorField { label: "Warning", value: skin_draft().custom.warning.clone(), on_change: move |value| skin_draft.write().custom.warning = value }
-                        SkinColorField { label: "Danger", value: skin_draft().custom.danger.clone(), on_change: move |value| skin_draft.write().custom.danger = value }
+                        SkinColorField { field: "background", label: crate::i18n::t("settings.color_background"), value: skin_draft().custom.background.clone(), on_change: move |value| skin_draft.write().custom.background = value }
+                        SkinColorField { field: "surface", label: crate::i18n::t("settings.color_surface"), value: skin_draft().custom.surface.clone(), on_change: move |value| skin_draft.write().custom.surface = value }
+                        SkinColorField { field: "surface_hover", label: crate::i18n::t("settings.color_surface_hover"), value: skin_draft().custom.surface_hover.clone(), on_change: move |value| skin_draft.write().custom.surface_hover = value }
+                        SkinColorField { field: "border", label: crate::i18n::t("settings.color_border"), value: skin_draft().custom.border.clone(), on_change: move |value| skin_draft.write().custom.border = value }
+                        SkinColorField { field: "border_strong", label: crate::i18n::t("settings.color_border_strong"), value: skin_draft().custom.border_strong.clone(), on_change: move |value| skin_draft.write().custom.border_strong = value }
+                        SkinColorField { field: "text", label: crate::i18n::t("settings.color_text"), value: skin_draft().custom.text.clone(), on_change: move |value| skin_draft.write().custom.text = value }
+                        SkinColorField { field: "text_muted", label: crate::i18n::t("settings.color_text_muted"), value: skin_draft().custom.text_muted.clone(), on_change: move |value| skin_draft.write().custom.text_muted = value }
+                        SkinColorField { field: "accent", label: crate::i18n::t("settings.color_accent"), value: skin_draft().custom.accent.clone(), on_change: move |value| skin_draft.write().custom.accent = value }
+                        SkinColorField { field: "accent_secondary", label: crate::i18n::t("settings.color_accent_secondary"), value: skin_draft().custom.accent_secondary.clone(), on_change: move |value| skin_draft.write().custom.accent_secondary = value }
+                        SkinColorField { field: "success", label: crate::i18n::t("settings.color_success"), value: skin_draft().custom.success.clone(), on_change: move |value| skin_draft.write().custom.success = value }
+                        SkinColorField { field: "warning", label: crate::i18n::t("settings.color_warning"), value: skin_draft().custom.warning.clone(), on_change: move |value| skin_draft.write().custom.warning = value }
+                        SkinColorField { field: "danger", label: crate::i18n::t("settings.color_danger"), value: skin_draft().custom.danger.clone(), on_change: move |value| skin_draft.write().custom.danger = value }
                     }
                 }
 

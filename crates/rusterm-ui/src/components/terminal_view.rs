@@ -2691,7 +2691,7 @@ pub fn TerminalView(
             ) {
                 div {
                     style: "position:absolute;right:10px;top:var(--suggestion-top, 2em);z-index:19;padding:5px 9px;background:var(--skin-bg);border:1px solid var(--skin-success);border-radius:4px;color:var(--skin-success);font-size:11px;pointer-events:none;",
-                    "Credential sent · input hidden by remote"
+                    { crate::i18n::t("onekey.submission_feedback") }
                 }
             }
 

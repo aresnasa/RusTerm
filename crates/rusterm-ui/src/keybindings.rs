@@ -50,7 +50,7 @@ pub fn action_for_event(
 
 pub fn format_key_chord(chord: Option<&KeyChord>) -> String {
     let Some(chord) = chord else {
-        return "Disabled".to_string();
+        return crate::i18n::t("keybindings.disabled");
     };
 
     let mut parts = Vec::new();
@@ -118,7 +118,7 @@ mod tests {
 
     #[test]
     fn formats_disabled_and_active_chords() {
-        assert_eq!(format_key_chord(None), "Disabled");
+        assert_eq!(format_key_chord(None), crate::i18n::t("keybindings.disabled"));
         assert!(format_key_chord(Keybindings::default().append_pane.as_ref()).contains('L'));
     }
 }

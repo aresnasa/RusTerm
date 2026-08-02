@@ -174,8 +174,8 @@ pub fn SuggestionPopup(
                                     background:transparent;
                                     flex-shrink:0;
                                 ",
-                                title: "Remove from history (Shift+Del)",
-                                aria_label: "Remove command from history",
+                                title: crate::i18n::t("suggestion.remove_history_tooltip"),
+                                aria_label: crate::i18n::t("suggestion.remove_history_aria"),
                                 // Keep the event local even if this component is
                                 // later rendered outside its current popup root.
                                 onpointerdown: move |e| {
