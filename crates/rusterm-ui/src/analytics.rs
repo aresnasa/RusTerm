@@ -286,7 +286,10 @@ pub mod disabled {
         ) -> anyhow::Result<()> {
             Ok(())
         }
-        pub fn command_corrections_for(&self, _typo: &str) -> Result<Vec<LearnedCorrection>> {
+        pub fn command_corrections_for(
+            &self,
+            _typo: &str,
+        ) -> anyhow::Result<Vec<LearnedCorrection>> {
             Ok(Vec::new())
         }
 
@@ -295,7 +298,7 @@ pub mod disabled {
         /// panel completion, terminal suggestion pipeline) work without
         /// `#[cfg]` guards. Note we return plain `String`s rather than a
         /// `rusterm_analytics` type so this module stays DuckDB-free.
-        pub fn suggest_by_prefix(&self, _prefix: &str, _limit: u32) -> Result<Vec<String>> {
+        pub fn suggest_by_prefix(&self, _prefix: &str, _limit: u32) -> anyhow::Result<Vec<String>> {
             Ok(Vec::new())
         }
     }
