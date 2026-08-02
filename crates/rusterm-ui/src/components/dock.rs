@@ -35,6 +35,7 @@ pub fn panel_label(panel: PanelId) -> &'static str {
         PanelId::Send => "Send",
         PanelId::EmbeddedShell => "Shell",
         PanelId::Transfers => "Transfers",
+        PanelId::Relay => "API",
     }
 }
 

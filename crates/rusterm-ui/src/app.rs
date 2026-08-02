@@ -592,11 +592,12 @@ fn render_workspace_dock_panel(
                 }
             }
         }
-        PanelId::Send | PanelId::EmbeddedShell | PanelId::Transfers => {
+        PanelId::Send | PanelId::EmbeddedShell | PanelId::Transfers | PanelId::Relay => {
             let active_tab = match panel {
                 PanelId::Send => BottomPanelTab::Send,
                 PanelId::EmbeddedShell => BottomPanelTab::Shell,
                 PanelId::Transfers => BottomPanelTab::Transfers,
+                PanelId::Relay => BottomPanelTab::Api,
                 _ => unreachable!(),
             };
             let (target_options, selected_target_ids, target_label) = {
@@ -635,6 +636,7 @@ fn render_workspace_dock_panel(
                             BottomPanelTab::Send => PanelId::Send,
                             BottomPanelTab::Shell => PanelId::EmbeddedShell,
                             BottomPanelTab::Transfers => PanelId::Transfers,
+                            BottomPanelTab::Api => PanelId::Relay,
                         };
                         update_workspace_preferences(state, |preferences| {
                             activate_workspace_panel(preferences, selected);

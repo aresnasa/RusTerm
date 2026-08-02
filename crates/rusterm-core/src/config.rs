@@ -621,6 +621,10 @@ pub enum BottomPanelTab {
     Send,
     Shell,
     Transfers,
+    /// REST API relay configuration + auto-generated curl examples. Mirrors
+    /// the standalone `RelayPanel` modal but lives in the bottom dock so the
+    /// user can configure it right next to the sessions it controls.
+    Api,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -633,10 +637,12 @@ pub enum PanelId {
     Send,
     EmbeddedShell,
     Transfers,
+    /// Bottom-dock REST API relay panel.
+    Relay,
 }
 
 impl PanelId {
-    pub const ALL: [Self; 7] = [
+    pub const ALL: [Self; 8] = [
         Self::Connections,
         Self::RemoteFiles,
         Self::Sessions,
@@ -644,13 +650,14 @@ impl PanelId {
         Self::Send,
         Self::EmbeddedShell,
         Self::Transfers,
+        Self::Relay,
     ];
 
     const fn default_zone(self) -> DockZone {
         match self {
             Self::Connections | Self::RemoteFiles => DockZone::Left,
             Self::Sessions | Self::History => DockZone::Right,
-            Self::Send | Self::EmbeddedShell | Self::Transfers => DockZone::Bottom,
+            Self::Send | Self::EmbeddedShell | Self::Transfers | Self::Relay => DockZone::Bottom,
         }
     }
 }
@@ -961,10 +968,16 @@ impl WorkspacePreferences {
                     BottomPanelTab::Send => PanelId::Send,
                     BottomPanelTab::Shell => PanelId::EmbeddedShell,
                     BottomPanelTab::Transfers => PanelId::Transfers,
+                    BottomPanelTab::Api => PanelId::Relay,
                 },
                 matches!(
                     self.dock_layout.bottom.active,
-                    None | Some(PanelId::Send | PanelId::EmbeddedShell | PanelId::Transfers)
+                    None | Some(
+                        PanelId::Send
+                            | PanelId::EmbeddedShell
+                            | PanelId::Transfers
+                            | PanelId::Relay
+                    )
                 ),
             ),
         ];
@@ -1003,6 +1016,7 @@ impl WorkspacePreferences {
                 PanelId::Send => BottomPanelTab::Send,
                 PanelId::EmbeddedShell => BottomPanelTab::Shell,
                 PanelId::Transfers => BottomPanelTab::Transfers,
+                PanelId::Relay => BottomPanelTab::Api,
                 _ => self.bottom_tab,
             };
         }

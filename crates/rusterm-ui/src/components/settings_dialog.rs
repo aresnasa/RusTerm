@@ -96,7 +96,7 @@ pub fn SettingsDialog(
     rsx! {
         div {
             "data-rusterm-settings-overlay": "true",
-            style: "--settings-bg:#141722;--settings-surface:#202438;--settings-surface-hover:#2a3046;--settings-border:#3b435d;--settings-border-strong:#66718f;--settings-text:#f4f6ff;--settings-text-muted:#b7bfd8;--settings-accent:#8ab4ff;--settings-danger:#ff8fa3;position:fixed;inset:0;background:rgba(5,6,10,0.86);display:flex;justify-content:center;align-items:center;padding:24px;box-sizing:border-box;isolation:isolate;z-index:20000;",
+            style: "--settings-bg:#1a1b26;--settings-surface:#24283b;--settings-surface-hover:#2a2b3d;--settings-border:#2a2b3d;--settings-border-strong:#2a2b3d;--settings-text:#c0caf5;--settings-text-muted:#9aa5ce;--settings-accent:#7aa2f7;--settings-danger:#f7768e;position:fixed;inset:0;background:rgba(0,0,0,0.6);display:flex;justify-content:center;align-items:center;padding:24px;box-sizing:border-box;isolation:isolate;z-index:20000;",
 
             div {
                 "data-rusterm-settings-panel": "true",

@@ -255,6 +255,48 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         // ── transfers.* — Transfers panel ────────────────────────────────
         "transfers.tab_title" => ("Transfers", "传输"),
 
+        // ── api.* — REST API relay panel (bottom dock) ────────────────────
+        "api.tab_title" => ("API", "API"),
+        "api.title" => ("REST API relay", "REST API 中转"),
+        "api.status_running" => ("Running at {url}", "运行中：{url}"),
+        "api.status_stopped" => ("Stopped", "已停止"),
+        "api.enable_on_startup" => ("Enable relay on startup", "启动时开启中转"),
+        "api.start" => ("Start", "启动"),
+        "api.stop" => ("Stop", "停止"),
+        "api.bind_addr" => ("Bind addr", "监听地址"),
+        "api.port" => ("Port", "端口"),
+        "api.base_url" => ("Base URL", "基础 URL"),
+        "api.no_account" => (
+            "No accounts configured. Add one below to authenticate curl requests.",
+            "尚未配置账号。在下方添加一个以通过 curl 鉴权。",
+        ),
+        "api.accounts" => ("Accounts (BasicAuth)", "账号（BasicAuth）"),
+        "api.username" => ("Username", "用户名"),
+        "api.password" => ("Password", "密码"),
+        "api.add_account" => ("Add account", "添加账号"),
+        "api.remove" => ("Remove", "删除"),
+        "api.readonly" => ("Read-only", "只读"),
+        "api.curl_examples" => (
+            "curl examples — run commands on your sessions",
+            "curl 示例 — 在你的会话上执行命令",
+        ),
+        "api.curl_hint" => (
+            "Pick a connected session and a command, then copy the curl. Replace USER:PASS with an account above.",
+            "选择一个已连接的会话和命令，然后复制 curl。将 USER:PASS 替换为上方账号。",
+        ),
+        "api.command" => ("Command", "命令"),
+        "api.session" => ("Session", "会话"),
+        "api.copy" => ("Copy", "复制"),
+        "api.copied" => ("Copied!", "已复制！"),
+        "api.no_sessions" => (
+            "No connected SSH sessions. Connect to a host first.",
+            "没有已连接的 SSH 会话。请先连接到主机。",
+        ),
+        "api.invalid_port" => ("Invalid port: {value}", "端口无效：{value}"),
+        "api.saved" => ("Saved to relay.json", "已保存到 relay.json"),
+        "api.account_exists" => ("Account \"{name}\" already exists", "账号“{name}”已存在"),
+        "api.fill_user_pass" => ("Username and password are required", "用户名和密码不能为空"),
+
         // ── ai.* — AI panel ──────────────────────────────────────────────
         "ai.title" => ("AI suggestions · shadow sandbox", "AI 建议 · 影子沙盒"),
         "ai.review" => ("Review execution", "审查执行"),

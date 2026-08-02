@@ -118,34 +118,35 @@ pub fn TunnelsPanel(state: Signal<crate::state::AppState>, on_close: EventHandle
 
     rsx! {
         style { r#"
-            .tunnels-overlay{{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:1000;}}
-            .tunnels-card{{width:min(860px,92vw);max-height:86vh;background:var(--skin-bg);color:var(--skin-text);border:1px solid var(--skin-border);border-radius:8px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 12px 40px rgba(0,0,0,.35);}}
-            .tunnels-head{{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--skin-border);}}
+            .tunnels-overlay{{position:fixed;inset:0;background:rgba(0,0,0,0.6);display:flex;align-items:center;justify-content:center;z-index:1000;}}
+            .tunnels-card{{width:min(860px,92vw);max-height:86vh;background:#24283b;color:#c0caf5;border:1px solid #2a2b3d;border-radius:8px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 12px 40px rgba(0,0,0,.35);}}
+            .tunnels-head{{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid #2a2b3d;}}
             .tunnels-body{{display:flex;min-height:0;flex:1;}}
-            .tunnels-list{{flex:1;min-width:0;overflow-y:auto;padding:8px 12px;border-right:1px solid var(--skin-border);}}
-            .tunnels-editor{{width:300px;flex:0 0 auto;overflow-y:auto;padding:12px;background:var(--skin-surface);}}
-            .tunnel-row{{display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid var(--skin-border);border-radius:6px;margin-bottom:6px;background:var(--skin-bg);}}
+            .tunnels-list{{flex:1;min-width:0;overflow-y:auto;padding:8px 12px;border-right:1px solid #2a2b3d;}}
+            .tunnels-editor{{width:300px;flex:0 0 auto;overflow-y:auto;padding:12px;background:#1a1b26;}}
+            .tunnel-row{{display:flex;align-items:center;gap:8px;padding:8px 10px;border:1px solid #2a2b3d;border-radius:6px;margin-bottom:6px;background:#1a1b26;}}
             .tunnel-dot{{width:9px;height:9px;border-radius:50%;flex:0 0 auto;}}
             .tunnel-dot.green{{background:#4caf50;box-shadow:0 0 6px #4caf50;}}
             .tunnel-dot.yellow{{background:#ffb300;box-shadow:0 0 6px #ffb300;}}
             .tunnel-dot.red{{background:#e53935;}}
             .tunnel-name{{flex:1;min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-size:12px;}}
-            .tunnel-sub{{font-size:10px;color:var(--skin-text-muted);overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}}
-            .tunnel-btn{{border:1px solid var(--skin-border);border-radius:4px;background:var(--skin-surface);color:var(--skin-text);font-size:11px;padding:3px 8px;cursor:pointer;}}
-            .tunnel-btn:hover{{border-color:var(--skin-accent);color:var(--skin-accent);}}
-            .tunnel-btn.danger:hover{{border-color:var(--skin-danger);color:var(--skin-danger);}}
+            .tunnel-sub{{font-size:10px;color:#9aa5ce;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}}
+            .tunnel-btn{{border:1px solid #2a2b3d;border-radius:4px;background:#1a1b26;color:#c0caf5;font-size:11px;padding:3px 8px;cursor:pointer;}}
+            .tunnel-btn:hover{{border-color:#7aa2f7;color:#7aa2f7;}}
+            .tunnel-btn.danger:hover{{border-color:#f7768e;color:#f7768e;}}
+            .tunnel-btn.primary{{background:#7aa2f7;color:#1a1b26;border:1px solid #7aa2f7;font-weight:600;}}
             .tunnel-field{{display:flex;flex-direction:column;gap:3px;margin-bottom:9px;font-size:11px;}}
-            .tunnel-field input,.tunnel-field select{{padding:5px 7px;border:1px solid var(--skin-border);border-radius:4px;background:var(--skin-bg);color:var(--skin-text);font-size:12px;}}
+            .tunnel-field input,.tunnel-field select{{padding:5px 7px;border:1px solid #2a2b3d;border-radius:4px;background:#1a1b26;color:#c0caf5;font-size:12px;}}
             .tunnel-hints{{display:flex;gap:4px;flex-wrap:wrap;margin-top:3px;}}
-            .tunnel-hint-chip{{border:1px solid var(--skin-accent);color:var(--skin-accent);border-radius:10px;padding:1px 8px;font-size:10px;cursor:pointer;background:transparent;}}
-            .tunnel-error{{color:var(--skin-danger);font-size:11px;margin-top:4px;}}
+            .tunnel-hint-chip{{border:1px solid #7aa2f7;color:#7aa2f7;border-radius:10px;padding:1px 8px;font-size:10px;cursor:pointer;background:transparent;}}
+            .tunnel-error{{color:#f7768e;font-size:11px;margin-top:4px;}}
             .tunnel-check{{display:flex;align-items:center;gap:6px;font-size:11px;margin-bottom:9px;}}
         "# }
 
         div { class: "tunnels-overlay", onclick: move |_| on_close.call(()),
             div { class: "tunnels-card", onclick: move |e| e.stop_propagation(),
                 div { class: "tunnels-head",
-                    span { style: "font-size:13px;font-weight:600;", "SSH Tunnels" }
+                    span { style: "font-size:16px;font-weight:600;", "SSH Tunnels" }
                     button {
                         class: "tunnel-btn",
                         onclick: move |_| {
@@ -170,7 +171,7 @@ pub fn TunnelsPanel(state: Signal<crate::state::AppState>, on_close: EventHandle
                     // ── list ────────────────────────────────────────────
                     div { class: "tunnels-list",
                         if snapshots().is_empty() {
-                            div { style: "padding:32px;text-align:center;color:var(--skin-text-muted);font-size:12px;",
+                            div { style: "padding:32px;text-align:center;color:#9aa5ce;font-size:12px;",
                                 "No tunnels yet. Create one to forward a local port through SSH."
                             }
                         } else {
@@ -361,7 +362,7 @@ pub fn TunnelsPanel(state: Signal<crate::state::AppState>, on_close: EventHandle
 
                             div { style: "display:flex;gap:8px;margin-top:6px;",
                                 button {
-                                    class: "tunnel-btn",
+                                    class: "tunnel-btn primary",
                                     onclick: move |_| {
                                         match build_config(&form()) {
                                             Ok(config) => {
@@ -391,7 +392,7 @@ pub fn TunnelsPanel(state: Signal<crate::state::AppState>, on_close: EventHandle
                     }
                 }
 
-                div { style: "display:flex;justify-content:flex-end;padding:8px 16px;border-top:1px solid var(--skin-border);",
+                div { style: "display:flex;justify-content:flex-end;padding:8px 16px;border-top:1px solid #2a2b3d;",
                     button { class: "tunnel-btn", onclick: move |_| on_close.call(()), "Close" }
                 }
             }

@@ -38,27 +38,28 @@ pub fn RelayPanel(state: Signal<crate::state::AppState>, on_close: EventHandler<
 
     rsx! {
         style { r#"
-            .relay-overlay{{position:fixed;inset:0;background:rgba(0,0,0,.45);display:flex;align-items:center;justify-content:center;z-index:1000;}}
-            .relay-card{{width:min(720px,92vw);max-height:86vh;background:var(--skin-bg);color:var(--skin-text);border:1px solid var(--skin-border);border-radius:8px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 12px 40px rgba(0,0,0,.35);}}
-            .relay-head{{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid var(--skin-border);}}
+            .relay-overlay{{position:fixed;inset:0;background:rgba(0,0,0,.6);display:flex;align-items:center;justify-content:center;z-index:1000;}}
+            .relay-card{{width:min(720px,92vw);max-height:86vh;background:#24283b;color:#c0caf5;border:1px solid #2a2b3d;border-radius:8px;display:flex;flex-direction:column;overflow:hidden;box-shadow:0 12px 40px rgba(0,0,0,.35);}}
+            .relay-head{{display:flex;align-items:center;justify-content:space-between;padding:12px 16px;border-bottom:1px solid #2a2b3d;}}
             .relay-body{{flex:1;min-height:0;overflow-y:auto;padding:14px 16px;}}
             .relay-row{{display:flex;align-items:center;gap:10px;margin-bottom:12px;font-size:12px;}}
-            .relay-input{{padding:5px 7px;border:1px solid var(--skin-border);border-radius:4px;background:var(--skin-bg);color:var(--skin-text);font-size:12px;}}
-            .relay-btn{{border:1px solid var(--skin-border);border-radius:4px;background:var(--skin-surface);color:var(--skin-text);font-size:11px;padding:4px 10px;cursor:pointer;}}
-            .relay-btn:hover{{border-color:var(--skin-accent);color:var(--skin-accent);}}
-            .relay-btn.warn{{border-color:var(--skin-danger);color:var(--skin-danger);}}
+            .relay-input{{padding:5px 7px;border:1px solid #2a2b3d;border-radius:4px;background:#1a1b26;color:#c0caf5;font-size:12px;}}
+            .relay-btn{{border:1px solid #2a2b3d;border-radius:4px;background:#1a1b26;color:#c0caf5;font-size:11px;padding:4px 10px;cursor:pointer;}}
+            .relay-btn:hover{{border-color:#7aa2f7;color:#7aa2f7;}}
+            .relay-btn.warn{{border-color:#f7768e;color:#f7768e;}}
+            .relay-btn.primary{{background:#7aa2f7;color:#1a1b26;border:1px solid #7aa2f7;font-weight:600;}}
             .relay-status{{font-size:11px;padding:6px 10px;border-radius:4px;margin-bottom:12px;}}
             .relay-status.ok{{background:rgba(76,175,80,.12);color:#4caf50;}}
             .relay-status.err{{background:rgba(229,57,53,.12);color:#e53935;}}
-            .relay-account{{border:1px solid var(--skin-border);border-radius:6px;padding:8px 10px;margin-bottom:6px;font-size:12px;}}
-            .relay-sect{{font-size:11px;font-weight:600;color:var(--skin-text-muted);text-transform:uppercase;letter-spacing:.5px;margin:14px 0 6px;}}
+            .relay-account{{background:#1a1b26;border:1px solid #2a2b3d;border-radius:6px;padding:8px 10px;margin-bottom:6px;font-size:12px;}}
+            .relay-sect{{font-size:11px;font-weight:600;color:#9aa5ce;text-transform:uppercase;letter-spacing:.5px;margin:14px 0 6px;}}
             .relay-field{{display:flex;flex-direction:column;gap:3px;margin-bottom:8px;font-size:11px;}}
         "# }
 
         div { class: "relay-overlay", onclick: move |_| on_close.call(()),
             div { class: "relay-card", onclick: move |e| e.stop_propagation(),
                 div { class: "relay-head",
-                    span { style: "font-size:13px;font-weight:600;", "REST API Relay" }
+                    span { style: "font-size:16px;font-weight:600;", "REST API Relay" }
                     button { class: "relay-btn", onclick: move |_| on_close.call(()), "Close" }
                 }
 
@@ -69,7 +70,7 @@ pub fn RelayPanel(state: Signal<crate::state::AppState>, on_close: EventHandler<
                             "Running at {started_url().clone().unwrap_or_default()}"
                         }
                     } else {
-                        div { class: "relay-status", style: "background:var(--skin-surface);color:var(--skin-text-muted);",
+                        div { class: "relay-status", style: "background:#24283b;color:#9aa5ce;",
                             "Stopped"
                         }
                     }
@@ -195,7 +196,7 @@ pub fn RelayPanel(state: Signal<crate::state::AppState>, on_close: EventHandler<
                             }
                         }
                         button {
-                            class: "relay-btn",
+                            class: "relay-btn primary",
                             onclick: move |_| {
                                 // Persist current edits without toggling the server.
                                 let cfg = config();
@@ -221,7 +222,7 @@ pub fn RelayPanel(state: Signal<crate::state::AppState>, on_close: EventHandler<
                                     div { style: "display:flex;align-items:center;justify-content:space-between;",
                                         span { style: "font-weight:600;", "{username}" }
                                         if account.readonly {
-                                            span { style: "font-size:10px;color:var(--skin-accent);", "read-only" }
+                                            span { style: "font-size:10px;color:#7aa2f7;", "read-only" }
                                         }
                                         button {
                                             class: "relay-btn",
@@ -243,10 +244,10 @@ pub fn RelayPanel(state: Signal<crate::state::AppState>, on_close: EventHandler<
                                             account.allowed_commands.join(", ")
                                         };
                                         rsx! {
-                                            div { style: "font-size:10px;color:var(--skin-text-muted);margin-top:3px;",
+                                            div { style: "font-size:10px;color:#9aa5ce;margin-top:3px;",
                                                 "hosts: {hosts_text}"
                                             }
-                                            div { style: "font-size:10px;color:var(--skin-text-muted);",
+                                            div { style: "font-size:10px;color:#9aa5ce;",
                                                 "commands: {commands_text}"
                                             }
                                         }
@@ -364,7 +365,7 @@ pub fn RelayPanel(state: Signal<crate::state::AppState>, on_close: EventHandler<
                     }
                 }
 
-                div { style: "padding:10px 16px;border-top:1px solid var(--skin-border);font-size:10px;color:var(--skin-text-muted);",
+                div { style: "padding:10px 16px;border-top:1px solid #2a2b3d;font-size:10px;color:#9aa5ce;",
                     {
                         let audit_dir = rusterm_core::logging::log_dir().display().to_string();
                         format!("Audit log: {audit_dir}/relay-audit.jsonl — every auth failure and command execution is recorded.")

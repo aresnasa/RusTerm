@@ -90,6 +90,11 @@ pub fn BottomToolPanel(
                     onclick: move |_| on_tab_change.call(BottomPanelTab::Transfers),
                     { crate::i18n::t("transfers.tab_title") }
                 }
+                button {
+                    class: if active_tab == BottomPanelTab::Api { "workspace-tab active" } else { "workspace-tab" },
+                    onclick: move |_| on_tab_change.call(BottomPanelTab::Api),
+                    { crate::i18n::t("api.tab_title") }
+                }
                 }
                 if active_tab == BottomPanelTab::Send {
                     button {
@@ -198,6 +203,9 @@ pub fn BottomToolPanel(
                         on_retry: move |job_id| on_retry_transfer.call(job_id),
                         on_clear_finished: move |_| on_clear_transfers.call(()),
                     }
+                },
+                BottomPanelTab::Api => rsx! {
+                    crate::components::ApiPanel { state }
                 },
             }
 
