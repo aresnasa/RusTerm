@@ -778,9 +778,24 @@ impl ConfigManager {
         persisted
     }
 
+    /// Strict read used by preference writes. Unlike legacy settings getters,
+    /// this must not turn a temporarily unreadable or malformed existing file
+    /// into defaults and overwrite the user's connections/credentials.
+    fn read_persisted_for_update(&self) -> Result<PersistedConfig> {
+        if !self.config_path.exists() {
+            return Ok(self.read_persisted());
+        }
+        let contents = fs::read_to_string(&self.config_path)
+            .context("Failed to read existing config before update")?;
+        let mut persisted: PersistedConfig = serde_json::from_str(&contents)
+            .context("Failed to parse existing config before update")?;
+        persisted.workspace = persisted.workspace.normalized();
+        Ok(persisted)
+    }
+
     /// Save the OneKey library. Preserves existing connections (read-modify-write).
     pub fn save_onekeys(&self, onekeys: &[OneKey]) -> Result<()> {
-        let existing = self.read_persisted();
+        let existing = self.read_persisted_for_update()?;
         let persisted = PersistedConfig {
             version: CONFIG_VERSION,
             connections: existing.connections,
@@ -815,17 +830,27 @@ impl ConfigManager {
     }
 
     pub fn load_onekeys(&self) -> Result<Vec<OneKey>> {
-        self.read_persisted()
-            .onekeys
+        let persisted_onekeys = self.read_persisted().onekeys;
+        let migrated_step_ids = persisted_onekeys
+            .iter()
+            .any(|onekey| onekey.steps.iter().any(|step| step.id.is_empty()));
+        let onekeys = persisted_onekeys
             .into_iter()
             .map(|pok| self.decrypt_onekey(pok))
-            .collect()
+            .collect::<Result<Vec<_>>>()?;
+        if migrated_step_ids {
+            // Preferences may immediately reference these generated IDs, so
+            // persist the migration before returning. Otherwise a restart
+            // would generate different IDs and make the new preference dangle.
+            self.save_onekeys(&onekeys)?;
+        }
+        Ok(onekeys)
     }
 
     /// Persist non-secret multi-match selections. Read-modify-write preserves
     /// encrypted credentials and every unrelated setting.
     pub fn save_onekey_preferences(&self, preferences: &[OneKeyPreference]) -> Result<()> {
-        let mut persisted = self.read_persisted();
+        let mut persisted = self.read_persisted_for_update()?;
         persisted.version = CONFIG_VERSION;
         persisted.master_password_hash = self.master_password_hash.clone();
         persisted.onekey_preferences = preferences.to_vec();
@@ -856,6 +881,7 @@ impl ConfigManager {
 
     fn encrypt_step(&self, s: &OneKeyStep) -> Result<PersistedOneKeyStep> {
         Ok(PersistedOneKeyStep {
+            id: s.id.clone(),
             label: s.label.clone(),
             expect: s.expect.clone(),
             send: self.encrypt_string(&s.send)?,
@@ -903,6 +929,11 @@ impl ConfigManager {
 
     fn decrypt_step(&self, s: PersistedOneKeyStep) -> Result<OneKeyStep> {
         Ok(OneKeyStep {
+            id: if s.id.is_empty() {
+                uuid::Uuid::new_v4().to_string()
+            } else {
+                s.id
+            },
             label: s.label,
             expect: s.expect,
             send: self.decrypt_value(&s.send)?,
@@ -1293,7 +1324,8 @@ mod tests {
             connection_id: "connection-a".to_string(),
             prompt_fingerprint: "sha256-prompt".to_string(),
             onekey_id: "onekey-b".to_string(),
-            step_index: 2,
+            step_id: "step-c".to_string(),
+            step_index: None,
         }];
 
         cm.save_onekey_preferences(&preferences).unwrap();
@@ -1304,6 +1336,16 @@ mod tests {
         cm.save_language(Language::En).unwrap();
 
         assert_eq!(cm.load_onekey_preferences(), preferences);
+    }
+
+    #[test]
+    fn malformed_existing_config_is_not_overwritten_by_preference_save() {
+        let (cm, _dir) = test_config_manager();
+        let malformed = "{not valid json";
+        fs::write(&cm.config_path, malformed).unwrap();
+
+        assert!(cm.save_onekey_preferences(&[]).is_err());
+        assert_eq!(fs::read_to_string(&cm.config_path).unwrap(), malformed);
     }
 
     #[test]
@@ -1319,6 +1361,31 @@ mod tests {
     }
 
     #[test]
+    fn legacy_index_based_preference_does_not_break_config_loading() {
+        let (cm, _dir) = test_config_manager();
+        fs::write(
+            &cm.config_path,
+            r#"{
+                "version": 1,
+                "connections": [],
+                "onekeys": [],
+                "onekey_preferences": [{
+                    "connection_id": "connection-a",
+                    "prompt_fingerprint": "prompt",
+                    "onekey_id": "onekey-a",
+                    "step_index": 1
+                }]
+            }"#,
+        )
+        .unwrap();
+
+        let preferences = cm.load_onekey_preferences();
+        assert_eq!(preferences.len(), 1);
+        assert!(preferences[0].step_id.is_empty());
+        assert_eq!(preferences[0].step_index, Some(1));
+    }
+
+    #[test]
     fn test_onekey_save_load_roundtrip() {
         let (cm, _dir) = test_config_manager();
         let onekeys = vec![OneKey {
@@ -1326,11 +1393,13 @@ mod tests {
             name: "git-inesa".to_string(),
             steps: vec![
                 OneKeyStep {
+                    id: uuid::Uuid::new_v4().to_string(),
                     label: "Username".to_string(),
                     expect: r"Username for \S+:".to_string(),
                     send: "my-user".to_string(),
                 },
                 OneKeyStep {
+                    id: uuid::Uuid::new_v4().to_string(),
                     label: "Password".to_string(),
                     // Use the current default so this remains a pure round-trip.
                     expect: DEFAULT_ONEKEY_PASSWORD_EXPECT.to_string(),
@@ -1365,6 +1434,7 @@ mod tests {
             .into_iter()
             .enumerate()
             .map(|(index, send)| OneKeyStep {
+                id: uuid::Uuid::new_v4().to_string(),
                 label: format!("Credential {index}"),
                 expect: format!(r"prompt-{index}:"),
                 send: send.to_string(),
@@ -1394,6 +1464,27 @@ mod tests {
     }
 
     #[test]
+    fn legacy_onekey_steps_receive_ids_that_survive_manager_recreation() {
+        let (cm, _dir) = test_config_manager();
+        cm.save_onekeys(&[OneKey {
+            id: "legacy".to_string(),
+            name: "legacy".to_string(),
+            steps: vec![OneKeyStep {
+                id: String::new(),
+                label: "Password".to_string(),
+                expect: "password:".to_string(),
+                send: "secret".to_string(),
+            }],
+        }])
+        .unwrap();
+
+        let first = cm.load_onekeys().unwrap();
+        let generated_id = first[0].steps[0].id.clone();
+        assert!(!generated_id.is_empty());
+        assert_eq!(cm.load_onekeys().unwrap()[0].steps[0].id, generated_id);
+    }
+
+    #[test]
     fn test_onekey_password_expect_migrated_for_git_https() {
         let (cm, _dir) = test_config_manager();
         let onekeys = vec![OneKey {
@@ -1401,11 +1492,13 @@ mod tests {
             name: "gitlab".to_string(),
             steps: vec![
                 OneKeyStep {
+                    id: uuid::Uuid::new_v4().to_string(),
                     label: "Username".to_string(),
                     expect: r"Username for \S+:".to_string(),
                     send: "user".to_string(),
                 },
                 OneKeyStep {
+                    id: uuid::Uuid::new_v4().to_string(),
                     label: "Password".to_string(),
                     expect: "password:".to_string(),
                     send: "pass".to_string(),
@@ -1429,6 +1522,7 @@ mod tests {
             id: "ok-legacy-default".to_string(),
             name: "account".to_string(),
             steps: vec![OneKeyStep {
+                id: uuid::Uuid::new_v4().to_string(),
                 label: "Password".to_string(),
                 expect: r"password for \S+:".to_string(),
                 send: "pass".to_string(),
@@ -1449,6 +1543,7 @@ mod tests {
             id: "ok-previous-default".to_string(),
             name: "account".to_string(),
             steps: vec![OneKeyStep {
+                id: uuid::Uuid::new_v4().to_string(),
                 label: "Password".to_string(),
                 expect: r"password(?: for \S+)?:".to_string(),
                 send: "pass".to_string(),
@@ -1473,6 +1568,7 @@ mod tests {
             id: "ok-ssh".to_string(),
             name: "ssh-host".to_string(),
             steps: vec![OneKeyStep {
+                id: uuid::Uuid::new_v4().to_string(),
                 label: "Password".to_string(),
                 expect: r"password:".to_string(),
                 send: "ssh-pass".to_string(),
@@ -1494,6 +1590,7 @@ mod tests {
             id: "ok1".to_string(),
             name: "n".to_string(),
             steps: vec![OneKeyStep {
+                id: uuid::Uuid::new_v4().to_string(),
                 label: "l".to_string(),
                 expect: "e".to_string(),
                 send: "s".to_string(),

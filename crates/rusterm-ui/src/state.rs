@@ -557,7 +557,7 @@ pub struct OneKeyMatch {
     /// Stable identifiers used by remembered selections. Display names and
     /// translated labels are intentionally not business keys.
     pub onekey_id: String,
-    pub step_index: usize,
+    pub step_id: String,
     pub name: String,
     pub label: String,
     pub send: String,
@@ -590,7 +590,7 @@ mod onekey_match_tests {
     fn debug_redacts_the_decrypted_send_value() {
         let entry = OneKeyMatch {
             onekey_id: "account-id".to_string(),
-            step_index: 0,
+            step_id: "step-id".to_string(),
             name: "account".to_string(),
             label: "Password".to_string(),
             send: "never-log-this-secret".to_string(),
@@ -2452,6 +2452,7 @@ pub fn close_session(
     state.onekey_popups.remove(id);
     state.onekey_submission_feedback.remove(id);
     state.onekey_submission_cooldown.remove(id);
+    state.onekey_preference_attempts.remove(id);
     state
         .onekey_skip_logged
         .retain(|(session_id, _)| session_id != id);
@@ -2621,6 +2622,7 @@ pub fn close_workspace(
         state.onekey_popups.remove(sid);
         state.onekey_submission_feedback.remove(sid);
         state.onekey_submission_cooldown.remove(sid);
+        state.onekey_preference_attempts.remove(sid);
         state
             .onekey_skip_logged
             .retain(|(session_id, _)| session_id != sid);

@@ -1546,16 +1546,22 @@ fn render_terminal_pane(
                                 app.suggestion_epoch = app.suggestion_epoch.wrapping_add(1);
                             }
                         }
-                        // Any manual input proves the previous credential flow
-                        // has moved on. Keep the learned preference, but clear
-                        // only the per-session attempt so a future prompt can
-                        // auto-fill again instead of being mistaken for a retry.
-                        {
-                            let mut app = state_for_cmd.write();
-                            app.onekey_submission_feedback.remove(&sid_clone);
-                            app.onekey_submission_cooldown.remove(&sid_clone);
-                            app.onekey_preference_attempts.remove(&sid_clone);
-                        }
+                        // A remembered attempt survives arbitrary keystrokes;
+                        // only submitting a non-credential command proves the
+                        // remote flow moved on. This prevents a real retry from
+                        // auto-sending the same rejected secret again.
+                        let current_line = state_for_cmd
+                            .read()
+                            .terminals
+                            .get(&sid_clone)
+                            .map(|terminal| terminal.lock().terminal.extract_current_line())
+                            .unwrap_or_default();
+                        note_manual_input_after_onekey_submission(
+                            &mut state_for_cmd.write(),
+                            &sid_clone,
+                            &data,
+                            &current_line,
+                        );
                         let is_enter = data.contains(&0x0d);
                         tracing::info!(
                             "[INPUT] session={} is_enter={} data_len={}",
@@ -2480,6 +2486,7 @@ fn render_terminal_pane(
                                     &[("credential", &label)],
                                 ),
                                 steps: vec![OneKeyStep {
+                                    id: uuid::Uuid::new_v4().to_string(),
                                     label,
                                     expect,
                                     send: send.clone(),
@@ -5985,7 +5992,8 @@ fn take_onekey_selection(
                         connection_id: popup.connection_id.clone()?,
                         prompt_fingerprint: popup.prompt_fingerprint.clone()?,
                         onekey_id: entry.onekey_id.clone(),
-                        step_index: entry.step_index,
+                        step_id: entry.step_id.clone(),
+                        step_index: None,
                     })
                 })
                 .flatten();
@@ -6113,6 +6121,34 @@ fn dismiss_onekey_popup(
     should_hide
 }
 
+fn clear_onekey_session_runtime(state: &mut AppState, session_id: &str) {
+    state.onekey_popups.remove(session_id);
+    state.onekey_submission_feedback.remove(session_id);
+    state.onekey_submission_cooldown.remove(session_id);
+    state.onekey_preference_attempts.remove(session_id);
+}
+
+fn note_manual_input_after_onekey_submission(
+    state: &mut AppState,
+    session_id: &str,
+    data: &[u8],
+    current_line: &str,
+) {
+    if !state.onekey_preference_attempts.contains_key(session_id) {
+        state.onekey_submission_feedback.remove(session_id);
+        state.onekey_submission_cooldown.remove(session_id);
+        return;
+    }
+    let submitted_command = data.contains(&b'\r')
+        && credential_kind(current_line).is_none()
+        && !strip_prompt(current_line).trim().is_empty();
+    if submitted_command {
+        state.onekey_preference_attempts.remove(session_id);
+        state.onekey_submission_feedback.remove(session_id);
+        state.onekey_submission_cooldown.remove(session_id);
+    }
+}
+
 fn dismiss_terminal_popups_for_focus_change(state: &mut AppState, session_id: &str) {
     state.history_completion_sessions.remove(session_id);
     if let Some(tab) = state.sessions.iter_mut().find(|tab| tab.id == session_id) {
@@ -6172,13 +6208,38 @@ fn first_matching_step<'a>(ok: &'a OneKey, line: &str) -> Option<&'a OneKeyStep>
     matching_step_with_index(ok, line).map(|(_, step)| step)
 }
 
+fn onekey_prompt_is_safe_to_remember(prompt: &str) -> bool {
+    let lower = strip_ansi(prompt).trim().to_lowercase();
+    !matches!(
+        lower.as_str(),
+        "password:" | "password" | "passwd:" | "passwd" | "passphrase:" | "passphrase"
+    )
+}
+
 fn onekey_prompt_fingerprint(prompt: &str) -> String {
-    let normalized = strip_ansi(prompt)
-        .split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .to_lowercase();
-    format!("{:x}", Sha256::digest(normalized.as_bytes()))
+    let plain = strip_ansi(prompt);
+    let lower = plain.to_lowercase();
+    let prompt_class = if is_sudo_password_prompt(&plain) {
+        "sudo-password"
+    } else if lower.contains("passphrase") {
+        "key-passphrase"
+    } else if lower.contains("username for") {
+        "git-username"
+    } else if lower.contains("password for") && lower.contains("http") {
+        "git-password"
+    } else {
+        match credential_kind(&plain) {
+            Some(CredentialKind::Password) => "generic-password",
+            Some(CredentialKind::Token) => "generic-token",
+            Some(CredentialKind::Username) => "generic-username",
+            None => "generic-credential",
+        }
+    };
+    // Preserve case because usernames, URLs, and repository paths may be
+    // case-sensitive. Only whitespace and ANSI presentation details normalize.
+    let normalized = plain.split_whitespace().collect::<Vec<_>>().join(" ");
+    let scoped = format!("{prompt_class}\0{normalized}");
+    format!("{:x}", Sha256::digest(scoped.as_bytes()))
 }
 
 fn onekey_prompt_text(state: &AppState, session_id: &str, data: &[u8]) -> String {
@@ -6296,7 +6357,7 @@ fn onekey_popup_for_output(
     let mut matches = Vec::new();
     let mut matched_expect = None;
     for onekey in &onekeys {
-        let Some((step_index, step)) = matching_step_with_index(onekey, last_line) else {
+        let Some((_step_index, step)) = matching_step_with_index(onekey, last_line) else {
             continue;
         };
         if matched_expect.is_none() {
@@ -6315,7 +6376,7 @@ fn onekey_popup_for_output(
         }
         matches.push(OneKeyMatch {
             onekey_id: onekey.id.clone(),
-            step_index,
+            step_id: step.id.clone(),
             name: onekey.name.clone(),
             label: onekey_step_label(step),
             send: step.send.clone(),
@@ -6332,7 +6393,8 @@ fn onekey_popup_for_output(
             .session_configs
             .get(session_id)
             .map(|config| config.id.clone()),
-        prompt_fingerprint: Some(onekey_prompt_fingerprint(last_line)),
+        prompt_fingerprint: onekey_prompt_is_safe_to_remember(last_line)
+            .then(|| onekey_prompt_fingerprint(last_line)),
         is_sudo_password: is_sudo_password_prompt(last_line),
         matches,
         selected: 0,
@@ -6480,8 +6542,7 @@ fn apply_onekey_popup(
         .matches
         .iter()
         .find(|candidate| {
-            candidate.onekey_id == preference.onekey_id
-                && candidate.step_index == preference.step_index
+            candidate.onekey_id == preference.onekey_id && candidate.step_id == preference.step_id
         })
         .cloned()
     else {
@@ -6564,6 +6625,9 @@ fn current_prompt_onekey_popups(state: &AppState) -> Vec<(String, OneKeyPopupSta
     enabled_session_ids
         .into_iter()
         .filter_map(|session_id| {
+            if state.onekey_preference_attempts.contains_key(&session_id) {
+                return None;
+            }
             onekey_popup_for_output(state, &session_id, b"")
                 .ok()
                 .map(|popup| (session_id, popup))
@@ -7093,7 +7157,7 @@ mod session_startup_tests {
             is_sudo_password: false,
             matches: vec![OneKeyMatch {
                 onekey_id: "account-id".to_string(),
-                step_index: 0,
+                step_id: "step-id".to_string(),
                 name: "account".to_string(),
                 label: "Username".to_string(),
                 send: "user".to_string(),
@@ -7109,7 +7173,7 @@ mod session_startup_tests {
             is_sudo_password: false,
             matches: vec![OneKeyMatch {
                 onekey_id: "account-id".to_string(),
-                step_index: 0,
+                step_id: "step-id".to_string(),
                 name: "account".to_string(),
                 label: "Password".to_string(),
                 send: "secret".to_string(),
@@ -7226,6 +7290,7 @@ mod session_startup_tests {
             id: "sudo-credential".to_string(),
             name: "sudo".to_string(),
             steps: vec![OneKeyStep {
+                id: uuid::Uuid::new_v4().to_string(),
                 label: "Password".to_string(),
                 expect: expect.to_string(),
                 send: "test-secret".to_string(),
@@ -7302,6 +7367,7 @@ mod session_startup_tests {
             id: "preferred-sudo-credential".to_string(),
             name: "preferred sudo".to_string(),
             steps: vec![OneKeyStep {
+                id: uuid::Uuid::new_v4().to_string(),
                 label: "Password".to_string(),
                 expect: expect.to_string(),
                 send: "preferred-secret".to_string(),
@@ -7333,6 +7399,79 @@ mod session_startup_tests {
             "the remembered credential should be reused without another popup"
         );
         assert_eq!(receiver.try_recv().unwrap(), b"preferred-secret\r");
+        refresh_onekey_popups_for_current_prompts_in_state(&mut state);
+        assert!(!state.onekey_popups.contains_key(session_id));
+        assert!(
+            receiver.try_recv().is_err(),
+            "refresh must not enable a duplicate send"
+        );
+    }
+
+    #[test]
+    fn bare_generic_password_prompt_is_not_remembered_automatically() {
+        let session_id = "sudo-pane";
+        let prompt = b"Password: ";
+        let mut state = state_with_enabled_onekey_for_prompt(r"password:", prompt);
+        state.onekeys.push(OneKey {
+            id: "other".to_string(),
+            name: "other".to_string(),
+            steps: vec![OneKeyStep {
+                id: "other-step".to_string(),
+                label: "Password".to_string(),
+                expect: r"password:".to_string(),
+                send: "other-secret".to_string(),
+            }],
+        });
+
+        check_onekey_match_in_state(&mut state, session_id, prompt);
+        let selection = take_onekey_selection(&mut state.onekey_popups, session_id, 1).unwrap();
+
+        assert!(selection.preference.is_none());
+        assert!(state.onekey_preferences.is_empty());
+    }
+
+    #[test]
+    fn command_submission_marks_auto_fill_accepted_and_keeps_preference_for_next_time() {
+        let session_id = "sudo-pane";
+        let expect = r"password:";
+        let prompt = b"[sudo: authenticate] Password: ";
+        let mut state = state_with_enabled_onekey(expect);
+        state.onekeys.push(OneKey {
+            id: "preferred-sudo-credential".to_string(),
+            name: "preferred sudo".to_string(),
+            steps: vec![OneKeyStep {
+                id: "preferred-step".to_string(),
+                label: "Password".to_string(),
+                expect: expect.to_string(),
+                send: "preferred-secret".to_string(),
+            }],
+        });
+        check_onekey_match_in_state(&mut state, session_id, prompt);
+        let selected = take_onekey_selection(&mut state.onekey_popups, session_id, 1).unwrap();
+        remember_onekey_preference(&mut state, selected.preference.unwrap());
+        state.onekey_submission_feedback.clear();
+        state.onekey_submission_cooldown.clear();
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let senders = HashMap::from([(session_id.to_string(), sender)]);
+
+        check_onekey_match_with_senders_in_state(&mut state, &senders, session_id, prompt);
+        assert_eq!(receiver.try_recv().unwrap(), b"preferred-secret\r");
+        note_manual_input_after_onekey_submission(
+            &mut state,
+            session_id,
+            b"\r",
+            "alice@host:~$ echo accepted",
+        );
+        assert!(state.onekey_preference_attempts.get(session_id).is_none());
+        assert_eq!(state.onekey_preferences.len(), 1);
+
+        state.terminals[session_id]
+            .lock()
+            .process_and_render(b"\r\n[sudo: authenticate] Password: ");
+        check_onekey_match_with_senders_in_state(&mut state, &senders, session_id, prompt);
+
+        assert_eq!(receiver.try_recv().unwrap(), b"preferred-secret\r");
+        assert!(!state.onekey_popups.contains_key(session_id));
     }
 
     #[test]
@@ -7345,6 +7484,7 @@ mod session_startup_tests {
             id: "preferred-sudo-credential".to_string(),
             name: "preferred sudo".to_string(),
             steps: vec![OneKeyStep {
+                id: uuid::Uuid::new_v4().to_string(),
                 label: "Password".to_string(),
                 expect: expect.to_string(),
                 send: "preferred-secret".to_string(),
@@ -7395,6 +7535,7 @@ mod session_startup_tests {
             id: "preferred".to_string(),
             name: "preferred".to_string(),
             steps: vec![OneKeyStep {
+                id: uuid::Uuid::new_v4().to_string(),
                 label: "Password".to_string(),
                 expect: r"password:".to_string(),
                 send: "preferred-secret".to_string(),
@@ -7422,6 +7563,7 @@ mod session_startup_tests {
             id: "other-password".to_string(),
             name: "other password".to_string(),
             steps: vec![OneKeyStep {
+                id: uuid::Uuid::new_v4().to_string(),
                 label: "Password".to_string(),
                 expect: expect.to_string(),
                 send: "other-secret".to_string(),
@@ -7452,6 +7594,7 @@ mod session_startup_tests {
             id: "soon-deleted".to_string(),
             name: "soon deleted".to_string(),
             steps: vec![OneKeyStep {
+                id: uuid::Uuid::new_v4().to_string(),
                 label: "Password".to_string(),
                 expect: r"password:".to_string(),
                 send: "deleted-secret".to_string(),
@@ -7466,6 +7609,43 @@ mod session_startup_tests {
 
         assert!(state.onekey_preferences.is_empty());
         assert_eq!(state.onekey_popups[session_id].matches.len(), 1);
+    }
+
+    #[test]
+    fn step_reordering_does_not_redirect_a_preference_to_another_secret() {
+        let session_id = "sudo-pane";
+        let prompt = b"[sudo: authenticate] Password: ";
+        let mut state = state_with_enabled_onekey(r"password:");
+        state.onekeys.push(OneKey {
+            id: "multi-step".to_string(),
+            name: "multi step".to_string(),
+            steps: vec![
+                OneKeyStep {
+                    id: "selected-step".to_string(),
+                    label: "Password".to_string(),
+                    expect: r"password:".to_string(),
+                    send: "selected-secret".to_string(),
+                },
+                OneKeyStep {
+                    id: "replacement-step".to_string(),
+                    label: "Password".to_string(),
+                    expect: r"password:".to_string(),
+                    send: "must-not-auto-send".to_string(),
+                },
+            ],
+        });
+        check_onekey_match_in_state(&mut state, session_id, prompt);
+        let selected = take_onekey_selection(&mut state.onekey_popups, session_id, 1).unwrap();
+        remember_onekey_preference(&mut state, selected.preference.unwrap());
+        state.onekeys[1].steps.remove(0);
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let senders = HashMap::from([(session_id.to_string(), sender)]);
+
+        check_onekey_match_with_senders_in_state(&mut state, &senders, session_id, prompt);
+
+        assert!(state.onekey_preferences.is_empty());
+        assert!(state.onekey_popups.contains_key(session_id));
+        assert!(receiver.try_recv().is_err());
     }
 
     #[test]
@@ -7815,6 +7995,7 @@ mod session_startup_tests {
             id: "sudo-credential".to_string(),
             name: "sudo".to_string(),
             steps: vec![OneKeyStep {
+                id: uuid::Uuid::new_v4().to_string(),
                 label: "Password".to_string(),
                 expect: rusterm_core::config::DEFAULT_ONEKEY_PASSWORD_EXPECT.to_string(),
                 send: "test-secret".to_string(),
@@ -7913,6 +8094,7 @@ mod session_startup_tests {
             id: "c".to_string(),
             name: "sudo".to_string(),
             steps: vec![OneKeyStep {
+                id: uuid::Uuid::new_v4().to_string(),
                 label: "Password".to_string(),
                 expect: rusterm_core::config::DEFAULT_ONEKEY_PASSWORD_EXPECT.to_string(),
                 send: "secret".to_string(),
@@ -9835,6 +10017,7 @@ fn start_serial_connection(
                                     tab.version += 1;
                                 }
                             }
+                            check_onekey_match(state, input_senders, &id, &data);
                         }
                         SessionEvent::Disconnected(id, reason) => {
                             tracing::info!(
@@ -9842,6 +10025,7 @@ fn start_serial_connection(
                                 &id[..id.len().min(8)],
                                 reason
                             );
+                            clear_onekey_session_runtime(&mut state.write(), &id);
                             let failed = crate::i18n::t("session.disconnected_short");
                             let reconnect = crate::i18n::t("session.reconnect_hint");
                             let msg = format!("\r\n{failed}\r\n{reconnect}\r\n");
@@ -9963,6 +10147,7 @@ fn start_telnet_connection(
                                     tab.version += 1;
                                 }
                             }
+                            check_onekey_match(state, input_senders, &id, &data);
                         }
                         SessionEvent::Disconnected(id, reason) => {
                             tracing::info!(
@@ -9970,6 +10155,7 @@ fn start_telnet_connection(
                                 &id[..id.len().min(8)],
                                 reason
                             );
+                            clear_onekey_session_runtime(&mut state.write(), &id);
                             let failed = crate::i18n::t("session.disconnected_short");
                             let reconnect = crate::i18n::t("session.reconnect_hint");
                             let msg = format!("\r\n{failed}\r\n{reconnect}\r\n");
@@ -14098,8 +14284,8 @@ fn looks_like_command(s: &str) -> bool {
 mod onekey_tests {
     use super::{
         CredentialKind, credential_kind, first_matching_step, is_sudo_password_prompt,
-        onekey_step_label, onekey_submission_bytes, send_onekey_submission, strip_ansi,
-        take_onekey_selection,
+        onekey_prompt_fingerprint, onekey_step_label, onekey_submission_bytes,
+        send_onekey_submission, strip_ansi, take_onekey_selection,
     };
     use crate::state::{OneKeyMatch, OneKeyPopupState};
     use regex::Regex;
@@ -14152,7 +14338,7 @@ mod onekey_tests {
                 is_sudo_password: false,
                 matches: vec![OneKeyMatch {
                     onekey_id: "saved-account-id".to_string(),
-                    step_index: 0,
+                    step_id: "step-id".to_string(),
                     name: "saved account".to_string(),
                     label: "sudo Password".to_string(),
                     send: "credential".to_string(),
@@ -14177,6 +14363,18 @@ mod onekey_tests {
             "duplicate selection queued twice"
         );
         assert!(!popups.contains_key(session_id));
+    }
+
+    #[test]
+    fn prompt_fingerprint_preserves_case_sensitive_identity() {
+        assert_ne!(
+            onekey_prompt_fingerprint("Password for 'https://host/Team/Repo':"),
+            onekey_prompt_fingerprint("Password for 'https://host/team/repo':")
+        );
+        assert_eq!(
+            onekey_prompt_fingerprint("\u{1b}[31mPassword:\u{1b}[0m  "),
+            onekey_prompt_fingerprint("Password:")
+        );
     }
 
     #[test]
@@ -14243,11 +14441,13 @@ mod onekey_tests {
             name: "git".to_string(),
             steps: vec![
                 OneKeyStep {
+                    id: uuid::Uuid::new_v4().to_string(),
                     label: "Username".to_string(),
                     expect: r"Username for \S+:".to_string(),
                     send: "myuser".to_string(),
                 },
                 OneKeyStep {
+                    id: uuid::Uuid::new_v4().to_string(),
                     label: "Password".to_string(),
                     expect: r"password for \S+:".to_string(),
                     send: "mypass".to_string(),
@@ -14273,11 +14473,13 @@ mod onekey_tests {
             name: "account".to_string(),
             steps: vec![
                 OneKeyStep {
+                    id: uuid::Uuid::new_v4().to_string(),
                     label: "Username".to_string(),
                     expect: r".+:".to_string(),
                     send: "wrong-user".to_string(),
                 },
                 OneKeyStep {
+                    id: uuid::Uuid::new_v4().to_string(),
                     label: "Password".to_string(),
                     expect: r"password.*:".to_string(),
                     send: "correct-password".to_string(),
@@ -14304,6 +14506,7 @@ mod onekey_tests {
             Some(CredentialKind::Password)
         );
         let step = OneKeyStep {
+            id: uuid::Uuid::new_v4().to_string(),
             label: String::new(),
             expect: "password:".to_string(),
             send: "secret".to_string(),
@@ -14329,11 +14532,13 @@ mod onekey_tests {
             name: "account".to_string(),
             steps: vec![
                 OneKeyStep {
+                    id: uuid::Uuid::new_v4().to_string(),
                     label: "Username".to_string(),
                     expect: r"Username for \S+:".to_string(),
                     send: "user".to_string(),
                 },
                 OneKeyStep {
+                    id: uuid::Uuid::new_v4().to_string(),
                     label: "Password".to_string(),
                     expect: expect.to_string(),
                     send: "pass".to_string(),

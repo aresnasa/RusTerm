@@ -1272,15 +1272,21 @@ fn default_suggestion_count() -> u8 {
 
 /// A remembered selection for one connection and one normalized prompt.
 /// `prompt_fingerprint` is a SHA-256 digest produced by the UI, so remote
-/// prompt text is not written to settings.json. `step_index` is stable while
-/// the referenced OneKey keeps its step order; stale references safely fall
-/// back to the chooser.
+/// prompt text is not written to settings.json. `step_id` is generated once and persisted with the encrypted step; stale
+/// references safely fall back to the chooser.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OneKeyPreference {
     pub connection_id: String,
     pub prompt_fingerprint: String,
     pub onekey_id: String,
-    pub step_index: usize,
+    /// Stable step identity. Empty only when deserializing an unreleased legacy
+    /// index-based preference, which safely falls back to the chooser.
+    #[serde(default)]
+    pub step_id: String,
+    /// Compatibility for early index-based preference records. New records
+    /// never write this field and never use it for credential selection.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub step_index: Option<usize>,
 }
 
 /// Built-in matcher for password and SSH key passphrase prompts. Matching is
@@ -1306,6 +1312,10 @@ pub struct OneKey {
 // accidental `tracing::debug!(?step)` calls don't leak credentials into logs.
 #[derive(Clone, Serialize, Deserialize, PartialEq)]
 pub struct OneKeyStep {
+    /// Stable identity used by remembered multi-match selections. Legacy
+    /// entries receive and persist a UUID when first loaded.
+    #[serde(default)]
+    pub id: String,
     /// Display label, e.g. "Username" / "Password".
     #[serde(default)]
     pub label: String,
@@ -1318,6 +1328,7 @@ pub struct OneKeyStep {
 impl std::fmt::Debug for OneKeyStep {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OneKeyStep")
+            .field("id", &self.id)
             .field("label", &self.label)
             .field("expect", &self.expect)
             .field("send", &"<redacted>")
@@ -1336,6 +1347,8 @@ pub struct PersistedOneKey {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedOneKeyStep {
+    #[serde(default)]
+    pub id: String,
     #[serde(default)]
     pub label: String,
     pub expect: String,

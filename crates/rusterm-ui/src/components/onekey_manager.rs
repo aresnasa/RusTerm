@@ -421,11 +421,13 @@ pub fn OneKeyManager(
                                     // classification, so they must not contain translated UI text.
                                     steps: vec![
                                         OneKeyStep {
+                                            id: uuid::Uuid::new_v4().to_string(),
                                             label: "Username".to_string(),
                                             expect: DEFAULT_ONEKEY_USERNAME_EXPECT.to_string(),
                                             send: String::new(),
                                         },
                                         OneKeyStep {
+                                            id: uuid::Uuid::new_v4().to_string(),
                                             label: "Password".to_string(),
                                             expect: DEFAULT_ONEKEY_PASSWORD_EXPECT.to_string(),
                                             send: String::new(),
@@ -466,6 +468,7 @@ pub fn OneKeyManager(
                                                     border: 1px solid #2a2b3d; border-radius: 4px; cursor: pointer; font-size: 11px;",
                                             onclick: move |_| {
                                                 entries.write()[idx].steps.push(OneKeyStep {
+                                                    id: uuid::Uuid::new_v4().to_string(),
                                                     label: "Password".to_string(),
                                                     // Covers bare and qualified password prompts.
                                                     expect: DEFAULT_ONEKEY_PASSWORD_EXPECT.to_string(),
@@ -679,6 +682,7 @@ mod tests {
             id: "id".to_string(),
             name: "account".to_string(),
             steps: vec![OneKeyStep {
+                id: uuid::Uuid::new_v4().to_string(),
                 label: "Password".to_string(),
                 expect: expect.to_string(),
                 send: send.to_string(),
