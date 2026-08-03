@@ -14,7 +14,7 @@
 //! bastion-host SSH.
 
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use russh::client;
 use russh::{ChannelMsg, ChannelStream, Pty};
@@ -130,6 +130,44 @@ pub async fn connect_direct(
 /// runaway remote process from exhausting memory.
 const MAX_EXEC_OUTPUT: usize = 8 * 1024 * 1024;
 
+/// Maximum retained output while matching bastion prompts. Keeping a tail is
+/// enough for prompt matching and diagnostics, while a noisy menu cannot grow
+/// memory without bound.
+const BASTION_LOGIN_BUFFER: usize = 64 * 1024;
+/// A prompt that produces no new output for this long is considered stuck.
+const BASTION_LOGIN_IDLE_TIMEOUT: Duration = Duration::from_secs(12);
+/// One expect step may run this long even if the server keeps producing noise.
+const BASTION_LOGIN_STEP_TIMEOUT: Duration = Duration::from_secs(20);
+/// Navigation can be replayed once because no business command has been sent.
+const BASTION_LOGIN_ATTEMPTS: usize = 2;
+
+fn remaining_timeout(started: Instant, total: Duration, phase: &str) -> anyhow::Result<Duration> {
+    let remaining = total.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        anyhow::bail!("{phase} exceeded the total timeout of {total:?}");
+    }
+    Ok(remaining)
+}
+
+async fn reconnect_within(
+    handle: &DirectHandle,
+    started: Instant,
+    total: Duration,
+) -> anyhow::Result<DirectHandle> {
+    let remaining = remaining_timeout(started, total, "bastion reconnect")?;
+    tokio::time::timeout(remaining, handle.reconnect())
+        .await
+        .map_err(|_| anyhow::anyhow!("bastion reconnect timed out after {remaining:?}"))?
+}
+
+async fn close_pty_channel(channel: &mut russh::Channel<client::Msg>) {
+    let _ = tokio::time::timeout(Duration::from_secs(1), async {
+        let _ = channel.eof().await;
+        let _ = channel.close().await;
+    })
+    .await;
+}
+
 impl DirectHandle {
     /// Run `command` on the remote host and capture stdout/stderr and the
     /// exit status. Returns partial output with `timed_out: true` when the
@@ -180,11 +218,10 @@ impl DirectHandle {
     /// we can recover stdout and the exit code from the echoed PTY stream)
     /// emulates what a human operator does interactively.
     ///
-    /// `stdin` (when supplied) is piped into the PTY *before* the command. This
-    /// is used for `sudo -S` password feeds; because the PTY echoes input by
-    /// default, callers should be aware the password would appear in a real
-    /// terminal — but the captured output is filtered to the sentinel-delimited
-    /// region, so credentials are not returned in `stdout`.
+    /// `stdin` (when supplied) is sent only after the command line. Before
+    /// credential input (for example `sudo -S`) is queued, terminal echo is
+    /// disabled and verified with a shell marker; the wrapper restores echo
+    /// after the command finishes.
     ///
     /// Output capture reuses [`MAX_EXEC_OUTPUT`] so a runaway command can't
     /// exhaust memory; `truncated` is set when the cap is hit.
@@ -200,17 +237,79 @@ impl DirectHandle {
         let sentinel = format!("RUSTERM_PTY_{}", random_sentinel_hex());
         let rc_tag = format!("{sentinel}_RC_");
 
-        let mut channel = self.handle.channel_open_session().await?;
+        let operation_started = Instant::now();
+        let mut channel = self.open_pty_shell(timeout).await?;
 
-        // Cooked-terminal PTY modes — same set as `SshClient::connect`.
-        // ICRNL maps Enter's \r to \n (without it some shells don't see the
-        // command as terminated); OPOST+ONLCR make output \n→\r\n. ECHO is
-        // kept ON intentionally — JumpServer and similar bastions render
-        // their interactive menus via echo, and disabling it can break the
-        // login flow. We strip the echoed command from captured output
-        // using the sentinel delimiters.
-        channel
-            .request_pty(
+        // Without a login script there is no prompt contract, but a short
+        // grace period still avoids racing a newly-created ordinary shell.
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        if stdin.is_some() {
+            let remaining = remaining_timeout(operation_started, timeout, "stdin echo protection")?;
+            self.disable_pty_echo_for_stdin(&mut channel, remaining)
+                .await?;
+        }
+
+        let wrapped = if stdin.is_some() {
+            format!(
+                "{{ {command} ; }} ; __rc=$? ; stty echo; printf '\\n{tag}%d\\n' \"$__rc\"\r",
+                command = command,
+                tag = rc_tag,
+            )
+        } else {
+            format!(
+                "{{ {command} ; }} ; __rc=$? ; printf '\\n{tag}%d\\n' \"$__rc\"\r",
+                command = command,
+                tag = rc_tag,
+            )
+        };
+        channel.data(wrapped.as_bytes()).await?;
+        if let Some(stdin) = stdin {
+            channel.data(stdin).await?;
+        }
+
+        let mut result = ExecResult::default();
+        let command_timeout =
+            remaining_timeout(operation_started, timeout, "PTY command execution")?;
+        let timed_out = match tokio::time::timeout(
+            command_timeout,
+            self.exec_via_pty_inner(&mut channel, &rc_tag, &mut result),
+        )
+        .await
+        {
+            Ok(inner) => {
+                inner?;
+                false
+            }
+            Err(_) => true,
+        };
+        result.timed_out = timed_out;
+
+        // Best-effort channel close; errors are ignored because the result
+        // is already captured.
+        close_pty_channel(&mut channel).await;
+        Ok(result)
+    }
+
+    async fn open_pty_shell(
+        &self,
+        timeout: Duration,
+    ) -> anyhow::Result<russh::Channel<client::Msg>> {
+        let setup_started = Instant::now();
+        let mut channel = tokio::time::timeout(timeout, self.handle.channel_open_session())
+            .await
+            .map_err(|_| anyhow::anyhow!("opening PTY channel timed out after {timeout:?}"))??;
+
+        let pty_remaining = match remaining_timeout(setup_started, timeout, "PTY request") {
+            Ok(remaining) => remaining,
+            Err(error) => {
+                close_pty_channel(&mut channel).await;
+                return Err(error);
+            }
+        };
+        let pty = tokio::time::timeout(
+            pty_remaining,
+            channel.request_pty(
                 false,
                 "xterm",
                 80,
@@ -230,61 +329,59 @@ impl DirectHandle {
                     (Pty::ECHOCTL, 1),
                     (Pty::ECHOKE, 1),
                 ],
-            )
-            .await?;
-        channel.request_shell(true).await?;
-
-        // Give the shell a moment to initialise before sending input. Some
-        // servers (JumpServer especially) emit a banner/menu before the shell
-        // prompt is ready; a short sleep lets the prompt land so our command
-        // isn't consumed as part of a menu selection.
-        tokio::time::sleep(Duration::from_millis(400)).await;
-
-        // Pipe optional stdin (e.g. sudo password) before the command.
-        if let Some(stdin) = stdin {
-            channel.data(stdin).await?;
+            ),
+        )
+        .await;
+        match pty {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                close_pty_channel(&mut channel).await;
+                return Err(error.into());
+            }
+            Err(_) => {
+                close_pty_channel(&mut channel).await;
+                anyhow::bail!("PTY request timed out after {pty_remaining:?}");
+            }
         }
 
-        // Construct the wrapped command:
-        //   { <command> ; } ; __rc=$?
-        //   printf '\n<sentinel>_RC_%d\n' "$__rc"
-        //
-        // The leading `{ ... ; }` group lets `;`-terminated and `|`-piped
-        // commands work without extra quoting. We capture $? *after* the
-        // group completes, then emit a uniquely-tagged line carrying the
-        // exit code. Everything between the command echo and the sentinel
-        // line is treated as command stdout.
-        //
-        // `printf` is used (not `echo`) because its format is portable
-        // across bash/dash/zsh/busybox and doesn't interpret backslashes
-        // in the command output.
-        let wrapped = format!(
-            "{{ {command} ; }} ; __rc=$? ; printf '\\n{tag}%d\\n' \"$__rc\"\n",
-            command = command,
-            tag = rc_tag,
-        );
-        channel.data(wrapped.as_bytes()).await?;
+        let shell_remaining = match remaining_timeout(setup_started, timeout, "PTY shell request") {
+            Ok(remaining) => remaining,
+            Err(error) => {
+                close_pty_channel(&mut channel).await;
+                return Err(error);
+            }
+        };
+        match tokio::time::timeout(shell_remaining, channel.request_shell(true)).await {
+            Ok(Ok(())) => Ok(channel),
+            Ok(Err(error)) => {
+                close_pty_channel(&mut channel).await;
+                Err(error.into())
+            }
+            Err(_) => {
+                close_pty_channel(&mut channel).await;
+                anyhow::bail!("PTY shell request timed out after {shell_remaining:?}")
+            }
+        }
+    }
 
-        let mut result = ExecResult::default();
-        let timed_out = match tokio::time::timeout(
-            timeout,
-            self.exec_via_pty_inner(&mut channel, &rc_tag, &mut result),
+    async fn disable_pty_echo_for_stdin(
+        &self,
+        channel: &mut russh::Channel<client::Msg>,
+        timeout: Duration,
+    ) -> anyhow::Result<()> {
+        let token = random_sentinel_hex();
+        let (hide_echo, marker) = stdin_ready_probe(&token);
+        channel.data(hide_echo.as_bytes()).await?;
+        let hidden_steps = [rusterm_core::LoginStep::Expect {
+            pattern: regex::escape(&marker),
+        }];
+        self.drive_pty_login(
+            channel,
+            &hidden_steps,
+            timeout.min(BASTION_LOGIN_STEP_TIMEOUT),
+            "stdin echo protection",
         )
         .await
-        {
-            Ok(inner) => {
-                inner?;
-                false
-            }
-            Err(_) => true,
-        };
-        result.timed_out = timed_out;
-
-        // Best-effort channel close; errors are ignored because the result
-        // is already captured.
-        let _ = channel.eof().await;
-        let _ = channel.close().await;
-        Ok(result)
     }
 
     /// Like [`exec_via_pty`](Self::exec_via_pty) but first replays a login
@@ -299,12 +396,12 @@ impl DirectHandle {
     ///
     /// `login_steps` is the parsed login script (from
     /// [`rusterm_core::parse_login_script`]). After the last step, the method
-    /// waits a short grace period for the target shell to initialise, then
-    /// sends the wrapped command with sentinel markers exactly like
-    /// `exec_via_pty`.
+    /// verifies that the target shell can execute a unique readiness probe;
+    /// only then is the wrapped business command sent.
     ///
     /// `SendOneKey` steps require credential resolution that is not available
-    /// in the headless relay path; they are skipped with a warning.
+    /// in the headless relay path. They fail safely rather than being skipped,
+    /// because skipping input could advance into the wrong interactive state.
     pub async fn exec_via_pty_with_login(
         &self,
         command: &str,
@@ -320,76 +417,171 @@ impl DirectHandle {
             "[relay] bastion login script active ({} steps), navigating menu before exec",
             login_steps.len()
         );
+        let operation_started = Instant::now();
 
+        // Navigation is safe to retry because the business command is not sent
+        // until both the script and an active-shell probe have completed.
+        let mut active = self.clone();
+        let mut ready_channel = None;
+        let mut last_error = None;
+
+        for attempt in 1..=BASTION_LOGIN_ATTEMPTS {
+            tracing::info!(
+                "[relay] bastion pre-command attempt {attempt}/{BASTION_LOGIN_ATTEMPTS}"
+            );
+
+            let setup_timeout = remaining_timeout(operation_started, timeout, "PTY setup")?
+                .min(Duration::from_secs(10));
+            let mut channel = match active.open_pty_shell(setup_timeout).await {
+                Ok(channel) => channel,
+                Err(error) => {
+                    last_error = Some(anyhow::anyhow!(
+                        "[bastion-pre-command] PTY setup failed on attempt {attempt}: {error:#}"
+                    ));
+                    if attempt < BASTION_LOGIN_ATTEMPTS {
+                        match reconnect_within(&active, operation_started, timeout).await {
+                            Ok(fresh) => {
+                                active = fresh;
+                                tokio::time::sleep(Duration::from_millis(250)).await;
+                                continue;
+                            }
+                            Err(reconnect_error) => {
+                                last_error = Some(anyhow::anyhow!(
+                                    "[bastion-pre-command] PTY setup failed: {error:#}; \
+                                     reconnect failed: {reconnect_error:#}"
+                                ));
+                            }
+                        }
+                    }
+                    break;
+                }
+            };
+
+            let navigation_timeout =
+                remaining_timeout(operation_started, timeout, "bastion navigation")?;
+            let navigation = active
+                .drive_pty_login(&mut channel, login_steps, navigation_timeout, "navigation")
+                .await;
+
+            let pre_command = match navigation {
+                Ok(()) => {
+                    // A completed menu script is not sufficient proof that a
+                    // target shell exists. Emit a harmless marker whose full
+                    // value does not occur in the echoed probe command, then
+                    // wait for the shell to produce it. Until this succeeds the
+                    // user's business command remains protected.
+                    let token = random_sentinel_hex();
+                    let (probe, marker) = shell_ready_probe(&token);
+                    if let Err(error) = channel.data(probe.as_bytes()).await {
+                        Err(anyhow::anyhow!("shell-ready probe send failed: {error:#}"))
+                    } else {
+                        let ready_steps = [rusterm_core::LoginStep::Expect {
+                            pattern: regex::escape(&marker),
+                        }];
+                        match remaining_timeout(
+                            operation_started,
+                            timeout,
+                            "shell-ready verification",
+                        ) {
+                            Ok(remaining) => {
+                                active
+                                    .drive_pty_login(
+                                        &mut channel,
+                                        &ready_steps,
+                                        remaining.min(BASTION_LOGIN_STEP_TIMEOUT),
+                                        "shell-ready verification",
+                                    )
+                                    .await
+                            }
+                            Err(error) => Err(error),
+                        }
+                    }
+                }
+                Err(error) => Err(error),
+            };
+
+            match pre_command {
+                Ok(()) => {
+                    tracing::info!(
+                        "[relay] bastion target shell verified on attempt {attempt}; \
+                         business command may now be sent"
+                    );
+                    ready_channel = Some(channel);
+                    break;
+                }
+                Err(error) => {
+                    close_pty_channel(&mut channel).await;
+                    tracing::warn!(
+                        "[relay] bastion pre-command attempt {attempt}/\
+                         {BASTION_LOGIN_ATTEMPTS} failed: {error:#}"
+                    );
+                    last_error = Some(anyhow::anyhow!(
+                        "[bastion-pre-command] attempt {attempt}/\
+                         {BASTION_LOGIN_ATTEMPTS} failed: {error:#}"
+                    ));
+                    if attempt < BASTION_LOGIN_ATTEMPTS {
+                        match reconnect_within(&active, operation_started, timeout).await {
+                            Ok(fresh) => {
+                                active = fresh;
+                                tokio::time::sleep(Duration::from_millis(250)).await;
+                            }
+                            Err(reconnect_error) => {
+                                last_error = Some(anyhow::anyhow!(
+                                    "[bastion-pre-command] attempt {attempt} failed: {error:#}; \
+                                     reconnect failed: {reconnect_error:#}"
+                                ));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let mut channel = ready_channel.ok_or_else(|| {
+            last_error.unwrap_or_else(|| {
+                anyhow::anyhow!("[bastion-pre-command] target shell was not reached")
+            })
+        })?;
+
+        // From here on no automatic retry is allowed: the business command may
+        // have side effects and must execute at most once.
         let sentinel = format!("RUSTERM_PTY_{}", random_sentinel_hex());
         let rc_tag = format!("{sentinel}_RC_");
 
-        let mut channel = self.handle.channel_open_session().await?;
-        channel
-            .request_pty(
-                false,
-                "xterm",
-                80,
-                24,
-                0,
-                0,
-                &[
-                    (Pty::ECHO, 1),
-                    (Pty::ICANON, 1),
-                    (Pty::ISIG, 1),
-                    (Pty::IEXTEN, 1),
-                    (Pty::ICRNL, 1),
-                    (Pty::OPOST, 1),
-                    (Pty::ONLCR, 1),
-                    (Pty::ECHOE, 1),
-                    (Pty::ECHOK, 1),
-                    (Pty::ECHOCTL, 1),
-                    (Pty::ECHOKE, 1),
-                ],
-            )
-            .await?;
-        channel.request_shell(true).await?;
-
-        // ── Phase 1: Navigate the bastion menu via expect/send ─────────────
-        //
-        // The whole navigation is bounded by `timeout` so a mismatched expect
-        // can't hang the API call forever.
-        let nav_result =
-            tokio::time::timeout(timeout, self.drive_pty_login(&mut channel, login_steps)).await;
-
-        match nav_result {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => {
-                let _ = channel.eof().await;
-                let _ = channel.close().await;
-                anyhow::bail!("bastion login navigation failed: {e:#}");
-            }
-            Err(_) => {
-                let _ = channel.eof().await;
-                let _ = channel.close().await;
-                anyhow::bail!("bastion login navigation timed out after {:?}", timeout);
-            }
+        if stdin.is_some() {
+            // Disable terminal echo and prove that the shell applied it before
+            // sending credential stdin. This prevents a queued sudo password
+            // from becoming an echoed shell command.
+            let remaining = remaining_timeout(operation_started, timeout, "stdin echo protection")?;
+            active
+                .disable_pty_echo_for_stdin(&mut channel, remaining)
+                .await?;
         }
 
-        // Give the target shell a moment to print its prompt / MOTD after the
-        // last menu selection lands.
-        tokio::time::sleep(Duration::from_millis(600)).await;
-
-        // ── Phase 2: Send the actual command with sentinel markers ──────────
+        let wrapped = if stdin.is_some() {
+            format!(
+                "{{ {command} ; }} ; __rc=$? ; stty echo; printf '\\n{tag}%d\\n' \"$__rc\"\r",
+                command = command,
+                tag = rc_tag,
+            )
+        } else {
+            format!(
+                "{{ {command} ; }} ; __rc=$? ; printf '\\n{tag}%d\\n' \"$__rc\"\r",
+                command = command,
+                tag = rc_tag,
+            )
+        };
+        channel.data(wrapped.as_bytes()).await?;
         if let Some(stdin) = stdin {
             channel.data(stdin).await?;
         }
-        let wrapped = format!(
-            "{{ {command} ; }} ; __rc=$? ; printf '\\n{tag}%d\\n' \"$__rc\"\n",
-            command = command,
-            tag = rc_tag,
-        );
-        channel.data(wrapped.as_bytes()).await?;
 
-        // ── Phase 3: Read until sentinel (same as exec_via_pty) ─────────────
         let mut result = ExecResult::default();
+        let command_timeout =
+            remaining_timeout(operation_started, timeout, "business command execution")?;
         let timed_out = match tokio::time::timeout(
-            timeout,
+            command_timeout,
             self.exec_via_pty_inner(&mut channel, &rc_tag, &mut result),
         )
         .await
@@ -402,8 +594,7 @@ impl DirectHandle {
         };
         result.timed_out = timed_out;
 
-        let _ = channel.eof().await;
-        let _ = channel.close().await;
+        close_pty_channel(&mut channel).await;
         Ok(result)
     }
 
@@ -418,92 +609,172 @@ impl DirectHandle {
         &self,
         channel: &mut russh::Channel<client::Msg>,
         steps: &[rusterm_core::LoginStep],
+        total_timeout: Duration,
+        phase: &'static str,
     ) -> anyhow::Result<()> {
         use rusterm_core::LoginStep;
 
         let mut buf: Vec<u8> = Vec::new();
+        let mut sent_values: Vec<String> = Vec::new();
         let mut step_idx = 0usize;
+        let total_started = Instant::now();
 
         while step_idx < steps.len() {
-            // Collect consecutive non-expect actions and fire them immediately.
+            if total_started.elapsed() >= total_timeout {
+                anyhow::bail!(login_wait_failure(
+                    phase,
+                    step_idx,
+                    "<total deadline>",
+                    total_started,
+                    total_started,
+                    &buf,
+                    &sent_values,
+                    "total deadline reached",
+                ));
+            }
+
             let expect_pattern: Option<&str> = match &steps[step_idx] {
                 LoginStep::Expect { pattern } => Some(pattern.as_str()),
                 _ => None,
             };
 
             if let Some(pattern) = expect_pattern {
-                // Wait until output matches this expect.
-                let re =
-                    if pattern.is_empty() {
-                        None
-                    } else {
-                        Some(regex::Regex::new(pattern).map_err(|e| {
-                            anyhow::anyhow!("invalid expect regex {pattern:?}: {e}")
-                        })?)
-                    };
+                tracing::info!("[relay] {phase} step {step_idx}: expect {pattern:?}");
+                let step_started = Instant::now();
+                let mut last_output = step_started;
 
                 loop {
-                    let text = String::from_utf8_lossy(&buf);
-                    let matched = match &re {
-                        Some(r) => r.is_match(&text),
-                        None => true, // empty pattern = instant match
-                    };
-                    if matched {
-                        // Clear consumed output so the next expect doesn't
-                        // re-fire on stale data.
+                    if login_pattern_matches(pattern, &buf)? {
+                        tracing::info!(
+                            "[relay] {phase} step {step_idx}: expect {pattern:?} matched"
+                        );
                         buf.clear();
                         break;
                     }
-                    // Read more PTY output.
-                    match channel.wait().await {
-                        Some(ChannelMsg::Data { data }) => {
-                            let combined = buf.len() + data.len();
-                            if combined < MAX_EXEC_OUTPUT {
-                                buf.extend_from_slice(&data);
-                            }
+
+                    let total_remaining = total_timeout.saturating_sub(total_started.elapsed());
+                    let step_remaining = BASTION_LOGIN_STEP_TIMEOUT
+                        .min(total_timeout)
+                        .saturating_sub(step_started.elapsed());
+                    let idle_remaining = BASTION_LOGIN_IDLE_TIMEOUT
+                        .min(total_timeout)
+                        .saturating_sub(last_output.elapsed());
+                    let wait_for = total_remaining.min(step_remaining).min(idle_remaining);
+
+                    if wait_for.is_zero() {
+                        let reason = if total_remaining.is_zero() {
+                            "total deadline reached"
+                        } else if step_remaining.is_zero() {
+                            "step deadline reached"
+                        } else {
+                            "PTY became idle"
+                        };
+                        anyhow::bail!(login_wait_failure(
+                            phase,
+                            step_idx,
+                            pattern,
+                            step_started,
+                            last_output,
+                            &buf,
+                            &sent_values,
+                            reason,
+                        ));
+                    }
+
+                    match tokio::time::timeout(wait_for, channel.wait()).await {
+                        Err(_) => {
+                            anyhow::bail!(login_wait_failure(
+                                phase,
+                                step_idx,
+                                pattern,
+                                step_started,
+                                last_output,
+                                &buf,
+                                &sent_values,
+                                "PTY became idle or a deadline elapsed",
+                            ));
                         }
-                        Some(ChannelMsg::ExtendedData { data, .. }) => {
-                            let combined = buf.len() + data.len();
-                            if combined < MAX_EXEC_OUTPUT {
-                                buf.extend_from_slice(&data);
-                            }
+                        Ok(Some(ChannelMsg::Data { data }))
+                        | Ok(Some(ChannelMsg::ExtendedData { data, .. })) => {
+                            append_bounded_login_output(&mut buf, &data);
+                            last_output = Instant::now();
                         }
-                        Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
-                            anyhow::bail!(
-                                "PTY closed while waiting for expect pattern {:?}",
-                                pattern
-                            );
+                        Ok(Some(ChannelMsg::Eof)) | Ok(Some(ChannelMsg::Close)) | Ok(None) => {
+                            anyhow::bail!(login_wait_failure(
+                                phase,
+                                step_idx,
+                                pattern,
+                                step_started,
+                                last_output,
+                                &buf,
+                                &sent_values,
+                                "PTY closed (eof=true)",
+                            ));
                         }
-                        _ => {}
+                        Ok(Some(_)) => {}
                     }
                 }
                 step_idx += 1;
             }
 
-            // Fire consecutive Send / Delay / SendOneKey steps.
             while step_idx < steps.len() {
+                if total_started.elapsed() >= total_timeout {
+                    anyhow::bail!(login_wait_failure(
+                        phase,
+                        step_idx,
+                        "<action>",
+                        total_started,
+                        total_started,
+                        &buf,
+                        &sent_values,
+                        "total deadline reached before action",
+                    ));
+                }
+
                 match &steps[step_idx] {
                     LoginStep::Expect { .. } => break,
                     LoginStep::Send { text } => {
-                        tracing::debug!("[relay] login step {step_idx}: send {:?}", text);
-                        channel.data(format!("{text}\\n").as_bytes()).await?;
+                        tracing::info!(
+                            "[relay] {phase} step {step_idx}: send ({} bytes)",
+                            text.len()
+                        );
+                        sent_values.push(text.clone());
+                        let payload = login_send_bytes(text);
+                        channel.data(payload.as_slice()).await.map_err(|error| {
+                            anyhow::anyhow!(
+                                "{phase} step {step_idx} failed to send input: {error:#}"
+                            )
+                        })?;
                         step_idx += 1;
                     }
                     LoginStep::Delay { ms } => {
-                        tracing::debug!("[relay] login step {step_idx}: delay {ms}ms");
-                        tokio::time::sleep(Duration::from_millis(*ms)).await;
+                        tracing::info!("[relay] {phase} step {step_idx}: delay {ms}ms");
+                        let delay = Duration::from_millis(*ms);
+                        let remaining = total_timeout.saturating_sub(total_started.elapsed());
+                        if delay > remaining {
+                            anyhow::bail!(login_wait_failure(
+                                phase,
+                                step_idx,
+                                "<delay>",
+                                total_started,
+                                total_started,
+                                &buf,
+                                &sent_values,
+                                "delay exceeds total deadline",
+                            ));
+                        }
+                        tokio::time::sleep(delay).await;
                         step_idx += 1;
                     }
                     LoginStep::SendOneKey { name } => {
-                        // OneKey credential resolution is not available in the
-                        // headless relay path. Skip with a warning rather than
-                        // failing — bastion menu navigation typically uses only
-                        // plain `send` steps.
-                        tracing::warn!(
-                            "[relay] login step {step_idx}: send_onekey {name:?} \
-                             is not supported in headless relay path, skipping"
+                        // Silently skipping a credential step advances the
+                        // state machine into an invalid state and can cause the
+                        // next input to land in the wrong prompt. Fail before
+                        // any business command is sent instead.
+                        anyhow::bail!(
+                            "{phase} step {step_idx}: send_onekey {name:?} is not \
+                             supported by the headless relay"
                         );
-                        step_idx += 1;
                     }
                 }
             }
@@ -638,10 +909,9 @@ impl DirectHandle {
     /// via [`exec_with_stdin`].
     ///
     /// Detection looks at both the literal JumpServer message and generic exec
-    /// failure markers seen in the wild. The PTY retry is bounded by the
-    /// same `timeout` (the exec attempt's time is already spent, so the PTY
-    /// path may run past the original deadline — this is intentional, since
-    /// a bastion's PTY setup is slower than an exec channel).
+    /// failure markers seen in the wild. The supplied `timeout` is an overall
+    /// deadline shared by the exec attempt, reconnect, login navigation and
+    /// PTY command, so a stuck bastion cannot multiply the API timeout.
     ///
     /// `login_steps` (when non-empty) enables bastion-menu navigation: the
     /// PTY fallback replays the expect/send script to traverse the bastion's
@@ -665,6 +935,17 @@ impl DirectHandle {
         timeout: Duration,
         login_steps: &[rusterm_core::LoginStep],
     ) -> anyhow::Result<ExecResult> {
+        // A configured login script explicitly identifies an interactive
+        // bastion. Do not speculatively execute the business command through
+        // an exec channel first: a server may run it but omit ExitStatus, and
+        // replaying through PTY would duplicate side effects.
+        if !login_steps.is_empty() {
+            return self
+                .exec_via_pty_with_login(command, stdin, timeout, login_steps)
+                .await;
+        }
+
+        let operation_started = Instant::now();
         let first = if let Some(stdin) = stdin {
             self.exec_with_stdin(command, stdin, timeout).await?
         } else {
@@ -684,28 +965,16 @@ impl DirectHandle {
         // shell channel is the first (and only) channel on that transport.
         // If reconnect is unavailable (no origin stored), fall back to the
         // old same-connection behaviour as a best-effort.
-        let use_login = !login_steps.is_empty();
-        match self.reconnect().await {
-            Ok(fresh) => {
-                if use_login {
-                    fresh
-                        .exec_via_pty_with_login(command, stdin, timeout, login_steps)
-                        .await
-                } else {
-                    fresh.exec_via_pty(command, stdin, timeout).await
-                }
-            }
+        let reconnect = reconnect_within(self, operation_started, timeout).await;
+        let remaining = remaining_timeout(operation_started, timeout, "PTY fallback")?;
+        match reconnect {
+            Ok(fresh) => fresh.exec_via_pty(command, stdin, remaining).await,
             Err(e) => {
                 tracing::warn!(
                     "[relay] reconnect for PTY fallback failed ({e:#}); \
                      attempting PTY on same connection"
                 );
-                if use_login {
-                    self.exec_via_pty_with_login(command, stdin, timeout, login_steps)
-                        .await
-                } else {
-                    self.exec_via_pty(command, stdin, timeout).await
-                }
+                self.exec_via_pty(command, stdin, remaining).await
             }
         }
     }
@@ -808,6 +1077,125 @@ impl DirectHandle {
 
 // ── Free-standing helpers ────────────────────────────────────────────────
 
+/// Strip ANSI escape sequences from raw PTY bytes, returning clean UTF-8 text.
+/// Mirrors the UI's `strip_ansi` so bastion menu prompts (which are wrapped
+/// in OSC title sequences and CSI colour codes) can be reliably matched by
+/// `expect` regexes in login scripts.
+fn strip_ansi_pty(data: &[u8]) -> String {
+    static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(
+            r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[()*+][A-Za-z0-9]|\x1b[@-_]",
+        )
+        .expect("static ANSI-stripping regex must compile")
+    });
+    let raw = String::from_utf8_lossy(data);
+    re.replace_all(&raw, "").to_string()
+}
+
+/// Encode an interactive login answer exactly like pressing Enter in a PTY.
+/// `ICRNL` maps carriage return to the line feed expected by the remote menu.
+fn login_send_bytes(text: &str) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(text.len() + 1);
+    bytes.extend_from_slice(text.as_bytes());
+    bytes.push(b'\r');
+    bytes
+}
+
+fn login_pattern_matches(pattern: &str, data: &[u8]) -> anyhow::Result<bool> {
+    if pattern.is_empty() {
+        return Ok(true);
+    }
+    let regex = regex::Regex::new(pattern)
+        .map_err(|error| anyhow::anyhow!("invalid expect regex {pattern:?}: {error}"))?;
+    Ok(regex.is_match(&strip_ansi_pty(data)))
+}
+
+/// Retain the newest prompt-sized tail. Menu redraws and banners can be very
+/// noisy; dropping old bytes is safe because expects only concern current UI.
+fn append_bounded_login_output(buffer: &mut Vec<u8>, data: &[u8]) {
+    if data.len() >= BASTION_LOGIN_BUFFER {
+        buffer.clear();
+        buffer.extend_from_slice(&data[data.len() - BASTION_LOGIN_BUFFER..]);
+        return;
+    }
+    let overflow = buffer
+        .len()
+        .saturating_add(data.len())
+        .saturating_sub(BASTION_LOGIN_BUFFER);
+    if overflow > 0 {
+        buffer.drain(..overflow);
+    }
+    buffer.extend_from_slice(data);
+}
+
+fn output_tail(data: &[u8], max_chars: usize, redactions: &[String]) -> String {
+    let mut clean = strip_ansi_pty(data);
+    for value in redactions.iter().filter(|value| !value.is_empty()) {
+        clean = clean.replace(value, "***");
+    }
+    clean
+        .chars()
+        .rev()
+        .take(max_chars)
+        .collect::<String>()
+        .chars()
+        .rev()
+        .collect()
+}
+
+fn bastion_menu_hint(data: &[u8]) -> &'static str {
+    let clean = strip_ansi_pty(data);
+    if clean.contains("请选择登录账号") {
+        "login-account menu"
+    } else if clean.contains("请选择目标资产") {
+        "target-asset menu"
+    } else if clean.contains("资产分类列表") || clean.contains("请选择资产分类") {
+        "asset-category menu"
+    } else {
+        "unknown prompt"
+    }
+}
+
+fn login_wait_failure(
+    phase: &str,
+    step_idx: usize,
+    pattern: &str,
+    step_started: Instant,
+    last_output: Instant,
+    data: &[u8],
+    redactions: &[String],
+    reason: &str,
+) -> String {
+    format!(
+        "{phase} step {step_idx} stuck waiting for {pattern:?}: {reason}; \
+         waited={:.1}s idle_for={:.1}s state={}; last_output={:?}",
+        step_started.elapsed().as_secs_f32(),
+        last_output.elapsed().as_secs_f32(),
+        bastion_menu_hint(data),
+        output_tail(data, 500, redactions),
+    )
+}
+
+/// Disable PTY echo and print the marker only if `stty` succeeded. The full
+/// marker is split across the printf format and argument so input echo cannot
+/// satisfy the expectation.
+fn stdin_ready_probe(token: &str) -> (String, String) {
+    let marker = format!("RUSTERM_STDIN_READY_{token}");
+    let command = format!("stty -echo && printf '\\nRUSTERM_STDIN_READY_%s\\n' '{token}'\r");
+    debug_assert!(!command.contains(&marker));
+    (command, marker)
+}
+
+/// Build a shell-readiness probe whose full marker does not appear in the
+/// echoed command line. Seeing `marker` therefore proves a shell executed it.
+fn shell_ready_probe(token: &str) -> (String, String) {
+    let marker = format!("RUSTERM_READY_{token}");
+    let command = format!("printf '\\nRUSTERM_READY_%s\\n' '{token}'\r");
+    debug_assert!(!command.contains(&marker));
+    (command, marker)
+}
+
 /// Generate 16 hex chars (64 bits) of randomness for a per-call sentinel.
 /// Uses the process nanosecond timer + thread id as a fallback when the
 /// `getrandom` crate isn't pulled in — sufficient entropy to avoid output
@@ -876,10 +1264,11 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 /// `exec` channel? Matches the literal JumpServer message and the generic
 /// markers we already detect in `SshSession::fetch_via_exec`.
 fn looks_like_exec_rejected(result: &ExecResult) -> bool {
-    if result.exit_code.is_some() && result.exit_code != Some(0) {
-        // A non-zero exit with the rejection text still triggers the PTY
-        // fallback — but a clean exit with stdout means the command ran.
-        // Only fall through if the output matches the rejection markers.
+    // Any reported exit status proves the server accepted and ran the exec
+    // request. Never replay such a command through PTY, even if its legitimate
+    // output happens to contain one of our rejection phrases.
+    if result.exit_code.is_some() {
+        return false;
     }
     let combined = format!("{} {}", result.stdout_string(), result.stderr_string());
     let combined = combined.to_ascii_lowercase();
@@ -948,6 +1337,15 @@ mod tests {
         // "exec request" alone (without "failed") should NOT trigger.
         let r = rc_result("logs: exec request #42 completed");
         assert!(!looks_like_exec_rejected(&r));
+    }
+
+    #[test]
+    fn never_replays_a_command_that_reported_an_exit_status() {
+        for exit_code in [0, 1, 126] {
+            let mut result = rc_result("command not allowed");
+            result.exit_code = Some(exit_code);
+            assert!(!looks_like_exec_rejected(&result));
+        }
     }
 
     #[test]
@@ -1029,5 +1427,76 @@ mod tests {
         let s = "line1\nline2\nline3";
         let out = strip_echoed_wrapper(s);
         assert_eq!(out, "line1\nline2\nline3");
+    }
+
+    #[test]
+    fn login_send_is_a_real_enter_not_literal_backslash_n() {
+        let bytes = login_send_bytes("/cao");
+        assert_eq!(bytes, b"/cao\r");
+        assert!(!bytes.ends_with(br"\n"));
+    }
+
+    #[test]
+    fn expect_matches_fragmented_ansi_wrapped_prompt() {
+        let mut buffer = Vec::new();
+        append_bounded_login_output(
+            &mut buffer,
+            b"\x1b]0;xuchao@host\x07\x1b[32m\xe8\xaf\xb7\xe9\x80\x89",
+        );
+        assert!(!login_pattern_matches("请选择目标资产", &buffer).unwrap());
+        append_bounded_login_output(
+            &mut buffer,
+            b"\xe6\x8b\xa9\xe7\x9b\xae\xe6\xa0\x87\xe8\xb5\x84\xe4\xba\xa7\xef\xbc\x9a\x1b[0m",
+        );
+        assert!(login_pattern_matches("请选择目标资产", &buffer).unwrap());
+    }
+
+    #[test]
+    fn login_output_buffer_keeps_recent_tail_when_noisy() {
+        let mut buffer = vec![b'a'; BASTION_LOGIN_BUFFER - 2];
+        append_bounded_login_output(&mut buffer, b"PROMPT");
+        assert_eq!(buffer.len(), BASTION_LOGIN_BUFFER);
+        assert!(buffer.ends_with(b"PROMPT"));
+    }
+
+    #[test]
+    fn diagnostic_tail_redacts_values_sent_by_login_script() {
+        let sent = vec!["super-secret".to_string()];
+        let tail = output_tail(b"Password: super-secret\r\nNext prompt", 500, &sent);
+        assert!(!tail.contains("super-secret"));
+        assert!(tail.contains("Password: ***"));
+    }
+
+    #[test]
+    fn stdin_ready_marker_requires_successful_echo_suppression() {
+        let (probe, marker) = stdin_ready_probe("0123456789abcdef");
+        assert!(probe.contains("stty -echo && printf"));
+        assert!(!probe.contains(&marker));
+    }
+
+    #[test]
+    fn shell_ready_marker_is_not_present_in_echoed_probe_command() {
+        let (probe, marker) = shell_ready_probe("0123456789abcdef");
+        assert!(probe.ends_with('\r'));
+        assert!(!probe.contains(&marker));
+        assert_eq!(marker, "RUSTERM_READY_0123456789abcdef");
+    }
+
+    #[test]
+    fn timeout_diagnostic_identifies_current_bastion_menu_and_tail() {
+        let now = Instant::now();
+        let error = login_wait_failure(
+            "navigation",
+            4,
+            "请选择目标资产",
+            now,
+            now,
+            "请选择目标资产：".as_bytes(),
+            &[],
+            "PTY became idle",
+        );
+        assert!(error.contains("navigation step 4"));
+        assert!(error.contains("target-asset menu"));
+        assert!(error.contains("last_output"));
     }
 }

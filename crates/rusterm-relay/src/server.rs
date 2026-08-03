@@ -168,10 +168,12 @@ struct ErrorBody<'a> {
     error: &'a str,
     #[serde(skip_serializing_if = "Option::is_none")]
     code: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<&'a str>,
 }
 
 fn error_response(status: StatusCode, msg: &str) -> Response {
-    error_response_with_code(status, msg, None)
+    error_response_with_detail(status, msg, None, None)
 }
 
 fn error_response_with_code<'a>(
@@ -179,7 +181,38 @@ fn error_response_with_code<'a>(
     msg: &'a str,
     code: Option<&'a str>,
 ) -> Response {
-    (status, Json(ErrorBody { error: msg, code })).into_response()
+    error_response_with_detail(status, msg, code, None)
+}
+
+fn error_response_with_detail<'a>(
+    status: StatusCode,
+    msg: &'a str,
+    code: Option<&'a str>,
+    detail: Option<&'a str>,
+) -> Response {
+    (
+        status,
+        Json(ErrorBody {
+            error: msg,
+            code,
+            detail,
+        }),
+    )
+        .into_response()
+}
+
+/// Return only structured bastion-state diagnostics to API clients. Arbitrary
+/// SSH errors and raw PTY tails may contain internal paths, banners or echoed
+/// input, so they remain in local audit logs instead of crossing the API.
+fn safe_executor_detail(error: &ExecutorError) -> Option<String> {
+    let ExecutorError::Exec(detail) = error else {
+        return None;
+    };
+    if !detail.contains("[bastion-pre-command]") {
+        return None;
+    }
+    let without_output = detail.split("; last_output=").next().unwrap_or(detail);
+    Some(without_output.chars().take(1_000).collect())
 }
 
 fn unauthorized() -> Response {
@@ -189,6 +222,7 @@ fn unauthorized() -> Response {
         Json(ErrorBody {
             error: "authentication required",
             code: None,
+            detail: None,
         }),
     )
         .into_response()
@@ -689,6 +723,7 @@ async fn exec(
                 ExecutorError::Exec(_) => (StatusCode::BAD_GATEWAY, "remote exec failed"),
                 ExecutorError::ElevationRequired(_) => unreachable!(),
             };
+            let detail = safe_executor_detail(&err);
             state.audit.log(AuditEntry {
                 ts: now_iso(),
                 account: account.username.clone(),
@@ -715,7 +750,7 @@ async fn exec(
                 Some(started.elapsed().as_millis() as u64),
                 false,
             );
-            error_response(status, msg)
+            error_response_with_detail(status, msg, None, detail.as_deref())
         }
     }
 }
@@ -919,6 +954,7 @@ mod tests {
     struct RecordingExecutor {
         elevated: std::sync::atomic::AtomicBool,
         fail_elevation: bool,
+        fail_exec: Option<String>,
     }
 
     #[async_trait::async_trait]
@@ -946,6 +982,9 @@ mod tests {
                 return Err(ExecutorError::ElevationRequired(
                     "No reusable sudo authorization is available".to_string(),
                 ));
+            }
+            if let Some(detail) = &self.fail_exec {
+                return Err(ExecutorError::Exec(detail.clone()));
             }
             Ok(ExecOutcome {
                 exit_code: Some(0),
@@ -1059,6 +1098,36 @@ mod tests {
         assert_eq!(status, 403);
         assert_eq!(body["code"], "elevation_required");
         assert_eq!(body["error"], "No reusable sudo authorization is available");
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn exec_failure_returns_actionable_detail() {
+        let executor = Arc::new(RecordingExecutor {
+            fail_exec: Some(
+                "[bastion-pre-command] navigation step 4 stuck waiting for target asset; \
+                 state=asset-category menu; last_output=secret-value"
+                    .to_string(),
+            ),
+            ..Default::default()
+        });
+        let handle = run(test_config(), executor, Arc::new(NullHistoryStore))
+            .await
+            .unwrap();
+        let (status, body) = post_json(
+            &format!("{}/api/v1/exec", handle.url()),
+            Some(("ops", "pw")),
+            &serde_json::json!({
+                "host_id": "host-1",
+                "command": "uptime",
+            }),
+        )
+        .await;
+        assert_eq!(status, 502);
+        assert_eq!(body["error"], "remote exec failed");
+        let detail = body["detail"].as_str().unwrap();
+        assert!(detail.contains("navigation step 4"));
+        assert!(!detail.contains("secret-value"));
         handle.shutdown().await;
     }
 
