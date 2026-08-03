@@ -972,6 +972,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn live_exec_detects_completion_marker_after_output_cap() {
+        let rc_tag = "RUSTERM_TEST_RC_";
+        let mut raw = Vec::new();
+        let mut marker_scan = Vec::new();
+        let oversized = vec![b'x'; MAX_LIVE_EXEC_OUTPUT + 128];
+
+        let (code, truncated) =
+            capture_live_exec_output(&mut raw, &mut marker_scan, &oversized, rc_tag);
+        assert_eq!(code, None);
+        assert!(truncated);
+        assert_eq!(raw.len(), MAX_LIVE_EXEC_OUTPUT);
+
+        let (code, truncated_again) = capture_live_exec_output(
+            &mut raw,
+            &mut marker_scan,
+            format!("{rc_tag}17\r\n").as_bytes(),
+            rc_tag,
+        );
+        assert_eq!(code, Some(17));
+        assert!(truncated_again);
+        assert_eq!(raw.len(), MAX_LIVE_EXEC_OUTPUT);
+    }
+
+    #[test]
     fn sudo_command_quotes_untrusted_command_without_embedding_a_password() {
         let command = "printf '%s' \"$HOME\"";
         let wrapped = sudo_command(command, true);
