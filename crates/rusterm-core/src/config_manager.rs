@@ -8,9 +8,9 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rand::RngCore;
 
 use crate::config::{
-    ConnectionConfig, ConnectionKind, DEFAULT_ONEKEY_PASSWORD_EXPECT, EncryptedValue,
-    FocusedTabAppearance, Keybindings, Language, OneKey, OneKeyPreference, OneKeyStep,
-    PersistedConfig, PersistedConnection, PersistedConnectionKind, PersistedOneKey,
+    ConnectionConfig, ConnectionKind, CustomApiTemplate, DEFAULT_ONEKEY_PASSWORD_EXPECT,
+    EncryptedValue, FocusedTabAppearance, Keybindings, Language, OneKey, OneKeyPreference,
+    OneKeyStep, PersistedConfig, PersistedConnection, PersistedConnectionKind, PersistedOneKey,
     PersistedOneKeyStep, PersistedProxyConfig, PersistedSshAuth, PersistedSshConfig, ProxyConfig,
     SidebarPreferences, SkinSettings, SshAuth, SshConfig, WorkspacePreferences,
 };
@@ -260,6 +260,7 @@ impl ConfigManager {
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
             language: existing.language,
+            api_custom_templates: existing.api_custom_templates,
         };
 
         let json =
@@ -295,6 +296,7 @@ impl ConfigManager {
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
             language: existing.language,
+            api_custom_templates: existing.api_custom_templates,
         };
 
         let json =
@@ -338,6 +340,7 @@ impl ConfigManager {
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
             language: existing.language,
+            api_custom_templates: existing.api_custom_templates,
         };
 
         let json =
@@ -378,6 +381,7 @@ impl ConfigManager {
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
             language: existing.language,
+            api_custom_templates: existing.api_custom_templates,
         };
 
         let json =
@@ -415,6 +419,7 @@ impl ConfigManager {
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
             language: existing.language,
+            api_custom_templates: existing.api_custom_templates,
         };
         let json =
             serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
@@ -452,6 +457,7 @@ impl ConfigManager {
             skin: skin.clone().normalized(),
             collect_usage_habits: existing.collect_usage_habits,
             language: existing.language,
+            api_custom_templates: existing.api_custom_templates,
         };
         let json =
             serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
@@ -497,6 +503,7 @@ impl ConfigManager {
             skin: existing.skin,
             collect_usage_habits: enabled,
             language: existing.language,
+            api_custom_templates: existing.api_custom_templates,
         };
 
         let json =
@@ -537,6 +544,7 @@ impl ConfigManager {
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
             language,
+            api_custom_templates: existing.api_custom_templates,
         };
 
         let json =
@@ -576,6 +584,7 @@ impl ConfigManager {
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
             language: existing.language,
+            api_custom_templates: existing.api_custom_templates,
         };
 
         let json =
@@ -615,6 +624,7 @@ impl ConfigManager {
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
             language: existing.language,
+            api_custom_templates: existing.api_custom_templates,
         };
 
         let json =
@@ -652,6 +662,7 @@ impl ConfigManager {
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
             language: existing.language,
+            api_custom_templates: existing.api_custom_templates,
         };
 
         let json =
@@ -731,6 +742,7 @@ impl ConfigManager {
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
             language: existing.language,
+            api_custom_templates: existing.api_custom_templates,
         };
 
         let json =
@@ -763,6 +775,7 @@ impl ConfigManager {
             skin: SkinSettings::default(),
             collect_usage_habits: false,
             language: Language::default(),
+            api_custom_templates: Vec::new(),
         };
 
         let mut persisted = if self.config_path.exists() {
@@ -816,6 +829,7 @@ impl ConfigManager {
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
             language: existing.language,
+            api_custom_templates: existing.api_custom_templates,
         };
 
         let json =
@@ -863,6 +877,27 @@ impl ConfigManager {
 
     pub fn load_onekey_preferences(&self) -> Vec<OneKeyPreference> {
         self.read_persisted().onekey_preferences
+    }
+
+    /// User-defined API panel templates. Legacy settings files load an
+    /// empty list.
+    pub fn load_api_templates(&self) -> Vec<CustomApiTemplate> {
+        self.read_persisted().api_custom_templates
+    }
+
+    /// Persist the user-defined API panel templates. Read-modify-write
+    /// preserves encrypted credentials and every unrelated setting.
+    pub fn save_api_templates(&self, templates: &[CustomApiTemplate]) -> Result<()> {
+        let mut persisted = self.read_persisted_for_update()?;
+        persisted.version = CONFIG_VERSION;
+        persisted.master_password_hash = self.master_password_hash.clone();
+        persisted.api_custom_templates = templates.to_vec();
+        let json =
+            serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
+        let temp_path = self.config_path.with_extension("json.tmp");
+        fs::write(&temp_path, &json).context("Failed to write config file")?;
+        fs::rename(&temp_path, &self.config_path).context("Failed to rename temp config file")?;
+        Ok(())
     }
 
     fn encrypt_onekey(&self, ok: &OneKey) -> Result<PersistedOneKey> {
@@ -1335,6 +1370,32 @@ mod tests {
         cm.save_language(Language::En).unwrap();
 
         assert_eq!(cm.load_onekey_preferences(), preferences);
+    }
+
+    #[test]
+    fn api_templates_roundtrip_and_survive_other_saves() {
+        let (cm, _dir) = test_config_manager();
+        let templates = vec![
+            CustomApiTemplate {
+                label: "check disk".to_string(),
+                mode: crate::config::ApiTemplateMode::Command,
+                body: "df -h /data".to_string(),
+            },
+            CustomApiTemplate {
+                label: "restart svc".to_string(),
+                mode: crate::config::ApiTemplateMode::Script,
+                body: "#!/bin/sh\nsystemctl restart my-svc".to_string(),
+            },
+        ];
+
+        cm.save_api_templates(&templates).unwrap();
+        assert_eq!(cm.load_api_templates(), templates);
+
+        cm.save_connections(&[]).unwrap();
+        cm.save_onekeys(&[]).unwrap();
+        cm.save_language(Language::En).unwrap();
+
+        assert_eq!(cm.load_api_templates(), templates);
     }
 
     #[test]

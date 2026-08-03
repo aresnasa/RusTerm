@@ -1170,6 +1170,30 @@ impl Keybindings {
     }
 }
 
+/// Which API-panel input a custom template targets. Mirrors the UI's
+/// `CurlMode` (Command | Script | Script base64) without coupling core to
+/// the UI crate.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApiTemplateMode {
+    Command,
+    Script,
+    ScriptBase64,
+}
+
+/// A user-defined quick-pick template for the API panel's curl builder.
+/// Non-secret: the label and body are plain command/script text the user
+/// chose to save as a shortcut chip.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CustomApiTemplate {
+    /// Chip label shown in the templates row.
+    pub label: String,
+    /// Which mode (and input field) the template targets.
+    pub mode: ApiTemplateMode,
+    /// The command or script body loaded into the input on click.
+    pub body: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedConfig {
     pub version: u32,
@@ -1239,6 +1263,10 @@ pub struct PersistedConfig {
     /// omit this field and get `Zh` via `Language`'s `#[default]`.
     #[serde(default)]
     pub language: Language,
+    /// User-defined API panel templates. Legacy settings files omit this
+    /// field and get an empty list.
+    #[serde(default)]
+    pub api_custom_templates: Vec<CustomApiTemplate>,
 }
 
 /// Default for `PersistedConfig::confirm_close_on_exit`. Kept as a function
@@ -1941,6 +1969,7 @@ mod tests {
             skin: SkinSettings::default(),
             collect_usage_habits: false,
             language: Language::default(),
+            api_custom_templates: Vec::new(),
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: PersistedConfig = serde_json::from_str(&json).unwrap();
@@ -1964,6 +1993,54 @@ mod tests {
         .unwrap();
         let parsed: PersistedConfig = serde_json::from_str(&json).unwrap();
         assert!(parsed.collect_usage_habits);
+    }
+
+    #[test]
+    fn api_custom_templates_default_empty_for_legacy_settings_and_roundtrip() {
+        // A legacy settings.json that predates custom API templates must
+        // deserialize with an empty list.
+        let config: PersistedConfig =
+            serde_json::from_str(r#"{"version":1,"connections":[]}"#).unwrap();
+        assert!(config.api_custom_templates.is_empty());
+
+        // Templates for every mode must round-trip.
+        let json = serde_json::to_string(&PersistedConfig {
+            api_custom_templates: vec![
+                CustomApiTemplate {
+                    label: "check disk".to_string(),
+                    mode: ApiTemplateMode::Command,
+                    body: "df -h /data".to_string(),
+                },
+                CustomApiTemplate {
+                    label: "restart svc".to_string(),
+                    mode: ApiTemplateMode::Script,
+                    body: "#!/bin/sh\nsystemctl restart my-svc".to_string(),
+                },
+                CustomApiTemplate {
+                    label: "b64".to_string(),
+                    mode: ApiTemplateMode::ScriptBase64,
+                    body: "IyEvYmluL3NoCnVwdGltZQ==".to_string(),
+                },
+            ],
+            ..config
+        })
+        .unwrap();
+        let parsed: PersistedConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.api_custom_templates.len(), 3);
+        assert_eq!(
+            parsed.api_custom_templates[0].mode,
+            ApiTemplateMode::Command
+        );
+        assert_eq!(parsed.api_custom_templates[1].mode, ApiTemplateMode::Script);
+        assert_eq!(
+            parsed.api_custom_templates[2].mode,
+            ApiTemplateMode::ScriptBase64
+        );
+        assert_eq!(parsed.api_custom_templates[1].label, "restart svc");
+        assert_eq!(
+            parsed.api_custom_templates[1].body,
+            "#!/bin/sh\nsystemctl restart my-svc"
+        );
     }
 
     #[test]

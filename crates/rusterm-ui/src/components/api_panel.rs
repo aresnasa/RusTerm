@@ -17,6 +17,7 @@
 //! reaching the SSH executor.
 
 use dioxus::prelude::*;
+use rusterm_core::config::{ApiTemplateMode, CustomApiTemplate};
 use rusterm_relay::{RelayAccount, hash_password};
 
 use crate::state::AppState;
@@ -31,6 +32,16 @@ enum CurlMode {
     Script,
     /// `{"script_base64": "..."}` — base64-encoded script.
     ScriptBase64,
+}
+
+/// Maps the UI's [`CurlMode`] to the persisted [`ApiTemplateMode`] used by
+/// user-defined templates in settings.json.
+fn template_mode_of(mode: CurlMode) -> ApiTemplateMode {
+    match mode {
+        CurlMode::Command => ApiTemplateMode::Command,
+        CurlMode::Script => ApiTemplateMode::Script,
+        CurlMode::ScriptBase64 => ApiTemplateMode::ScriptBase64,
+    }
 }
 
 /// A quick-pick template shown in the API panel. Selecting one loads its body
@@ -242,6 +253,31 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
     let mut curl_mode = use_signal(|| CurlMode::Command);
     let mut curl_elevated = use_signal(|| true);
     let mut copied = use_signal(|| false);
+
+    // User-defined templates (persisted in settings.json). Loaded once at
+    // panel mount; add/delete operations write back through ConfigManager.
+    let mut custom_templates = use_signal(|| {
+        state
+            .read()
+            .config_manager
+            .as_ref()
+            .map(|cm| cm.load_api_templates())
+            .unwrap_or_default()
+    });
+    // Inline add-template form state.
+    let mut adding_template = use_signal(|| false);
+    let mut new_template_label = use_signal(String::new);
+    let mut new_template_body = use_signal(String::new);
+    let mut template_error = use_signal(String::new);
+    // Persist the full template list. `Signal` is Copy, so this closure is
+    // Copy and can be moved into several handlers.
+    let persist_templates = move |templates: Vec<CustomApiTemplate>| {
+        if let Some(cm) = state.read().config_manager.clone()
+            && let Err(e) = cm.save_api_templates(&templates)
+        {
+            tracing::error!("Failed to save custom API templates: {e}");
+        }
+    };
 
     let (enabled, bind_addr_str, port_str) = {
         let cfg = config.read();
@@ -728,6 +764,132 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
                                 { tmpl.label }
                             }
                         }
+                        // User-defined templates for the current mode. Each
+                        // chip loads its body like a built-in; the trailing ×
+                        // deletes it (persisted immediately).
+                        for (idx, tmpl) in custom_templates()
+                            .into_iter()
+                            .enumerate()
+                            .filter(|(_, t)| t.mode == template_mode_of(curl_mode()))
+                        {
+                            {
+                                let body_for_click = tmpl.body.clone();
+                                rsx! {
+                                    span {
+                                        key: "custom-tmpl-{idx}",
+                                        style: "display:inline-flex;align-items:stretch;",
+                                        button {
+                                            class: "api-btn",
+                                            style: "font-size:11px;padding:2px 4px 2px 8px;border-top-right-radius:0;border-bottom-right-radius:0;",
+                                            title: "{tmpl.body}",
+                                            onclick: move |_| match curl_mode() {
+                                                CurlMode::Command => curl_command.set(body_for_click.clone()),
+                                                CurlMode::Script => curl_script.set(body_for_click.clone()),
+                                                CurlMode::ScriptBase64 => curl_script_base64.set(body_for_click.clone()),
+                                            },
+                                            "{tmpl.label}"
+                                        }
+                                        button {
+                                            class: "api-btn",
+                                            style: "font-size:11px;padding:2px 6px;border-top-left-radius:0;border-bottom-left-radius:0;color:#f7768e;",
+                                            title: { crate::i18n::t("api.template_delete") },
+                                            onclick: move |_| {
+                                                let mut list = custom_templates.write();
+                                                if idx < list.len() {
+                                                    list.remove(idx);
+                                                }
+                                                let snapshot = list.clone();
+                                                drop(list);
+                                                persist_templates(snapshot);
+                                            },
+                                            "×"
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                        // "+ Add template" opens the inline form below; the
+                        // new template is saved for the CURRENT mode.
+                        button {
+                            class: "api-btn",
+                            style: "font-size:11px;padding:2px 8px;color:#7aa2f7;",
+                            onclick: move |_| {
+                                let now_adding = !adding_template();
+                                adding_template.set(now_adding);
+                                if !now_adding {
+                                    template_error.set(String::new());
+                                }
+                            },
+                            { crate::i18n::t("api.add_template") }
+                        }
+                    }
+                    if adding_template() {
+                        div { class: "api-row", style: "gap:4px;margin-bottom:8px;flex-wrap:wrap;align-items:flex-start;",
+                            input {
+                                class: "api-input",
+                                style: "font-size:11px;flex:0 0 140px;",
+                                value: "{new_template_label}",
+                                placeholder: crate::i18n::t("api.template_name_placeholder"),
+                                oninput: move |e| new_template_label.set(e.value()),
+                            }
+                            if curl_mode() == CurlMode::Command {
+                                input {
+                                    class: "api-input",
+                                    style: "font-size:11px;flex:1 1 200px;font-family:monospace;",
+                                    value: "{new_template_body}",
+                                    placeholder: crate::i18n::t("api.template_body_placeholder"),
+                                    oninput: move |e| new_template_body.set(e.value()),
+                                }
+                            } else {
+                                textarea {
+                                    class: "api-input",
+                                    style: "font-size:11px;flex:1 1 200px;min-height:60px;font-family:monospace;resize:vertical;",
+                                    value: "{new_template_body}",
+                                    placeholder: crate::i18n::t("api.template_body_placeholder"),
+                                    oninput: move |e| new_template_body.set(e.value()),
+                                }
+                            }
+                            button {
+                                class: "api-btn",
+                                style: "font-size:11px;padding:2px 8px;",
+                                onclick: move |_| {
+                                    let label = new_template_label().trim().to_string();
+                                    let body = new_template_body().trim().to_string();
+                                    if label.is_empty() || body.is_empty() {
+                                        template_error.set(crate::i18n::t("api.template_fill_required"));
+                                        return;
+                                    }
+                                    let mut list = custom_templates.write();
+                                    list.push(CustomApiTemplate {
+                                        label,
+                                        mode: template_mode_of(curl_mode()),
+                                        body,
+                                    });
+                                    let snapshot = list.clone();
+                                    drop(list);
+                                    persist_templates(snapshot);
+                                    new_template_label.set(String::new());
+                                    new_template_body.set(String::new());
+                                    template_error.set(String::new());
+                                    adding_template.set(false);
+                                },
+                                { crate::i18n::t("api.template_save") }
+                            }
+                            button {
+                                class: "api-btn",
+                                style: "font-size:11px;padding:2px 8px;",
+                                onclick: move |_| {
+                                    adding_template.set(false);
+                                    template_error.set(String::new());
+                                },
+                                { crate::i18n::t("api.template_cancel") }
+                            }
+                            if !template_error().is_empty() {
+                                span { style: "font-size:11px;color:#f7768e;align-self:center;",
+                                    "{template_error}"
+                                }
+                            }
+                        }
                     }
                     div { class: "api-field api-command-field",
                         span {
@@ -1194,6 +1356,21 @@ fn gen_curl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn template_mode_maps_every_curl_mode_to_a_distinct_persisted_mode() {
+        // Custom templates are stored per mode; the mapping must be 1:1 so a
+        // template saved in one tab never leaks into another tab's chip row.
+        assert_eq!(
+            template_mode_of(CurlMode::Command),
+            ApiTemplateMode::Command
+        );
+        assert_eq!(template_mode_of(CurlMode::Script), ApiTemplateMode::Script);
+        assert_eq!(
+            template_mode_of(CurlMode::ScriptBase64),
+            ApiTemplateMode::ScriptBase64
+        );
+    }
 
     #[test]
     fn curl_includes_endpoint_user_and_body() {

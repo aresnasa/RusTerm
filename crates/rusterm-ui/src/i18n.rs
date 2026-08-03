@@ -330,6 +330,16 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         "api.mode_script" => ("Script", "脚本"),
         "api.mode_script_base64" => ("Script (base64)", "脚本 (base64)"),
         "api.templates_label" => ("Templates", "模板"),
+        "api.add_template" => ("+ Add template", "+ 新增模板"),
+        "api.template_name_placeholder" => ("Template name", "模板名称"),
+        "api.template_body_placeholder" => ("Command or script content", "命令或脚本内容"),
+        "api.template_save" => ("Save", "保存"),
+        "api.template_cancel" => ("Cancel", "取消"),
+        "api.template_delete" => ("Delete template", "删除模板"),
+        "api.template_fill_required" => (
+            "Template name and content are required",
+            "模板名称和内容不能为空",
+        ),
         "api.script_label" => ("Script", "脚本"),
         "api.script_edit_hint" => (
             "↓ Multi-line shell script. Each line passes the hard-floor validator; the whole script is scanned by dcg if installed.",
