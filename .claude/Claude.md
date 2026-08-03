@@ -144,4 +144,47 @@ if [ "$RUSTERM_FAILED" -ne 0 ]; then
 printf '\n一个或多个 RusTerm API 请求失败（最后状态：%s）。\n' "$RUSTERM_FAILED" >&2
 fi
 的脚本模板，可以做成 alias，然后只保留用户需要输入的命令，可以改造为 rusterm "user cli"，不需要强制输入""这里可以直接生成一个 alias 的函数给到用户，后续可以直接复用。改造一下 API 的脚本模板。
-87.
+87. 有个场景需要考虑刷新export RUSTERM_API_URL='http://127.0.0.1:8877'
+export RUSTERM_API_USER='aresnasa'
+
+rusterm() {
+if [ "$#" -eq 0 ]; then
+printf '用法：rusterm <命令...>\n' >&2
+return 2
+fi
+
+if [ -z "${RUSTERM_API_PASSWORD+x}" ]; then
+printf 'RusTerm API 密码：' >&2
+RUSTERM_STTY=$(stty -g)
+trap 'stty "$RUSTERM_STTY"' 0 1 2 15
+stty -echo
+IFS= read -r RUSTERM_API_PASSWORD
+stty "$RUSTERM_STTY"
+trap - 0 1 2 15
+printf '\n' >&2
+export RUSTERM_API_PASSWORD
+fi
+
+RUSTERM_FAILED=0
+for RUSTERM_TARGET in '100eac5a-2ef7-427f-84e1-9e03e2b61820'; do
+curl --silent --show-error --fail-with-body \
+      --connect-timeout 10 --max-time 120 \
+      --request POST \
+      --user "${RUSTERM_API_USER}:${RUSTERM_API_PASSWORD}" \
+      --header 'Accept: text/plain' \
+      --header 'Content-Type: text/plain; charset=utf-8' \
+      --data-binary "$*" \
+      "${RUSTERM_API_URL}/r/${RUSTERM_TARGET}?elevated=true" || RUSTERM_FAILED=$?
+done
+
+if [ "$RUSTERM_FAILED" -ne 0 ]; then
+printf '\n一个或多个 RusTerm API 请求失败（最后状态：%s）。\n' "$RUSTERM_FAILED" >&2
+fi
+return "$RUSTERM_FAILED"
+}
+
+# 立即执行；此函数后续仍可复用
+# 使用 rusterm <命令...>；包含 &&、管道或重定向时请为命令加引号
+rusterm uname -a
+这里会用老的（上次次会话的配置）不符合预期，这里需要能够刷新（按照当前会话的情况来记录相关节点信息），需要优化
+88.
