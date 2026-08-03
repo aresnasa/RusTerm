@@ -225,9 +225,9 @@ impl ConfigManager {
             .collect()
     }
 
-    /// Read the `restore_disabled` flag from settings.json. Used on unlock to
-    /// decide whether to even attempt loading `session_state.enc` (no point
-    /// decrypting a file we'll never restore from).
+    /// Read the legacy restore-dialog preference from settings.json.
+    /// Automatic session recovery ignores it, but loading it preserves config
+    /// compatibility with existing installations.
     pub fn load_restore_disabled(&self) -> bool {
         self.read_persisted().restore_disabled
     }
@@ -272,10 +272,9 @@ impl ConfigManager {
         Ok(())
     }
 
-    /// Persist the `restore_disabled` flag to settings.json. Used when the user
-    /// picks "不再询问" on the restore dialog — we set the flag so we never
-    /// prompt again (and stop saving session state entirely).
-    /// Preserves existing connections + OneKeys (read-modify-write).
+    /// Persist the legacy restore-dialog preference while preserving existing
+    /// connections and OneKeys. Automatic recovery no longer reads this value
+    /// as an enable/disable switch.
     pub fn save_restore_disabled(&self, restore_disabled: bool) -> Result<()> {
         let existing = self.read_persisted();
         let persisted = PersistedConfig {

@@ -61,7 +61,8 @@ const MAGIC: &[u8; 4] = b"RUSS";
 const VERSION: u8 = 1;
 const FILE_NAME: &str = "session_state.enc";
 
-/// Top-level persisted snapshot. One per app exit; one per app launch.
+/// Top-level persisted snapshot. Rewritten periodically and on app exit, then
+/// consumed as the automatic recovery source on the next launch.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct SessionState {
     /// Schema version — bump when the on-disk layout changes. Older versions
@@ -249,10 +250,9 @@ impl SessionState {
         Ok(())
     }
 
-    /// Delete the session-state file. Called when the user picks "不再询问"
-    /// (don't ask again) on the restore dialog — we don't want to re-prompt
-    /// on every launch, so we wipe the file and let future saves be skipped
-    /// (the UI gates saves on a settings flag).
+    /// Delete the session-state file. Retained for maintenance and explicit
+    /// reset flows; normal startup recovery now persists an empty snapshot when
+    /// no terminal was logged in instead of deleting the file.
     pub fn delete() -> Result<()> {
         let path = Self::resolve_path()?;
         if path.exists() {

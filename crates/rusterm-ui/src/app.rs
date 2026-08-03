@@ -32,7 +32,6 @@ use crate::components::DockZoneView;
 use crate::components::MasterPasswordDialog;
 use crate::components::OneKeyManager;
 use crate::components::RelayPanel;
-use crate::components::RestoreSessionDialog;
 use crate::components::SettingsDialog;
 use crate::components::ShadowExecutionDialog;
 use crate::components::ShadowResultDialog;
@@ -8083,6 +8082,46 @@ mod session_startup_tests {
     }
 
     #[test]
+    fn legacy_never_ask_flag_does_not_block_automatic_startup_restore() {
+        let snapshot = rusterm_core::SessionState {
+            schema_version: 1,
+            saved_at: chrono::Utc::now(),
+            active_session: None,
+            sessions: vec![rusterm_core::PersistedSession {
+                id: "connected".to_string(),
+                name: "connected".to_string(),
+                kind: SessionType::Ssh,
+                hostname: Some("example.test".to_string()),
+                connection_id: Some("connection".to_string()),
+                cwd: None,
+                command_history_tail: Vec::new(),
+                terminal_size: None,
+            }],
+            theme: None,
+        };
+
+        let candidate = startup_restore_candidate(true, Some(snapshot));
+
+        assert!(
+            candidate.is_some(),
+            "legacy prompt preference must not disable recovery"
+        );
+    }
+
+    #[test]
+    fn empty_snapshot_does_not_trigger_startup_restore() {
+        let snapshot = rusterm_core::SessionState {
+            schema_version: 1,
+            saved_at: chrono::Utc::now(),
+            active_session: None,
+            sessions: Vec::new(),
+            theme: None,
+        };
+
+        assert!(startup_restore_candidate(false, Some(snapshot)).is_none());
+    }
+
+    #[test]
     fn local_shell_integration_does_not_send_full_script_through_pty() {
         let setup = shell_integration_setup();
 
@@ -12002,10 +12041,24 @@ fn open_local_terminal(
     start_shell_connection(state, input_senders, session_id, shell_config);
 }
 
+/// Return the non-empty snapshot that should be restored immediately after
+/// unlock.
+///
+/// `restore_disabled` is intentionally ignored. It is a legacy preference for
+/// the removed confirmation modal, not a durable logout signal. Whether a
+/// terminal should return is recorded by snapshot membership instead.
+
+fn startup_restore_candidate(
+    _legacy_restore_disabled: bool,
+    loaded: Option<rusterm_core::SessionState>,
+) -> Option<rusterm_core::SessionState> {
+    loaded.filter(|snapshot| !snapshot.sessions.is_empty())
+}
+
 /// Restore sessions from a saved `SessionState` snapshot.
 ///
-/// Called when the user picks "恢复" on the restore dialog. For each
-/// `PersistedSession` in the snapshot:
+/// Called automatically after unlock when a non-empty snapshot was loaded.
+/// For each `PersistedSession` in the snapshot:
 ///
 /// 1. Look up the matching `ConnectionConfig` by `connection_id` (for SSH/
 ///    Telnet/Tcp) or build a default `ShellConfig` (for Shell).
@@ -12267,16 +12320,11 @@ fn save_layout_snapshot(state: &Signal<AppState>) {
 /// command-history tails, terminal sizes) is persisted.
 ///
 /// Best-effort: failures (no master key, encrypt/write error) are logged but
-/// never block the exit. No-op when `restore_disabled` is set or there are no
-/// sessions — mirrors the gating in `AppState::save_session_state`.
+/// never block the exit. Empty snapshots are still written so a previous
+/// logged-in state cannot be restored after the user has disconnected or
+/// closed every terminal.
 fn save_session_state_snapshot(state: &Signal<AppState>) {
     let s = state.read();
-    if s.restore_disabled {
-        return;
-    }
-    if s.sessions.is_empty() {
-        return;
-    }
     let Some(cm) = s.config_manager.as_ref() else {
         return;
     };
@@ -12345,23 +12393,6 @@ fn schedule_cd_after_restore(
         // the signal alive in this async context.
         let _ = state.read().sessions.len();
     });
-}
-
-/// Save settings.json (specifically the `restore_disabled` flag) without
-/// touching connections or OneKeys. Used when the user picks "不再询问" on
-/// the restore dialog.
-fn save_settings(state: &Signal<AppState>) {
-    let cm = match state.read().config_manager.clone() {
-        Some(cm) => cm,
-        None => {
-            tracing::error!("ConfigManager not initialized, cannot save settings");
-            return;
-        }
-    };
-    let restore_disabled = state.read().restore_disabled;
-    if let Err(e) = cm.save_restore_disabled(restore_disabled) {
-        tracing::error!("Failed to save restore_disabled flag: {}", e);
-    }
 }
 
 /// Stable destination for a connection opened into a pane.
@@ -13769,10 +13800,9 @@ pub fn App() -> Element {
     // graceful shutdown. 30s is a balance between not losing too much state
     // and not hammering the disk with encrypted writes.
     //
-    // We skip saving while:
-    // - The app is still locked (no master key available yet)
-    // - `restore_disabled` is true (user picked "不再询问" earlier)
-    // - There are no sessions open (nothing to save)
+    // We skip saving only while the app is locked (no master key available).
+    // Empty snapshots are intentionally persisted: they record that no terminal
+    // was logged in and prevent an older non-empty snapshot from being restored.
     //
     // The save itself is atomic (temp + rename) so concurrent saves from
     // multiple sources (this loop + the close handler) can't corrupt the
@@ -13784,12 +13814,6 @@ pub fn App() -> Element {
 
             let s = state_for_save.read();
             if s.unlock_state != UnlockState::Unlocked {
-                continue;
-            }
-            if s.restore_disabled {
-                continue;
-            }
-            if s.sessions.is_empty() {
                 continue;
             }
             let Some(cm) = s.config_manager.as_ref() else {
@@ -13888,10 +13912,25 @@ pub fn App() -> Element {
                                     }
                                 };
                                 let onekey_preferences = cm.load_onekey_preferences();
+                                // Decrypt the previous snapshot before moving the
+                                // ConfigManager into AppState. The snapshot contains
+                                // only terminals that were still connected at the
+                                // last save, so its presence is the startup trigger.
+                                let loaded_session_state =
+                                    match rusterm_core::SessionState::load(&cm.master_key()) {
+                                        Ok(loaded) => loaded,
+                                        Err(e) => {
+                                            tracing::warn!(
+                                                "Failed to load saved session state (will skip restore): {}",
+                                                e
+                                            );
+                                            None
+                                        }
+                                    };
                                 let mut s = state.write();
-                                // Load the persisted `restore_disabled` flag from
-                                // settings.json so we know whether to even
-                                // attempt loading `session_state.enc`.
+                                // Keep reading the legacy dialog preference for
+                                // settings compatibility. It no longer gates
+                                // persistence or automatic startup recovery.
                                 s.restore_disabled = cm.load_restore_disabled();
                                 s.confirm_close_on_exit = cm.load_confirm_close_on_exit();
                                 s.comparison_diff_warning_enabled =
@@ -13949,45 +13988,25 @@ pub fn App() -> Element {
                                     }
                                 }
 
-                                // Load saved session state (if any) and prepare
-                                // the restore-confirmation modal. We DON'T
-                                // restore here — the user gets to decide via the
-                                // modal (3 buttons: 恢复 / 跳过 / 不再询问).
-                                // If `restore_disabled` was already true (from
-                                // a previous "不再询问" choice that survived
-                                // because it's persisted in settings.json),
-                                // we skip the load entirely — no point in
-                                // decrypting a file we'll never restore from.
-                                if !s.restore_disabled {
-                                    if let Some(cm_ref) = s.config_manager.as_ref() {
-                                        let master_key = cm_ref.master_key();
-                                        match rusterm_core::SessionState::load(&master_key) {
-                                            Ok(Some(loaded)) => {
-                                                tracing::info!(
-                                                    "Loaded saved session state: {} sessions, saved at {}",
-                                                    loaded.sessions.len(),
-                                                    loaded.saved_at
-                                                );
-                                                s.restore_pending = Some(loaded);
-                                            }
-                                            Ok(None) => {
-                                                // First launch or no saved state — fine, nothing to restore.
-                                                tracing::debug!("No saved session state found");
-                                            }
-                                            Err(e) => {
-                                                // Corrupt/tampered/wrong key —
-                                                // log and continue without
-                                                // prompting. Better to silently
-                                                // skip than to nag the user
-                                                // about a corrupt file they
-                                                // can't do anything about.
-                                                tracing::warn!(
-                                                    "Failed to load saved session state (will skip restore): {}",
-                                                    e
-                                                );
-                                            }
-                                        }
-                                    }
+                                // Automatic startup recovery. The legacy
+                                // `restore_disabled` flag controlled the old modal;
+                                // it must not permanently suppress saving/loading.
+                                // An empty snapshot means no terminal was logged in
+                                // at exit and therefore intentionally does nothing.
+                                let startup_restore = startup_restore_candidate(
+                                    s.restore_disabled,
+                                    loaded_session_state,
+                                );
+                                drop(s);
+                                if let Some(to_restore) = startup_restore {
+                                    tracing::info!(
+                                        "Automatically restoring {} logged-in session(s), saved at {}",
+                                        to_restore.sessions.len(),
+                                        to_restore.saved_at
+                                    );
+                                    restore_sessions(state, input_senders, to_restore);
+                                } else {
+                                    tracing::debug!("No logged-in session state found for startup restore");
                                 }
                             }
                             Err(e) => {
@@ -15255,50 +15274,6 @@ pub fn App() -> Element {
             RelayPanel {
                 state,
                 on_close: move |_| modal.set(Modal::None),
-            }
-        }
-
-        // ── Session-state restore dialog (feature #17) ─────────────────────
-        // Shown after unlock if `session_state.enc` was loaded successfully.
-        // Three actions (see `RestoreSessionDialog`):
-        //   恢复     → restore each session + `cd <last_cwd>`
-        //   跳过     → clear without restoring
-        //   不再询问 → clear + set `restore_disabled = true` (also deletes
-        //             the saved state file so we don't re-prompt)
-        //
-        // The restore action is non-destructive: we only reconnect sessions
-        // and send a single `cd` per session. We NEVER re-execute past
-        // commands or scripts — the user explicitly asked us not to.
-        if let Some(loaded) = state.read().restore_pending.clone() {
-            RestoreSessionDialog {
-                session_count: loaded.sessions.len(),
-                saved_at: loaded.saved_at.format("%Y-%m-%d %H:%M").to_string(),
-                on_restore: move |_| {
-                    // Take the pending state out so we don't re-show the dialog.
-                    let to_restore = state.write().restore_pending.take();
-                    if let Some(to_restore) = to_restore {
-                        restore_sessions(state, input_senders, to_restore);
-                    }
-                },
-                on_skip: move |_| {
-                    // Just clear the pending state — don't restore, don't
-                    // disable future prompts.
-                    state.write().restore_pending = None;
-                },
-                on_never_ask: move |_| {
-                    // Clear pending + disable future prompts + delete the
-                    // saved state file so we don't re-prompt on next launch
-                    // either.
-                    state.write().restore_pending = None;
-                    state.write().restore_disabled = true;
-                    if let Err(e) = rusterm_core::SessionState::delete() {
-                        tracing::warn!("Failed to delete session state file: {}", e);
-                    }
-                    // Persist the `restore_disabled` flag so it survives
-                    // across launches. We piggyback on the existing settings
-                    // save path (writes settings.json).
-                    save_settings(&state);
-                },
             }
         }
 

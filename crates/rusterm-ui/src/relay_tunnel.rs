@@ -79,6 +79,66 @@ fn read_connections() -> Vec<ConnectionConfig> {
         .unwrap_or_default()
 }
 
+// ── Live session registry (for relay exec reuse) ─────────────────────────
+//
+// When a user has an SSH session open in the UI (already navigated through
+// the bastion menu to the target node), the relay executor can reuse that
+// live PTY instead of opening a fresh connection. This registry mirrors
+// the UI's `ssh_sessions` + `session_configs` maps so the executor can find
+// a connected session by host_id.
+
+/// A live session entry available for command reuse.
+#[derive(Clone)]
+pub struct LiveSessionEntry {
+    /// The SSH session handle (holds the authenticated russh client +
+    /// output tap mechanism).
+    pub session: rusterm_ssh::SshSession,
+    /// The input sender for injecting keystrokes into the PTY.
+    pub input_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    /// The connection id this session was opened from.
+    pub connection_id: String,
+}
+
+static SESSION_REGISTRY: OnceLock<RwLock<Vec<LiveSessionEntry>>> = OnceLock::new();
+
+fn session_registry() -> &'static RwLock<Vec<LiveSessionEntry>> {
+    SESSION_REGISTRY.get_or_init(|| RwLock::new(Vec::new()))
+}
+
+/// Mirror live sessions into the shared registry. Called by the UI whenever
+/// sessions are opened, closed, or their connection mapping changes.
+pub fn sync_session_registry(entries: Vec<LiveSessionEntry>) {
+    if let Ok(mut guard) = session_registry().write() {
+        *guard = entries;
+    }
+}
+
+/// Find a live connected session for the given `host_id` (matched against
+/// both connection id and connection name).
+fn find_live_session(host_id: &str) -> Option<LiveSessionEntry> {
+    let guard = session_registry().read().ok()?;
+    guard
+        .iter()
+        .find(|entry| entry.connection_id == host_id)
+        .cloned()
+        .or_else(|| {
+            // Fall back to matching by connection name.
+            let connections = read_connections();
+            let target_name = connections
+                .iter()
+                .find(|c| c.id == host_id)
+                .map(|c| c.name.clone())?;
+            guard
+                .iter()
+                .find(|entry| {
+                    connections
+                        .iter()
+                        .any(|c| c.id == entry.connection_id && c.name == target_name)
+                })
+                .cloned()
+        })
+}
+
 // ── Short-lived sudo credential lease ───────────────────────────────────
 //
 // The lease TTL is a local upper bound, not a mirror of the remote sudo
@@ -462,12 +522,112 @@ impl RelayHistoryStore for AppRelayHistoryStore {
     }
 }
 
-/// Runs validated relay commands against saved SSH hosts. One fresh SSH
-/// connection per request: simple, honest about cost, and naturally
-/// rebound after remote host changes — the rate limiter keeps the cost of
-/// connection-per-call bounded for abusive clients.
+/// Runs validated relay commands against saved SSH hosts. Tries to reuse
+/// an already-connected UI session first (which has already navigated the
+/// bastion menu); falls back to a fresh SSH connection if no live session
+/// is available.
 #[derive(Debug, Default)]
 pub struct AppRelayExecutor;
+
+/// Execute a command by reusing a live UI session's interactive PTY.
+///
+/// The session is already logged in (possibly behind a bastion host the
+/// user manually navigated). We:
+/// 1. Install an output tap on the session.
+/// 2. Send a sentinel-wrapped command via the session's input sender.
+/// 3. Collect output until the sentinel completion marker appears.
+/// 4. Remove the tap and parse stdout + exit code.
+///
+/// Returns `Ok(Some(outcome))` if a live session was used, `Ok(None)` if
+/// no live session is available (caller falls back to fresh connect).
+async fn exec_via_live_session(
+    entry: &LiveSessionEntry,
+    command: &str,
+    timeout: Duration,
+) -> Result<ExecOutcome, String> {
+    use rusterm_ssh::direct::{find_complete_rc_marker, random_sentinel_hex, strip_echoed_wrapper};
+
+    let started = Instant::now();
+    let sentinel = format!("RUSTERM_PTY_{}", random_sentinel_hex());
+    let rc_tag = format!("{sentinel}_RC_");
+
+    // Install the output tap BEFORE sending anything so we don't miss
+    // the command echo or early output chunks.
+    let mut tap_rx = entry.session.install_output_tap();
+
+    // Build the wrapper command. We use the same pattern as the PTY exec
+    // path: `{ command ; } ; __rc=$? ; printf '\n<tag>%d\n' "$__rc"`.
+    let wrapped = format!(
+        "{{ {command} ; }} ; __rc=$? ; printf '\\n{tag}%d\\n' \"$__rc\"\r",
+        command = command,
+        tag = rc_tag,
+    );
+
+    tracing::info!(
+        "[relay] reusing live session {} for exec",
+        entry.session.session_id()
+    );
+
+    // Inject the command into the live PTY.
+    entry
+        .input_tx
+        .send(wrapped.into_bytes())
+        .map_err(|e| format!("failed to send command to session: {e}"))?;
+
+    // Collect output until we see the sentinel marker or timeout.
+    let mut raw: Vec<u8> = Vec::new();
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+
+    let mut timed_out = false;
+    let mut truncated = false;
+    const MAX_TAP_OUTPUT: usize = 1024 * 1024; // 1 MiB
+
+    loop {
+        tokio::select! {
+            biased;
+            Some(data) = tap_rx.recv() => {
+                if raw.len() < MAX_TAP_OUTPUT {
+                    raw.extend_from_slice(&data);
+                } else {
+                    truncated = true;
+                }
+                if find_complete_rc_marker(&raw, &rc_tag).is_some() {
+                    break;
+                }
+            }
+            _ = &mut deadline => {
+                timed_out = true;
+                break;
+            }
+        }
+    }
+
+    // Always clean up the tap.
+    entry.session.remove_output_tap();
+
+    // Parse the captured output using the same logic as the PTY exec path.
+    let marker = find_complete_rc_marker(&raw, &rc_tag);
+    let exit_code = marker.map(|(_, code)| code);
+
+    let stdout = if let Some((tag_idx, _)) = marker {
+        let before = String::from_utf8_lossy(&raw[..tag_idx]);
+        let before = before.trim_end_matches(['\r', '\n', ' ']);
+        strip_echoed_wrapper(before).into_owned()
+    } else {
+        // No valid sentinel — return best-effort raw output.
+        String::from_utf8_lossy(&raw).into_owned()
+    };
+
+    Ok(ExecOutcome {
+        exit_code,
+        stdout,
+        stderr: String::new(), // PTY merges stderr into stdout
+        timed_out,
+        truncated,
+        duration_ms: started.elapsed().as_millis() as u64,
+    })
+}
 
 #[async_trait]
 impl RelayExecutor for AppRelayExecutor {
@@ -485,6 +645,85 @@ impl RelayExecutor for AppRelayExecutor {
         elevated: bool,
         timeout: Duration,
     ) -> Result<ExecOutcome, ExecutorError> {
+        // ── Fast path: reuse a live UI session if one exists. ──
+        //
+        // If the user has an SSH tab open that's already connected to this
+        // host (and has navigated through any bastion menu), we inject the
+        // command directly into that interactive PTY. This avoids re-opening
+        // a connection, re-authenticating, and re-navigating the bastion.
+        //
+        // For elevated commands, the live-session path sends the sudo
+        // password via the PTY if needed. The session's PTY echo state is
+        // managed by the remote shell, so we don't need stty tricks here.
+        if let Some(entry) = find_live_session(host_id) {
+            let actual_command = if elevated {
+                sudo_command(command, false)
+            } else {
+                command.to_string()
+            };
+            match exec_via_live_session(&entry, &actual_command, timeout).await {
+                Ok(outcome) => {
+                    // Check for sudo auth failure on elevated commands.
+                    if elevated
+                        && sudo_authorization_failed(&ExecResult {
+                            exit_code: outcome.exit_code,
+                            stdout: outcome.stdout.clone().into_bytes(),
+                            stderr: outcome.stderr.clone().into_bytes(),
+                            timed_out: outcome.timed_out,
+                            truncated: outcome.truncated,
+                        })
+                    {
+                        // Try with cached sudo credential.
+                        let (credential_key, _) = read_connections()
+                            .into_iter()
+                            .find_map(|conn| {
+                                if conn.id == host_id || conn.name == host_id {
+                                    sudo_credential_key(&conn).map(|k| (k, conn))
+                                } else {
+                                    None
+                                }
+                            })
+                            .ok_or_else(|| {
+                                ExecutorError::ElevationRequired("host not found".to_string())
+                            })?;
+                        let lookup =
+                            sudo_credentials().get_with_status(&credential_key, Instant::now());
+                        match lookup {
+                            SudoCredentialLookup::Hit(credential) => {
+                                let password_command = sudo_command(command, true);
+                                // Send password followed by the command.
+                                let combined =
+                                    format!("{}\n{}", credential.as_str(), password_command);
+                                let outcome = exec_via_live_session(&entry, &combined, timeout)
+                                    .await
+                                    .map_err(ExecutorError::Exec)?;
+                                sudo_credentials().touch(&credential_key, Instant::now());
+                                return Ok(outcome);
+                            }
+                            SudoCredentialLookup::Expired => {
+                                return Err(ExecutorError::ElevationRequired(crate::i18n::t(
+                                    "relay.sudo_authorization_expired",
+                                )));
+                            }
+                            SudoCredentialLookup::Missing => {
+                                return Err(ExecutorError::ElevationRequired(crate::i18n::t(
+                                    "relay.sudo_authorization_unavailable",
+                                )));
+                            }
+                        }
+                    }
+                    return Ok(outcome);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "[relay] live-session exec failed for {host_id}: {e}; falling back to fresh connect"
+                    );
+                    // Fall through to the fresh-connect path below.
+                }
+            }
+        }
+
+        // ── Slow path: fresh SSH connection (existing behaviour). ──
         let (credential_key, ssh, login_script) = read_connections()
             .into_iter()
             .find_map(|conn| {

@@ -358,21 +358,17 @@ pub struct AppState {
 
     // ── Session-state restore (feature #17) ─────────────────────────────
     //
-    // On unlock we load `session_state.enc` (if it exists) and stash the
-    // decrypted `SessionState` here. The UI renders a restore-confirmation
-    // modal while this is `Some`; the three modal buttons clear it.
-    //   - 恢复 (Restore):   reconnect each session + `cd <cwd>`
-    //   - 跳过 (Skip):      clear without restoring
-    //   - 不再询问 (Never):  clear + set `restore_disabled = true` in settings
+    // Recovery is automatic after unlock. The snapshot contains only sessions
+    // that were `Connected` at the last save; restore never re-executes past
+    // commands or scripts — only a safe `cd` to the last reported directory.
     //
-    // We deliberately never re-execute past commands or scripts — only
-    // `cd`, which is side-effect-free. See `session_state.rs` docs.
+    // Kept for deserialization/API compatibility with the old confirmation
+    // modal. It is no longer populated by the startup path.
     #[serde(skip)]
     pub restore_pending: Option<rusterm_core::SessionState>,
-    /// Set when the user picks "不再询问" so we never re-prompt (and stop
-    /// saving session state entirely). Persisted in `settings.json` so the
-    /// choice survives across launches. The user can re-enable via the
-    /// settings panel (future work).
+    /// Legacy "don't ask again" preference. Automatic recovery deliberately
+    /// ignores this value so an old choice cannot permanently suppress session
+    /// persistence and startup restore.
     pub restore_disabled: bool,
     /// Whether to show the "是否确实要关闭本软件？" confirmation dialog when
     /// the user closes the last window. Default true (safe default — always
@@ -814,6 +810,10 @@ impl AppState {
     /// Build a `SessionState` snapshot from the current app state, suitable
     /// for saving to `session_state.enc`.
     ///
+    /// Only terminals whose runtime state is `Connected` are captured. This
+    /// makes snapshot membership the durable record of which terminals were
+    /// logged in when the app last exited.
+    ///
     /// Captures, per session:
     /// - id, name, kind, hostname, connection_id
     /// - cwd (last reported by the shell via OSC 7 — `None` if the shell
@@ -834,6 +834,16 @@ impl AppState {
             .sessions
             .iter()
             .filter(|tab| self.bottom_shell_session_id.as_deref() != Some(tab.id.as_str()))
+            // Presence in the encrypted snapshot is the durable record that
+            // this terminal was logged in when the app last exited. Tabs that
+            // were already disconnected are deliberately omitted so startup
+            // recovery does not resurrect sessions the user had logged out of.
+            .filter(|tab| {
+                matches!(
+                    self.session_connection_states.get(&tab.id),
+                    Some(SessionConnectionState::Connected)
+                )
+            })
             .map(|tab| {
                 // Tail of command history — last 100 entries, display-only.
                 let history_tail: Vec<String> = if tab.command_history.len() > 100 {
@@ -904,13 +914,11 @@ impl AppState {
     ///
     /// `master_key` is the AES-256-GCM key derived from the master password;
     /// comes from `ConfigManager::master_key()`.
+    ///
+    /// The legacy `restore_disabled` flag only represented whether to show the
+    /// old confirmation prompt. It no longer suppresses persistence or
+    /// automatic recovery.
     pub fn save_session_state(&self, master_key: &[u8; 32]) -> anyhow::Result<()> {
-        if self.restore_disabled {
-            // User explicitly disabled restore — don't save, don't re-prompt.
-            // If they want to re-enable, they can do so from settings (future
-            // work: a settings toggle that clears `restore_disabled`).
-            return Ok(());
-        }
         let state = self.build_session_state(self.theme_name());
         state.save(master_key)
     }
@@ -3135,6 +3143,9 @@ mod tests {
         let mut state = state_with_tabs(&["workspace", "embedded-shell"]);
         state.bottom_shell_session_id = Some("embedded-shell".to_string());
         state.active_session = Some("embedded-shell".to_string());
+        state
+            .session_connection_states
+            .insert("workspace".to_string(), SessionConnectionState::Connected);
 
         let snapshot = state.build_session_state("Default Dark");
 
@@ -3159,6 +3170,55 @@ mod tests {
 
         assert!(snapshot.sessions.is_empty());
         assert_eq!(snapshot.active_session, None);
+    }
+
+    #[test]
+    fn session_snapshot_roundtrip_restores_only_terminals_logged_in_at_exit() {
+        let mut state = state_with_tabs(&["connected", "disconnected"]);
+        state.active_session = Some("disconnected".to_string());
+        state
+            .session_connection_states
+            .insert("connected".to_string(), SessionConnectionState::Connected);
+        state.session_connection_states.insert(
+            "disconnected".to_string(),
+            SessionConnectionState::Disconnected,
+        );
+
+        let snapshot = state.build_session_state("Default Dark");
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("session_state.enc");
+        let key = [7_u8; 32];
+        snapshot.save_to(&path, &key).unwrap();
+        let loaded = rusterm_core::SessionState::load_from(&path, &key)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(
+            loaded
+                .sessions
+                .iter()
+                .map(|session| session.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["connected"]
+        );
+        assert_eq!(loaded.active_session.as_deref(), Some("connected"));
+
+        // A later save after the final terminal disconnects must overwrite the
+        // earlier non-empty snapshot. Otherwise a subsequent launch would
+        // resurrect a stale login.
+        state.session_connection_states.insert(
+            "connected".to_string(),
+            SessionConnectionState::Disconnected,
+        );
+        state
+            .build_session_state("Default Dark")
+            .save_to(&path, &key)
+            .unwrap();
+        let logged_out = rusterm_core::SessionState::load_from(&path, &key)
+            .unwrap()
+            .unwrap();
+        assert!(logged_out.sessions.is_empty());
+        assert_eq!(logged_out.active_session, None);
     }
 
     /// move_session_to_leftmost must relocate the matching tab to index 0.

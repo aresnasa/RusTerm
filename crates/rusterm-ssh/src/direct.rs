@@ -797,47 +797,45 @@ impl DirectHandle {
         // Data and ExtendedData; for a PTY, sshd typically sends everything
         // via Data, but we merge both to be safe.
         let mut raw: Vec<u8> = Vec::new();
-        let mut saw_sentinel = false;
+        let mut closed_before_marker = false;
 
         loop {
             match channel.wait().await {
                 Some(ChannelMsg::Data { data }) => {
-                    let combined = raw.len();
-                    if combined < MAX_EXEC_OUTPUT {
+                    if raw.len() < MAX_EXEC_OUTPUT {
                         raw.extend_from_slice(&data);
                     } else {
                         result.truncated = true;
-                    }
-                    // Cheap early-exit: stop reading once the sentinel is
-                    // visible in the stream. We still drain one more iteration
-                    // in case the exit-code digits straddle a Data boundary.
-                    if let Some(idx) = find_subsequence(&raw, rc_tag.as_bytes()) {
-                        saw_sentinel = true;
-                        // Check whether the trailing newline (end of the
-                        // sentinel line) is already in the buffer.
-                        let after_tag = &raw[idx + rc_tag.len()..];
-                        if after_tag.contains(&b'\n') {
-                            break;
-                        }
                     }
                 }
                 Some(ChannelMsg::ExtendedData { data, ext: _ }) => {
                     // PTY sessions usually funnel stderr through Data; merge
                     // ExtendedData too for completeness.
-                    let combined = raw.len();
-                    if combined < MAX_EXEC_OUTPUT {
+                    if raw.len() < MAX_EXEC_OUTPUT {
                         raw.extend_from_slice(&data);
                     } else {
                         result.truncated = true;
                     }
                 }
-                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => break,
+                Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
+                    closed_before_marker = true;
+                    break;
+                }
                 _ => {}
+            }
+
+            // The echoed wrapper contains `<rc_tag>%d`, so the tag alone is
+            // not a completion signal. Wait for an actual decimal status and
+            // its terminating newline; the parser also handles split chunks.
+            if find_complete_rc_marker(&raw, rc_tag).is_some() {
+                break;
             }
         }
 
-        let _ = saw_sentinel; // used only for control flow above
         Self::extract_pty_output(&raw, rc_tag, result);
+        if closed_before_marker && result.exit_code.is_none() {
+            anyhow::bail!("PTY channel closed before command completion marker");
+        }
         Ok(())
     }
 
@@ -853,39 +851,17 @@ impl DirectHandle {
     /// <prompt>
     /// ```
     ///
-    /// Strategy: find the *last* occurrence of `rc_tag`. The exit code is the
-    /// decimal digits immediately after it (up to the next newline). Stdout
-    /// is everything *after* the first occurrence of the echoed command
-    /// newline up to the sentinel line. If the sentinel is absent (channel
-    /// closed prematurely), keep the entire raw stream as stdout with no exit
-    /// code — this matches the headless `exec` behaviour for a killed process.
+    /// Strategy: accept only a complete marker containing decimal exit-code
+    /// digits followed by `\r?\n`. The echoed wrapper contains
+    /// `<rc_tag>%d`, which must never be interpreted as command completion.
+    /// If the sentinel is absent, keep the entire raw stream as best-effort
+    /// stdout; the caller decides whether premature channel closure is fatal.
     fn extract_pty_output(raw: &[u8], rc_tag: &str, result: &mut ExecResult) {
-        let raw_str = String::from_utf8_lossy(raw);
+        let marker = find_complete_rc_marker(raw, rc_tag);
 
-        // 1) Exit code: digits between `rc_tag` and the next newline.
-        if let Some(tag_idx) = raw_str.rfind(rc_tag) {
-            let after = &raw_str[tag_idx + rc_tag.len()..];
-            // Collect leading decimal digits (the exit code). tolerate an
-            // optional leading space.
-            let digits: String = after
-                .trim_start()
-                .chars()
-                .take_while(|c| c.is_ascii_digit())
-                .collect();
-            if let Ok(code) = digits.parse::<u32>() {
-                result.exit_code = Some(code);
-            }
-        }
-
-        // 2) Stdout: the content between the command echo and the sentinel.
-        //    Use `rfind` (last occurrence) because the echoed wrapper command
-        //    contains the `rc_tag` literally inside its `printf '\n<tag>...'`
-        //    format string — the *real* sentinel is the last occurrence,
-        //    which is followed by digits and a newline. Walking back from
-        //    there drops the trailing blank line that `printf '\n...'`
-        //    injects before the marker, plus any prompt.
-        let stdout = if let Some(tag_idx) = raw_str.rfind(rc_tag) {
-            let before = &raw_str[..tag_idx];
+        let stdout = if let Some((tag_idx, exit_code)) = marker {
+            result.exit_code = Some(exit_code);
+            let before = String::from_utf8_lossy(&raw[..tag_idx]);
             // Drop trailing CR/LF and whitespace.
             let before = before.trim_end_matches(['\r', '\n', ' ']);
             // Strip the echoed wrapper command line(s). The marker `__rc=$?`
@@ -893,8 +869,8 @@ impl DirectHandle {
             // echoed command — never real command output.
             strip_echoed_wrapper(before)
         } else {
-            // No sentinel — keep raw stream as stdout (best-effort).
-            raw_str.to_string()
+            // No valid sentinel — never strip at an echoed `%d` placeholder.
+            String::from_utf8_lossy(raw).into_owned()
         };
 
         result.stdout = stdout.into_bytes();
@@ -1200,7 +1176,7 @@ fn shell_ready_probe(token: &str) -> (String, String) {
 /// Uses the process nanosecond timer + thread id as a fallback when the
 /// `getrandom` crate isn't pulled in — sufficient entropy to avoid output
 /// collisions in any plausible command output.
-fn random_sentinel_hex() -> String {
+pub fn random_sentinel_hex() -> String {
     // Prefer the OS RNG when available; fall back to a time+thread mix.
     // Both paths yield 8 bytes → 16 hex chars.
     let bytes: [u8; 8] = match try_os_random() {
@@ -1260,6 +1236,54 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack.windows(needle.len()).position(|w| w == needle)
 }
 
+/// Find the last complete PTY exit-code marker.
+///
+/// A valid marker is exactly `<rc_tag><digits>\r?\n`. In particular, this
+/// rejects the `<rc_tag>%d\n` format string echoed as part of the shell
+/// wrapper before the business command has run.
+pub fn find_complete_rc_marker(raw: &[u8], rc_tag: &str) -> Option<(usize, u32)> {
+    let tag = rc_tag.as_bytes();
+    if tag.is_empty() || tag.len() >= raw.len() {
+        return None;
+    }
+
+    let mut search_from = 0;
+    let mut last_complete = None;
+    while search_from + tag.len() < raw.len() {
+        let Some(relative) = find_subsequence(&raw[search_from..], tag) else {
+            break;
+        };
+        let tag_idx = search_from + relative;
+        let mut cursor = tag_idx + tag.len();
+        let digits_start = cursor;
+        let mut exit_code = 0_u32;
+        let mut overflowed = false;
+
+        while cursor < raw.len() && raw[cursor].is_ascii_digit() {
+            match exit_code
+                .checked_mul(10)
+                .and_then(|value| value.checked_add(u32::from(raw[cursor] - b'0')))
+            {
+                Some(value) => exit_code = value,
+                None => overflowed = true,
+            }
+            cursor += 1;
+        }
+
+        let has_digits = cursor > digits_start;
+        if cursor < raw.len() && raw[cursor] == b'\r' {
+            cursor += 1;
+        }
+        if has_digits && !overflowed && cursor < raw.len() && raw[cursor] == b'\n' {
+            last_complete = Some((tag_idx, exit_code));
+        }
+
+        search_from = tag_idx + tag.len();
+    }
+
+    last_complete
+}
+
 /// Heuristic: does this [`ExecResult`] look like the server rejected the
 /// `exec` channel? Matches the literal JumpServer message and the generic
 /// markers we already detect in `SshSession::fetch_via_exec`.
@@ -1288,7 +1312,7 @@ fn looks_like_exec_rejected(result: &ExecResult) -> bool {
 /// real command output. We also strip a leading prompt-only fragment
 /// (`$ `, `# `, `> `) from the first surviving line so the returned stdout
 /// starts cleanly at the command's actual output.
-fn strip_echoed_wrapper(s: &str) -> String {
+pub fn strip_echoed_wrapper(s: &str) -> String {
     s.split('\n')
         .filter(|line| {
             let trimmed = line.trim_matches(['\r', ' ']);
@@ -1365,6 +1389,65 @@ mod tests {
         assert_eq!(find_subsequence(b"hello", b""), None);
         assert_eq!(find_subsequence(b"abc", b"abcd"), None);
         assert_eq!(find_subsequence(b"abc", b"abc"), Some(0));
+    }
+
+    #[test]
+    fn complete_rc_marker_rejects_echoed_wrapper_placeholder() {
+        let tag = "RUSTERM_PTY_0123456789abcdef_RC_";
+        let raw = b"$ { uname -a ; } ; __rc=$? ; printf '\\nRUSTERM_PTY_0123456789abcdef_RC_%d\\n' \"$__rc\"\r\n";
+
+        assert_eq!(find_complete_rc_marker(raw, tag), None);
+    }
+
+    #[test]
+    fn complete_rc_marker_selects_real_marker_after_echo() {
+        let tag = "RUSTERM_PTY_0123456789abcdef_RC_";
+        let raw = b"$ printf 'RUSTERM_PTY_0123456789abcdef_RC_%d\\n' \"$__rc\"\r\ncommand output\r\nRUSTERM_PTY_0123456789abcdef_RC_0\r\n";
+
+        assert_eq!(
+            find_complete_rc_marker(raw, tag),
+            Some((raw.len() - tag.len() - 3, 0))
+        );
+    }
+
+    #[test]
+    fn complete_rc_marker_waits_for_digits_and_newline_across_chunks() {
+        let tag = "RUSTERM_PTY_0123456789abcdef_RC_";
+        let mut raw = format!("output\r\n{tag}").into_bytes();
+        assert_eq!(find_complete_rc_marker(&raw, tag), None);
+
+        raw.extend_from_slice(b"12");
+        assert_eq!(find_complete_rc_marker(&raw, tag), None);
+
+        raw.extend_from_slice(b"3\r");
+        assert_eq!(find_complete_rc_marker(&raw, tag), None);
+
+        raw.push(b'\n');
+        assert_eq!(find_complete_rc_marker(&raw, tag), Some((8, 123)));
+    }
+
+    #[test]
+    fn complete_rc_marker_parses_nonzero_exit_code() {
+        let tag = "RUSTERM_PTY_0123456789abcdef_RC_";
+        let raw = format!("{tag}127\n");
+
+        assert_eq!(find_complete_rc_marker(raw.as_bytes(), tag), Some((0, 127)));
+    }
+
+    #[test]
+    fn complete_rc_marker_survives_trailing_prompt_output() {
+        let tag = "RUSTERM_PTY_0123456789abcdef_RC_";
+        let raw = format!("{tag}0\r\n{}", "prompt ".repeat(20));
+
+        assert_eq!(find_complete_rc_marker(raw.as_bytes(), tag), Some((0, 0)));
+    }
+
+    #[test]
+    fn complete_rc_marker_rejects_similar_output() {
+        let tag = "RUSTERM_PTY_0123456789abcdef_RC_";
+        let raw = b"RUSTERM_PTY_0123456789abcdef_RC_not-a-code\nRUSTERM_PTY_other_RC_0\n";
+
+        assert_eq!(find_complete_rc_marker(raw, tag), None);
     }
 
     #[test]

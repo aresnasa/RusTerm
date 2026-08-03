@@ -1183,10 +1183,9 @@ pub struct PersistedConfig {
     pub onekey_preferences: Vec<OneKeyPreference>,
     #[serde(default)]
     pub master_password_hash: Option<String>,
-    /// Whether the user picked "不再询问" on the session-state restore dialog.
-    /// When true, we don't save session state and don't prompt on next launch.
-    /// The user can re-enable via settings (future work: a settings toggle).
-    /// Default false for backward compat — existing users get the prompt.
+    /// Legacy preference from the former session-restore confirmation dialog.
+    /// Retained for settings compatibility; automatic startup recovery no
+    /// longer lets this flag suppress session-state persistence or loading.
     #[serde(default)]
     pub restore_disabled: bool,
     /// Whether to show the "是否确实要关闭本软件？" confirmation dialog when the

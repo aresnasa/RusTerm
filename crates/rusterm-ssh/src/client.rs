@@ -173,10 +173,15 @@ impl SshClient {
         // Shared guard: only one task may send Disconnected
         let disconnected = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
+        // Optional output tap for relay exec reuse.
+        let output_tap: Arc<parking_lot::RwLock<Option<mpsc::UnboundedSender<Vec<u8>>>>> =
+            Arc::new(parking_lot::RwLock::new(None));
+
         // Output reader: forward data from SSH channel to event channel
         let sid_read = session_id.clone();
         let evt_read = self.event_tx.clone();
         let disconnected_read = disconnected.clone();
+        let tap_read = output_tap.clone();
         tokio::spawn(async move {
             let mut reader = read_half;
             // Track the last Data message to dedup against ExtendedData.
@@ -216,7 +221,14 @@ impl SshClient {
                     _ => continue,
                 };
 
-                let _ = evt_read.send(SessionEvent::Output(sid_read.clone(), bytes));
+                let _ = evt_read.send(SessionEvent::Output(sid_read.clone(), bytes.clone()));
+
+                // Forward to output tap if one is installed (relay exec
+                // reuse path). Cloning the bytes is cheap compared to the
+                // network round-trip and keeps the UI display unaffected.
+                if let Some(tap) = tap_read.read().as_ref() {
+                    let _ = tap.send(bytes);
+                }
             }
             if disconnected_read
                 .compare_exchange(
@@ -314,6 +326,7 @@ impl SshClient {
                 session_id,
                 event_tx: self.event_tx.clone(),
                 disconnected,
+                output_tap,
             },
         ))
     }
@@ -527,6 +540,11 @@ pub struct SshSession {
     session_id: String,
     event_tx: mpsc::UnboundedSender<SessionEvent>,
     disconnected: Arc<std::sync::atomic::AtomicBool>,
+    /// Optional output tap installed by the relay executor to capture
+    /// command output from the live interactive PTY. When `Some`, the
+    /// output reader task forwards every data chunk here in addition to
+    /// the normal UI event channel.
+    output_tap: Arc<parking_lot::RwLock<Option<mpsc::UnboundedSender<Vec<u8>>>>>,
 }
 
 impl std::fmt::Debug for SshSession {
@@ -592,6 +610,29 @@ impl SshSession {
             ));
         }
         Ok(())
+    }
+
+    /// The session/tab id used as the key in `ssh_sessions`.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Install a temporary output tap. Every data chunk the output reader
+    /// forwards to the UI event channel is also sent to the returned
+    /// receiver. Call [`remove_output_tap`] when done to stop forwarding.
+    ///
+    /// Only one tap may be active at a time; installing a new one replaces
+    /// the previous. The relay executor uses this to capture the output
+    /// of a sentinel-wrapped command injected into the live interactive PTY.
+    pub fn install_output_tap(&self) -> mpsc::UnboundedReceiver<Vec<u8>> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        *self.output_tap.write() = Some(tx);
+        rx
+    }
+
+    /// Remove the output tap if one is installed.
+    pub fn remove_output_tap(&self) {
+        *self.output_tap.write() = None;
     }
 
     /// Fetch remote shell history. Tries exec channel first, then falls back
