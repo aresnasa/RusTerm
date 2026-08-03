@@ -1442,6 +1442,48 @@ mod tests {
     }
 
     #[test]
+    fn template_form_prefill_uses_current_mode_input_as_body() {
+        // Each mode pulls from its own input field, trimmed, so opening the
+        // add-template form captures exactly what the user typed there.
+        let (label, body) =
+            template_form_prefill(CurlMode::Command, "  kubectl get nodes|wc -l  ", "s", "b64");
+        assert_eq!(body, "kubectl get nodes|wc -l");
+        // Command labels default to the command itself, like built-ins.
+        assert_eq!(label, "kubectl get nodes|wc -l");
+
+        let (label, body) =
+            template_form_prefill(CurlMode::Script, "cmd", "#!/bin/sh\nuptime\n", "b64");
+        assert_eq!(body, "#!/bin/sh\nuptime");
+        // Script bodies make poor labels; the user names those themselves.
+        assert_eq!(label, "");
+
+        let (label, body) = template_form_prefill(CurlMode::ScriptBase64, "cmd", "s", " QQ== ");
+        assert_eq!(body, "QQ==");
+        assert_eq!(label, "");
+    }
+
+    #[test]
+    fn template_form_prefill_truncates_long_command_labels() {
+        // The chip row must stay readable: long commands keep their full body
+        // but get an ellipsized label capped at TEMPLATE_LABEL_MAX_CHARS.
+        let long_cmd = "a".repeat(TEMPLATE_LABEL_MAX_CHARS + 5);
+        let (label, body) = template_form_prefill(CurlMode::Command, &long_cmd, "", "");
+        assert_eq!(body, long_cmd);
+        assert_eq!(label.chars().count(), TEMPLATE_LABEL_MAX_CHARS + 1);
+        assert!(label.ends_with('…'));
+
+        // Multi-byte safety: truncation counts chars, not bytes.
+        let cjk_cmd = "测".repeat(TEMPLATE_LABEL_MAX_CHARS + 3);
+        let (label, body) = template_form_prefill(CurlMode::Command, &cjk_cmd, "", "");
+        assert_eq!(body, cjk_cmd);
+        assert_eq!(label.chars().count(), TEMPLATE_LABEL_MAX_CHARS + 1);
+
+        // Short commands are used verbatim, no ellipsis.
+        let (label, _) = template_form_prefill(CurlMode::Command, "uptime", "", "");
+        assert_eq!(label, "uptime");
+    }
+
+    #[test]
     fn curl_includes_endpoint_user_and_body() {
         let curl = gen_curl(
             "http://127.0.0.1:8080",
