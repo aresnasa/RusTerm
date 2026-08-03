@@ -1089,8 +1089,22 @@ mod tests {
         }
     }
 
-    fn live_key(conn_id: &str, sess_id: &str) -> (String, String) {
-        (conn_id.to_string(), sess_id.to_string())
+    fn live_key(conn_id: &str, sess_id: &str) -> (String, String, bool) {
+        (conn_id.to_string(), sess_id.to_string(), true)
+    }
+
+    /// Registry entry for a tab whose login script failed/aborted or that
+    /// the operator navigated manually — reachable only via its exact
+    /// session-qualified selector.
+    fn manual_live_key(conn_id: &str, sess_id: &str) -> (String, String, bool) {
+        (conn_id.to_string(), sess_id.to_string(), false)
+    }
+
+    fn bastion_conn(id: &str, name: &str) -> ConnectionConfig {
+        ConnectionConfig {
+            login_script: Some("expect \"Opt>\"\nsend \"1\"".to_string()),
+            ..conn(id, name)
+        }
     }
 
     /// A session-qualified selector must resolve to the exact tab — never a

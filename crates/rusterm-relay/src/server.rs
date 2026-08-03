@@ -212,11 +212,16 @@ fn error_response_with_detail<'a>(
 /// Return only structured bastion-state diagnostics to API clients. Arbitrary
 /// SSH errors and raw PTY tails may contain internal paths, banners or echoed
 /// input, so they remain in local audit logs instead of crossing the API.
+/// Whitelisted markers:
+/// - `[bastion-pre-command]`: bastion navigation state diagnostics.
+/// - `[live-session-required]`: the selector targets a bastion tab that is
+///   no longer live; the executor refused the wrong-node fallback and the
+///   client needs to know why (actionable: reconnect the tab).
 fn safe_executor_detail(error: &ExecutorError) -> Option<String> {
     let ExecutorError::Exec(detail) = error else {
         return None;
     };
-    if !detail.contains("[bastion-pre-command]") {
+    if !detail.contains("[bastion-pre-command]") && !detail.contains("[live-session-required]") {
         return None;
     }
     let without_output = detail.split("; last_output=").next().unwrap_or(detail);
