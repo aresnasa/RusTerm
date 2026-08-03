@@ -287,6 +287,230 @@ impl DirectHandle {
         Ok(result)
     }
 
+    /// Like [`exec_via_pty`](Self::exec_via_pty) but first replays a login
+    /// script to navigate an interactive bastion / jump-host menu before
+    /// sending the actual command.
+    ///
+    /// Bastion hosts such as QiZhi (齐治交互终端) or JumpServer present a
+    /// multi-step asset-selection menu after login instead of a shell. A human
+    /// operator navigates by typing numbers (category → asset → account) until
+    /// they reach a shell on the target node. This method automates that flow
+    /// using the same `expect`/`send`/`delay` DSL as the UI login scripts.
+    ///
+    /// `login_steps` is the parsed login script (from
+    /// [`rusterm_core::parse_login_script`]). After the last step, the method
+    /// waits a short grace period for the target shell to initialise, then
+    /// sends the wrapped command with sentinel markers exactly like
+    /// `exec_via_pty`.
+    ///
+    /// `SendOneKey` steps require credential resolution that is not available
+    /// in the headless relay path; they are skipped with a warning.
+    pub async fn exec_via_pty_with_login(
+        &self,
+        command: &str,
+        stdin: Option<&[u8]>,
+        timeout: Duration,
+        login_steps: &[rusterm_core::LoginStep],
+    ) -> anyhow::Result<ExecResult> {
+        if login_steps.is_empty() {
+            return self.exec_via_pty(command, stdin, timeout).await;
+        }
+
+        tracing::info!(
+            "[relay] bastion login script active ({} steps), navigating menu before exec",
+            login_steps.len()
+        );
+
+        let sentinel = format!("RUSTERM_PTY_{}", random_sentinel_hex());
+        let rc_tag = format!("{sentinel}_RC_");
+
+        let mut channel = self.handle.channel_open_session().await?;
+        channel
+            .request_pty(
+                false,
+                "xterm",
+                80,
+                24,
+                0,
+                0,
+                &[
+                    (Pty::ECHO, 1),
+                    (Pty::ICANON, 1),
+                    (Pty::ISIG, 1),
+                    (Pty::IEXTEN, 1),
+                    (Pty::ICRNL, 1),
+                    (Pty::OPOST, 1),
+                    (Pty::ONLCR, 1),
+                    (Pty::ECHOE, 1),
+                    (Pty::ECHOK, 1),
+                    (Pty::ECHOCTL, 1),
+                    (Pty::ECHOKE, 1),
+                ],
+            )
+            .await?;
+        channel.request_shell(true).await?;
+
+        // ── Phase 1: Navigate the bastion menu via expect/send ─────────────
+        //
+        // The whole navigation is bounded by `timeout` so a mismatched expect
+        // can't hang the API call forever.
+        let nav_result =
+            tokio::time::timeout(timeout, self.drive_pty_login(&mut channel, login_steps)).await;
+
+        match nav_result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => {
+                let _ = channel.eof().await;
+                let _ = channel.close().await;
+                anyhow::bail!("bastion login navigation failed: {e:#}");
+            }
+            Err(_) => {
+                let _ = channel.eof().await;
+                let _ = channel.close().await;
+                anyhow::bail!("bastion login navigation timed out after {:?}", timeout);
+            }
+        }
+
+        // Give the target shell a moment to print its prompt / MOTD after the
+        // last menu selection lands.
+        tokio::time::sleep(Duration::from_millis(600)).await;
+
+        // ── Phase 2: Send the actual command with sentinel markers ──────────
+        if let Some(stdin) = stdin {
+            channel.data(stdin).await?;
+        }
+        let wrapped = format!(
+            "{{ {command} ; }} ; __rc=$? ; printf '\\n{tag}%d\\n' \"$__rc\"\n",
+            command = command,
+            tag = rc_tag,
+        );
+        channel.data(wrapped.as_bytes()).await?;
+
+        // ── Phase 3: Read until sentinel (same as exec_via_pty) ─────────────
+        let mut result = ExecResult::default();
+        let timed_out = match tokio::time::timeout(
+            timeout,
+            self.exec_via_pty_inner(&mut channel, &rc_tag, &mut result),
+        )
+        .await
+        {
+            Ok(inner) => {
+                inner?;
+                false
+            }
+            Err(_) => true,
+        };
+        result.timed_out = timed_out;
+
+        let _ = channel.eof().await;
+        let _ = channel.close().await;
+        Ok(result)
+    }
+
+    /// Drive an expect/send login script against a live PTY channel.
+    ///
+    /// Reads chunks of PTY output into an accumulating buffer, and whenever
+    /// the current `Expect` step's regex matches the buffer, fires the
+    /// following `Send`/`Delay` steps until the next `Expect` (or end of
+    /// script). Discards matched output from the buffer after each expect
+    /// so stale prompts don't trigger re-matches.
+    async fn drive_pty_login(
+        &self,
+        channel: &mut russh::Channel<client::Msg>,
+        steps: &[rusterm_core::LoginStep],
+    ) -> anyhow::Result<()> {
+        use rusterm_core::LoginStep;
+
+        let mut buf: Vec<u8> = Vec::new();
+        let mut step_idx = 0usize;
+
+        while step_idx < steps.len() {
+            // Collect consecutive non-expect actions and fire them immediately.
+            let expect_pattern: Option<&str> = match &steps[step_idx] {
+                LoginStep::Expect { pattern } => Some(pattern.as_str()),
+                _ => None,
+            };
+
+            if let Some(pattern) = expect_pattern {
+                // Wait until output matches this expect.
+                let re =
+                    if pattern.is_empty() {
+                        None
+                    } else {
+                        Some(regex::Regex::new(pattern).map_err(|e| {
+                            anyhow::anyhow!("invalid expect regex {pattern:?}: {e}")
+                        })?)
+                    };
+
+                loop {
+                    let text = String::from_utf8_lossy(&buf);
+                    let matched = match &re {
+                        Some(r) => r.is_match(&text),
+                        None => true, // empty pattern = instant match
+                    };
+                    if matched {
+                        // Clear consumed output so the next expect doesn't
+                        // re-fire on stale data.
+                        buf.clear();
+                        break;
+                    }
+                    // Read more PTY output.
+                    match channel.wait().await {
+                        Some(ChannelMsg::Data { data }) => {
+                            let combined = buf.len() + data.len();
+                            if combined < MAX_EXEC_OUTPUT {
+                                buf.extend_from_slice(&data);
+                            }
+                        }
+                        Some(ChannelMsg::ExtendedData { data, .. }) => {
+                            let combined = buf.len() + data.len();
+                            if combined < MAX_EXEC_OUTPUT {
+                                buf.extend_from_slice(&data);
+                            }
+                        }
+                        Some(ChannelMsg::Eof) | Some(ChannelMsg::Close) | None => {
+                            anyhow::bail!(
+                                "PTY closed while waiting for expect pattern {:?}",
+                                pattern
+                            );
+                        }
+                        _ => {}
+                    }
+                }
+                step_idx += 1;
+            }
+
+            // Fire consecutive Send / Delay / SendOneKey steps.
+            while step_idx < steps.len() {
+                match &steps[step_idx] {
+                    LoginStep::Expect { .. } => break,
+                    LoginStep::Send { text } => {
+                        tracing::debug!("[relay] login step {step_idx}: send {:?}", text);
+                        channel.data(format!("{text}\\n").as_bytes()).await?;
+                        step_idx += 1;
+                    }
+                    LoginStep::Delay { ms } => {
+                        tracing::debug!("[relay] login step {step_idx}: delay {ms}ms");
+                        tokio::time::sleep(Duration::from_millis(*ms)).await;
+                        step_idx += 1;
+                    }
+                    LoginStep::SendOneKey { name } => {
+                        // OneKey credential resolution is not available in the
+                        // headless relay path. Skip with a warning rather than
+                        // failing — bastion menu navigation typically uses only
+                        // plain `send` steps.
+                        tracing::warn!(
+                            "[relay] login step {step_idx}: send_onekey {name:?} \
+                             is not supported in headless relay path, skipping"
+                        );
+                        step_idx += 1;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Read loop for [`exec_via_pty`]: accumulate channel data until the
     /// sentinel exit-code line appears (or the channel closes / the result
     /// cap is hit). On success, trims captured stdout to the content between
@@ -418,11 +642,28 @@ impl DirectHandle {
     /// same `timeout` (the exec attempt's time is already spent, so the PTY
     /// path may run past the original deadline — this is intentional, since
     /// a bastion's PTY setup is slower than an exec channel).
+    ///
+    /// `login_steps` (when non-empty) enables bastion-menu navigation: the
+    /// PTY fallback replays the expect/send script to traverse the bastion's
+    /// interactive asset-selection menu before sending the actual command.
     pub async fn exec_with_fallback(
         &self,
         command: &str,
         stdin: Option<&[u8]>,
         timeout: Duration,
+    ) -> anyhow::Result<ExecResult> {
+        self.exec_with_fallback_and_login(command, stdin, timeout, &[])
+            .await
+    }
+
+    /// Like [`exec_with_fallback`](Self::exec_with_fallback) but with optional
+    /// bastion login-script navigation.
+    pub async fn exec_with_fallback_and_login(
+        &self,
+        command: &str,
+        stdin: Option<&[u8]>,
+        timeout: Duration,
+        login_steps: &[rusterm_core::LoginStep],
     ) -> anyhow::Result<ExecResult> {
         let first = if let Some(stdin) = stdin {
             self.exec_with_stdin(command, stdin, timeout).await?
@@ -443,14 +684,28 @@ impl DirectHandle {
         // shell channel is the first (and only) channel on that transport.
         // If reconnect is unavailable (no origin stored), fall back to the
         // old same-connection behaviour as a best-effort.
+        let use_login = !login_steps.is_empty();
         match self.reconnect().await {
-            Ok(fresh) => fresh.exec_via_pty(command, stdin, timeout).await,
+            Ok(fresh) => {
+                if use_login {
+                    fresh
+                        .exec_via_pty_with_login(command, stdin, timeout, login_steps)
+                        .await
+                } else {
+                    fresh.exec_via_pty(command, stdin, timeout).await
+                }
+            }
             Err(e) => {
                 tracing::warn!(
                     "[relay] reconnect for PTY fallback failed ({e:#}); \
                      attempting PTY on same connection"
                 );
-                self.exec_via_pty(command, stdin, timeout).await
+                if use_login {
+                    self.exec_via_pty_with_login(command, stdin, timeout, login_steps)
+                        .await
+                } else {
+                    self.exec_via_pty(command, stdin, timeout).await
+                }
             }
         }
     }

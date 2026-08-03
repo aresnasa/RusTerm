@@ -485,13 +485,14 @@ impl RelayExecutor for AppRelayExecutor {
         elevated: bool,
         timeout: Duration,
     ) -> Result<ExecOutcome, ExecutorError> {
-        let (credential_key, ssh) = read_connections()
+        let (credential_key, ssh, login_script) = read_connections()
             .into_iter()
             .find_map(|conn| {
                 if conn.id == host_id || conn.name == host_id {
                     let key = sudo_credential_key(&conn)?;
+                    let script = conn.login_script.clone();
                     match conn.kind {
-                        ConnectionKind::Ssh(ssh) => Some((key, ssh)),
+                        ConnectionKind::Ssh(ssh) => Some((key, ssh, script)),
                         _ => None,
                     }
                 } else {
@@ -499,6 +500,31 @@ impl RelayExecutor for AppRelayExecutor {
                 }
             })
             .ok_or_else(|| ExecutorError::UnknownHost(host_id.to_string()))?;
+
+        // Parse the per-connection login script DSL (if any). Bastion hosts
+        // like QiZhi (齐治交互终端) present an interactive asset-selection
+        // menu after SSH login; the login script automates navigating that
+        // menu (expect category list → send number → …) before the actual
+        // command runs on the target node behind the bastion.
+        let login_steps = match login_script.as_deref() {
+            Some(text) if !text.trim().is_empty() => match rusterm_core::parse_login_script(text) {
+                Ok(steps) if !steps.is_empty() => {
+                    tracing::info!(
+                        "[relay] host {host_id} has login script ({} steps)",
+                        steps.len()
+                    );
+                    steps
+                }
+                Ok(_) => Vec::new(),
+                Err(e) => {
+                    tracing::warn!(
+                        "[relay] host {host_id} login script parse error: {e}; ignoring"
+                    );
+                    Vec::new()
+                }
+            },
+            _ => Vec::new(),
+        };
 
         let started = Instant::now();
         let handle = connect_direct(&ssh, DirectConnectOptions::default())
@@ -515,7 +541,7 @@ impl RelayExecutor for AppRelayExecutor {
         let result = if elevated {
             let non_interactive_command = sudo_command(command, false);
             let first = handle
-                .exec_with_fallback(&non_interactive_command, None, timeout)
+                .exec_with_fallback_and_login(&non_interactive_command, None, timeout, &login_steps)
                 .await
                 .map_err(|e| ExecutorError::Exec(format!("{e:#}")))?;
             if !sudo_authorization_failed(&first) {
@@ -540,7 +566,12 @@ impl RelayExecutor for AppRelayExecutor {
                 let stdin = Zeroizing::new(format!("{}\n", credential.as_str()));
                 let password_command = sudo_command(command, true);
                 let second = handle
-                    .exec_with_fallback(&password_command, Some(stdin.as_bytes()), timeout)
+                    .exec_with_fallback_and_login(
+                        &password_command,
+                        Some(stdin.as_bytes()),
+                        timeout,
+                        &login_steps,
+                    )
                     .await
                     .map_err(|e| ExecutorError::Exec(format!("{e:#}")))?;
                 if sudo_authorization_failed(&second) {
@@ -559,7 +590,7 @@ impl RelayExecutor for AppRelayExecutor {
             }
         } else {
             handle
-                .exec_with_fallback(command, None, timeout)
+                .exec_with_fallback_and_login(command, None, timeout, &login_steps)
                 .await
                 .map_err(|e| ExecutorError::Exec(format!("{e:#}")))?
         };
