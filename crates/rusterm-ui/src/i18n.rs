@@ -719,6 +719,10 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
             "RUSTERM_API_USER is not set; export it first (e.g. export RUSTERM_API_USER=yourname).",
             "RUSTERM_API_USER 未设置；请先导出（例如 export RUSTERM_API_USER=你的用户名）。",
         ),
+        "api.password_not_tty" => (
+            "RUSTERM_API_PASSWORD is not set and stdin is not a terminal; export it first.",
+            "RUSTERM_API_PASSWORD 未设置且 stdin 不是终端；请先导出。",
+        ),
 
         // ── common / connection / sidebar additions ───────────────────
         "common.active" => ("Active", "活动"),
