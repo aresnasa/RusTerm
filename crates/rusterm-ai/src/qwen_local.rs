@@ -444,10 +444,7 @@ const GGUF_FILE: &str = "qwen25-coder-1.5b-q4k.gguf";
 /// **Expensive** — must be called from a background thread, not the UI
 /// thread. The `progress` callback is invoked throughout so the UI can
 /// show a progress bar / status text.
-pub fn ensure_model(
-    cache_dir: &Path,
-    progress: impl Fn(SetupProgress) + Sync,
-) -> Result<PathBuf> {
+pub fn ensure_model(cache_dir: &Path, progress: impl Fn(SetupProgress) + Sync) -> Result<PathBuf> {
     let progress = progress;
     std::fs::create_dir_all(cache_dir)
         .with_context(|| format!("creating cache dir {cache_dir:?}"))?;
@@ -463,12 +460,12 @@ pub fn ensure_model(
     }
 
     // Download tokenizer + config (small files, always needed).
-    download_file($1, $2, &progress)?;
-    download_file($1, $2, &progress)?;
+    download_file(TOKENIZER_FILE, &tokenizer_path, &progress)?;
+    download_file(CONFIG_FILE, &config_path, &progress)?;
 
     // Download the BF16 safetensors (large, ~3 GB) if not already present.
     if !safetensors_path.exists() {
-        download_file($1, $2, &progress)?;
+        download_file(SAFETENSORS_FILE, &safetensors_path, &progress)?;
     }
 
     // Quantize BF16 → Q4_K GGUF.
