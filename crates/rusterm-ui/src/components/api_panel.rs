@@ -333,10 +333,15 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
         .as_ref()
         .map(|cm| cm.load_qwen_local_settings().enabled)
         .unwrap_or(false);
-    let mut ai_description = use_signal(String::new);
-    let mut ai_kind_python = use_signal(|| false); // false = shell, true = python
-    let mut ai_status = use_signal(String::new);
-    let mut ai_busy = use_signal(|| false);
+    // `Signal` is `Copy`, so `.set()` works without `mut`.
+    #[cfg_attr(not(feature = "qwen-local"), allow(unused_variables))]
+    let ai_description = use_signal(String::new);
+    #[cfg_attr(not(feature = "qwen-local"), allow(unused_variables))]
+    let ai_kind_python = use_signal(|| false); // false = shell, true = python
+    #[cfg_attr(not(feature = "qwen-local"), allow(unused_variables))]
+    let ai_status = use_signal(String::new);
+    #[cfg_attr(not(feature = "qwen-local"), allow(unused_variables))]
+    let ai_busy = use_signal(|| false);
     // Persist the full template list. `Signal` is Copy, so this closure is
     // Copy and can be moved into several handlers.
     let persist_templates = move |templates: Vec<CustomApiTemplate>| {
@@ -1498,14 +1503,14 @@ fn run_local_generation(
 #[cfg(feature = "qwen-local")]
 fn render_ai_section(
     qwen_enabled: bool,
-    ai_description: Signal<String>,
-    ai_kind_python: Signal<bool>,
-    ai_status: Signal<String>,
-    ai_busy: Signal<bool>,
+    mut ai_description: Signal<String>,
+    mut ai_kind_python: Signal<bool>,
+    mut ai_status: Signal<String>,
+    mut ai_busy: Signal<bool>,
     curl_mode: Signal<CurlMode>,
-    curl_command: Signal<String>,
-    curl_script: Signal<String>,
-    curl_script_base64: Signal<String>,
+    mut curl_command: Signal<String>,
+    mut curl_script: Signal<String>,
+    mut curl_script_base64: Signal<String>,
 ) -> Element {
     if !qwen_enabled {
         return rsx! {};
@@ -1598,7 +1603,7 @@ fn render_ai_section(
                                         ai_status.set(
                                             crate::i18n::tf(
                                                 "ai_runtime.local.generate_failed",
-                                                &[("error", "thread panicked")],
+                                                &[("error", &"thread panicked".to_string())],
                                             )
                                         );
                                         ai_busy.set(false);
