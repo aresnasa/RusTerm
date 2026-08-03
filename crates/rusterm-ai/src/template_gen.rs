@@ -1,9 +1,9 @@
 //! Prompt engineering + response parsing for local template generation.
 //!
-//! The local Qwen2.5-Coder model is instructed to produce either a shell
-//! script or a Python script based on the user's natural-language
-//! description. The prompt is carefully scoped so a 1.5B model can
-//! reliably produce useful, safe output:
+//! The local Qwen2.5-Coder model is instructed to produce a single shell
+//! command, a shell script, or a Python script based on the user's
+//! natural-language description. The prompt is carefully scoped so a 1.5B
+//! model can reliably produce useful, safe output:
 //!
 //! - **System role**: "You are a DevOps assistant that writes short
 //!   deployment/diagnostic scripts."
@@ -13,9 +13,11 @@
 
 #![cfg(feature = "qwen-local")]
 
-/// Which kind of script the model should generate.
+/// Which kind of API template the model should generate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TemplateKind {
+    /// Exactly one POSIX shell command (the API panel's `Command` mode).
+    Command,
     /// A POSIX `sh` script (the API panel's `Script` mode).
     ShellScript,
     /// A Python 3 script wrapped in a `python3 - <<'PYEOF'` heredoc so it
@@ -26,6 +28,7 @@ pub enum TemplateKind {
 impl TemplateKind {
     pub fn label(self) -> &'static str {
         match self {
+            Self::Command => "Command",
             Self::ShellScript => "Shell Script",
             Self::PythonScript => "Python Script",
         }
@@ -38,12 +41,28 @@ impl TemplateKind {
 /// Keeping it short and explicit is critical for a 1.5B model — verbose
 /// instructions degrade output quality.
 pub fn build_prompt(description: &str, kind: TemplateKind) -> String {
+    if kind == TemplateKind::Command {
+        return format!(
+            "You are a DevOps assistant. Write exactly one POSIX shell command \
+             for the following task. The command must be a single line. Output \
+             ONLY the command inside a single ```sh code block — no shebang, \
+             `set -e`, comments, or explanation.\n\n\
+             Example output:\n\
+             ```sh\n\
+             uname -a\n\
+             ```\n\n\
+             Task: {description}"
+        );
+    }
+
     let lang = match kind {
+        TemplateKind::Command => unreachable!("command prompt returned above"),
         TemplateKind::ShellScript => "POSIX sh",
         TemplateKind::PythonScript => "Python 3 (wrapped in a python3 heredoc)",
     };
 
     let example = match kind {
+        TemplateKind::Command => unreachable!("command prompt returned above"),
         TemplateKind::ShellScript => {
             "Example output:\n\
              ```sh\n\
@@ -122,6 +141,29 @@ pub fn parse_response(response: &str) -> String {
     trimmed.to_string()
 }
 
+/// Parse a model response according to the requested template contract.
+/// Script responses preserve their multi-line body. Command responses are
+/// reduced to the first executable line so a small model cannot accidentally
+/// put a shebang or a second command into the relay's single-command field.
+pub fn parse_generated_response(response: &str, kind: TemplateKind) -> String {
+    let parsed = parse_response(response);
+    if kind != TemplateKind::Command {
+        return parsed;
+    }
+
+    parsed
+        .lines()
+        .map(str::trim)
+        .find(|line| {
+            !line.is_empty()
+                && *line != "set -e"
+                && !line.starts_with("#!")
+                && !line.starts_with('#')
+        })
+        .unwrap_or_default()
+        .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -155,5 +197,24 @@ mod tests {
         let p = build_prompt("check disk space", TemplateKind::ShellScript);
         assert!(p.contains("check disk space"));
         assert!(p.contains("POSIX sh"));
+    }
+
+    #[test]
+    fn command_prompt_requires_exactly_one_shell_command() {
+        let prompt = build_prompt("show the kernel", TemplateKind::Command);
+
+        assert!(prompt.contains("show the kernel"));
+        assert!(prompt.contains("exactly one"));
+        assert!(prompt.contains("single line"));
+    }
+
+    #[test]
+    fn command_response_returns_one_command_without_script_prelude() {
+        let response = "```sh\n#!/bin/sh\nset -e\nuname -a\nuptime\n```";
+
+        assert_eq!(
+            parse_generated_response(response, TemplateKind::Command),
+            "uname -a"
+        );
     }
 }

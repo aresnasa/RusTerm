@@ -25,4 +25,4 @@ pub use qwen_local::{
     HardwareCapability, QwenLocalModel, SetupProgress, detect_hardware, ensure_model,
 };
 #[cfg(feature = "qwen-local")]
-pub use template_gen::{TemplateKind, build_prompt, parse_response};
+pub use template_gen::{TemplateKind, build_prompt, parse_generated_response, parse_response};

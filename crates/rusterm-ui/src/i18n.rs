@@ -591,11 +591,25 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         "ai_runtime.local.loading" => ("Loading model into memory…", "正在加载模型到内存…"),
         "ai_runtime.local.generating" => ("Generating template…", "正在生成模板…"),
         "ai_runtime.local.generate_failed" => ("Generation failed: {error}", "生成失败：{error}"),
+        "ai_runtime.local.empty_generation" => {
+            ("The model returned an empty template", "模型返回了空模板")
+        }
         "ai_runtime.local.ready" => ("Local model ready", "本地模型就绪"),
         "ai_runtime.local.ai_generate" => ("✨ AI Generate", "✨ AI 生成"),
-        "ai_runtime.local.ai_generate_hint" => ("Describe the script you want", "描述你想要的脚本"),
+        "ai_runtime.local.ai_generate_hint" => (
+            "Describe the command or script template you want",
+            "描述你想要的命令或脚本模板",
+        ),
+        "ai_runtime.local.kind_command" => ("Command", "命令"),
         "ai_runtime.local.kind_shell" => ("Shell", "Shell"),
         "ai_runtime.local.kind_python" => ("Python", "Python"),
+        "ai_runtime.local.base64_hint" => (
+            "AI writes the source script; RusTerm encodes it as Base64 automatically.",
+            "AI 生成原始脚本，RusTerm 会自动编码为 Base64。",
+        ),
+        "ai_runtime.local.manual_template" => {
+            ("Or save the current content manually", "或手动保存当前内容")
+        }
         "ai_runtime.local.suggestion_title" => ("AI suggestion", "AI 建议"),
         "ai_runtime.local.suggestion_apply" => ("Apply", "应用"),
         "ai_runtime.local.suggestion_saved" => ("Auto-saved", "已自动保存"),
