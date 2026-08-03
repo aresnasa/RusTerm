@@ -1250,6 +1250,10 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
             "This host sits behind a bastion (login script configured), so the command must run inside the exact logged-in terminal tab — only that tab knows which target node it navigated to. The requested tab is not available (closed, disconnected, or the selector is stale). Keep the tab connected and re-copy the curl command from the API panel.",
             "此主机位于堡垒机之后（已配置登录脚本），命令必须在已登录的那个终端标签页内执行——只有该标签页知道自己导航到了哪个目标节点。请求指定的标签页不可用（已关闭、已断开或选择器已过时）。请保持该标签页在线，并从 API 面板重新复制 curl 命令。",
         ),
+        "relay.live_sudo_unavailable" => (
+            "Non-interactive sudo (sudo -n) was refused on this bastion node, and passwords are never injected into a live terminal (its echo would leak the secret). Run any sudo command once inside that terminal tab to refresh the sudo timestamp and retry, or uncheck 'Execute with reused sudo authorization' (not needed when logged in as root).",
+            "该堡垒机节点上非交互 sudo（sudo -n）被拒绝，而实时终端内绝不注入密码（回显会泄露密码）。请先在该终端标签页内运行一次任意 sudo 命令刷新 sudo 时间戳后重试，或取消勾选“复用 sudo 授权执行”（以 root 登录时无需 sudo）。",
+        ),
         "relay.start_timeout_or_runtime_wedged" => (
             "Relay start timed out or runtime is wedged: {error}",
             "中转启动超时或运行时卡死：{error}",

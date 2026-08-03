@@ -458,29 +458,50 @@ fn sudo_command(command: &str, read_password_from_stdin: bool) -> String {
     format!("sudo {mode} -- sh -lc {}", shell_single_quote(command),)
 }
 
+/// Lowercase substrings in sudo's diagnostics that indicate the failure was
+/// about authorization (missing/rejected password, no TTY, not in sudoers)
+/// rather than the wrapped command itself exiting non-zero.
+const SUDO_FAILURE_NEEDLES: &[&str] = &[
+    "password is required",
+    "a password is required",
+    "no password was provided",
+    "incorrect password",
+    "sorry, try again",
+    "authentication failure",
+    "interactive authentication is required",
+    "a terminal is required",
+    "no tty present",
+    "must have a tty",
+    "is not in the sudoers",
+    "may not run sudo",
+    "not allowed to execute",
+    "not permitted to execute",
+];
+
+fn output_matches_sudo_failure(output: &str) -> bool {
+    let lower = output.to_ascii_lowercase();
+    SUDO_FAILURE_NEEDLES
+        .iter()
+        .any(|needle| lower.contains(needle))
+}
+
 fn sudo_authorization_failed(result: &ExecResult) -> bool {
     if result.exit_code == Some(0) {
         return false;
     }
-    let stderr = result.stderr_string().to_ascii_lowercase();
-    [
-        "password is required",
-        "a password is required",
-        "no password was provided",
-        "incorrect password",
-        "sorry, try again",
-        "authentication failure",
-        "interactive authentication is required",
-        "a terminal is required",
-        "no tty present",
-        "must have a tty",
-        "is not in the sudoers",
-        "may not run sudo",
-        "not allowed to execute",
-        "not permitted to execute",
-    ]
-    .iter()
-    .any(|needle| stderr.contains(needle))
+    output_matches_sudo_failure(&result.stderr_string())
+}
+
+/// Detect a `sudo -n` authorization failure from a live-PTY run. Unlike the
+/// dedicated exec channel, a PTY merges stderr into the main output stream,
+/// so sudo's diagnostics arrive in the outcome's stdout and
+/// [`sudo_authorization_failed`] (which only inspects stderr) would miss
+/// them.
+fn live_sudo_failed(exit_code: Option<u32>, merged_output: &str) -> bool {
+    if exit_code == Some(0) {
+        return false;
+    }
+    output_matches_sudo_failure(merged_output)
 }
 
 // ── Relay command-history store ─────────────────────────────────────────────
@@ -758,16 +779,23 @@ impl RelayExecutor for AppRelayExecutor {
         timeout: Duration,
     ) -> Result<ExecOutcome, ExecutorError> {
         // ── Fast path: reuse a live UI session if one exists. ──
-        // Elevated execution intentionally stays on the existing dedicated
-        // connection path: safely answering an interactive sudo prompt needs
-        // a stricter state machine than injecting a password into the live
-        // terminal.
-        if !elevated {
-            if let Some(entry) = find_live_session(host_id) {
+        // Non-elevated commands run verbatim inside the live PTY. Elevated
+        // commands on a *bastion* session-qualified selector run as
+        // `sudo -n` inside the same PTY — a fresh connection would land on
+        // the bastion entry host, not the node the tab navigated to. No
+        // password is ever injected into the live PTY (its echo would leak
+        // the secret); if `sudo -n` is refused the caller gets a clear
+        // `elevation_required` explaining how to refresh the timestamp.
+        // Elevated execution on *direct* hosts keeps the dedicated
+        // connection path, where `sudo -S` reads the cached credential from
+        // stdin without echo.
+        let bastion_live_only = live_session_required(host_id, &read_connections());
+        if let Some(entry) = find_live_session(host_id) {
+            if !elevated {
                 match exec_via_live_session(&entry, command, timeout).await {
                     Ok(outcome) => return Ok(outcome),
                     Err(LiveExecError::BeforeSend(error)) => {
-                        if live_session_required(host_id, &read_connections()) {
+                        if bastion_live_only {
                             tracing::error!(
                                 "[relay] live session required for bastion selector {host_id} but unavailable before send: {error}; refusing bastion fallback"
                             );
@@ -789,29 +817,68 @@ impl RelayExecutor for AppRelayExecutor {
                         )));
                     }
                 }
-            } else if live_session_required(host_id, &read_connections()) {
-                // A session-qualified selector on a bastion host with no
-                // matching live tab: the tab was closed (or its selector is
-                // stale). A fresh connection would land on the bastion entry
-                // host — the exact wrong-node bug this guard exists for.
-                tracing::error!(
-                    "[relay] live session required for bastion selector {host_id} but no live tab matched; refusing bastion fallback"
-                );
-                return Err(ExecutorError::Exec(format!(
-                    "[live-session-required] {}",
-                    crate::i18n::t("relay.live_session_required"),
-                )));
+            } else if bastion_live_only {
+                let non_interactive_command = sudo_command(command, false);
+                match exec_via_live_session(&entry, &non_interactive_command, timeout).await {
+                    Ok(outcome) => {
+                        // A PTY merges stderr into stdout, so sudo's
+                        // diagnostics land in `outcome.stdout`.
+                        if live_sudo_failed(outcome.exit_code, &outcome.stdout) {
+                            tracing::warn!(
+                                "[relay] non-interactive sudo refused inside live session {host_id}; not injecting a password into a live PTY"
+                            );
+                            return Err(ExecutorError::ElevationRequired(crate::i18n::t(
+                                "relay.live_sudo_unavailable",
+                            )));
+                        }
+                        return Ok(outcome);
+                    }
+                    Err(LiveExecError::BeforeSend(error)) => {
+                        tracing::error!(
+                            "[relay] live session required for bastion selector {host_id} but unavailable before send: {error}; refusing bastion fallback"
+                        );
+                        return Err(ExecutorError::Exec(format!(
+                            "[live-session-required] {}: {error}",
+                            crate::i18n::t("relay.live_session_required"),
+                        )));
+                    }
+                    Err(LiveExecError::AfterSend(error)) => {
+                        tracing::error!(
+                            "[relay] live-session command status unknown for {host_id}: {error}; refusing automatic retry"
+                        );
+                        return Err(ExecutorError::Exec(format!(
+                            "{error}; the command was not retried"
+                        )));
+                    }
+                }
             }
+            // Elevated + direct host: fall through to the dedicated
+            // connection below, which can answer sudo's password prompt
+            // over a no-echo exec channel.
+        } else if bastion_live_only {
+            // A session-qualified selector on a bastion host with no
+            // matching live tab: the tab was closed (or its selector is
+            // stale). A fresh connection would land on the bastion entry
+            // host — the exact wrong-node bug this guard exists for.
+            tracing::error!(
+                "[relay] live session required for bastion selector {host_id} but no live tab matched; refusing bastion fallback"
+            );
+            return Err(ExecutorError::Exec(format!(
+                "[live-session-required] {}",
+                crate::i18n::t("relay.live_session_required"),
+            )));
         }
 
         // ── Slow path: fresh SSH connection (existing behaviour). ──
-        // Reached by plain selectors, elevated execution, and
-        // session-qualified selectors on *direct* hosts whose tab has
+        // Reached by plain selectors, elevated execution on direct hosts,
+        // and session-qualified selectors on *direct* hosts whose tab has
         // closed (strip the suffix and connect to the base host — a fresh
         // connection reaches the same machine). Bastion selectors never
-        // reach this point without a live tab: the guard above rejects
-        // them, because a fresh connection would land on the bastion entry
-        // host instead of the node the tab had navigated to.
+        // reach this point: with a live tab they are served inside that
+        // PTY above (elevated runs use `sudo -n`), and without one the
+        // guard above rejects them, because a fresh connection would land
+        // on the bastion entry host instead of the node the tab had
+        // navigated to.
         let (base_host_id, _) = split_host_selector(host_id);
         let (credential_key, ssh, login_script) = read_connections()
             .into_iter()
@@ -1261,6 +1328,14 @@ mod tests {
             "sudo -S -p '' -- sh -lc 'printf '\"'\"'%s'\"'\"' \"$HOME\"'"
         );
         assert!(!wrapped.contains("secret"));
+
+        // The live-PTY elevated path relies on the non-interactive form:
+        // `sudo -n` must fail fast instead of prompting inside the PTY.
+        let non_interactive = sudo_command(command, false);
+        assert_eq!(
+            non_interactive,
+            "sudo -n -- sh -lc 'printf '\"'\"'%s'\"'\"' \"$HOME\"'"
+        );
     }
 
     #[test]
@@ -1291,6 +1366,35 @@ mod tests {
             truncated: false,
         };
         assert!(sudo_authorization_failed(&interactive_auth_failure));
+    }
+
+    /// A live PTY merges stderr into stdout, so `live_sudo_failed` must
+    /// find sudo's diagnostics in the merged output stream — and must not
+    /// misread an ordinary non-zero exit (or diagnostics echoed by a
+    /// successful command) as an authorization failure.
+    #[test]
+    fn live_sudo_failure_detection_reads_merged_output_and_respects_exit_code() {
+        // Success: never an auth failure, even if the output happens to
+        // mention a sudo-like phrase (e.g. grepping logs for it).
+        assert!(!live_sudo_failed(Some(0), "sudo: a password is required"));
+        // Plain command failure with unrelated output.
+        assert!(!live_sudo_failed(Some(1), "application error"));
+        // sudo -n refused: diagnostics arrive on the merged PTY stream.
+        assert!(live_sudo_failed(Some(1), "sudo: a password is required\n"));
+        assert!(live_sudo_failed(
+            Some(1),
+            "sudo: sorry, you must have a tty to run sudo\n"
+        ));
+        // Not in sudoers is also an authorization problem.
+        assert!(live_sudo_failed(
+            Some(1),
+            "ops is not in the sudoers file.  This incident will be reported.\n"
+        ));
+        // Unknown exit code (marker lost) with sudo diagnostics still
+        // counts as a failure — better a clear elevation error than
+        // returning sudo noise as command output.
+        assert!(live_sudo_failed(None, "sudo: no password was provided\n"));
+        assert!(!live_sudo_failed(None, "partial output only"));
     }
 
     fn key(connection_id: &str, host: &str) -> SudoCredentialKey {
