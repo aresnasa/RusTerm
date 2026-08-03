@@ -1,0 +1,10 @@
+[package]
+name = "rusterm-ohmyzsh"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+tracing.workspace = true
+anyhow.workspace = true
+dirs.workspace = true
+once_cell.workspace = true

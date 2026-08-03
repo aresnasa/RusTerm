@@ -314,6 +314,13 @@ pub struct AppState {
     /// is off, this is a no-op stub.
     #[serde(skip)]
     pub analytics: crate::analytics::AnalyticsHandle,
+    /// oh-my-zsh plugin-alias index, loaded once on startup via a
+    /// `spawn_blocking` task. `None` when oh-my-zsh isn't installed or the
+    /// load hasn't completed. The suggestion query reads this as a 4th
+    /// suggestion source (after session history, SQLite FTS5, and DuckDB
+    /// analytics). Cheap to clone: the alias index is shared via `Arc`.
+    #[serde(skip)]
+    pub ohmyzsh: Option<rusterm_ohmyzsh::OhMyZsh>,
     /// Per-tab multi-pane layout. When a tab is in `Single` preset (the
     /// default), the rendering path falls back to the legacy
     /// single-active-session view. When the user cycles to Split2H /
@@ -730,6 +737,7 @@ impl Default for AppState {
             transfer_cancellations: HashMap::new(),
             bottom_shell_session_id: None,
             analytics: crate::analytics::AnalyticsHandle::default(),
+            ohmyzsh: None,
             layouts: HashMap::new(),
             focused_pane: None,
             layout_preset: LayoutPreset::default(),

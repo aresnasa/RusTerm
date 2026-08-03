@@ -7225,6 +7225,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "rusterm-ohmyzsh"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "dirs",
+ "once_cell",
+ "tracing",
+]
+
+[[package]]
 name = "rusterm-plugins"
 version = "0.1.0"
 dependencies = [
@@ -7370,6 +7380,7 @@ dependencies = [
  "rusterm-crypto",
  "rusterm-db",
  "rusterm-history",
+ "rusterm-ohmyzsh",
  "rusterm-plugins",
  "rusterm-proto",
  "rusterm-relay",

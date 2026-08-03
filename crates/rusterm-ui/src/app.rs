@@ -119,6 +119,39 @@ fn save_workspace_preferences(state: &Signal<AppState>) {
 /// misconfigured expect from silently hanging the session initialization.
 const LOGIN_SCRIPT_EXPECT_TIMEOUT_SECS: u64 = 30;
 
+/// Maximum wall-clock seconds an SSH connect attempt (TCP connect + SSH
+/// handshake + authentication + PTY/shell request) may take before we give
+/// up and declare the session disconnected.
+///
+/// The TCP connect itself has a 15 s timeout (`CONNECT_TIMEOUT` in
+/// `rusterm-ssh/src/transport.rs`), but the SSH handshake and authentication
+/// phases have no timeout — a server that accepts the TCP connection but
+/// never responds to the SSH version banner, or a keyboard-interactive auth
+/// that never sends its challenge, would hang forever. Without this overall
+/// cap, the session state would be stuck in `Reconnecting` indefinitely and
+/// the user could never trigger another reconnect attempt (because
+/// [`begin_reconnect`] only allows `Disconnected -> Reconnecting`).
+///
+/// 30 s is generous enough for a slow handshake + key auth on a high-latency
+/// link, but bounded so a hung server doesn't lock the session forever.
+const SSH_CONNECT_TIMEOUT_SECS: u64 = 30;
+
+/// Wall-clock seconds the session may stay in the `Reconnecting` state before
+/// a watchdog automatically flips it back to `Disconnected`.
+///
+/// This is the safety net for any code path that sets the state to
+/// `Reconnecting` but fails to transition it to `Connected` or `Disconnected`
+/// within a reasonable time — e.g. a `client.connect()` call that hangs past
+/// its [`SSH_CONNECT_TIMEOUT_SECS`] cap because the future was never polled to
+/// completion (dropped sender, runtime shutdown, etc.). When the watchdog
+/// fires, it writes a reconnect-prompt message to the terminal and sets the
+/// state to `Disconnected`, so the user can press Enter to try again.
+///
+/// Set slightly above `SSH_CONNECT_TIMEOUT_SECS` so the explicit connect
+/// timeout fires first (producing a specific error message) and the watchdog
+/// only catches truly stuck states.
+const RECONNECT_WATCHDOG_SECS: u64 = 45;
+
 /// Upper bound on the coalesced byte payload fed to `process_and_render` in a
 /// single event-loop tick.
 ///
@@ -2367,6 +2400,36 @@ fn render_terminal_pane(
                                         {
                                             seen.insert(cmd.to_lowercase().clone());
                                             all_suggestions.push(cmd);
+                                        }
+                                    }
+                                }
+
+                                // 4. oh-my-zsh plugin aliases. The user's
+                                //    enabled zsh plugins (git, docker, kubectl,
+                                //    ...) define aliases like `gst='git
+                                //    status'`, `gco='git checkout'`, `dc='docker
+                                //    compose'`. Surfacing these as suggestions
+                                //    means the popup shows the aliases the
+                                //    user's shell already understands — the
+                                //    "auto-popup" integration the user asked for
+                                //    ("很多自动弹出的功能可以集成到本项目").
+                                //
+                                //    We only add aliases that match the prefix
+                                //    AND aren't already in the seen set (so a
+                                //    command the user has run before — and thus
+                                //    is in history — doesn't appear twice). The
+                                //    expansion is available via
+                                //    `OhMyZsh::expand_alias` for inline ghost-text,
+                                //    but here we just add the alias NAME as a
+                                //    suggestion (the popup shows the name; the
+                                //    user can Tab to accept it).
+                                if let Some(ref omz) = state_for_cmd.read().ohmyzsh {
+                                    for alias in omz.aliases_for_prefix(&cmd_part, sug_count * 2) {
+                                        if !seen.contains(alias.name.to_lowercase().as_str())
+                                            && !recent_failed.contains(&alias.name)
+                                        {
+                                            seen.insert(alias.name.to_lowercase());
+                                            all_suggestions.push(alias.name);
                                         }
                                     }
                                 }
@@ -8708,6 +8771,40 @@ mod session_startup_tests {
         assert!(begin_reconnect(&mut state, "pane-a"));
     }
 
+    /// A session stuck in `Reconnecting` (because the connect attempt hung and
+    /// the watchdog hasn't fired yet) rejects `begin_reconnect` — this is the
+    /// bug the user hit ("多次都没有触发会话恢复"). The fix is the watchdog
+    /// that flips `Reconnecting -> Disconnected` after `RECONNECT_WATCHDOG_SECS`,
+    /// after which `begin_reconnect` succeeds again. This test pins the
+    /// before/after contract: stuck-`Reconnecting` blocks, but once the
+    /// watchdog (or the connect-timeout Err branch) flips it to `Disconnected`,
+    /// a retry is allowed.
+    #[test]
+    fn reconnect_retry_works_after_watchdog_flips_stuck_reconnecting_to_disconnected() {
+        let mut state = AppState::default();
+        // Session is stuck in Reconnecting (connect attempt hung).
+        state
+            .session_connection_states
+            .insert("stuck".to_string(), SessionConnectionState::Reconnecting);
+        // While stuck, begin_reconnect must reject (prevents overlapping
+        // connect attempts on the same session).
+        assert!(!begin_reconnect(&mut state, "stuck"));
+        assert_eq!(
+            state.session_connection_states.get("stuck"),
+            Some(&SessionConnectionState::Reconnecting),
+        );
+        // Watchdog (or connect-timeout Err branch) flips to Disconnected.
+        state
+            .session_connection_states
+            .insert("stuck".to_string(), SessionConnectionState::Disconnected);
+        // Now a retry must succeed.
+        assert!(begin_reconnect(&mut state, "stuck"));
+        assert_eq!(
+            state.session_connection_states.get("stuck"),
+            Some(&SessionConnectionState::Reconnecting),
+        );
+    }
+
     fn assert_terminal_size_eq(actual: TerminalSize, expected: TerminalSize) {
         assert_eq!(actual.cols, expected.cols);
         assert_eq!(actual.rows, expected.rows);
@@ -8945,7 +9042,34 @@ fn start_ssh_connection(
         let host_for_import = ssh_config.host.clone();
         let client = rusterm_ssh::SshClient::new(ssh_config, event_tx.clone());
 
-        match client.connect(tab_id.clone(), initial_size).await {
+        // Cap the entire connect attempt (TCP + SSH handshake + auth + PTY
+        // request) so a server that accepts TCP but never completes the
+        // handshake/auth can't hang the session in `Reconnecting` forever.
+        // See [`SSH_CONNECT_TIMEOUT_SECS`] for the rationale.
+        let connect_result = tokio::time::timeout(
+            std::time::Duration::from_secs(SSH_CONNECT_TIMEOUT_SECS),
+            client.connect(tab_id.clone(), initial_size),
+        )
+        .await;
+        let connect_result = match connect_result {
+            Ok(inner) => inner,
+            Err(_) => {
+                // Timeout elapsed — treat as a connect failure so the Err
+                // branch below sets the state to `Disconnected` and surfaces a
+                // reconnect prompt.
+                tracing::warn!(
+                    "[Reconnect] SSH connect timed out after {}s for {}",
+                    SSH_CONNECT_TIMEOUT_SECS,
+                    &tab_id[..tab_id.len().min(8)]
+                );
+                Err(anyhow::anyhow!(
+                    "connect to {} timed out after {}s",
+                    host_for_import,
+                    SSH_CONNECT_TIMEOUT_SECS
+                ))
+            }
+        };
+        match connect_result {
             Ok((session, ssh_session)) => {
                 {
                     let mut app = state.write();
@@ -12164,6 +12288,8 @@ fn reconnect_session(
         previous_size.cols,
         previous_size.rows
     );
+    // Clone before the `match` moves `tab_id` into the connect function.
+    let wd_tab_id = tab_id.clone();
     match conn.kind {
         ConnectionKind::Ssh(ssh_config) => {
             start_ssh_connection(state, input_senders, tab_id, ssh_config);
@@ -12188,6 +12314,48 @@ fn reconnect_session(
             );
         }
     }
+
+    // Reconnect watchdog: if the session is still in `Reconnecting` after
+    // [`RECONNECT_WATCHDOG_SECS`], flip it back to `Disconnected` so the user
+    // can press Enter to retry. This is the safety net for any code path that
+    // sets `Reconnecting` but never transitions out of it — e.g. a
+    // `client.connect()` future that was dropped before completing, or a
+    // connect attempt that hung past its explicit timeout because the runtime
+    // was overloaded. Without this, the session would be stuck in
+    // `Reconnecting` forever and `begin_reconnect` would keep rejecting
+    // retries (it only allows `Disconnected -> Reconnecting`).
+    let mut wd_state = state;
+    spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_secs(RECONNECT_WATCHDOG_SECS)).await;
+        let stuck = matches!(
+            wd_state.read().session_connection_states.get(&wd_tab_id),
+            Some(SessionConnectionState::Reconnecting)
+        );
+        if stuck {
+            tracing::warn!(
+                "[Reconnect] watchdog: session {} stuck in Reconnecting after {}s, flipping to Disconnected",
+                &wd_tab_id[..wd_tab_id.len().min(8)],
+                RECONNECT_WATCHDOG_SECS
+            );
+            {
+                let mut s = wd_state.write();
+                s.session_connection_states
+                    .insert(wd_tab_id.clone(), SessionConnectionState::Disconnected);
+            }
+            // Surface a reconnect prompt so the user knows they can retry.
+            let terminals = wd_state.read().terminals.clone();
+            if let Some(handle) = terminals.get(&wd_tab_id) {
+                let reconnect = crate::i18n::t("session.press_enter_to_reconnect");
+                let msg = format!("\r\n{}\r\n", reconnect);
+                let render_result = handle.lock().process_and_render(msg.as_bytes());
+                let mut s = wd_state.write();
+                if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == wd_tab_id) {
+                    tab.render_output = render_result;
+                    tab.version += 1;
+                }
+            }
+        }
+    });
 }
 
 #[component]
@@ -12781,6 +12949,40 @@ pub fn App() -> Element {
                 }
             }
         }
+    });
+
+    // One-time startup: detect and load oh-my-zsh plugin aliases so the
+    // suggestion popup can surface them as a 4th suggestion source (after
+    // session history, SQLite FTS5, and DuckDB analytics).
+    //
+    // `OhMyZsh::load` does synchronous file I/O (reads `~/.zshrc` + each
+    // enabled plugin's `.plugin.zsh` file) and string parsing, so we wrap it
+    // in `spawn_blocking` to avoid blocking the async runtime. The result is
+    // a small `HashMap<String, PluginAlias>` (typically 200-500 entries for
+    // a git+docker+kubectl setup) shared via `Arc`, so cloning it into the
+    // signal is cheap.
+    //
+    // If oh-my-zsh isn't installed (`load` returns `None`), the state field
+    // stays `None` and the suggestion query simply skips this source — no
+    // error, no user-visible impact. This is the opt-in nature of the
+    // integration: users who don't have oh-my-zsh see no change.
+    let mut ohmyzsh_state = state.clone();
+    let _ohmyzsh_load = use_future(move || async move {
+        let loaded = tokio::task::spawn_blocking(rusterm_ohmyzsh::OhMyZsh::load)
+            .await
+            .ok()
+            .flatten();
+        if let Some(ref omz) = loaded {
+            tracing::info!(
+                "[ohmyzsh] integration active: {} aliases from {} plugins (theme={:?})",
+                omz.alias_count(),
+                omz.enabled_plugins().len(),
+                omz.theme()
+            );
+        } else {
+            tracing::debug!("[ohmyzsh] not installed or no plugins enabled; integration inactive");
+        }
+        ohmyzsh_state.write().ohmyzsh = loaded;
     });
 
     // ── Last-window close interception ─────────────────────────────────

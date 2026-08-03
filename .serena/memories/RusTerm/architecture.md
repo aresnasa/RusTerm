@@ -492,3 +492,51 @@ These let future diagnosis distinguish "cache never written" (no `write` log) fr
 - `touch` is only called after the remote *accepted* the password (`sudo_authorization_failed(&second)` is false). If the remote rejects it, `clear_key` drops the lease immediately. So a stale/wrong password can't be kept alive by `touch`.
 - The 30-min TTL + refresh-on-use still respects the remote sudo authority: if the remote sudo timestamp expires (configurable via `timestamp_timeout`), the next `sudo -S` will fail with auth-required → `clear_key` → `sudo_authorization_rejected`. The user must re-run sudo in their terminal.
 - Host/port/user isolation is unchanged: `SudoCredentialKey` still binds to `connection_id + host + port + username`. Editing a connection to a different host still produces a different key (pinned by the existing `sudo_credentials_are_host_bound_expiring_and_revocable_by_session` test).
+
+## Output protection for huge output (tree/ls on millions of files, 2026-08-03)
+
+**Problem**: `tree`/`ls` on a directory with millions of entries floods the SSH/PTY reader with thousands of small `SessionEvent::Output` chunks per second. The unbounded MPSC channel between reader and consumer grows without limit, the per-chunk VTE parse + render allocation overwhelms the event loop, and the session's memory footprint climbs until the process is killed.
+
+**Fix** (commit 789ca4f, already in tree): three layers of protection in `crates/rusterm-ui/src/app.rs`:
+1. **`drain_output_batch`** (~L202) — coalesces all immediately-available `SessionEvent::Output` events for the same session into a single buffer (capped at `MAX_OUTPUT_BATCH_BYTES = 1 MiB`), then processes+renders once. Cuts per-chunk overhead by 1/N.
+2. **`shed_backlog_overflow`** (~L252) — when the batch hits the 1 MiB cap (meaning there's a backlog), drains remaining same-session `Output` events into a bounded tail buffer. If total backlog exceeds `MAX_BACKLOG_BYTES = 8 MiB`, drops the oldest surplus and keeps only the most recent 8 MiB (the tail — what the user cares about: end of `tree`/`ls` output, final prompt, exit codes). Mirrors hardware terminal overrun behavior.
+3. **Terminal scrollback cap** (`rusterm-core/src/terminal.rs` L437) — `scrollback_capacity: 10_000` lines, trimmed on every push via `VecDeque::pop_front` (O(1)). The terminal grid itself never grows without limit.
+
+All 4 connection types (SSH, shell, serial, telnet) use the same `drain_output_batch` + `pending_event` pattern in their event loops. Non-`Output` events (Disconnected, Error) are preserved — returned as the pending event so the outer loop processes them normally.
+
+## Session recovery fix — stuck Reconnecting (2026-08-03)
+
+**Bug**: "多次都没有触发会话恢复了" — after a disconnect, pressing Enter to reconnect sometimes didn't work. The session was stuck in `Reconnecting` and `begin_reconnect` only allows `Disconnected → Reconnecting`, so retries were silently rejected.
+
+**Root cause**: `start_ssh_connection`'s `client.connect().await` call had NO overall timeout. The TCP connect has a 15s timeout (`CONNECT_TIMEOUT` in `rusterm-ssh/src/transport.rs`), but the SSH handshake and authentication phases have no timeout — a server that accepts TCP but never responds to the SSH version banner, or a keyboard-interactive auth that never sends its challenge, would hang forever. While hung, the state stays `Reconnecting` and the user can never trigger another reconnect.
+
+**Fix** (2 layers, both in `crates/rusterm-ui/src/app.rs`):
+1. **`SSH_CONNECT_TIMEOUT_SECS = 30`** — wraps the `client.connect()` call in `tokio::time::timeout`. On timeout, treats it as a connect failure (Err branch sets state to `Disconnected` + shows reconnect prompt). 30s is generous enough for a slow handshake + key auth on a high-latency link.
+2. **`RECONNECT_WATCHDOG_SECS = 45`** — a `spawn` in `reconnect_session` that sleeps 45s, then checks if the session is still `Reconnecting`. If so, flips it to `Disconnected` + writes a reconnect prompt to the terminal. This is the safety net for any code path that sets `Reconnecting` but never transitions out (e.g. a dropped future, runtime overload). Set slightly above `SSH_CONNECT_TIMEOUT_SECS` so the explicit timeout fires first.
+
+**Test**: `reconnect_retry_works_after_watchdog_flips_stuck_reconnecting_to_disconnected` — pins the before/after contract: stuck-`Reconnecting` blocks `begin_reconnect`, but once flipped to `Disconnected`, a retry succeeds.
+
+## oh-my-zsh native integration (2026-08-03)
+
+**Goal**: natively integrate oh-my-zsh (https://github.com/ohmyzsh/ohmyzsh) so the plugin aliases the user's shell already understands become first-class suggestions in the RusTerm UI — the "auto-popup" integration the user asked for.
+
+**New crate**: `rusterm-ohmyzsh` (`crates/rusterm-ohmyzsh/`).
+- `OhMyZsh::detect()` — finds `~/.oh-my-zsh` (or `$ZSH` env var), reads `~/.zshrc` for `plugins=(...)` and `ZSH_THEME="..."`. Returns `None` if not installed.
+- `OhMyZsh::load()` — detect + read each enabled plugin's `*.plugin.zsh` file, parse `alias name='value'` definitions into an in-memory `HashMap<String, PluginAlias>`. Last-loaded plugin wins (mirrors zsh source order).
+- `OhMyZsh::aliases_for_prefix(prefix, limit)` — returns aliases matching the prefix, sorted by name length (shorter first). Used by the suggestion query.
+- `OhMyZsh::expand_alias(name)` — returns the expansion for a full alias name. Available for inline ghost-text (future work).
+- `PluginAlias { name, expansion, plugin }` — the parsed alias struct.
+- 20 unit tests (plugin parsing, theme parsing, alias parsing, prefix matching, last-loaded-wins).
+- **NOT executed**: pure file reads + string parsing. No zsh scripts are run.
+- **NOT installed**: reads the user's existing `~/.oh-my-zsh`; if not present, the crate is a no-op.
+
+**Wiring** (`crates/rusterm-ui/src/app.rs` + `state.rs`):
+- `AppState.ohmyzsh: Option<rusterm_ohmyzsh::OhMyZsh>` (serde-skip) — loaded once on startup.
+- `_ohmyzsh_load` `use_future` in `App()` — calls `OhMyZsh::load` via `spawn_blocking` (synchronous file I/O), stores result in `state.write().ohmyzsh`. Logs `[ohmyzsh] integration active: N aliases from M plugins` or `not installed; integration inactive`.
+- **Suggestion query source #4**: after the 3 existing sources (session history, SQLite FTS5, DuckDB analytics), the query checks `state.read().ohmyzsh` and calls `aliases_for_prefix(&cmd_part, sug_count * 2)`. Aliases matching the prefix AND not already seen AND not in `recent_failed_commands` are added to `all_suggestions`. The alias NAME is the suggestion (the popup shows `gst`, `gco`, etc.); the expansion is available for future ghost-text rendering.
+
+**What this gives the user**: when typing `g`, the popup now shows oh-my-zsh git-plugin aliases (`g`, `ga`, `gaa`, `gst`, `gco`, ...) alongside history-based suggestions. When typing `d`, docker-plugin aliases appear. This is the "auto-popup" integration — the aliases surface automatically based on the user's `~/.zshrc` plugin configuration, without the shell having to be the source.
+
+**Workspace changes**: `Cargo.toml` workspace members + deps gained `rusterm-ohmyzsh`; `rusterm-ui/Cargo.toml` gained `rusterm-ohmyzsh.workspace = true`.
+
+**Test totals**: rusterm-ohmyzsh 20, rusterm-ui 619 (was 618 — +1 reconnect watchdog test), workspace all green.
