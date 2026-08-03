@@ -187,4 +187,25 @@ return "$RUSTERM_FAILED"
 # 使用 rusterm <命令...>；包含 &&、管道或重定向时请为命令加引号
 rusterm uname -a
 这里会用老的（上次次会话的配置）不符合预期，这里需要能够刷新（按照当前会话的情况来记录相关节点信息），需要优化
-88.
+88. 继续检查并调整生成的脚本逻辑，rusterm uname -a
+
+curl: (3) URL rejected: Malformed input to a URL function
+
+一个或多个 RusTerm API 请求失败（最后状态：3）。
+❯ vim test.sh
+❯ bash test.sh
+
+==> b03d42ee-e052-4484-93f8-ada44086a484
+Linux k8s-node-202-216 5.15.0-186-generic #196-Ubuntu SMP Sat Jun 20 16:09:34 UTC 2026 x86_64 x86_64 x86_64 GNU/Linux
+
+==> dbbb5b8f-0e20-46d6-94c6-95e050435c73
+Linux k8s-node-202-217 5.4.0-216-generic #236-Ubuntu SMP Fri Apr 11 19:53:21 UTC 2025 x86_64 x86_64 x86_64 GNU/Linux
+
+==> 42725271-d0cb-4118-98c3-2198e6b3c654
+curl: (22) The requested URL returned error: 403
+{"error":"此主机没有可复用的 sudo 授权。请在其已启用 OneKey 的 RusTerm 会话中运行一次 sudo，然后重试。","code":"elevation_required"}
+==> 100eac5a-2ef7-427f-84e1-9e03e2b61820
+Linux gpu-muxi-001.x86.test.brainpp.dev 5.15.0-119-generic #1，将API 脚本放到 test.sh 中执行会报错这些，直接执行会报错（curl: (3) URL rejected: Malformed input to a URL function
+
+一个或多个 RusTerm API 请求失败（最后状态：3）。），需要彻底修复，同时能够及时的清理历史记忆（这里正常情况下是需要 unset 原来的配置，再重新执行的，避免同一个终端申请了多个变量。）
+89. 优化鼠标复制会话终端的内容逻辑，需要能够支持完整的窗口中内容的复制，当前只能复制一部分内容，需要优化。
