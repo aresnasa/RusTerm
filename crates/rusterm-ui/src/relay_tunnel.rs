@@ -97,6 +97,13 @@ pub struct LiveSessionEntry {
     pub input_tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
     /// The connection id this session was opened from.
     pub connection_id: String,
+    /// Whether the connection either has no login script or its login
+    /// script ran to completion in this session. Sessions whose script
+    /// failed/aborted (the operator may have navigated the bastion menu
+    /// manually) are still published so a session-qualified selector can
+    /// target the exact tab, but plain selectors skip them: their PTY may
+    /// be sitting on an unknown node or still at the bastion menu.
+    pub login_script_completed: bool,
 }
 
 static SESSION_REGISTRY: OnceLock<RwLock<Vec<LiveSessionEntry>>> = OnceLock::new();
