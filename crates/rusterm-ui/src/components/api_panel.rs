@@ -44,6 +44,45 @@ fn template_mode_of(mode: CurlMode) -> ApiTemplateMode {
     }
 }
 
+/// Longest label pre-filled from the user's typed command when opening the
+/// add-template form. Longer commands are truncated with an ellipsis so the
+/// template chip stays readable; the full body is preserved separately.
+const TEMPLATE_LABEL_MAX_CHARS: usize = 30;
+
+/// Derives `(label, body)` pre-fill values for the inline add-template form
+/// from whatever the user has already typed into the current mode's input,
+/// so "save what I just ran as a template" is one click instead of retyping.
+///
+/// - The body is the current input, trimmed.
+/// - In `Command` mode the label defaults to the command itself (truncated),
+///   matching the built-in templates whose labels are the commands.
+/// - Script modes leave the label empty: a script body makes a poor label.
+fn template_form_prefill(
+    mode: CurlMode,
+    command: &str,
+    script: &str,
+    script_base64: &str,
+) -> (String, String) {
+    let body = match mode {
+        CurlMode::Command => command,
+        CurlMode::Script => script,
+        CurlMode::ScriptBase64 => script_base64,
+    }
+    .trim()
+    .to_string();
+    let label = match mode {
+        CurlMode::Command => {
+            let mut label: String = body.chars().take(TEMPLATE_LABEL_MAX_CHARS).collect();
+            if body.chars().count() > TEMPLATE_LABEL_MAX_CHARS {
+                label.push('…');
+            }
+            label
+        }
+        CurlMode::Script | CurlMode::ScriptBase64 => String::new(),
+    };
+    (label, body)
+}
+
 /// A quick-pick template shown in the API panel. Selecting one loads its body
 /// into the matching input field for the current [`CurlMode`]. Templates are
 /// starting points — the user can edit the input afterwards. The generated
