@@ -1027,7 +1027,7 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
                         }
                     }
                     if adding_template() {
-                        div { class: "api-row", style: "gap:4px;margin-bottom:8px;flex-wrap:wrap;align-items:flex-start;"},{
+                        div { class: "api-row", style: "gap:4px;margin-bottom:8px;flex-wrap:wrap;align-items:flex-start;",
                             input {
                                 class: "api-input",
                                 style: "font-size:11px;flex:0 0 140px;",

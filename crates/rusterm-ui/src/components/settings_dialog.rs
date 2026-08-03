@@ -433,14 +433,12 @@ fn subsequence_score(needle: &str, haystack: &str) -> Option<usize> {
     }
     let mut matched = 0usize;
     let mut first = None;
-    let mut last = 0usize;
     for (index, ch) in haystack.chars().enumerate() {
         if ch == needle[matched] {
             first.get_or_insert(index);
-            last = index;
             matched += 1;
             if matched == needle.len() {
-                let span = last.saturating_sub(first.unwrap_or(0));
+                let span = index.saturating_sub(first.unwrap_or(0));
                 return Some(300usize.saturating_sub(span));
             }
         }
