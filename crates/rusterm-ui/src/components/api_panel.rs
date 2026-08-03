@@ -83,6 +83,7 @@ fn template_form_prefill(
     (label, body)
 }
 
+#[cfg_attr(not(feature = "qwen-local"), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum AiSuggestionKind {
     Shell,
@@ -98,6 +99,7 @@ impl AiSuggestionKind {
     }
 }
 
+#[cfg_attr(not(feature = "qwen-local"), allow(dead_code))]
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum AiSuggestionSaveState {
     Saved,
@@ -113,8 +115,10 @@ struct AiTemplateSuggestion {
     save_state: AiSuggestionSaveState,
 }
 
+#[cfg_attr(not(feature = "qwen-local"), allow(dead_code))]
 const AI_TEMPLATE_DESCRIPTION_MAX_CHARS: usize = 36;
 
+#[cfg_attr(not(feature = "qwen-local"), allow(dead_code))]
 fn ai_template_label(description: &str, kind: AiSuggestionKind) -> String {
     let description = description.trim();
     let mut short = description
@@ -131,6 +135,7 @@ fn ai_template_label(description: &str, kind: AiSuggestionKind) -> String {
     format!("AI · {kind} · {short}")
 }
 
+#[cfg_attr(not(feature = "qwen-local"), allow(dead_code))]
 fn ai_custom_template(suggestion: &AiTemplateSuggestion) -> CustomApiTemplate {
     CustomApiTemplate {
         label: suggestion.label.clone(),
@@ -139,6 +144,7 @@ fn ai_custom_template(suggestion: &AiTemplateSuggestion) -> CustomApiTemplate {
     }
 }
 
+#[cfg_attr(not(feature = "qwen-local"), allow(dead_code))]
 fn has_same_ai_template(templates: &[CustomApiTemplate], body: &str) -> bool {
     templates.iter().any(|template| {
         template.mode == ApiTemplateMode::Script && template.body.trim() == body.trim()
