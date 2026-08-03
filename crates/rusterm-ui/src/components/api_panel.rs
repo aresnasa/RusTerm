@@ -750,6 +750,8 @@ rusterm() {{\n\
       export RUSTERM_HOSTS\n\
     fi\n\
   fi\n\
+  RUSTERM_HOSTS=$(printf '%s' \"$RUSTERM_HOSTS\" | tr -d '\\r')\n\
+  RUSTERM_API_URL=$(printf '%s' \"$RUSTERM_API_URL\" | tr -d '\\r')\n\
   if [ -z \"$RUSTERM_HOSTS\" ]; then\n\
     printf '{no_hosts}\\n' >&2\n\
     return 1\n\
@@ -757,9 +759,11 @@ rusterm() {{\n\
   RUSTERM_FAILED=0\n\
   RUSTERM_COUNT=0\n\
   for RUSTERM_TARGET in $RUSTERM_HOSTS; do\n\
+    [ -z \"$RUSTERM_TARGET\" ] && continue\n\
     RUSTERM_COUNT=$((RUSTERM_COUNT + 1))\n\
   done\n\
   for RUSTERM_TARGET in $RUSTERM_HOSTS; do\n\
+    [ -z \"$RUSTERM_TARGET\" ] && continue\n\
     [ \"$RUSTERM_COUNT\" -gt 1 ] && printf '\\n==> %s\\n' \"$RUSTERM_TARGET\"\n\
     curl --silent --show-error --fail-with-body \\\n      --connect-timeout 10 --max-time 120 \\\n      --request POST \\\n      --user \"${{RUSTERM_API_USER}}:${{RUSTERM_API_PASSWORD}}\" \\\n      --header 'Accept: text/plain' \\\n      --header 'Content-Type: text/plain; charset=utf-8' \\\n      --data-binary \"$*\" \\\n      \"${{RUSTERM_API_URL}}/r/${{RUSTERM_TARGET}}{elevated_query}\" || RUSTERM_FAILED=$?\n\
   done\n\n\
