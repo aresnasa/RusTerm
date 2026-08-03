@@ -127,18 +127,24 @@ pub fn sync_session_registry(entries: Vec<LiveSessionEntry>) {
 /// connection can sit on *different* target nodes, so a session-qualified
 /// selector must never fall back to a sibling tab — that is precisely how
 /// commands end up on the wrong node. If the exact tab is gone, we return
-/// `None` and the caller takes the fresh-connection slow path.
+/// `None`; the caller decides between the fresh-connection slow path
+/// (direct hosts) and an explicit error (bastion hosts, see
+/// [`live_session_required`]).
 ///
 /// Plain selectors keep the legacy behaviour: first entry matching the
-/// connection id, then a fallback by connection name.
+/// connection id, then a fallback by connection name — but only across
+/// sessions whose login script completed (or that have none). A tab where
+/// the operator navigated the bastion menu manually is only reachable via
+/// its exact session-qualified selector.
 fn find_live_session(host_selector: &str) -> Option<LiveSessionEntry> {
     let guard = session_registry().read().ok()?;
-    let keys: Vec<(String, String)> = guard
+    let keys: Vec<(String, String, bool)> = guard
         .iter()
         .map(|entry| {
             (
                 entry.connection_id.clone(),
                 entry.session.session_id().to_string(),
+                entry.login_script_completed,
             )
         })
         .collect();
@@ -147,36 +153,62 @@ fn find_live_session(host_selector: &str) -> Option<LiveSessionEntry> {
 }
 
 /// Testable core of [`find_live_session`]: resolves a selector to an index
-/// into `entries`, given as `(connection_id, session_id)` pairs (a plain
-/// projection of the registry, so tests don't need to construct a real
-/// [`rusterm_ssh::SshSession`]).
+/// into `entries`, given as `(connection_id, session_id,
+/// login_script_completed)` triples (a plain projection of the registry, so
+/// tests don't need to construct a real [`rusterm_ssh::SshSession`]).
 fn find_live_session_index(
     host_selector: &str,
-    entries: &[(String, String)],
+    entries: &[(String, String, bool)],
     connections: &[ConnectionConfig],
 ) -> Option<usize> {
     let (base, session_id) = split_host_selector(host_selector);
     if let Some(session_id) = session_id {
+        // Exact-tab routing: the caller chose this specific PTY, so login
+        // script state is irrelevant — a manually navigated tab is exactly
+        // what the operator wants to reuse.
         return entries
             .iter()
-            .position(|(conn_id, sess_id)| sess_id == session_id && conn_id == base);
+            .position(|(conn_id, sess_id, _)| sess_id == session_id && conn_id == base);
     }
 
     entries
         .iter()
-        .position(|(conn_id, _)| conn_id == host_selector)
+        .position(|(conn_id, _, plain_ok)| *plain_ok && conn_id == host_selector)
         .or_else(|| {
             // Fall back to matching by connection name.
             let target_name = connections
                 .iter()
                 .find(|c| c.id == host_selector)
                 .map(|c| c.name.clone())?;
-            entries.iter().position(|(conn_id, _)| {
-                connections
-                    .iter()
-                    .any(|c| &c.id == conn_id && c.name == target_name)
+            entries.iter().position(|(conn_id, _, plain_ok)| {
+                *plain_ok
+                    && connections
+                        .iter()
+                        .any(|c| &c.id == conn_id && c.name == target_name)
             })
         })
+}
+
+/// Whether a host selector may only execute inside its exact live TTY.
+///
+/// True for session-qualified selectors (`{connection_id}@{tab_id}`) whose
+/// base connection has a login script — i.e. bastion/jumpserver hosts. The
+/// "currently on node X" state lives solely inside that tab's PTY channel:
+/// a fresh SSH connection (or any other tab) lands back on the bastion
+/// entry host and returns output from the wrong machine, so the caller must
+/// fail loudly instead of falling back. Direct hosts keep the
+/// fresh-connection fallback — a new connection reaches the same machine.
+fn live_session_required(host_selector: &str, connections: &[ConnectionConfig]) -> bool {
+    let (base, session_id) = split_host_selector(host_selector);
+    if session_id.is_none() {
+        return false;
+    }
+    connections.iter().any(|c| {
+        (c.id == base || c.name == base)
+            && c.login_script
+                .as_deref()
+                .is_some_and(|script| !script.trim().is_empty())
+    })
 }
 
 // ── Short-lived sudo credential lease ───────────────────────────────────
