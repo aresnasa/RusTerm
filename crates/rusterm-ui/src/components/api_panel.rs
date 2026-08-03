@@ -675,6 +675,7 @@ fn gen_curl_preview_for_language(
     let shell_escape = |value: &str| value.replace('\'', "'\"'\"'");
     let shell_quote = |value: &str| format!("'{}'", shell_escape(value));
     let password_prompt = shell_escape(&crate::i18n::t_for("api.password_prompt", language));
+    let password_not_tty = shell_escape(&crate::i18n::t_for("api.password_not_tty", language));
     let command_marker_title = crate::i18n::t_for("api.command_marker_title", language);
     let command_marker_help = crate::i18n::t_for("api.command_marker_help", language);
     let request_failed = shell_escape(&crate::i18n::t_for("api.request_failed", language));
@@ -731,7 +732,7 @@ rusterm() {{\n\
     return 2\n\
   fi\n\
   if [ \"$1\" = \"--refresh\" ]; then\n\
-    unset RUSTERM_HOSTS\n\
+    unset RUSTERM_HOSTS RUSTERM_API_PASSWORD\n\
     shift\n\
     [ \"$#\" -eq 0 ] && return 0\n\
   fi\n\
@@ -747,6 +748,10 @@ rusterm() {{\n\
   fi\n\
 \n\
   if [ -z \"${{RUSTERM_API_PASSWORD+x}}\" ]; then\n\
+    if [ ! -t 0 ]; then\n\
+      printf '{password_not_tty}\\n' >&2\n\
+      return 1\n\
+    fi\n\
     printf '{password_prompt}' >&2\n\
     RUSTERM_STTY=$(stty -g)\n\
     trap 'stty \"$RUSTERM_STTY\"' 0 1 2 15\n\
@@ -770,6 +775,7 @@ rusterm() {{\n\
     return 1\n\
   fi\n\n\
   RUSTERM_FAILED=0\n\
+  RUSTERM_ELEVATED='{elevated_query}'\n\
   RUSTERM_COUNT=0\n\
   for RUSTERM_TARGET in $RUSTERM_HOSTS; do\n\
     [ -z \"$RUSTERM_TARGET\" ] && continue\n\
@@ -778,7 +784,23 @@ rusterm() {{\n\
   for RUSTERM_TARGET in $RUSTERM_HOSTS; do\n\
     [ -z \"$RUSTERM_TARGET\" ] && continue\n\
     [ \"$RUSTERM_COUNT\" -gt 1 ] && printf '\\n==> %s\\n' \"$RUSTERM_TARGET\"\n\
-    curl --silent --show-error --fail-with-body \\\n      --connect-timeout 10 --max-time 120 \\\n      --request POST \\\n      --user \"${{RUSTERM_API_USER}}:${{RUSTERM_API_PASSWORD}}\" \\\n      --header 'Accept: text/plain' \\\n      --header 'Content-Type: text/plain; charset=utf-8' \\\n      --data-binary \"$*\" \\\n      \"${{RUSTERM_API_URL}}/r/${{RUSTERM_TARGET}}{elevated_query}\" || RUSTERM_FAILED=$?\n\
+    if [ -n \"$RUSTERM_ELEVATED\" ]; then\n\
+      RUSTERM_OUT=$(curl --silent --show-error --fail-with-body \\\n        --connect-timeout 10 --max-time 120 \\\n        --request POST \\\n        --user \"${{RUSTERM_API_USER}}:${{RUSTERM_API_PASSWORD}}\" \\\n        --header 'Accept: text/plain' \\\n        --header 'Content-Type: text/plain; charset=utf-8' \\\n        --data-binary \"$*\" \\\n        \"${{RUSTERM_API_URL}}/r/${{RUSTERM_TARGET}}${{RUSTERM_ELEVATED}}\" 2>&1)\n\
+      RUSTERM_STATUS=$?\n\
+      if [ \"$RUSTERM_STATUS\" -eq 0 ]; then\n\
+        printf '%s\\n' \"$RUSTERM_OUT\"\n\
+        continue\n\
+      fi\n\
+      case \"$RUSTERM_OUT\" in\n\
+        *elevation_required*) ;;\n\
+        *)\n\
+          printf '%s\\n' \"$RUSTERM_OUT\" >&2\n\
+          RUSTERM_FAILED=$RUSTERM_STATUS\n\
+          continue\n\
+          ;;\n\
+      esac\n\
+    fi\n\
+    curl --silent --show-error --fail-with-body \\\n      --connect-timeout 10 --max-time 120 \\\n      --request POST \\\n      --user \"${{RUSTERM_API_USER}}:${{RUSTERM_API_PASSWORD}}\" \\\n      --header 'Accept: text/plain' \\\n      --header 'Content-Type: text/plain; charset=utf-8' \\\n      --data-binary \"$*\" \\\n      \"${{RUSTERM_API_URL}}/r/${{RUSTERM_TARGET}}\" || RUSTERM_FAILED=$?\n\
   done\n\n\
   if [ \"$RUSTERM_FAILED\" -ne 0 ]; then\n\
     printf '\\n{request_failed}\\n' \"$RUSTERM_FAILED\" >&2\n\
@@ -868,6 +890,10 @@ fi\n"
             "export RUSTERM_API_URL={url}\n\
 export RUSTERM_API_USER={user}\n\
 if [ -z \"${{RUSTERM_API_PASSWORD+x}}\" ]; then\n\
+  if [ ! -t 0 ]; then\n\
+    printf '{password_not_tty}\\n' >&2\n\
+    exit 1\n\
+  fi\n\
   printf '{password_prompt}' >&2\n\
   RUSTERM_STTY=$(stty -g)\n\
   trap 'stty \"$RUSTERM_STTY\"' 0 1 2 15\n\
@@ -938,7 +964,7 @@ mod tests {
         );
         assert!(
             curl.contains("export RUSTERM_API_URL='http://127.0.0.1:8080'")
-                && curl.contains("\"${RUSTERM_API_URL}/r/${RUSTERM_TARGET}?elevated=true\""),
+                && curl.contains("\"${RUSTERM_API_URL}/r/${RUSTERM_TARGET}${RUSTERM_ELEVATED}\""),
             "missing short-form endpoint export/use: {curl}"
         );
         assert!(curl.contains("export RUSTERM_API_USER='alice'"), "{curl}");
@@ -1003,11 +1029,13 @@ mod tests {
             ),
             "{curl}"
         );
-        assert_eq!(curl.matches("--data-binary \"$*\"").count(), 1, "{curl}");
+        assert!(curl.matches("--data-binary \"$*\"").count() >= 1, "{curl}");
         assert!(
             curl.contains("\"${RUSTERM_API_URL}/r/${RUSTERM_TARGET}\""),
             "non-elevated calls should not add an elevated query: {curl}"
         );
+        assert!(curl.contains("if [ ! -t 0 ]; then"), "{curl}");
+        assert!(curl.contains("RUSTERM_ELEVATED=''"), "{curl}");
         assert!(
             curl.contains("--silent --show-error --fail-with-body"),
             "{curl}"
@@ -1073,8 +1101,8 @@ mod tests {
             "function must handle --refresh: {curl}"
         );
         assert!(
-            curl.contains("unset RUSTERM_HOSTS"),
-            "--refresh must clear the cached host list: {curl}"
+            curl.contains("unset RUSTERM_HOSTS RUSTERM_API_PASSWORD"),
+            "--refresh must clear cached hosts and credentials: {curl}"
         );
 
         // RUSTERM_HOSTS override path: if the user pre-exports it, discovery
@@ -1122,11 +1150,55 @@ mod tests {
             "execution loop must skip empty targets: {curl}"
         );
 
-        // Elevated query is still applied per-target.
+        // Elevated requests fall back per host when sudo authorization is
+        // unavailable, without failing requests to other hosts.
+        assert!(curl.contains("if [ ! -t 0 ]; then"), "{curl}");
+        assert!(curl.contains("RUSTERM_ELEVATED='?elevated=true'"), "{curl}");
+        assert!(curl.contains("*elevation_required*)"), "{curl}");
         assert!(
-            curl.contains("\"${RUSTERM_API_URL}/r/${RUSTERM_TARGET}?elevated=true\""),
+            curl.contains("\"${RUSTERM_API_URL}/r/${RUSTERM_TARGET}${RUSTERM_ELEVATED}\""),
             "elevated must be forwarded as a query param: {curl}"
         );
+        assert!(
+            curl.contains("\"${RUSTERM_API_URL}/r/${RUSTERM_TARGET}\""),
+            "elevation_required must fall back to a normal request: {curl}"
+        );
+    }
+
+    #[test]
+    fn generated_curl_templates_are_valid_posix_shell() {
+        use std::io::Write as _;
+        use std::process::{Command, Stdio};
+
+        let session = ["host-a".to_string()];
+        let payloads = [
+            CurlPayload::Command("printf '%s\\n' ok".to_string()),
+            CurlPayload::Script("printf '%s\\n' ok".to_string()),
+            CurlPayload::ScriptBase64("cHJpbnRmICclc1xcbicgb2s=".to_string()),
+        ];
+
+        for payload in payloads {
+            let script = gen_curl("http://127.0.0.1:8877", "alice", &session, &payload, true);
+            let mut child = Command::new("/bin/sh")
+                .arg("-n")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("/bin/sh must be available");
+            child
+                .stdin
+                .take()
+                .expect("piped stdin")
+                .write_all(script.as_bytes())
+                .expect("write generated shell template");
+            let output = child.wait_with_output().expect("wait for /bin/sh -n");
+            assert!(
+                output.status.success(),
+                "generated template failed /bin/sh -n: {}\n{script}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
     }
 
     #[test]

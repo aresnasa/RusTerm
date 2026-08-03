@@ -90,6 +90,16 @@ struct TextSelection {
     head: (usize, usize),
 }
 
+/// Finalize a drag at the button-release cell. Browsers may coalesce or omit
+/// the last mousemove before mouseup, so the cached head can otherwise stop
+/// short of the position where the user actually released the pointer.
+fn finalize_selection_on_mouse_up(
+    selection: TextSelection,
+    release_cell: Option<(usize, usize)>,
+) -> TextSelection {
+    release_cell.map_or(selection, |head| TextSelection { head, ..selection })
+}
+
 /// Resolve the current terminal-owned selection to clipboard text.
 ///
 /// The cached text is normally populated on mouseup. Keeping this fallback at
@@ -2113,6 +2123,8 @@ pub fn TerminalView(
         }
         selecting.set(false);
         let Some(ts) = selection() else { return };
+        let ts = finalize_selection_on_mouse_up(ts, event_cell(&e));
+        selection.set(Some(ts));
         if ts.anchor == ts.head {
             // Plain click, no drag → clear any prior selection.
             selection.set(None);
@@ -2729,11 +2741,12 @@ mod tests {
         ClipboardCopyOutcome, CopyShortcut, OneKeyKeyAction, PopupDirection, SEARCH_CURRENT_BG,
         SEARCH_MATCH_BG, TerminalOverlayKeyAction, TextSelection, accepts_history_completion,
         accepts_inline_suggestion, app_owns_mouse, cell_style, color_to_css,
-        copy_text_to_clipboard, cursor_key_seq, event_cell_from_coords, find_search_matches,
-        is_find_shortcut, is_history_completion_shortcut, onekey_popup_key_action,
-        online_search_url, popup_layout, scroll_thumb_geometry, search_query_from_selection,
-        suggestion_navigation_index, terminal_key_bytes, terminal_overlay_key_action,
-        terminal_selection_text, word_range_in_row,
+        copy_text_to_clipboard, cursor_key_seq, event_cell_from_coords,
+        finalize_selection_on_mouse_up, find_search_matches, is_find_shortcut,
+        is_history_completion_shortcut, onekey_popup_key_action, online_search_url, popup_layout,
+        scroll_thumb_geometry, search_query_from_selection, suggestion_navigation_index,
+        terminal_key_bytes, terminal_overlay_key_action, terminal_selection_text,
+        word_range_in_row,
     };
     use dioxus::prelude::{Code, Key};
     use rusterm_core::terminal::{CellColor, RenderCell, RenderRow};
@@ -2967,6 +2980,40 @@ mod tests {
         assert_eq!(
             copy_text_to_clipboard(String::new()),
             ClipboardCopyOutcome::SkippedEmpty
+        );
+    }
+
+    #[test]
+    fn mouseup_release_cell_completes_full_visible_window_selection() {
+        let rows = vec![
+            row_from("first"),
+            row_from(""),
+            RenderRow {
+                cells: cells_from("soft-"),
+                wrapped: true,
+            },
+            RenderRow {
+                cells: vec![
+                    wide_cell('错'),
+                    wide_next_cell(),
+                    wide_cell('误'),
+                    wide_next_cell(),
+                ],
+                wrapped: false,
+            },
+        ];
+        let stale_selection = TextSelection {
+            anchor: (0, 0),
+            // Simulates the final mousemove arriving before the pointer reaches
+            // the bottom-right release position.
+            head: (1, 0),
+        };
+
+        let finalized = finalize_selection_on_mouse_up(stale_selection, Some((3, 3)));
+
+        assert_eq!(
+            terminal_selection_text("", Some(finalized), &rows),
+            "first\n\nsoft-错误"
         );
     }
 
