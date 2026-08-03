@@ -700,16 +700,16 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
             "立即执行；此函数后续仍可复用",
         ),
         "api.command_marker_help" => (
-            "Use rusterm <command...>; quote commands containing &&, pipes, or redirects. Run rusterm --refresh to re-discover hosts after reconnecting.",
-            "使用 rusterm <命令...>；包含 &&、管道或重定向时请为命令加引号。重连后运行 rusterm --refresh 可重新发现主机。",
+            "Use rusterm <command...>; quote commands containing &&, pipes, or redirects. The function always targets the sessions selected when it was copied.",
+            "使用 rusterm <命令...>；包含 &&、管道或重定向时请为命令加引号。此函数始终以复制时勾选的会话为目标。",
         ),
         "api.request_failed" => (
             "One or more RusTerm API requests failed (last status: %s).",
             "一个或多个 RusTerm API 请求失败（最后状态：%s）。",
         ),
         "api.no_hosts" => (
-            "No hosts discovered; run rusterm --refresh or set RUSTERM_HOSTS manually.",
-            "未发现主机；请运行 rusterm --refresh 或手动设置 RUSTERM_HOSTS。",
+            "No hosts were selected when this function was copied.",
+            "复制此函数时未选择任何主机。",
         ),
         "api.missing_config" => (
             "RUSTERM_API_URL is not set; export it first (e.g. export RUSTERM_API_URL=http://127.0.0.1:8877).",
