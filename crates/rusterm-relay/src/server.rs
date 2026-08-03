@@ -1346,6 +1346,37 @@ mod tests {
         handle.shutdown().await;
     }
 
+    /// When the executor refuses to run a bastion command outside its live
+    /// terminal tab, the client must see the actionable reason (reconnect
+    /// the tab / refresh the selector) — not a bare "remote exec failed".
+    #[tokio::test]
+    async fn exec_live_session_required_detail_reaches_the_client() {
+        let executor = Arc::new(RecordingExecutor {
+            fail_exec: Some(
+                "[live-session-required] the command must run inside the logged-in tab".to_string(),
+            ),
+            ..Default::default()
+        });
+        let handle = run(test_config(), executor, Arc::new(NullHistoryStore))
+            .await
+            .unwrap();
+        let (status, body) = post_json(
+            &format!("{}/api/v1/exec", handle.url()),
+            Some(("ops", "pw")),
+            &serde_json::json!({
+                "host_id": "host-1",
+                "command": "uptime",
+            }),
+        )
+        .await;
+        assert_eq!(status, 502);
+        assert_eq!(body["error"], "remote exec failed");
+        let detail = body["detail"].as_str().unwrap();
+        assert!(detail.contains("[live-session-required]"));
+        assert!(detail.contains("logged-in tab"));
+        handle.shutdown().await;
+    }
+
     #[tokio::test]
     async fn exec_defaults_to_non_elevated_for_legacy_clients() {
         let executor = Arc::new(RecordingExecutor::default());

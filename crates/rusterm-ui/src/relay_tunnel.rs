@@ -1125,7 +1125,8 @@ mod tests {
             Some(0)
         );
         // Tab closed → no silent fallback to the surviving sibling tab; the
-        // caller must take the fresh-connection slow path instead.
+        // caller then either takes the fresh-connection slow path (direct
+        // hosts) or fails loudly (bastion hosts, `live_session_required`).
         assert_eq!(
             find_live_session_index("conn-j@tab-gone", &entries, &connections),
             None
@@ -1158,6 +1159,73 @@ mod tests {
             find_live_session_index("conn-z", &entries, &connections),
             None
         );
+    }
+
+    /// A tab whose login script failed (or that was navigated manually)
+    /// must stay reachable via its exact session-qualified selector — that
+    /// PTY is the only place holding the "currently on node X" state — but
+    /// plain selectors must skip it: its node is unknown to the executor.
+    #[test]
+    fn manually_navigated_tab_reachable_only_via_exact_selector() {
+        let entries = vec![
+            manual_live_key("conn-j", "tab-manual"),
+            live_key("conn-j", "tab-scripted"),
+        ];
+        let connections = vec![bastion_conn("conn-j", "jumpserver")];
+
+        // Exact selector hits the manually navigated tab.
+        assert_eq!(
+            find_live_session_index("conn-j@tab-manual", &entries, &connections),
+            Some(0)
+        );
+        // Plain selector skips it and lands on the script-completed tab.
+        assert_eq!(
+            find_live_session_index("conn-j", &entries, &connections),
+            Some(1)
+        );
+
+        // With only the manual tab live, a plain selector matches nothing
+        // (including via the name fallback).
+        let manual_only = vec![manual_live_key("conn-j", "tab-manual")];
+        assert_eq!(
+            find_live_session_index("conn-j", &manual_only, &connections),
+            None
+        );
+        assert_eq!(
+            find_live_session_index("conn-j@tab-manual", &manual_only, &connections),
+            Some(0)
+        );
+    }
+
+    /// Bastion selectors must never fall back to a fresh SSH connection:
+    /// only the session-qualified selector of a login-script host demands a
+    /// live tab. Plain selectors and direct hosts keep the slow-path
+    /// fallback (a fresh connection reaches the same machine there).
+    #[test]
+    fn live_session_required_only_for_session_qualified_bastion_selectors() {
+        let connections = vec![
+            bastion_conn("conn-j", "jumpserver"),
+            conn("conn-d", "direct"),
+        ];
+
+        // Bastion + session suffix → live tab required.
+        assert!(live_session_required("conn-j@tab-1", &connections));
+        // Name-based selector with suffix also counts.
+        assert!(live_session_required("jumpserver@tab-1", &connections));
+        // Plain bastion selector → slow path may replay the login script.
+        assert!(!live_session_required("conn-j", &connections));
+        // Direct host → fallback always allowed.
+        assert!(!live_session_required("conn-d@tab-2", &connections));
+        assert!(!live_session_required("conn-d", &connections));
+        // Unknown host → the slow path reports UnknownHost as before.
+        assert!(!live_session_required("conn-x@tab-3", &connections));
+
+        // A blank login script does not make a host a bastion.
+        let blank = vec![ConnectionConfig {
+            login_script: Some("   ".to_string()),
+            ..conn("conn-b", "blankscript")
+        }];
+        assert!(!live_session_required("conn-b@tab-4", &blank));
     }
 
     #[test]
