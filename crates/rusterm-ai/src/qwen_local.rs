@@ -214,6 +214,7 @@ fn best_device() -> Result<Device> {
 /// Subset of HuggingFace `config.json` fields needed to build the GGUF
 /// metadata and drive the quantizer. Extra fields are ignored.
 #[derive(Debug, serde::Deserialize)]
+#[allow(dead_code)] // parsed for completeness; not all fields are used
 struct HfConfig {
     vocab_size: usize,
     hidden_size: usize,
