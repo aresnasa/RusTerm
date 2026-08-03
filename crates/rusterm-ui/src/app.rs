@@ -82,6 +82,36 @@ fn save_config(state: &Signal<AppState>) {
     crate::relay_tunnel::sync_connection_registry(s.connections.clone());
 }
 
+/// Rebuild the live session registry from the current AppState. Called
+/// whenever a session is opened or closed so the relay executor can find
+/// connected sessions for command reuse.
+///
+/// Only sessions with a matching `session_configs` entry (which maps
+/// session_id → connection_id) are included.
+fn sync_live_sessions(
+    state: &Signal<AppState>,
+    input_senders: &Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+) {
+    let app = state.read();
+    let senders = input_senders.read();
+
+    let entries: Vec<crate::relay_tunnel::LiveSessionEntry> = app
+        .ssh_sessions
+        .iter()
+        .filter_map(|(session_id, session)| {
+            let connection_id = app.session_configs.get(session_id)?.id.clone();
+            let input_tx = senders.get(session_id)?.clone();
+            Some(crate::relay_tunnel::LiveSessionEntry {
+                session: session.clone(),
+                input_tx,
+                connection_id,
+            })
+        })
+        .collect();
+
+    crate::relay_tunnel::sync_session_registry(entries);
+}
+
 fn save_sidebar_preferences(state: &Signal<AppState>) {
     let (config_manager, preferences) = {
         let app = state.read();
@@ -9580,6 +9610,10 @@ fn start_ssh_connection(
                     .write()
                     .insert(tab_id.clone(), session.input_tx.clone());
 
+                // Sync the live session registry so the relay executor can
+                // reuse this already-connected session for API commands.
+                sync_live_sessions(&state, &input_senders);
+
                 state
                     .write()
                     .close_senders
@@ -10683,6 +10717,7 @@ fn start_ssh_connection(
                             }
                             input_senders.write().remove(&id);
                             state.write().login_scripts.remove(&id);
+                            sync_live_sessions(&state, &input_senders);
                             let mut s = state.write();
                             s.session_connection_states
                                 .insert(id.clone(), SessionConnectionState::Disconnected);
@@ -11262,6 +11297,7 @@ fn start_shell_connection(
                             );
                             input_senders.write().remove(&id);
                             state.write().login_scripts.remove(&id);
+                            sync_live_sessions(&state, &input_senders);
                             let mut s = state.write();
                             s.session_connection_states
                                 .insert(id.clone(), SessionConnectionState::Disconnected);
