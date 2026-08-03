@@ -14705,9 +14705,9 @@ pub fn App() -> Element {
                 keybindings: state.read().keybindings.clone(),
                 skin: state.read().skin.clone(),
                 usage_habits_enabled: state.read().collect_usage_habits,
-                qwen_local_enabled: state.read().config_manager.as_ref()
-                    .map(|cm| cm.load_qwen_local_settings().enabled)
-                    .unwrap_or(false),
+                qwen_local_settings: state.read().config_manager.as_ref()
+                    .map(|cm| cm.load_qwen_local_settings())
+                    .unwrap_or_default(),
                 qwen_local_warning: {
                     #[cfg(feature = "qwen-local")]
                     {
@@ -14861,6 +14861,18 @@ pub fn App() -> Element {
                             }
                         }
                     });
+                },
+                on_save_qwen_local: move |settings: rusterm_core::config::QwenLocalSettings| {
+                    if let Some(cm) = state.read().config_manager.clone() {
+                        if let Err(e) = cm.save_qwen_local_settings(&settings) {
+                            tracing::error!("Failed to save qwen-local settings: {}", e);
+                        }
+                    }
+                    tracing::info!(
+                        "[QWEN-LOCAL] template generation {} (model: {})",
+                        if settings.enabled { "enabled" } else { "disabled" },
+                        settings.active_model_id
+                    );
                 },
             }
         }

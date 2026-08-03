@@ -1,13 +1,15 @@
 //! Local on-device LLM inference for template generation.
 //!
 //! Uses [candle](https://github.com/huggingface/candle) to run a quantized
-//! **Qwen2.5-Coder-1.5B-Instruct** model entirely on the user's machine —
-//! no API keys, no network calls after the initial download.
+//! model entirely on the user's machine — no API keys, no network calls
+//! after the initial download. The default model is
+//! **Qwen2.5-Coder-1.5B-Instruct**, but any qwen2-architecture model can
+//! be configured via [`rusterm_core::config::ModelConfig`].
 //!
 //! # Pipeline
 //!
-//! 1. **Download** the original BF16 safetensors from HuggingFace
-//!    (`Qwen/Qwen2.5-Coder-1.5B-Instruct`).
+//! 1. **Download** the original BF16 safetensors from a HuggingFace mirror
+//!    (defaults to `https://hf-mirror.com`; configurable per-user).
 //! 2. **Quantize** on the Rust side using `candle::quantized::QTensor::quantize`
 //!    to GGUF Q4_K format (4-bit K-quants — the recommended balance of size
 //!    and quality for a 1.5B model). The quantized GGUF is cached so this
@@ -24,7 +26,7 @@
 
 #![cfg(feature = "qwen-local")]
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
@@ -34,21 +36,15 @@ use candle::quantized::{GgmlDType, QTensor};
 use candle_transformers::generation::{LogitsProcessor, Sampling};
 use candle_transformers::models::quantized_qwen2::ModelWeights as Qwen2;
 use rayon::prelude::*;
+use rusterm_core::config::ModelConfig;
 use tokenizers::Tokenizer;
 
 // ── Constants ───────────────────────────────────────────────────────────
-
-/// HuggingFace repo for the original (unquantized) model.
-const HF_REPO: &str = "Qwen/Qwen2.5-Coder-1.5B-Instruct";
 
 /// Quantization level applied during the Rust-side conversion.
 /// Q4_K offers ~4-bit precision with K-quant super-blocks — the
 /// recommended default for 1-2B models per llama.cpp benchmarks.
 const QUANT_DTYPE: GgmlDType = GgmlDType::Q4K;
-
-/// Qwen2 instruct chat template tokens.
-const PROMPT_TEMPLATE: &str = "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n";
-const EOS_TOKEN: &str = "<|im_end|>";
 
 /// Inference defaults — tuned for short template generation.
 const DEFAULT_TEMPERATURE: f64 = 0.7;
@@ -355,18 +351,18 @@ fn dtype_for(gguf_name: &str, tensor_rank: usize) -> GgmlDType {
     }
 }
 
-/// Quantize a directory of BF16 safetensors into a single Q4_K GGUF file.
+/// Quantize BF16 safetensors file(s) into a single Q4_K GGUF file.
 ///
 /// This is the "Rust-side quantization" step: we load the original
-/// HuggingFace safetensors, remap tensor names to the GGUF convention,
-/// quantize weight matrices with `QTensor::quantize`, and write the
-/// result with `gguf_file::write`. The output is a standard GGUF that
-/// `quantized_qwen2::ModelWeights::from_gguf` can load directly.
+/// HuggingFace safetensors (one or more shards), remap tensor names to
+/// the GGUF convention, quantize weight matrices with `QTensor::quantize`,
+/// and write the result with `gguf_file::write`. The output is a standard
+/// GGUF that `quantized_qwen2::ModelWeights::from_gguf` can load directly.
 ///
 /// `progress` is called as each tensor is quantized so the UI can show a
 /// progress bar.
 fn quantize_to_gguf(
-    safetensors_path: &Path,
+    safetensors_paths: &[PathBuf],
     config_path: &Path,
     output_path: &Path,
     progress: &(impl Fn(SetupProgress) + Sync),
@@ -378,10 +374,14 @@ fn quantize_to_gguf(
 
     let metadata = build_gguf_metadata(&hf_config);
 
-    // 2. Load all tensors from the safetensors file.
-    let tensors: HashMap<String, candle::Tensor> =
-        candle::safetensors::load(safetensors_path, &Device::Cpu)
-            .with_context(|| format!("loading safetensors at {safetensors_path:?}"))?;
+    // 2. Load all tensors from the safetensors file(s). Multi-file models
+    //    have their tensors spread across shards; merge into one map.
+    let mut tensors: HashMap<String, candle::Tensor> = HashMap::new();
+    for path in safetensors_paths {
+        let shard = candle::safetensors::load(path, &Device::Cpu)
+            .with_context(|| format!("loading safetensors at {path:?}"))?;
+        tensors.extend(shard);
+    }
 
     // 3. Map names + quantize in parallel (rayon).
     //    Progress is tracked via an atomic counter because rayon's
@@ -433,11 +433,18 @@ fn quantize_to_gguf(
 
 // ── Model download + cache management ──────────────────────────────────
 
-/// Filenames we need from the HuggingFace repo.
+/// Filenames we need from the HuggingFace repo. These are the same for
+/// every qwen2-architecture model — only `repo_id` differs.
 const SAFETENSORS_FILE: &str = "model.safetensors";
+const SAFETENSORS_INDEX_FILE: &str = "model.safetensors.index.json";
 const TOKENIZER_FILE: &str = "tokenizer.json";
 const CONFIG_FILE: &str = "config.json";
-const GGUF_FILE: &str = "qwen25-coder-1.5b-q4k.gguf";
+
+/// Derive the GGUF cache filename from a model id. Each model gets its own
+/// file so switching models doesn't overwrite the cached GGUF of another.
+fn gguf_filename(model: &ModelConfig) -> String {
+    format!("{}-q4k.gguf", model.id)
+}
 
 /// Ensure the quantized model exists in `cache_dir`. Downloads + quantizes
 /// on first run; subsequent calls return the cached GGUF path immediately.
@@ -445,15 +452,33 @@ const GGUF_FILE: &str = "qwen25-coder-1.5b-q4k.gguf";
 /// **Expensive** — must be called from a background thread, not the UI
 /// thread. The `progress` callback is invoked throughout so the UI can
 /// show a progress bar / status text.
-pub fn ensure_model(cache_dir: &Path, progress: impl Fn(SetupProgress) + Sync) -> Result<PathBuf> {
+///
+/// `mirror_url` sets the HuggingFace download endpoint (e.g.
+/// `https://hf-mirror.com`). Pass `"https://huggingface.co"` for direct
+/// access.
+pub fn ensure_model(
+    cache_dir: &Path,
+    model: &ModelConfig,
+    mirror_url: &str,
+    progress: impl Fn(SetupProgress) + Sync,
+) -> Result<PathBuf> {
+    // Reject unsupported architectures early — before downloading 3 GB.
+    if model.architecture != "qwen2" {
+        return Err(anyhow!(
+            "Unsupported architecture '{}': only 'qwen2' is currently supported. \
+             The candle quantized_qwen2 loader cannot handle other architectures.",
+            model.architecture
+        ));
+    }
+
     let progress = progress;
     std::fs::create_dir_all(cache_dir)
         .with_context(|| format!("creating cache dir {cache_dir:?}"))?;
 
-    let gguf_path = cache_dir.join(GGUF_FILE);
+    let gguf_name = gguf_filename(model);
+    let gguf_path = cache_dir.join(&gguf_name);
     let tokenizer_path = cache_dir.join(TOKENIZER_FILE);
     let config_path = cache_dir.join(CONFIG_FILE);
-    let safetensors_path = cache_dir.join(SAFETENSORS_FILE);
 
     // Fast path: GGUF already cached.
     if gguf_path.exists() && tokenizer_path.exists() {
@@ -461,40 +486,58 @@ pub fn ensure_model(cache_dir: &Path, progress: impl Fn(SetupProgress) + Sync) -
     }
 
     // Download tokenizer + config (small files, always needed).
-    download_file(TOKENIZER_FILE, &tokenizer_path, &progress)?;
-    download_file(CONFIG_FILE, &config_path, &progress)?;
+    download_file(
+        TOKENIZER_FILE,
+        &tokenizer_path,
+        &model.repo_id,
+        mirror_url,
+        &progress,
+    )?;
+    download_file(
+        CONFIG_FILE,
+        &config_path,
+        &model.repo_id,
+        mirror_url,
+        &progress,
+    )?;
 
-    // Download the BF16 safetensors (large, ~3 GB) if not already present.
-    if !safetensors_path.exists() {
-        download_file(SAFETENSORS_FILE, &safetensors_path, &progress)?;
-    }
+    // Download safetensors (single file or multi-file shards).
+    let safetensors_paths = download_safetensors(cache_dir, &model.repo_id, mirror_url, &progress)?;
 
     // Quantize BF16 → Q4_K GGUF.
-    quantize_to_gguf(&safetensors_path, &config_path, &gguf_path, &progress)?;
+    quantize_to_gguf(&safetensors_paths, &config_path, &gguf_path, &progress)?;
 
-    // Clean up the 3 GB safetensors to save disk space. The GGUF is the
-    // permanent cache; if the user wants to re-quantize at a different
-    // level, the safetensors will be re-downloaded.
-    let _ = std::fs::remove_file(&safetensors_path);
+    // Clean up the large safetensors file(s) to save disk space. The GGUF
+    // is the permanent cache; if the user wants to re-quantize at a
+    // different level, the safetensors will be re-downloaded.
+    for path in &safetensors_paths {
+        let _ = std::fs::remove_file(path);
+    }
 
     Ok(gguf_path)
 }
 
 /// Download a single file from the HuggingFace repo into `dest`.
 ///
-/// Uses `hf_hub`'s sync API with a simple progress estimate based on
-/// file size. The hf_hub crate caches downloads in its own internal
-/// cache, so repeated calls are cheap.
+/// Uses `hf_hub`'s sync API with a custom `mirror_url` endpoint (e.g.
+/// `https://hf-mirror.com`). The hf_hub crate caches downloads in its own
+/// internal cache, so repeated calls are cheap. Returns the path hf_hub
+/// cached the file at (which may differ from `dest`).
 fn download_file(
     filename: &str,
     dest: &Path,
+    repo_id: &str,
+    mirror_url: &str,
     progress: &(impl Fn(SetupProgress) + Sync),
-) -> Result<()> {
-    let api = hf_hub::api::sync::Api::new().map_err(|e| anyhow!("hf_hub init: {e}"))?;
-    let repo = api.model(HF_REPO.to_string());
+) -> Result<PathBuf> {
+    let api = hf_hub::api::sync::ApiBuilder::new()
+        .with_endpoint(mirror_url.to_string())
+        .build()
+        .map_err(|e| anyhow!("hf_hub init for {mirror_url}: {e}"))?;
+    let repo = api.model(repo_id.to_string());
     let downloaded = repo
         .get(filename)
-        .map_err(|e| anyhow!("downloading {filename}: {e}"))?;
+        .map_err(|e| anyhow!("downloading {filename} from {repo_id}: {e}"))?;
 
     // hf_hub caches files in its own dir; copy to our cache_dir for
     // a predictable location.
@@ -510,29 +553,90 @@ fn download_file(
         progress: 1.0,
     });
 
-    Ok(())
+    Ok(downloaded)
+}
+
+/// Subset of the `model.safetensors.index.json` file. Only `weight_map` is
+/// needed — it maps tensor names to shard filenames.
+#[derive(Debug, serde::Deserialize)]
+struct SafetensorsIndex {
+    weight_map: HashMap<String, String>,
+}
+
+/// Download the model's safetensors files. Handles both single-file
+/// (`model.safetensors`) and multi-file shard layouts (detected via the
+/// `model.safetensors.index.json` manifest).
+///
+/// Returns the list of local paths to the downloaded safetensors files.
+fn download_safetensors(
+    cache_dir: &Path,
+    repo_id: &str,
+    mirror_url: &str,
+    progress: &(impl Fn(SetupProgress) + Sync),
+) -> Result<Vec<PathBuf>> {
+    // Try to download the index file. A 404 means single-file layout.
+    let index_path = cache_dir.join(SAFETENSORS_INDEX_FILE);
+    match download_file(
+        SAFETENSORS_INDEX_FILE,
+        &index_path,
+        repo_id,
+        mirror_url,
+        progress,
+    ) {
+        Ok(_) => {
+            // Multi-file: parse the index, download every unique shard.
+            let index_text = std::fs::read_to_string(&index_path)
+                .with_context(|| format!("reading safetensors index at {index_path:?}"))?;
+            let index: SafetensorsIndex =
+                serde_json::from_str(&index_text).context("parsing safetensors index")?;
+            let shard_files: BTreeSet<String> = index.weight_map.values().cloned().collect();
+
+            // Clean up the index file — it's not needed after download.
+            let _ = std::fs::remove_file(&index_path);
+
+            let mut paths = Vec::with_capacity(shard_files.len());
+            for shard in shard_files {
+                let dest = cache_dir.join(&shard);
+                download_file(&shard, &dest, repo_id, mirror_url, progress)?;
+                paths.push(dest);
+            }
+            Ok(paths)
+        }
+        Err(_) => {
+            // Single-file layout: just download model.safetensors.
+            let dest = cache_dir.join(SAFETENSORS_FILE);
+            download_file(SAFETENSORS_FILE, &dest, repo_id, mirror_url, progress)?;
+            Ok(vec![dest])
+        }
+    }
 }
 
 // ── Inference ──────────────────────────────────────────────────────────
 
-/// A loaded, ready-to-generate quantized Qwen2.5-Coder model.
+/// A loaded, ready-to-generate quantized Qwen2 model.
 ///
-/// Holds the model weights, tokenizer, and compute device in one struct.
-/// Clone is not implemented — there's only one model instance per session.
-/// Call [`QwenLocalModel::generate`] for each user prompt; the KV cache is
+/// Holds the model weights, tokenizer, compute device, and the model's
+/// prompt template + EOS token id in one struct. Clone is not implemented
+/// — there's only one model instance per session. Call
+/// [`QwenLocalModel::generate`] for each user prompt; the KV cache is
 /// cleared between calls so prompts are independent.
 pub struct QwenLocalModel {
     model: Qwen2,
     tokenizer: Tokenizer,
     device: Device,
     eos_token_id: u32,
+    prompt_template: String,
 }
 
 impl QwenLocalModel {
     /// Load a quantized GGUF + tokenizer from disk into memory.
     ///
+    /// `model` provides the EOS token and prompt template used by
+    /// [`generate`](Self::generate). The GGUF file should have been
+    /// produced by [`ensure_model`] for the same model.
+    ///
     /// **Expensive** (~1 GB loaded) — call from a background thread.
-    pub fn load(gguf_path: &Path, tokenizer_path: &Path) -> Result<Self> {
+    pub fn load(gguf_path: &Path, tokenizer_path: &Path, model: &ModelConfig) -> Result<Self> {
         let device = best_device()?;
 
         // Load tokenizer.
@@ -544,21 +648,22 @@ impl QwenLocalModel {
             .with_context(|| format!("opening GGUF at {gguf_path:?}"))?;
         let content = gguf_file::Content::read(&mut file)
             .map_err(|e| anyhow!("reading GGUF content: {e}"))?;
-        let model = Qwen2::from_gguf(content, &mut file, &device)
+        let model_weights = Qwen2::from_gguf(content, &mut file, &device)
             .map_err(|e| anyhow!("building Qwen2 model: {e}"))?;
 
-        // Resolve EOS token id.
+        // Resolve EOS token id from the model config.
         let eos_token_id = tokenizer
             .get_vocab(true)
-            .get(EOS_TOKEN)
+            .get(&model.eos_token)
             .copied()
-            .ok_or_else(|| anyhow!("EOS token '{EOS_TOKEN}' not in vocab"))?;
+            .ok_or_else(|| anyhow!("EOS token '{}' not in vocab", model.eos_token))?;
 
         Ok(Self {
-            model,
+            model: model_weights,
             tokenizer,
             device,
             eos_token_id,
+            prompt_template: model.prompt_template.clone(),
         })
     }
 
@@ -591,8 +696,8 @@ impl QwenLocalModel {
         // Clear any leftover KV cache from a previous call.
         self.model.clear_kv_cache();
 
-        // Format the prompt with the Qwen2 instruct chat template.
-        let prompt = PROMPT_TEMPLATE.replace("{prompt}", user_prompt);
+        // Format the prompt with the model's chat template.
+        let prompt = self.prompt_template.replace("{prompt}", user_prompt);
 
         // Tokenize.
         let encoding = self

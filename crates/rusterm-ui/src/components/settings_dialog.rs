@@ -103,14 +103,15 @@ pub fn SettingsDialog(
     #[props(default)]
     on_export_usage_habits: EventHandler<()>,
     /// Whether local AI template generation (Qwen2.5-Coder-1.5B) is enabled.
+    /// Full local-AI settings: mirror URL, active model, custom models.
     #[props(default)]
-    qwen_local_enabled: bool,
+    qwen_local_settings: rusterm_core::config::QwenLocalSettings,
     /// Hardware warning text for the local AI toggle (empty if OK).
     #[props(default)]
     qwen_local_warning: String,
-    /// Fires with the new enabled state when the user toggles local AI.
+    /// Fires with the new settings when the user clicks Save.
     #[props(default)]
-    on_save_qwen_local: EventHandler<bool>,
+    on_save_qwen_local: EventHandler<rusterm_core::config::QwenLocalSettings>,
     /// Current UI language.
     #[props(default)]
     language: Language,
@@ -132,7 +133,14 @@ pub fn SettingsDialog(
     let mut sug_count = use_signal(|| suggestion_count);
     let mut comparison_warning_enabled = use_signal(|| comparison_diff_warning_enabled);
     let mut usage_habits = use_signal(|| usage_habits_enabled);
-    let mut qwen_local = use_signal(|| qwen_local_enabled);
+    let mut qwen_local = use_signal(|| qwen_local_settings.clone());
+    // Custom-model form state (collapsible "Add custom model" section).
+    let mut show_custom_form = use_signal(|| false);
+    let mut custom_name = use_signal(String::new);
+    let mut custom_repo = use_signal(String::new);
+    let mut custom_template = use_signal(String::new);
+    let mut custom_eos = use_signal(String::new);
+    let mut custom_error = use_signal(String::new);
     let mut keybinding_draft = use_signal(|| keybindings.normalized());
     let mut skin_draft = use_signal(|| skin.normalized());
     let skin_preview = skin_draft().palette();
@@ -487,7 +495,7 @@ pub fn SettingsDialog(
                     { crate::i18n::t("settings.export_report_help") }
                 }
 
-                // ── Local AI template generation ───────────────────────────
+                // ── Local AI template generation ───────────────────────
                 h3 {
                     style: "margin: 24px 0 6px; font-size: 16px;",
                     { crate::i18n::t("ai_runtime.local.enable") }
@@ -506,13 +514,17 @@ pub fn SettingsDialog(
                         style: "display: flex; align-items: center; gap: 8px;",
                         input {
                             r#type: "checkbox",
-                            checked: "{qwen_local()}",
+                            checked: "{qwen_local().enabled}",
                             style: "width: 16px; height: 16px; cursor: pointer; accent-color: var(--settings-accent);",
-                            onchange: move |e| qwen_local.set(e.checked()),
+                            onchange: move |e| {
+                                let mut s = qwen_local();
+                                s.enabled = e.checked();
+                                qwen_local.set(s);
+                            },
                         }
                         span {
                             style: "font-size: 11px; color: var(--settings-text-muted);",
-                            {if qwen_local() { crate::i18n::t("settings.on") } else { crate::i18n::t("settings.off") }}
+                            {if qwen_local().enabled { crate::i18n::t("settings.on") } else { crate::i18n::t("settings.off") }}
                         }
                     }
                 }
@@ -520,6 +532,236 @@ pub fn SettingsDialog(
                     div {
                         style: "font-size: 11px; color: #e0af68; margin-top: 8px; line-height: 1.5;",
                         { crate::i18n::tf("ai_runtime.local.hw_warning", &[("warning", &qwen_local_warning)]) }
+                    }
+                }
+
+                // ── Mirror URL ───────────────────────────────────────────
+                div {
+                    style: "margin-top: 12px;",
+                    label {
+                        style: "font-size: 12px; color: var(--settings-text); display: block; margin-bottom: 4px;",
+                        { crate::i18n::t("ai_runtime.local.mirror_url") }
+                    }
+                    input {
+                        r#type: "text",
+                        value: "{qwen_local().mirror_url}",
+                        style: "width: 100%; box-sizing: border-box; padding: 6px 8px; border: 1px solid var(--settings-border); border-radius: 4px; background: var(--settings-bg); color: var(--settings-text); font-size: 12px;",
+                        oninput: move |e| {
+                            let mut s = qwen_local();
+                            s.mirror_url = e.value();
+                            qwen_local.set(s);
+                        },
+                    }
+                    div {
+                        style: "font-size: 10px; color: var(--settings-text-muted); margin-top: 4px; line-height: 1.5;",
+                        { crate::i18n::t("ai_runtime.local.mirror_url_hint") }
+                    }
+                }
+
+                // ── Model selector ───────────────────────────────────────
+                div {
+                    style: "margin-top: 12px;",
+                    label {
+                        style: "font-size: 12px; color: var(--settings-text); display: block; margin-bottom: 4px;",
+                        { crate::i18n::t("ai_runtime.local.model_select") }
+                    }
+                    select {
+                        style: "width: 100%; box-sizing: border-box; padding: 6px 8px; border: 1px solid var(--settings-border); border-radius: 4px; background: var(--settings-bg); color: var(--settings-text); font-size: 12px;",
+                        onchange: move |e| {
+                            let mut s = qwen_local();
+                            s.active_model_id = e.value();
+                            qwen_local.set(s);
+                        },
+                        {
+                            let current_id = qwen_local().active_model_id.clone();
+                            let mut options: Vec<rusterm_core::config::ModelConfig> =
+                                rusterm_core::config::builtin_models();
+                            options.extend(qwen_local().custom_models.iter().cloned());
+                            rsx! {
+                                for m in options {
+                                    option {
+                                        value: "{m.id}",
+                                        selected: "{current_id == m.id}",
+                                        {m.name}
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // ── Custom model form (collapsible) ──────────────────────
+                div {
+                    style: "margin-top: 8px;",
+                    button {
+                        style: "background: transparent; border: 1px dashed var(--settings-border); color: var(--settings-text-muted); border-radius: 4px; padding: 6px 12px; cursor: pointer; font-size: 11px; width: 100%; box-sizing: border-box;",
+                        onclick: move |_| show_custom_form.set(!show_custom_form()),
+                        { if show_custom_form() {
+                            crate::i18n::t("ai_runtime.local.custom_form_hide")
+                        } else {
+                            crate::i18n::t("ai_runtime.local.custom_form_show")
+                        }}
+                    }
+                }
+                if show_custom_form() {
+                    div {
+                        style: "margin-top: 8px; padding: 12px; border: 1px solid var(--settings-border); border-radius: 4px; display: flex; flex-direction: column; gap: 8px;",
+                        div {
+                            style: "font-size: 11px; font-weight: 600; color: var(--settings-text);",
+                            { crate::i18n::t("ai_runtime.local.custom_form_title") }
+                        }
+                        div {
+                            label {
+                                style: "font-size: 11px; color: var(--settings-text-muted); display: block; margin-bottom: 2px;",
+                                { crate::i18n::t("ai_runtime.local.custom_name") }
+                            }
+                            input {
+                                r#type: "text",
+                                value: "{custom_name()}",
+                                placeholder: "My Custom Model",
+                                style: "width: 100%; box-sizing: border-box; padding: 4px 8px; border: 1px solid var(--settings-border); border-radius: 4px; background: var(--settings-bg); color: var(--settings-text); font-size: 11px;",
+                                oninput: move |e| custom_name.set(e.value()),
+                            }
+                        }
+                        div {
+                            label {
+                                style: "font-size: 11px; color: var(--settings-text-muted); display: block; margin-bottom: 2px;",
+                                { crate::i18n::t("ai_runtime.local.custom_repo") }
+                            }
+                            input {
+                                r#type: "text",
+                                value: "{custom_repo()}",
+                                placeholder: "Qwen/Qwen2.5-Coder-1.5B-Instruct",
+                                style: "width: 100%; box-sizing: border-box; padding: 4px 8px; border: 1px solid var(--settings-border); border-radius: 4px; background: var(--settings-bg); color: var(--settings-text); font-size: 11px;",
+                                oninput: move |e| custom_repo.set(e.value()),
+                            }
+                        }
+                        div {
+                            label {
+                                style: "font-size: 11px; color: var(--settings-text-muted); display: block; margin-bottom: 2px;",
+                                { crate::i18n::t("ai_runtime.local.custom_template") }
+                                span { style: "font-family: monospace; color: var(--settings-text-muted);", " {{prompt}} " }
+                            }
+                            input {
+                                r#type: "text",
+                                value: "{custom_template()}",
+                                placeholder: "<|im_start|>user\n{{prompt}}<|im_end|>\n<|im_start|>assistant\n",
+                                style: "width: 100%; box-sizing: border-box; padding: 4px 8px; border: 1px solid var(--settings-border); border-radius: 4px; background: var(--settings-bg); color: var(--settings-text); font-size: 11px;",
+                                oninput: move |e| custom_template.set(e.value()),
+                            }
+                        }
+                        div {
+                            label {
+                                style: "font-size: 11px; color: var(--settings-text-muted); display: block; margin-bottom: 2px;",
+                                { crate::i18n::t("ai_runtime.local.custom_eos") }
+                            }
+                            input {
+                                r#type: "text",
+                                value: "{custom_eos()}",
+                                placeholder: "<|im_end|>",
+                                style: "width: 100%; box-sizing: border-box; padding: 4px 8px; border: 1px solid var(--settings-border); border-radius: 4px; background: var(--settings-bg); color: var(--settings-text); font-size: 11px;",
+                                oninput: move |e| custom_eos.set(e.value()),
+                            }
+                        }
+                        if !custom_error().is_empty() {
+                            div {
+                                style: "font-size: 10px; color: var(--settings-danger);",
+                                { custom_error() }
+                            }
+                        }
+                        div {
+                            style: "display: flex; gap: 8px;",
+                            button {
+                                style: "background: var(--settings-accent); border: none; color: var(--settings-bg); border-radius: 4px; padding: 4px 12px; cursor: pointer; font-size: 11px; font-weight: 600;",
+                                onclick: move |_| {
+                                    let name = custom_name().trim().to_string();
+                                    let repo = custom_repo().trim().to_string();
+                                    let tmpl = custom_template().trim().to_string();
+                                    let eos = custom_eos().trim().to_string();
+                                    if name.is_empty() || repo.is_empty() || tmpl.is_empty() || eos.is_empty() {
+                                        custom_error.set(crate::i18n::t("ai_runtime.local.custom_err_empty").to_string());
+                                        return;
+                                    }
+                                    if !tmpl.contains("{prompt}") {
+                                        custom_error.set(crate::i18n::t("ai_runtime.local.custom_err_template").to_string());
+                                        return;
+                                    }
+                                    let mut s = qwen_local();
+                                    // Generate id from name: lowercase + replace non-alphanum with hyphens.
+                                    let id = name.to_lowercase().chars().map(|c| {
+                                        if c.is_alphanumeric() { c } else { '-' }
+                                    }).collect::<String>();
+                                    if s.custom_models.iter().any(|m| m.id == id)
+                                        || rusterm_core::config::builtin_models().iter().any(|m| m.id == id)
+                                    {
+                                        custom_error.set(crate::i18n::t("ai_runtime.local.custom_err_dup").to_string());
+                                        return;
+                                    }
+                                    s.custom_models.push(rusterm_core::config::ModelConfig {
+                                        id: id.clone(),
+                                        name: name.clone(),
+                                        repo_id: repo,
+                                        architecture: "qwen2".to_string(),
+                                        prompt_template: tmpl,
+                                        eos_token: eos,
+                                    });
+                                    s.active_model_id = id;
+                                    qwen_local.set(s);
+                                    custom_name.set(String::new());
+                                    custom_repo.set(String::new());
+                                    custom_template.set(String::new());
+                                    custom_eos.set(String::new());
+                                    custom_error.set(String::new());
+                                    show_custom_form.set(false);
+                                },
+                                { crate::i18n::t("ai_runtime.local.custom_add") }
+                            }
+                            button {
+                                style: "background: transparent; border: 1px solid var(--settings-border); color: var(--settings-text-muted); border-radius: 4px; padding: 4px 12px; cursor: pointer; font-size: 11px;",
+                                onclick: move |_| {
+                                    custom_name.set(String::new());
+                                    custom_repo.set(String::new());
+                                    custom_template.set(String::new());
+                                    custom_eos.set(String::new());
+                                    custom_error.set(String::new());
+                                    show_custom_form.set(false);
+                                },
+                                { crate::i18n::t("common.cancel") }
+                            }
+                        }
+                    }
+                }
+
+                // ── Custom models list (with delete buttons) ──────────────
+                if !qwen_local().custom_models.is_empty() {
+                    div {
+                        style: "margin-top: 8px; display: flex; flex-direction: column; gap: 4px;",
+                        for m in qwen_local().custom_models.clone() {
+                            div {
+                                style: "display: flex; align-items: center; justify-content: space-between; gap: 8px; padding: 4px 8px; border: 1px solid var(--settings-border); border-radius: 4px;",
+                                span {
+                                    style: "font-size: 11px; color: var(--settings-text);",
+                                    {m.name.clone()}
+                                    span {
+                                        style: "font-size: 10px; color: var(--settings-text-muted); margin-left: 6px;",
+                                        {m.repo_id.clone()}
+                                    }
+                                }
+                                button {
+                                    style: "background: transparent; border: none; color: var(--settings-danger); cursor: pointer; font-size: 11px; padding: 2px 6px;",
+                                    onclick: move |_| {
+                                        let mut s = qwen_local();
+                                        s.custom_models.retain(|x| x.id != m.id);
+                                        // If we just deleted the active model, fall back to default.
+                                        if s.active_model_id == m.id {
+                                            s.active_model_id = "qwen25-coder-1.5b".to_string();
+                                        }
+                                        qwen_local.set(s);
+                                    },
+                                    "✕"
+                                }
+                            }
+                        }
                     }
                 }
 
@@ -628,7 +870,13 @@ pub fn SettingsDialog(
                             sug_count.set(3);
                             comparison_warning_enabled.set(true);
                             usage_habits.set(false);
-                            qwen_local.set(false);
+                            qwen_local.set(rusterm_core::config::QwenLocalSettings::default());
+                            show_custom_form.set(false);
+                            custom_name.set(String::new());
+                            custom_repo.set(String::new());
+                            custom_template.set(String::new());
+                            custom_eos.set(String::new());
+                            custom_error.set(String::new());
                             keybinding_draft.set(Keybindings::default());
                             skin_draft.set(SkinSettings::default());
                             capturing_keybinding.set(None);

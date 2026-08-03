@@ -572,8 +572,8 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         // ── ai_runtime.local.* — local LLM template generation ─────────
         "ai_runtime.local.enable" => ("Local AI Template Generation", "本地 AI 模板生成"),
         "ai_runtime.local.enable_hint" => (
-            "Run Qwen2.5-Coder-1.5B on this machine to generate scripts offline. ~1 GB RAM needed.",
-            "在本机运行 Qwen2.5-Coder-1.5B 离线生成脚本，需约 1 GB 内存。",
+            "Run a small LLM on this machine to generate scripts offline. ~1 GB RAM needed. Models download from the configured mirror.",
+            "在本机运行小型 LLM 离线生成脚本，需约 1 GB 内存。模型从配置的镜像下载。",
         ),
         "ai_runtime.local.hw_warning" => ("Hardware warning: {warning}", "硬件警告：{warning}"),
         "ai_runtime.local.enable_anyway" => ("Enable anyway", "仍然启用"),
@@ -594,6 +594,32 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         "ai_runtime.local.ai_generate_hint" => ("Describe the script you want", "描述你想要的脚本"),
         "ai_runtime.local.kind_shell" => ("Shell", "Shell"),
         "ai_runtime.local.kind_python" => ("Python", "Python"),
+
+        // ── ai_runtime.local.* — mirror URL + model selector + custom models ─
+        "ai_runtime.local.mirror_url" => ("Download mirror", "下载镜像"),
+        "ai_runtime.local.mirror_url_hint" => (
+            "HuggingFace endpoint for model downloads. Use https://hf-mirror.com in China, or https://huggingface.co for direct access.",
+            "HuggingFace 模型下载镜像地址。国内使用 https://hf-mirror.com，直连请用 https://huggingface.co。",
+        ),
+        "ai_runtime.local.model_select" => ("Active model", "当前模型"),
+        "ai_runtime.local.custom_form_show" => ("+ Add custom model", "+ 添加自定义模型"),
+        "ai_runtime.local.custom_form_hide" => ("Cancel custom model", "取消添加自定义模型"),
+        "ai_runtime.local.custom_form_title" => ("Custom model details", "自定义模型详情"),
+        "ai_runtime.local.custom_name" => ("Display name", "显示名称"),
+        "ai_runtime.local.custom_repo" => ("HuggingFace repo ID", "HuggingFace 仓库 ID"),
+        "ai_runtime.local.custom_template" => (
+            "Prompt template (must contain {prompt})",
+            "提示词模板（必须包含 {prompt}）",
+        ),
+        "ai_runtime.local.custom_eos" => ("EOS token", "结束符"),
+        "ai_runtime.local.custom_add" => ("Add", "添加"),
+        "ai_runtime.local.custom_err_empty" => ("All fields are required.", "所有字段都必须填写。"),
+        "ai_runtime.local.custom_err_template" => {
+            ("Template must contain {prompt}.", "模板必须包含 {prompt}。")
+        }
+        "ai_runtime.local.custom_err_dup" => {
+            ("A model with this name already exists.", "同名模型已存在。")
+        }
 
         // ── send.* — additional send-panel state ───────────────────────
         "send.no_target" => ("No target", "无目标"),

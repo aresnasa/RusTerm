@@ -327,12 +327,13 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
     // ── Local AI template generation (Qwen2.5-Coder-1.5B) ───────────
     // Feature-gated at compile time. When `qwen-local` is not enabled in
     // rusterm-ai, the button is hidden and these signals are unused.
-    let qwen_enabled = state
+    let qwen_settings = state
         .read()
         .config_manager
         .as_ref()
-        .map(|cm| cm.load_qwen_local_settings().enabled)
-        .unwrap_or(false);
+        .map(|cm| cm.load_qwen_local_settings())
+        .unwrap_or_default();
+    let qwen_enabled = qwen_settings.enabled;
     // `Signal` is `Copy`, so `.set()` works without `mut`.
     #[cfg_attr(not(feature = "qwen-local"), allow(unused_variables))]
     let ai_description = use_signal(String::new);
@@ -1039,6 +1040,7 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
                     // function so the rsx! macro never sees `#[cfg]`.
                     { render_ai_section(
                         qwen_enabled,
+                        qwen_settings.clone(),
                         ai_description,
                         ai_kind_python,
                         ai_status,
@@ -1464,13 +1466,19 @@ fn gen_curl(
 /// returns the raw model text. The caller ([`ApiPanel`]'s spawn closure)
 /// parses the response and fills the appropriate input field.
 ///
+/// `settings` provides the mirror URL, active model, and custom models.
+/// The model is resolved via [`rusterm_core::config::resolve_model`].
+///
 /// Returns `Err(message)` on any failure so the UI can show a friendly
 /// error string.
 #[cfg(feature = "qwen-local")]
 fn run_local_generation(
     description: &str,
     kind: rusterm_ai::TemplateKind,
+    settings: &rusterm_core::config::QwenLocalSettings,
 ) -> Result<String, String> {
+    use rusterm_core::config::resolve_model;
+
     // Determine the cache directory (app data dir / qwen-local).
     let cache_dir = dirs::data_dir()
         .or_else(dirs::home_dir)
@@ -1478,16 +1486,20 @@ fn run_local_generation(
         .join("RusTerm")
         .join("qwen-local");
 
+    // Resolve which model to use (builtin preset or custom).
+    let model = resolve_model(settings);
+
     // Ensure the model is downloaded + quantized. This is a no-op if the
     // GGUF is already cached.
-    rusterm_ai::ensure_model(&cache_dir, |_| {}).map_err(|e| e.to_string())?;
+    rusterm_ai::ensure_model(&cache_dir, &model, &settings.mirror_url, |_| {})
+        .map_err(|e| e.to_string())?;
 
-    let gguf_path = cache_dir.join("qwen25-coder-1.5b-q4k.gguf");
+    let gguf_path = cache_dir.join(format!("{}-q4k.gguf", model.id));
     let tokenizer_path = cache_dir.join("tokenizer.json");
 
     // Load the model into memory.
-    let mut model =
-        rusterm_ai::QwenLocalModel::load(&gguf_path, &tokenizer_path).map_err(|e| e.to_string())?;
+    let mut model = rusterm_ai::QwenLocalModel::load(&gguf_path, &tokenizer_path, &model)
+        .map_err(|e| e.to_string())?;
 
     // Build the prompt and generate.
     let prompt = rusterm_ai::build_prompt(description, kind);
@@ -1503,6 +1515,7 @@ fn run_local_generation(
 #[cfg(feature = "qwen-local")]
 fn render_ai_section(
     qwen_enabled: bool,
+    qwen_settings: rusterm_core::config::QwenLocalSettings,
     mut ai_description: Signal<String>,
     mut ai_kind_python: Signal<bool>,
     mut ai_status: Signal<String>,
@@ -1561,12 +1574,16 @@ fn render_ai_section(
                             rusterm_ai::TemplateKind::ShellScript
                         };
                         let mode = curl_mode();
+                        // Read the full local-AI settings (mirror URL, active
+                        // model, custom models) before spawning so the worker
+                        // thread doesn't touch the UI state.
+                        let settings = qwen_settings.clone();
                         ai_busy.set(true);
                         ai_status.set(crate::i18n::t("ai_runtime.local.preparing"));
                         spawn(async move {
                             let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
                             std::thread::spawn(move || {
-                                let result = run_local_generation(&desc, kind);
+                                let result = run_local_generation(&desc, kind, &settings);
                                 let _ = tx.send(result);
                             });
                             loop {
@@ -1631,6 +1648,7 @@ fn render_ai_section(
 #[allow(clippy::too_many_arguments)]
 fn render_ai_section(
     _qwen_enabled: bool,
+    _qwen_settings: rusterm_core::config::QwenLocalSettings,
     _ai_description: Signal<String>,
     _ai_kind_python: Signal<bool>,
     _ai_status: Signal<String>,

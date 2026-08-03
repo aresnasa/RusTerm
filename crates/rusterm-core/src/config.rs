@@ -1318,6 +1318,33 @@ pub struct QwenLocalSettings {
     /// machine. The UI still shows the warning text but allows enabling.
     #[serde(default)]
     pub force_enabled: bool,
+    /// HuggingFace mirror endpoint used for downloads.
+    /// Defaults to `"https://hf-mirror.com"` (China mirror). Users behind
+    /// the GFW or with slow HuggingFace connectivity can keep the default;
+    /// users with direct access can set `"https://huggingface.co"`.
+    /// The `HF_ENDPOINT` env var still takes priority inside the download
+    /// layer when the user has not customized this field.
+    #[serde(default = "default_mirror_url")]
+    pub mirror_url: String,
+    /// Currently selected model id — matches either a [`builtin_models`]
+    /// preset id or a [`QwenLocalSettings::custom_models`] entry id.
+    /// Defaults to `"qwen25-coder-1.5b"`.
+    #[serde(default = "default_model_id")]
+    pub active_model_id: String,
+    /// User-defined custom models. Empty by default. Builtins are not
+    /// duplicated here — the UI merges [`builtin_models`] with this list.
+    #[serde(default)]
+    pub custom_models: Vec<ModelConfig>,
+}
+
+/// Default mirror endpoint — the HuggingFace China mirror.
+fn default_mirror_url() -> String {
+    "https://hf-mirror.com".to_string()
+}
+
+/// Default active model id — the Qwen2.5-Coder-1.5B preset.
+fn default_model_id() -> String {
+    "qwen25-coder-1.5b".to_string()
 }
 
 impl Default for QwenLocalSettings {
@@ -1325,8 +1352,103 @@ impl Default for QwenLocalSettings {
         Self {
             enabled: false,
             force_enabled: false,
+            mirror_url: default_mirror_url(),
+            active_model_id: default_model_id(),
+            custom_models: Vec::new(),
         }
     }
+}
+
+/// Configuration for a single local model (builtin preset or user-defined).
+///
+/// All Qwen2-family models (Qwen2.5-Coder, Qwen2, Qwen2.5) share the
+/// `qwen2` architecture and the `<|im_start|>` chat template, so switching
+/// between them only requires changing `id`/`name`/`repo_id`. Models with
+/// other architectures are rejected at load time with a clear error —
+/// future versions may expand the supported architecture set.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ModelConfig {
+    /// Unique stable id, e.g. `"qwen25-coder-1.5b"` or `"my-custom-model"`.
+    /// Used to derive the GGUF cache filename (`{id}-q4k.gguf`).
+    pub id: String,
+    /// Display name shown in the UI model selector.
+    pub name: String,
+    /// HuggingFace repo id, e.g. `"Qwen/Qwen2.5-Coder-1.5B-Instruct"`.
+    pub repo_id: String,
+    /// Architecture family. Only `"qwen2"` is currently supported by the
+    /// candle `quantized_qwen2` loader. Other values produce a clear error
+    /// at load time.
+    #[serde(default = "default_model_arch")]
+    pub architecture: String,
+    /// Chat template with a single `{prompt}` placeholder. Qwen2-family
+    /// models use `<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n`.
+    pub prompt_template: String,
+    /// End-of-sequence token, e.g. `"<|im_end|>"`.
+    pub eos_token: String,
+}
+
+/// Default architecture — only `qwen2` is currently supported.
+fn default_model_arch() -> String {
+    "qwen2".to_string()
+}
+
+/// Built-in model presets. All use the `qwen2` architecture so they work
+/// with the existing candle `quantized_qwen2` loader.
+///
+/// The first entry is the default fallback when `active_model_id` doesn't
+/// match any builtin or custom model.
+pub fn builtin_models() -> Vec<ModelConfig> {
+    let qwen_template = "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n".to_string();
+    let qwen_eos = "<|im_end|>".to_string();
+    vec![
+        ModelConfig {
+            id: "qwen25-coder-1.5b".into(),
+            name: "Qwen2.5-Coder-1.5B-Instruct".into(),
+            repo_id: "Qwen/Qwen2.5-Coder-1.5B-Instruct".into(),
+            architecture: "qwen2".into(),
+            prompt_template: qwen_template.clone(),
+            eos_token: qwen_eos.clone(),
+        },
+        ModelConfig {
+            id: "qwen25-coder-0.5b".into(),
+            name: "Qwen2.5-Coder-0.5B-Instruct".into(),
+            repo_id: "Qwen/Qwen2.5-Coder-0.5B-Instruct".into(),
+            architecture: "qwen2".into(),
+            prompt_template: qwen_template.clone(),
+            eos_token: qwen_eos.clone(),
+        },
+        ModelConfig {
+            id: "qwen2-1.5b".into(),
+            name: "Qwen2-1.5B-Instruct".into(),
+            repo_id: "Qwen/Qwen2-1.5B-Instruct".into(),
+            architecture: "qwen2".into(),
+            prompt_template: qwen_template.clone(),
+            eos_token: qwen_eos.clone(),
+        },
+    ]
+}
+
+/// Resolve the active model from settings. Searches builtin presets first,
+/// then custom models. Falls back to the first builtin if the id is unknown
+/// (e.g. a custom model was deleted but `active_model_id` still points to
+/// it).
+pub fn resolve_model(settings: &QwenLocalSettings) -> ModelConfig {
+    let builtins = builtin_models();
+    if let Some(m) = builtins.iter().find(|m| m.id == settings.active_model_id) {
+        return m.clone();
+    }
+    if let Some(m) = settings
+        .custom_models
+        .iter()
+        .find(|m| m.id == settings.active_model_id)
+    {
+        return m.clone();
+    }
+    // Fallback: first builtin (Qwen2.5-Coder-1.5B by convention).
+    builtins
+        .into_iter()
+        .next()
+        .expect("builtin_models() must return at least one preset")
 }
 
 // --- OneKeys (ZOC-style Expect/Send auto-fill) ---
@@ -2110,5 +2232,99 @@ mod tests {
             let de: SshAuth = serde_json::from_str(&json).unwrap();
             assert_eq!(auth, de);
         }
+    }
+
+    #[test]
+    fn qwen_local_settings_defaults_and_legacy() {
+        // Default settings: disabled, default mirror, default model.
+        let s = QwenLocalSettings::default();
+        assert!(!s.enabled);
+        assert!(!s.force_enabled);
+        assert_eq!(s.mirror_url, "https://hf-mirror.com");
+        assert_eq!(s.active_model_id, "qwen25-coder-1.5b");
+        assert!(s.custom_models.is_empty());
+
+        // Legacy settings.json (pre-Phase-2) with only enabled/force_enabled
+        // must deserialize with the new defaults filled in.
+        let legacy = r#"{"enabled":true,"force_enabled":true}"#;
+        let parsed: QwenLocalSettings = serde_json::from_str(legacy).unwrap();
+        assert!(parsed.enabled);
+        assert!(parsed.force_enabled);
+        assert_eq!(parsed.mirror_url, "https://hf-mirror.com");
+        assert_eq!(parsed.active_model_id, "qwen25-coder-1.5b");
+        assert!(parsed.custom_models.is_empty());
+    }
+
+    #[test]
+    fn qwen_local_settings_roundtrip_with_custom_model() {
+        let settings = QwenLocalSettings {
+            enabled: true,
+            force_enabled: false,
+            mirror_url: "https://huggingface.co".to_string(),
+            active_model_id: "my-model".to_string(),
+            custom_models: vec![ModelConfig {
+                id: "my-model".to_string(),
+                name: "My Custom Model".to_string(),
+                repo_id: "org/custom-model".to_string(),
+                architecture: "qwen2".to_string(),
+                prompt_template: "<|im_start|>user\n{prompt}<|im_end|>\n<|im_start|>assistant\n"
+                    .to_string(),
+                eos_token: "<|im_end|>".to_string(),
+            }],
+        };
+        let json = serde_json::to_string(&settings).unwrap();
+        let parsed: QwenLocalSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(settings, parsed);
+    }
+
+    #[test]
+    fn builtin_models_non_empty_with_default_first() {
+        let models = builtin_models();
+        assert!(!models.is_empty());
+        // The first preset must be the Qwen2.5-Coder-1.5B (the default fallback).
+        assert_eq!(models[0].id, "qwen25-coder-1.5b");
+        assert_eq!(models[0].repo_id, "Qwen/Qwen2.5-Coder-1.5B-Instruct");
+        // All builtins must use qwen2 architecture.
+        for m in &models {
+            assert_eq!(m.architecture, "qwen2");
+            assert!(m.prompt_template.contains("{prompt}"));
+        }
+    }
+
+    #[test]
+    fn resolve_model_finds_builtin_and_custom_and_falls_back() {
+        // Builtin: found by id.
+        let s = QwenLocalSettings {
+            active_model_id: "qwen25-coder-0.5b".to_string(),
+            ..Default::default()
+        };
+        let m = resolve_model(&s);
+        assert_eq!(m.id, "qwen25-coder-0.5b");
+        assert_eq!(m.repo_id, "Qwen/Qwen2.5-Coder-0.5B-Instruct");
+
+        // Custom: found by id.
+        let s = QwenLocalSettings {
+            active_model_id: "my-custom".to_string(),
+            custom_models: vec![ModelConfig {
+                id: "my-custom".to_string(),
+                name: "My Custom".to_string(),
+                repo_id: "org/custom".to_string(),
+                architecture: "qwen2".to_string(),
+                prompt_template: "{prompt}".to_string(),
+                eos_token: "<end>".to_string(),
+            }],
+            ..Default::default()
+        };
+        let m = resolve_model(&s);
+        assert_eq!(m.id, "my-custom");
+        assert_eq!(m.repo_id, "org/custom");
+
+        // Unknown id: falls back to first builtin.
+        let s = QwenLocalSettings {
+            active_model_id: "does-not-exist".to_string(),
+            ..Default::default()
+        };
+        let m = resolve_model(&s);
+        assert_eq!(m.id, "qwen25-coder-1.5b");
     }
 }
