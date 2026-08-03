@@ -639,9 +639,9 @@ impl CurlPreviewParts {
     }
 }
 
-/// Build the shell snippet as three text fragments so the JSON `command` value
+/// Build the shell snippet as three text fragments so the editable payload
 /// can be styled independently without injecting HTML or matching duplicate
-/// command text elsewhere in the script.
+/// text elsewhere in the script.
 fn gen_curl_preview(
     url: &str,
     default_user: &str,
@@ -678,6 +678,92 @@ fn gen_curl_preview_for_language(
     let command_marker_title = crate::i18n::t_for("api.command_marker_title", language);
     let command_marker_help = crate::i18n::t_for("api.command_marker_help", language);
     let request_failed = shell_escape(&crate::i18n::t_for("api.request_failed", language));
+
+    if let CurlPayload::Command(command) = payload {
+        let function_usage = shell_escape(&crate::i18n::t_for("api.function_usage", language));
+        let targets = hosts
+            .iter()
+            .map(|host| shell_quote(host))
+            .collect::<Vec<_>>()
+            .join(" ");
+        let elevated_query = if elevated { "?elevated=true" } else { "" };
+        let target_marker = if hosts.len() > 1 {
+            "    printf '\\n==> %s\\n' \"$RUSTERM_TARGET\"\n"
+        } else {
+            ""
+        };
+
+        // Ordinary words can be pasted as `rusterm uname -a`. Shell syntax
+        // such as `&&`, pipes, redirects, quotes, or repeated whitespace must
+        // remain one argument so the local shell does not consume it first.
+        let can_be_unquoted = !command.is_empty()
+            && !command.starts_with(' ')
+            && !command.ends_with(' ')
+            && !command.contains("  ")
+            && command.chars().all(|ch| {
+                ch.is_alphanumeric()
+                    || matches!(
+                        ch,
+                        ' ' | '-' | '_' | '.' | '/' | ':' | '=' | '@' | '%' | '+' | ','
+                    )
+            });
+        let (invocation_before, rendered_command, invocation_after) = if command.is_empty() {
+            (
+                "# rusterm <command...>".to_string(),
+                String::new(),
+                "\n".to_string(),
+            )
+        } else if can_be_unquoted {
+            ("rusterm ".to_string(), command.clone(), "\n".to_string())
+        } else {
+            (
+                "rusterm '".to_string(),
+                shell_escape(command),
+                "'\n".to_string(),
+            )
+        };
+
+        return CurlPreviewParts {
+            before_command: format!(
+                "export RUSTERM_API_URL={url}\n\
+export RUSTERM_API_USER={user}\n\n\
+rusterm() {{\n\
+  if [ \"$#\" -eq 0 ]; then\n\
+    printf '{function_usage}\\n' >&2\n\
+    return 2\n\
+  fi\n\n\
+  if [ -z \"${{RUSTERM_API_PASSWORD+x}}\" ]; then\n\
+    printf '{password_prompt}' >&2\n\
+    RUSTERM_STTY=$(stty -g)\n\
+    trap 'stty \"$RUSTERM_STTY\"' 0 1 2 15\n\
+    stty -echo\n\
+    IFS= read -r RUSTERM_API_PASSWORD\n\
+    stty \"$RUSTERM_STTY\"\n\
+    trap - 0 1 2 15\n\
+    printf '\\n' >&2\n\
+    export RUSTERM_API_PASSWORD\n\
+  fi\n\n\
+  RUSTERM_FAILED=0\n\
+  for RUSTERM_TARGET in {targets}; do\n\
+{target_marker}\
+    curl --silent --show-error --fail-with-body \\\n      --connect-timeout 10 --max-time 120 \\\n      --request POST \\\n      --user \"${{RUSTERM_API_USER}}:${{RUSTERM_API_PASSWORD}}\" \\\n      --header 'Accept: text/plain' \\\n      --header 'Content-Type: text/plain; charset=utf-8' \\\n      --data-binary \"$*\" \\\n      \"${{RUSTERM_API_URL}}/r/${{RUSTERM_TARGET}}{elevated_query}\" || RUSTERM_FAILED=$?\n\
+  done\n\n\
+  if [ \"$RUSTERM_FAILED\" -ne 0 ]; then\n\
+    printf '\\n{request_failed}\\n' \"$RUSTERM_FAILED\" >&2\n\
+  fi\n\
+  return \"$RUSTERM_FAILED\"\n\
+}}\n\n\
+# {command_marker_title}\n\
+# {command_marker_help}\n\
+{invocation_before}",
+                url = shell_quote(url.trim_end_matches('/')),
+                user = shell_quote(default_user),
+            ),
+            command: rendered_command,
+            after_command: invocation_after,
+        };
+    }
+
     // Build the JSON body for one host. The payload variant selects the
     // field name (`command`, `script`, or `script_base64`); the relay
     // enforces mutual exclusivity server-side.
@@ -820,37 +906,29 @@ mod tests {
         );
         assert!(
             curl.contains("export RUSTERM_API_URL='http://127.0.0.1:8080'")
-                && curl.contains("\"${RUSTERM_API_URL}/api/v1/exec\""),
-            "missing endpoint export/use: {curl}"
+                && curl.contains("\"${RUSTERM_API_URL}/r/${RUSTERM_TARGET}?elevated=true\""),
+            "missing short-form endpoint export/use: {curl}"
+        );
+        assert!(curl.contains("export RUSTERM_API_USER='alice'"), "{curl}");
+        assert!(
+            curl.contains("rusterm() {"),
+            "missing reusable function: {curl}"
         );
         assert!(
-            curl.contains("export RUSTERM_API_USER='alice'"),
-            "missing configured user export: {curl}"
+            curl.contains("for RUSTERM_TARGET in 'prod-web'; do"),
+            "{curl}"
         );
+        assert!(curl.contains("--data-binary \"$*\""), "{curl}");
+        assert!(curl.contains("--header 'Accept: text/plain'"), "{curl}");
         assert!(
-            curl.contains("--user \"${RUSTERM_API_USER}:${RUSTERM_API_PASSWORD}\""),
-            "missing environment-based basic-auth: {curl}"
+            curl.contains("--header 'Content-Type: text/plain; charset=utf-8'"),
+            "{curl}"
         );
-        assert!(
-            curl.contains("IFS= read -r RUSTERM_API_PASSWORD"),
-            "password should be read once at runtime: {curl}"
-        );
-        assert!(
-            !curl.contains(":PASS"),
-            "placeholder must be removed: {curl}"
-        );
-        assert!(
-            curl.contains("host_id\":\"prod-web\""),
-            "missing host_id: {curl}"
-        );
-        assert!(
-            curl.contains("command\":\"uname -a\""),
-            "missing command: {curl}"
-        );
-        assert!(
-            curl.contains("elevated\":true"),
-            "missing elevation flag: {curl}"
-        );
+        assert!(curl.contains("IFS= read -r RUSTERM_API_PASSWORD"), "{curl}");
+        assert!(curl.ends_with("rusterm uname -a\n"), "{curl}");
+        assert!(!curl.contains("/api/v1/exec"), "{curl}");
+        assert!(!curl.contains(r#"\"command\""#), "{curl}");
+        assert!(!curl.contains(":PASS"), "{curl}");
     }
 
     #[test]
@@ -863,11 +941,20 @@ mod tests {
             false,
         );
 
-        assert_eq!(curl.matches("rusterm_exec '").count(), 2, "{curl}");
-        assert!(curl.contains(r#"host_id":"host-a"#), "{curl}");
-        assert!(curl.contains(r#"host_id":"host-b"#), "{curl}");
-        assert!(curl.contains("command -v jq"), "{curl}");
-        assert!(curl.contains("python3 -m json.tool"), "{curl}");
+        assert_eq!(curl.matches("rusterm() {").count(), 1, "{curl}");
+        assert!(
+            curl.contains("for RUSTERM_TARGET in 'host-a' 'host-b'; do"),
+            "{curl}"
+        );
+        assert!(
+            curl.contains("printf '\\n==> %s\\n' \"$RUSTERM_TARGET\""),
+            "{curl}"
+        );
+        assert_eq!(curl.matches("--data-binary \"$*\"").count(), 1, "{curl}");
+        assert!(
+            curl.contains("\"${RUSTERM_API_URL}/r/${RUSTERM_TARGET}\""),
+            "non-elevated calls should not add an elevated query: {curl}"
+        );
         assert!(
             curl.contains("--silent --show-error --fail-with-body"),
             "{curl}"
@@ -900,37 +987,46 @@ mod tests {
         )
         .into_script();
 
-        assert!(english.contains("# EDIT REMOTE COMMAND BELOW"), "{english}");
+        assert!(
+            english.contains("# RUN NOW; THE FUNCTION REMAINS REUSABLE"),
+            "{english}"
+        );
         assert!(english.contains("RusTerm API password: "), "{english}");
-        assert!(!english.contains("在下方修改远程命令"), "{english}");
-        assert!(chinese.contains("# 在下方修改远程命令"), "{chinese}");
+        assert!(english.contains("Usage: rusterm <command...>"), "{english}");
+        assert!(
+            !english.contains("立即执行；此函数后续仍可复用"),
+            "{english}"
+        );
+        assert!(
+            chinese.contains("# 立即执行；此函数后续仍可复用"),
+            "{chinese}"
+        );
         assert!(chinese.contains("RusTerm API 密码："), "{chinese}");
-        assert!(!chinese.contains("EDIT REMOTE COMMAND BELOW"), "{chinese}");
+        assert!(chinese.contains("用法：rusterm <命令...>"), "{chinese}");
+        assert!(
+            !chinese.contains("RUN NOW; THE FUNCTION REMAINS REUSABLE"),
+            "{chinese}"
+        );
         for script in [english, chinese] {
-            assert!(
-                script.contains("command\":\"docker ps\""),
-                "the editable command should remain in the JSON body: {script}"
-            );
+            assert!(script.ends_with("rusterm docker ps\n"), "{script}");
+            assert!(!script.contains(r#"\"command\""#), "{script}");
         }
     }
 
     #[test]
     fn curl_escapes_json_special_chars_in_command() {
-        // A command with a double-quote and backslash must be JSON-escaped so
-        // the generated body stays valid JSON the relay can parse. The raw
-        // command `echo "hi" \n` must become `echo \"hi\" \\n` in the
-        // JSON value (quotes → \", backslash → \\).
         let curl = gen_curl(
             "http://x",
             "u",
             &["h".to_string()],
-            &CurlPayload::Command(r#"echo "hi" \n"#.to_string()),
+            &CurlPayload::Command(r#"echo "hi" 'there' \n"#.to_string()),
             false,
         );
         assert!(
-            curl.contains(r#"command":"echo \"hi\" \\n""#),
-            "bad escape: {curl}"
+            curl.ends_with("rusterm 'echo \"hi\" '\"'\"'there'\"'\"' \\n'\n"),
+            "shell-sensitive commands must be emitted as one safely quoted argument: {curl}"
         );
+        assert!(!curl.contains(r#"\"command\""#), "{curl}");
     }
 
     #[test]
@@ -949,8 +1045,8 @@ mod tests {
 
         assert_eq!(marked.matches("<mark>").count(), 1);
         assert!(
-            marked.contains(r#""command":"<mark>repeat</mark>""#),
-            "highlight must wrap only the command field value: {marked}"
+            marked.ends_with("rusterm <mark>repeat</mark>\n"),
+            "highlight must wrap only the sample command: {marked}"
         );
     }
 
@@ -964,11 +1060,14 @@ mod tests {
             false,
         );
 
-        assert_eq!(preview.command, r#"echo \"hi\" '"'"'there'"'"' \\n"#);
-        let script = preview.into_script();
+        assert_eq!(preview.command, r#"echo "hi" '"'"'there'"'"' \n"#);
+        let marked = format!(
+            "{}<mark>{}</mark>{}",
+            preview.before_command, preview.command, preview.after_command
+        );
         assert!(
-            script.contains(r#"command":"echo \"hi\" '"'"'there'"'"' \\n""#),
-            "highlight fragments must concatenate into the escaped shell script: {script}"
+            marked.ends_with("rusterm '<mark>echo \"hi\" '\"'\"'there'\"'\"' \\n</mark>'\n"),
+            "outer quotes must stay outside the highlighted command: {marked}"
         );
     }
 
@@ -983,9 +1082,10 @@ mod tests {
         );
 
         assert!(preview.command.is_empty());
+        let script = preview.into_script();
         assert!(
-            preview.into_script().contains(r#""command":"""#),
-            "empty command must remain valid JSON"
+            script.ends_with("# rusterm <command...>\n"),
+            "an empty command should leave a reusable example instead of executing: {script}"
         );
     }
 

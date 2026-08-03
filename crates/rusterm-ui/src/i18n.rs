@@ -292,8 +292,8 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
             "curl 示例 — 在你的会话上执行命令",
         ),
         "api.curl_hint" => (
-            "The copied script exports the configured username and asks for the API password once per shell. It never places the password in shell history.",
-            "复制的脚本会导出已配置的用户名，并在每个 shell 中仅询问一次 API 密码；密码不会写入 shell 历史。",
+            "Command mode copies a reusable rusterm shell function. Run it as `rusterm uname -a`; the API password is requested once per shell and never placed in shell history.",
+            "命令模式会复制一个可复用的 rusterm shell 函数，可直接执行 `rusterm uname -a`；每个 shell 仅询问一次 API 密码，且不会写入 shell 历史。",
         ),
         "api.command" => ("Command", "命令"),
         "api.command_edit_hint" => (
@@ -690,14 +690,18 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         // ── api.* — keys reserved for the endpoint/curl UI follow-up ───
         "api.endpoints" => ("Endpoints", "端点"),
         "api.endpoint_reference" => (
-            "GET  {url}/api/v1/health      # liveness, no auth\nGET  {url}/api/v1/hosts        # list hosts (BasicAuth)\nPOST {url}/api/v1/exec         # { host_id, command, elevated?, timeout_ms? }\nPOST {url}/api/v1/parse-curl   # parse a pasted curl into JSON",
-            "GET  {url}/api/v1/health      # 存活检查，无需鉴权\nGET  {url}/api/v1/hosts        # 列出主机（BasicAuth）\nPOST {url}/api/v1/exec         # { host_id, command, elevated?, timeout_ms? }\nPOST {url}/api/v1/parse-curl   # 将粘贴的 curl 解析为 JSON",
+            "GET  {url}/api/v1/health      # liveness, no auth\nGET  {url}/api/v1/hosts        # list hosts (BasicAuth)\nPOST {url}/r/{host_id}         # plain command body, plain stdout\nPOST {url}/api/v1/exec         # { host_id, command, elevated?, timeout_ms? }\nPOST {url}/api/v1/parse-curl   # parse a pasted curl into JSON",
+            "GET  {url}/api/v1/health      # 存活检查，无需鉴权\nGET  {url}/api/v1/hosts        # 列出主机（BasicAuth）\nPOST {url}/r/{host_id}         # 纯文本命令请求体，直接返回 stdout\nPOST {url}/api/v1/exec         # { host_id, command, elevated?, timeout_ms? }\nPOST {url}/api/v1/parse-curl   # 将粘贴的 curl 解析为 JSON",
         ),
         "api.password_prompt" => ("RusTerm API password: ", "RusTerm API 密码："),
-        "api.command_marker_title" => ("EDIT REMOTE COMMAND BELOW", "在下方修改远程命令"),
+        "api.function_usage" => ("Usage: rusterm <command...>", "用法：rusterm <命令...>"),
+        "api.command_marker_title" => (
+            "RUN NOW; THE FUNCTION REMAINS REUSABLE",
+            "立即执行；此函数后续仍可复用",
+        ),
         "api.command_marker_help" => (
-            "Change the JSON \"command\" value",
-            "请替换 JSON 中的 \"command\" 值",
+            "Use rusterm <command...>; quote commands containing &&, pipes, or redirects",
+            "使用 rusterm <命令...>；包含 &&、管道或重定向时请为命令加引号",
         ),
         "api.request_failed" => (
             "One or more RusTerm API requests failed (last status: %s).",
@@ -1463,8 +1467,9 @@ mod tests {
 
         for language in [Language::En, Language::Zh] {
             let reference = translate("api.endpoint_reference", language).unwrap();
-            assert_eq!(reference.lines().count(), 4);
+            assert_eq!(reference.lines().count(), 5);
             assert!(reference.contains("{url}"));
+            assert!(reference.contains("/r/{host_id}"));
             for field in ["host_id", "command", "elevated?", "timeout_ms?"] {
                 assert!(reference.contains(field));
             }
