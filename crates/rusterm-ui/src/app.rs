@@ -9108,19 +9108,49 @@ fn start_ssh_connection(
 
                 let _session_guard = session;
 
-                // Pre-seed session history from local shell history.
-                // Filter out commands that are known to have failed so they
-                // don't show up in the suggestion popup immediately on connect.
-                // (The background import below will later merge in remote
-                // history with the same filter.)
+                // Pre-seed session history from local shell history IN THE
+                // BACKGROUND so the output event loop can start immediately
+                // after PTY creation. This is the "枝干" (branch) — deferred
+                // history loading — while the "主干" (trunk) is the session IO
+                // loop below. The suggestion popup will be empty for the first
+                // beat after connect, then populate once this completes.
+                //
+                // The sync `HybridHistoryProvider::search` (which reads
+                // ~/.bash_history, ~/.zsh_history, fish_history, and the
+                // atuin DB) is wrapped in `spawn_blocking` so it does not
+                // starve the async runtime's worker threads.
+                //
+                // Results are MERGED (prepend with dedup) rather than
+                // overwritten, because the output loop's deferred-recording
+                // commit path may have already pushed runtime commands by
+                // the time this completes.
                 {
-                    let provider = rusterm_history::HybridHistoryProvider::new();
-                    let initial_history: Vec<String> = provider
-                        .search("", 3000)
-                        .into_iter()
-                        .map(|m| m.command)
-                        .collect();
-                    if !initial_history.is_empty() {
+                    let sid_for_preseed = tab_id.clone();
+                    let mut state_for_preseed = state;
+                    spawn(async move {
+                        let initial_history: Vec<String> = match tokio::task::spawn_blocking(|| {
+                            let provider = rusterm_history::HybridHistoryProvider::new();
+                            provider
+                                .search("", 3000)
+                                .into_iter()
+                                .map(|m| m.command)
+                                .collect::<Vec<String>>()
+                        })
+                        .await
+                        {
+                            Ok(v) => v,
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Local history pre-seed panicked for {}: {}",
+                                    sid_for_preseed,
+                                    e
+                                );
+                                return;
+                            }
+                        };
+                        if initial_history.is_empty() {
+                            return;
+                        }
                         let db_path = dirs::data_dir()
                             .unwrap_or_default()
                             .join("rusterm")
@@ -9134,13 +9164,27 @@ fn start_ssh_connection(
                             .into_iter()
                             .filter(|cmd| !failed_set.contains(cmd))
                             .collect();
-                        if !filtered.is_empty() {
-                            let mut s = state.write();
-                            if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == tab_id) {
-                                tab.command_history = filtered;
+                        if filtered.is_empty() {
+                            return;
+                        }
+                        let mut s = state_for_preseed.write();
+                        if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == sid_for_preseed) {
+                            // Merge: prepend pre-seeded local history (it is
+                            // older than any runtime commands the output loop
+                            // may have already committed via deferred
+                            // recording). Dedup against the existing list.
+                            let mut existing = tab.command_history.clone();
+                            let before_len = existing.len();
+                            for cmd in filtered.into_iter().rev() {
+                                if !existing.contains(&cmd) {
+                                    existing.insert(0, cmd);
+                                }
+                            }
+                            if existing.len() != before_len {
+                                tab.command_history = existing;
                             }
                         }
-                    }
+                    });
                 }
 
                 // Background: import remote shell history into the local DB
@@ -10100,49 +10144,79 @@ fn start_shell_connection(
                 });
             }
 
-            // Pre-populate local shell history from native history files.
+            // Pre-populate local shell history from native history files IN
+            // THE BACKGROUND so the output event loop starts immediately.
             // Filter out commands that are known to have failed (marked via
             // `mark_command_failed`) so typos like `pwdwd` — which live in
             // `~/.bash_history` / `~/.zsh_history` — don't show up in the
             // suggestion popup. Same rationale as the SSH import path.
             //
-            // The DB query is async, so we spawn a task to fetch the
-            // known-failed set, filter the local history, and write the
-            // result back into the session's `command_history`.
+            // The sync `HybridHistoryProvider::search` is wrapped in
+            // `spawn_blocking` to avoid blocking the async runtime. Results
+            // are MERGED (prepend with dedup) rather than overwritten, so
+            // runtime commands committed by the output loop's deferred-
+            // recording path are not clobbered.
             {
-                let provider = rusterm_history::HybridHistoryProvider::new();
-                let local_history: Vec<String> = provider
-                    .search("", 2000)
-                    .into_iter()
-                    .map(|m| m.command)
-                    .collect();
-                if !local_history.is_empty() {
-                    let sid_for_local_import = tab_id.clone();
-                    let mut state_for_local_import = state;
-                    spawn(async move {
-                        let db_path = dirs::data_dir()
-                            .unwrap_or_default()
-                            .join("rusterm")
-                            .join("rusterm.db");
-                        let mut failed_set: std::collections::HashSet<String> =
-                            std::collections::HashSet::new();
-                        if let Ok(db) = rusterm_db::Database::open(Some(db_path)).await {
-                            failed_set = db.known_failed_commands().await.unwrap_or_default();
-                        }
-                        let filtered: Vec<String> = local_history
+                let sid_for_local_import = tab_id.clone();
+                let mut state_for_local_import = state;
+                spawn(async move {
+                    let local_history: Vec<String> = match tokio::task::spawn_blocking(|| {
+                        let provider = rusterm_history::HybridHistoryProvider::new();
+                        provider
+                            .search("", 2000)
                             .into_iter()
-                            .filter(|cmd| !failed_set.contains(cmd))
-                            .collect();
-                        if !filtered.is_empty() {
-                            let mut s = state_for_local_import.write();
-                            if let Some(tab) =
-                                s.sessions.iter_mut().find(|t| t.id == sid_for_local_import)
-                            {
-                                tab.command_history = filtered;
+                            .map(|m| m.command)
+                            .collect::<Vec<String>>()
+                    })
+                    .await
+                    {
+                        Ok(v) => v,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Local history pre-seed panicked for {}: {}",
+                                sid_for_local_import,
+                                e
+                            );
+                            return;
+                        }
+                    };
+                    if local_history.is_empty() {
+                        return;
+                    }
+                    let db_path = dirs::data_dir()
+                        .unwrap_or_default()
+                        .join("rusterm")
+                        .join("rusterm.db");
+                    let mut failed_set: std::collections::HashSet<String> =
+                        std::collections::HashSet::new();
+                    if let Ok(db) = rusterm_db::Database::open(Some(db_path)).await {
+                        failed_set = db.known_failed_commands().await.unwrap_or_default();
+                    }
+                    let filtered: Vec<String> = local_history
+                        .into_iter()
+                        .filter(|cmd| !failed_set.contains(cmd))
+                        .collect();
+                    if filtered.is_empty() {
+                        return;
+                    }
+                    let mut s = state_for_local_import.write();
+                    if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == sid_for_local_import)
+                    {
+                        // Merge: prepend pre-seeded local history (older than
+                        // any runtime commands the output loop may have already
+                        // committed). Dedup against the existing list.
+                        let mut existing = tab.command_history.clone();
+                        let before_len = existing.len();
+                        for cmd in filtered.into_iter().rev() {
+                            if !existing.contains(&cmd) {
+                                existing.insert(0, cmd);
                             }
                         }
-                    });
-                }
+                        if existing.len() != before_len {
+                            tab.command_history = existing;
+                        }
+                    }
+                });
             }
 
             let _session_guard = session;
