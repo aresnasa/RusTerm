@@ -163,7 +163,7 @@ fn router(state: AppState) -> Router {
         //   curl -s -u user:pass http://localhost:8877/r/jumpserver -d 'uname -a'
         .route("/r/{host_id}", post(exec_shortform))
         // Companion list endpoint: GET /r with no host_id returns a plain-text
-        // host list (one `id\tname` per line) for shell functions that need to
+        // host list (one host id per line) for shell functions that need to
         // discover hosts at runtime without pulling in jq/python.
         .route("/r", get(list_hosts_shortform))
         .with_state(state)
@@ -338,7 +338,7 @@ async fn list_hosts(
     Json(hosts).into_response()
 }
 
-/// Plain-text companion to [`list_hosts`]. Returns `id\tname` per line so a
+/// Plain-text companion to [`list_hosts`]. Returns one host id per line so a
 /// shell function can populate `RUSTERM_HOSTS` without jq/python. Auth and
 /// `allowed_hosts` filtering are identical to the JSON endpoint.
 async fn list_hosts_shortform(
@@ -360,8 +360,6 @@ async fn list_hosts_shortform(
     let mut body = String::new();
     for host in &hosts {
         body.push_str(&host.id);
-        body.push('\t');
-        body.push_str(&host.name);
         body.push('\n');
     }
     ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response()
@@ -1325,14 +1323,14 @@ mod tests {
         let (status, _, _) = raw_text_get(&url, Some(("ops", "wrong"))).await;
         assert_eq!(status, 401);
 
-        // Authenticated → 200 with one `id\tname` line per host.
+        // Authenticated → 200 with one host id per line.
         let (status, headers, body) = raw_text_get(&url, Some(("ops", "pw"))).await;
         assert_eq!(status, 200);
         assert_eq!(
             headers.get("content-type").unwrap(),
             "text/plain; charset=utf-8"
         );
-        assert_eq!(body, "host-1\tprod\n");
+        assert_eq!(body, "host-1\n");
 
         handle.shutdown().await;
     }
@@ -1400,7 +1398,7 @@ mod tests {
         let (status, _, body) = raw_text_get(&url, Some(("ops", "pw"))).await;
         assert_eq!(status, 200);
         // Only host-1 reaches the caller; host-2 is filtered out.
-        assert_eq!(body, "host-1\tprod\n");
+        assert_eq!(body, "host-1\n");
 
         handle.shutdown().await;
     }

@@ -681,17 +681,8 @@ fn gen_curl_preview_for_language(
 
     if let CurlPayload::Command(command) = payload {
         let function_usage = shell_escape(&crate::i18n::t_for("api.function_usage", language));
-        let targets = hosts
-            .iter()
-            .map(|host| shell_quote(host))
-            .collect::<Vec<_>>()
-            .join(" ");
+        let no_hosts = shell_escape(&crate::i18n::t_for("api.no_hosts", language));
         let elevated_query = if elevated { "?elevated=true" } else { "" };
-        let target_marker = if hosts.len() > 1 {
-            "    printf '\\n==> %s\\n' \"$RUSTERM_TARGET\"\n"
-        } else {
-            ""
-        };
 
         // Ordinary words can be pasted as `rusterm uname -a`. Shell syntax
         // such as `&&`, pipes, redirects, quotes, or repeated whitespace must
@@ -723,6 +714,11 @@ fn gen_curl_preview_for_language(
             )
         };
 
+        // Host ids are NOT baked into the copied function. At runtime the
+        // function discovers the current hosts via `GET /r` (plain text, one
+        // id per line) so the snippet keeps working after sessions reconnect
+        // or the selected host changes. `RUSTERM_HOSTS` may be pre-exported to
+        // pin a target; `--refresh` forces re-discovery.
         return CurlPreviewParts {
             before_command: format!(
                 "export RUSTERM_API_URL={url}\n\
@@ -731,6 +727,11 @@ rusterm() {{\n\
   if [ \"$#\" -eq 0 ]; then\n\
     printf '{function_usage}\\n' >&2\n\
     return 2\n\
+  fi\n\
+  if [ \"$1\" = \"--refresh\" ]; then\n\
+    unset RUSTERM_HOSTS\n\
+    shift\n\
+    [ \"$#\" -eq 0 ] && return 0\n\
   fi\n\n\
   if [ -z \"${{RUSTERM_API_PASSWORD+x}}\" ]; then\n\
     printf '{password_prompt}' >&2\n\
@@ -743,9 +744,23 @@ rusterm() {{\n\
     printf '\\n' >&2\n\
     export RUSTERM_API_PASSWORD\n\
   fi\n\n\
+  if [ -z \"${{RUSTERM_HOSTS+x}}\" ]; then\n\
+    RUSTERM_HOSTS=$(curl --silent --fail \\\n      --user \"${{RUSTERM_API_USER}}:${{RUSTERM_API_PASSWORD}}\" \\\n      \"${{RUSTERM_API_URL}}/r\")\n\
+    if [ -n \"$RUSTERM_HOSTS\" ]; then\n\
+      export RUSTERM_HOSTS\n\
+    fi\n\
+  fi\n\
+  if [ -z \"$RUSTERM_HOSTS\" ]; then\n\
+    printf '{no_hosts}\\n' >&2\n\
+    return 1\n\
+  fi\n\n\
   RUSTERM_FAILED=0\n\
-  for RUSTERM_TARGET in {targets}; do\n\
-{target_marker}\
+  RUSTERM_COUNT=0\n\
+  for RUSTERM_TARGET in $RUSTERM_HOSTS; do\n\
+    RUSTERM_COUNT=$((RUSTERM_COUNT + 1))\n\
+  done\n\
+  for RUSTERM_TARGET in $RUSTERM_HOSTS; do\n\
+    [ \"$RUSTERM_COUNT\" -gt 1 ] && printf '\\n==> %s\\n' \"$RUSTERM_TARGET\"\n\
     curl --silent --show-error --fail-with-body \\\n      --connect-timeout 10 --max-time 120 \\\n      --request POST \\\n      --user \"${{RUSTERM_API_USER}}:${{RUSTERM_API_PASSWORD}}\" \\\n      --header 'Accept: text/plain' \\\n      --header 'Content-Type: text/plain; charset=utf-8' \\\n      --data-binary \"$*\" \\\n      \"${{RUSTERM_API_URL}}/r/${{RUSTERM_TARGET}}{elevated_query}\" || RUSTERM_FAILED=$?\n\
   done\n\n\
   if [ \"$RUSTERM_FAILED\" -ne 0 ]; then\n\
@@ -900,7 +915,7 @@ mod tests {
         let curl = gen_curl(
             "http://127.0.0.1:8080",
             "alice",
-            &["prod-web".to_string()],
+            &[],
             &CurlPayload::Command("uname -a".to_string()),
             true,
         );
@@ -914,9 +929,18 @@ mod tests {
             curl.contains("rusterm() {"),
             "missing reusable function: {curl}"
         );
+        // Hosts are discovered at runtime via GET /r, never baked in.
         assert!(
-            curl.contains("for RUSTERM_TARGET in 'prod-web'; do"),
-            "{curl}"
+            curl.contains("\"${RUSTERM_API_URL}/r\"") && curl.contains("RUSTERM_HOSTS=$(curl"),
+            "function must discover hosts dynamically: {curl}"
+        );
+        assert!(
+            !curl.contains("prod-web"),
+            "host id must not be baked in: {curl}"
+        );
+        assert!(
+            curl.contains("if [ \"$1\" = \"--refresh\" ]; then"),
+            "function must support --refresh: {curl}"
         );
         assert!(curl.contains("--data-binary \"$*\""), "{curl}");
         assert!(curl.contains("--header 'Accept: text/plain'"), "{curl}");
@@ -942,12 +966,24 @@ mod tests {
         );
 
         assert_eq!(curl.matches("rusterm() {").count(), 1, "{curl}");
+        // Hosts are not baked in; the loop iterates the discovered list.
         assert!(
-            curl.contains("for RUSTERM_TARGET in 'host-a' 'host-b'; do"),
-            "{curl}"
+            curl.contains("for RUSTERM_TARGET in $RUSTERM_HOSTS; do"),
+            "loop must iterate discovered hosts: {curl}"
         );
         assert!(
-            curl.contains("printf '\\n==> %s\\n' \"$RUSTERM_TARGET\""),
+            !curl.contains("host-a"),
+            "host ids must not be baked in: {curl}"
+        );
+        assert!(
+            !curl.contains("host-b"),
+            "host ids must not be baked in: {curl}"
+        );
+        // Multi-host marker is emitted conditionally on RUSTERM_COUNT > 1.
+        assert!(
+            curl.contains(
+                "[ \"$RUSTERM_COUNT\" -gt 1 ] && printf '\\n==> %s\\n' \"$RUSTERM_TARGET\""
+            ),
             "{curl}"
         );
         assert_eq!(curl.matches("--data-binary \"$*\"").count(), 1, "{curl}");
@@ -962,6 +998,77 @@ mod tests {
         assert!(
             curl.contains("--connect-timeout 10 --max-time 120"),
             "{curl}"
+        );
+    }
+
+    #[test]
+    fn curl_command_mode_discovers_hosts_at_runtime_and_never_bakes_them_in() {
+        // The whole point of the dynamic-discovery rewrite: a copied function
+        // must keep working after the session that was selected at copy time
+        // goes away. We pass a non-empty session list to prove even selected
+        // hosts are NOT baked in.
+        let curl = gen_curl(
+            "http://relay.example:8877",
+            "ops",
+            &[
+                "100eac5a-2ef7-427f-84e1-9e03e2b61820".to_string(),
+                "staging-host".to_string(),
+            ],
+            &CurlPayload::Command("uname -a".to_string()),
+            true,
+        );
+
+        // Neither the UUID nor the friendly name may appear in the output.
+        assert!(
+            !curl.contains("100eac5a"),
+            "selected host id must not be baked in: {curl}"
+        );
+        assert!(
+            !curl.contains("staging-host"),
+            "selected host name must not be baked in: {curl}"
+        );
+
+        // Discovery hits GET /r with the same credentials.
+        assert!(
+            curl.contains("RUSTERM_HOSTS=$(curl --silent --fail"),
+            "must discover hosts via curl: {curl}"
+        );
+        assert!(
+            curl.contains("--user \"${RUSTERM_API_USER}:${RUSTERM_API_PASSWORD}\""),
+            "discovery must reuse the same credentials: {curl}"
+        );
+        assert!(
+            curl.contains("\"${RUSTERM_API_URL}/r\""),
+            "discovery must hit /r (no host_id): {curl}"
+        );
+
+        // --refresh support.
+        assert!(
+            curl.contains("if [ \"$1\" = \"--refresh\" ]; then"),
+            "function must handle --refresh: {curl}"
+        );
+        assert!(
+            curl.contains("unset RUSTERM_HOSTS"),
+            "--refresh must clear the cached host list: {curl}"
+        );
+
+        // RUSTERM_HOSTS override path: if the user pre-exports it, discovery
+        // is skipped.
+        assert!(
+            curl.contains("if [ -z \"${RUSTERM_HOSTS+x}\" ]; then"),
+            "discovery must be gated on RUSTERM_HOSTS being unset: {curl}"
+        );
+
+        // No-hosts guard returns a clear error instead of a silent no-op.
+        assert!(
+            curl.contains("if [ -z \"$RUSTERM_HOSTS\" ]; then"),
+            "must guard against an empty host list: {curl}"
+        );
+
+        // Elevated query is still applied per-target.
+        assert!(
+            curl.contains("\"${RUSTERM_API_URL}/r/${RUSTERM_TARGET}?elevated=true\""),
+            "elevated must be forwarded as a query param: {curl}"
         );
     }
 
@@ -1091,6 +1198,8 @@ mod tests {
 
     #[test]
     fn curl_handles_missing_session_with_placeholder() {
+        // Command mode discovers hosts at runtime, so an empty session list
+        // must still produce a working function (no HOST placeholder needed).
         let curl = gen_curl(
             "http://x",
             "u",
@@ -1099,8 +1208,26 @@ mod tests {
             false,
         );
         assert!(
-            curl.contains("HOST"),
-            "missing-session should use HOST placeholder: {curl}"
+            curl.contains("RUSTERM_HOSTS=$(curl"),
+            "command mode must discover hosts dynamically even with no session: {curl}"
+        );
+        assert!(
+            !curl.contains("'HOST'"),
+            "command mode must not bake in a placeholder: {curl}"
+        );
+
+        // Script / base64 mode still bakes in a HOST placeholder when no
+        // session is selected, because those payloads target a single host.
+        let script = gen_curl(
+            "http://x",
+            "u",
+            &[],
+            &CurlPayload::Script("echo hi\n".to_string()),
+            false,
+        );
+        assert!(
+            script.contains("'HOST'"),
+            "script mode should still use HOST placeholder: {script}"
         );
     }
 

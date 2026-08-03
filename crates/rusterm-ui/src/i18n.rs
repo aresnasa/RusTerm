@@ -690,8 +690,8 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         // ── api.* — keys reserved for the endpoint/curl UI follow-up ───
         "api.endpoints" => ("Endpoints", "端点"),
         "api.endpoint_reference" => (
-            "GET  {url}/api/v1/health      # liveness, no auth\nGET  {url}/api/v1/hosts        # list hosts (BasicAuth)\nPOST {url}/r/{host_id}         # plain command body, plain stdout\nPOST {url}/api/v1/exec         # { host_id, command, elevated?, timeout_ms? }\nPOST {url}/api/v1/parse-curl   # parse a pasted curl into JSON",
-            "GET  {url}/api/v1/health      # 存活检查，无需鉴权\nGET  {url}/api/v1/hosts        # 列出主机（BasicAuth）\nPOST {url}/r/{host_id}         # 纯文本命令请求体，直接返回 stdout\nPOST {url}/api/v1/exec         # { host_id, command, elevated?, timeout_ms? }\nPOST {url}/api/v1/parse-curl   # 将粘贴的 curl 解析为 JSON",
+            "GET  {url}/api/v1/health      # liveness, no auth\nGET  {url}/api/v1/hosts        # list hosts (BasicAuth, JSON)\nGET  {url}/r                    # list host_ids (BasicAuth, plain text)\nPOST {url}/r/{host_id}         # plain command body, plain stdout\nPOST {url}/api/v1/exec         # { host_id, command, elevated?, timeout_ms? }\nPOST {url}/api/v1/parse-curl   # parse a pasted curl into JSON",
+            "GET  {url}/api/v1/health      # 存活检查，无需鉴权\nGET  {url}/api/v1/hosts        # 列出主机（BasicAuth，JSON）\nGET  {url}/r                    # 列出 host_id（BasicAuth，纯文本）\nPOST {url}/r/{host_id}         # 纯文本命令请求体，直接返回 stdout\nPOST {url}/api/v1/exec         # { host_id, command, elevated?, timeout_ms? }\nPOST {url}/api/v1/parse-curl   # 将粘贴的 curl 解析为 JSON",
         ),
         "api.password_prompt" => ("RusTerm API password: ", "RusTerm API 密码："),
         "api.function_usage" => ("Usage: rusterm <command...>", "用法：rusterm <命令...>"),
@@ -700,12 +700,16 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
             "立即执行；此函数后续仍可复用",
         ),
         "api.command_marker_help" => (
-            "Use rusterm <command...>; quote commands containing &&, pipes, or redirects",
-            "使用 rusterm <命令...>；包含 &&、管道或重定向时请为命令加引号",
+            "Use rusterm <command...>; quote commands containing &&, pipes, or redirects. Run rusterm --refresh to re-discover hosts after reconnecting.",
+            "使用 rusterm <命令...>；包含 &&、管道或重定向时请为命令加引号。重连后运行 rusterm --refresh 可重新发现主机。",
         ),
         "api.request_failed" => (
             "One or more RusTerm API requests failed (last status: %s).",
             "一个或多个 RusTerm API 请求失败（最后状态：%s）。",
+        ),
+        "api.no_hosts" => (
+            "No hosts discovered; run rusterm --refresh or set RUSTERM_HOSTS manually.",
+            "未发现主机；请运行 rusterm --refresh 或手动设置 RUSTERM_HOSTS。",
         ),
 
         // ── common / connection / sidebar additions ───────────────────
@@ -1467,9 +1471,10 @@ mod tests {
 
         for language in [Language::En, Language::Zh] {
             let reference = translate("api.endpoint_reference", language).unwrap();
-            assert_eq!(reference.lines().count(), 5);
+            assert_eq!(reference.lines().count(), 6);
             assert!(reference.contains("{url}"));
             assert!(reference.contains("/r/{host_id}"));
+            assert!(reference.contains("GET  {url}/r"));
             for field in ["host_id", "command", "elevated?", "timeout_ms?"] {
                 assert!(reference.contains(field));
             }
