@@ -65,6 +65,7 @@ pub fn BottomToolPanel(
             .send-target-action{{border:1px solid var(--skin-border);background:var(--skin-surface);color:var(--skin-text-muted);border-radius:3px;padding:3px 8px;font-size:10px;cursor:pointer;}}
             .send-target-action:hover{{color:var(--skin-accent);border-color:var(--skin-accent);}}
             .workspace-resize-handle:hover,.workspace-resize-handle.active{{background:var(--skin-accent);box-shadow:0 0 6px rgba(122,162,247,.5);}}
+            .workspace-resize-handle:hover .dock-resize-grip,.workspace-resize-handle.active .dock-resize-grip{{background:var(--skin-bg);opacity:1;}}
         " }
         div {
             style: if embedded {
@@ -226,13 +227,17 @@ pub fn BottomToolPanel(
             if !embedded {
             div {
                 class: if resize_drag().is_some() { "workspace-resize-handle active" } else { "workspace-resize-handle" },
-                style: "position:absolute;left:0;top:-3px;width:100%;height:6px;z-index:80;cursor:row-resize;background:transparent;",
+                style: "position:absolute;left:0;top:-4px;width:100%;height:8px;z-index:80;cursor:row-resize;background:color-mix(in srgb,var(--skin-border-strong) 60%,transparent);transition:background .12s ease,box-shadow .12s ease;",
                 onmousedown: move |event: MouseEvent| {
                     if event.trigger_button() == Some(MouseButton::Primary) {
                         event.prevent_default();
                         resize_drag.set(Some((event.client_coordinates().y, live_height())));
                     }
                 },
+                span {
+                    class: "dock-resize-grip dock-resize-grip-h",
+                    style: "position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:22px;height:2px;border-radius:1px;background:var(--skin-text-muted);opacity:0.7;transition:opacity .12s ease,background .12s ease;pointer-events:none;",
+                }
             }
             }
         }

@@ -186,6 +186,7 @@ pub fn Sidebar(
             .ctx-label{{padding:7px 12px 3px;font-size:10px;color:var(--skin-text-muted);text-transform:uppercase;letter-spacing:.5px;}}
             .ctx-danger:hover{{color:var(--skin-danger);}}
             .sidebar-resize-handle:hover,.sidebar-resize-handle.active{{background:var(--skin-accent);box-shadow:0 0 6px rgba(122,162,247,.55);}}
+            .sidebar-resize-handle:hover .dock-resize-grip,.sidebar-resize-handle.active .dock-resize-grip{{background:var(--skin-bg);opacity:1;}}
             .connection-group-header{{border:1px solid transparent;border-radius:4px;transition:background .1s,border-color .1s,color .1s;}}
             .connection-group-header.connection-group-drop-target{{background:rgba(122,162,247,.16);border-color:var(--skin-accent);color:var(--skin-text);}}
         " }
@@ -379,7 +380,7 @@ pub fn Sidebar(
             if !embedded {
             div {
                 class: if resize_drag().is_some() { "sidebar-resize-handle active" } else { "sidebar-resize-handle" },
-                style: "position:absolute;right:-3px;top:0;width:6px;height:100%;z-index:80;cursor:col-resize;background:transparent;transition:background .1s;",
+                style: "position:absolute;right:-4px;top:0;width:8px;height:100%;z-index:80;cursor:col-resize;background:color-mix(in srgb,var(--skin-border-strong) 60%,transparent);transition:background .12s ease,box-shadow .12s ease;",
                 title: crate::i18n::t("connections.resize_sidebar"),
                 onmousedown: move |event: MouseEvent| {
                     if event.trigger_button() == Some(MouseButton::Primary) {
@@ -406,6 +407,10 @@ pub fn Sidebar(
                     updated.width_px = live_width();
                     on_preferences_change.call(updated);
                 },
+                span {
+                    class: "dock-resize-grip dock-resize-grip-v",
+                    style: "position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:2px;height:22px;border-radius:1px;background:var(--skin-text-muted);opacity:0.7;transition:opacity .12s ease,background .12s ease;pointer-events:none;",
+                }
             }
             }
         }

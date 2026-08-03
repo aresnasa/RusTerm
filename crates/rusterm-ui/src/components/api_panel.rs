@@ -682,6 +682,8 @@ fn gen_curl_preview_for_language(
     if let CurlPayload::Command(command) = payload {
         let function_usage = shell_escape(&crate::i18n::t_for("api.function_usage", language));
         let no_hosts = shell_escape(&crate::i18n::t_for("api.no_hosts", language));
+        let missing_config = shell_escape(&crate::i18n::t_for("api.missing_config", language));
+        let missing_user = shell_escape(&crate::i18n::t_for("api.missing_user", language));
         let elevated_query = if elevated { "?elevated=true" } else { "" };
 
         // Ordinary words can be pasted as `rusterm uname -a`. Shell syntax
@@ -732,7 +734,18 @@ rusterm() {{\n\
     unset RUSTERM_HOSTS\n\
     shift\n\
     [ \"$#\" -eq 0 ] && return 0\n\
-  fi\n\n\
+  fi\n\
+  RUSTERM_API_URL=$(printf '%s' \"$RUSTERM_API_URL\" | tr -d '\\r')\n\
+  RUSTERM_API_USER=$(printf '%s' \"$RUSTERM_API_USER\" | tr -d '\\r')\n\
+  if [ -z \"$RUSTERM_API_URL\" ]; then\n\
+    printf '{missing_config}\\n' >&2\n\
+    return 1\n\
+  fi\n\
+  if [ -z \"$RUSTERM_API_USER\" ]; then\n\
+    printf '{missing_user}\\n' >&2\n\
+    return 1\n\
+  fi\n\
+\n\
   if [ -z \"${{RUSTERM_API_PASSWORD+x}}\" ]; then\n\
     printf '{password_prompt}' >&2\n\
     RUSTERM_STTY=$(stty -g)\n\
@@ -743,7 +756,8 @@ rusterm() {{\n\
     trap - 0 1 2 15\n\
     printf '\\n' >&2\n\
     export RUSTERM_API_PASSWORD\n\
-  fi\n\n\
+  fi\n\
+\n\
   if [ -z \"${{RUSTERM_HOSTS+x}}\" ]; then\n\
     RUSTERM_HOSTS=$(curl --silent --show-error --fail \\\n      --user \"${{RUSTERM_API_USER}}:${{RUSTERM_API_PASSWORD}}\" \\\n      \"${{RUSTERM_API_URL}}/r\" | tr -d '\\r')\n\
     if [ -n \"$RUSTERM_HOSTS\" ]; then\n\
@@ -751,7 +765,6 @@ rusterm() {{\n\
     fi\n\
   fi\n\
   RUSTERM_HOSTS=$(printf '%s' \"$RUSTERM_HOSTS\" | tr -d '\\r')\n\
-  RUSTERM_API_URL=$(printf '%s' \"$RUSTERM_API_URL\" | tr -d '\\r')\n\
   if [ -z \"$RUSTERM_HOSTS\" ]; then\n\
     printf '{no_hosts}\\n' >&2\n\
     return 1\n\
@@ -1087,6 +1100,19 @@ mod tests {
         assert!(
             curl.contains("RUSTERM_API_URL=$(printf '%s' \"$RUSTERM_API_URL\" | tr -d '\\r')"),
             "must sanitize RUSTERM_API_URL of carriage returns: {curl}"
+        );
+
+        // Empty-config guard: if RUSTERM_API_URL is unset/empty (e.g. the user
+        // pasted only the function without the export lines, or opened a fresh
+        // shell), the function must fail fast with a clear message instead of
+        // building a relative URL like "/r/host" that curl rejects with (3).
+        assert!(
+            curl.contains("if [ -z \"$RUSTERM_API_URL\" ]; then"),
+            "must guard against an empty RUSTERM_API_URL: {curl}"
+        );
+        assert!(
+            curl.contains("if [ -z \"$RUSTERM_API_USER\" ]; then"),
+            "must guard against an empty RUSTERM_API_USER: {curl}"
         );
 
         // Execution loop must skip empty targets (defensive against trailing

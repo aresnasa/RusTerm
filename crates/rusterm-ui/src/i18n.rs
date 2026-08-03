@@ -711,6 +711,14 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
             "No hosts discovered; run rusterm --refresh or set RUSTERM_HOSTS manually.",
             "未发现主机；请运行 rusterm --refresh 或手动设置 RUSTERM_HOSTS。",
         ),
+        "api.missing_config" => (
+            "RUSTERM_API_URL is not set; export it first (e.g. export RUSTERM_API_URL=http://127.0.0.1:8877).",
+            "RUSTERM_API_URL 未设置；请先导出（例如 export RUSTERM_API_URL=http://127.0.0.1:8877）。",
+        ),
+        "api.missing_user" => (
+            "RUSTERM_API_USER is not set; export it first (e.g. export RUSTERM_API_USER=yourname).",
+            "RUSTERM_API_USER 未设置；请先导出（例如 export RUSTERM_API_USER=你的用户名）。",
+        ),
 
         // ── common / connection / sidebar additions ───────────────────
         "common.active" => ("Active", "活动"),

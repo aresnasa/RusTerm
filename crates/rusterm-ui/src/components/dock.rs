@@ -420,16 +420,34 @@ pub fn DockZoneView(
     } else {
         "col-resize"
     };
+    // Resting handle uses a semi-transparent accent-tinted fill so the grip is
+    // visibly clickable even before hover. The grip bar (a short rounded
+    // rectangle centered on the handle) gives an explicit "drag here" affordance.
     let handle_style = match zone {
         DockZone::Left => {
-            "position:absolute;right:-4px;top:0;width:8px;height:100%;z-index:80;cursor:col-resize;background:var(--skin-border-strong);transition:background 0.12s ease,box-shadow 0.12s ease;"
+            "position:absolute;right:-4px;top:0;width:8px;height:100%;z-index:80;cursor:col-resize;background:color-mix(in srgb,var(--skin-border-strong) 60%,transparent);transition:background 0.12s ease,box-shadow 0.12s ease;"
         }
         DockZone::Right => {
-            "position:absolute;left:-4px;top:0;width:8px;height:100%;z-index:80;cursor:col-resize;background:var(--skin-border-strong);transition:background 0.12s ease,box-shadow 0.12s ease;"
+            "position:absolute;left:-4px;top:0;width:8px;height:100%;z-index:80;cursor:col-resize;background:color-mix(in srgb,var(--skin-border-strong) 60%,transparent);transition:background 0.12s ease,box-shadow 0.12s ease;"
         }
         DockZone::Bottom => {
-            "position:absolute;left:0;top:-4px;width:100%;height:8px;z-index:80;cursor:row-resize;background:var(--skin-border-strong);transition:background 0.12s ease,box-shadow 0.12s ease;"
+            "position:absolute;left:0;top:-4px;width:100%;height:8px;z-index:80;cursor:row-resize;background:color-mix(in srgb,var(--skin-border-strong) 60%,transparent);transition:background 0.12s ease,box-shadow 0.12s ease;"
         }
+    };
+    // Grip bar: a short rounded bar centered on the handle. Vertical handles
+    // (Left/Right) get a tall narrow bar; the Bottom handle gets a wide flat
+    // bar. The bar contrasts with the handle fill so the affordance reads at a
+    // glance and inverts to bg-colored on hover/active.
+    let (grip_class, grip_style) = if zone == DockZone::Bottom {
+        (
+            "dock-resize-grip dock-resize-grip-h",
+            "position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:22px;height:2px;border-radius:1px;background:var(--skin-text-muted);opacity:0.7;transition:opacity 0.12s ease,background 0.12s ease;pointer-events:none;",
+        )
+    } else {
+        (
+            "dock-resize-grip dock-resize-grip-v",
+            "position:absolute;top:50%;left:50%;transform:translate(-50%,-50%);width:2px;height:22px;border-radius:1px;background:var(--skin-text-muted);opacity:0.7;transition:opacity 0.12s ease,background 0.12s ease;pointer-events:none;",
+        )
     };
     let target_index = drag
         .as_ref()
@@ -441,14 +459,16 @@ pub fn DockZoneView(
 
     rsx! {
         style { r#"
-            .dock-tab {{ border:0;background:transparent;color:var(--skin-text-muted);padding:7px 9px;font-size:11px;cursor:pointer;border-bottom:2px solid transparent;white-space:nowrap;user-select:none;-webkit-user-select:none; }}
+            .dock-tab {{ border:0;background:transparent;color:var(--skin-text-muted);padding:7px 9px;font-size:11px;cursor:grab;border-bottom:2px solid transparent;white-space:nowrap;user-select:none;-webkit-user-select:none; }}
             .dock-tab:hover {{ color:var(--skin-text);background:var(--skin-surface-hover); }}
-            .dock-tab.active {{ color:var(--skin-accent);border-bottom-color:var(--skin-accent); }}
+            .dock-tab.active {{ color:var(--skin-accent);border-bottom-color:var(--skin-accent);cursor:grab; }}
+            .dock-tab:active {{ cursor:grabbing; }}
             .dock-close {{ margin-left:auto;margin-right:5px;border:0;background:transparent;color:var(--skin-text-muted);cursor:pointer;padding:4px 7px;font-size:14px; }}
             .dock-close:hover {{ color:var(--skin-text);background:var(--skin-surface-hover); }}
             .dock-insertion {{ width:2px;align-self:stretch;flex:0 0 2px;background:var(--skin-accent);box-shadow:0 0 6px color-mix(in srgb,var(--skin-accent) 75%,transparent); }}
             .dock-resize-handle {{ transition: background 0.12s ease, box-shadow 0.12s ease; }}
             .dock-resize-handle:hover,.dock-resize-handle.active {{ background:var(--skin-accent);box-shadow:0 0 6px color-mix(in srgb,var(--skin-accent) 55%,transparent); }}
+            .dock-resize-handle:hover .dock-resize-grip,.dock-resize-handle.active .dock-resize-grip {{ background:var(--skin-bg);opacity:1; }}
         "# }
         div {
             "data-rusterm-dock-zone": "{zone_value}",
@@ -533,6 +553,10 @@ pub fn DockZoneView(
                         install_dock_resize_listeners(position, zone, generation);
                     }
                 },
+                span {
+                    class: "{grip_class}",
+                    style: "{grip_style}",
+                }
             }
         }
     }
