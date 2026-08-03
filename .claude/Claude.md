@@ -215,4 +215,5 @@ Linux gpu-muxi-001.x86.test.brainpp.dev 5.15.0-119-generic #1，将API 脚本放
 93. [@Image](zed:///agent/pasted-image?name=Image) 需要修复这个 API 的脚本逻辑，优化相关代码，需要实时的切换 API 执行的节点并复用会话已经连接的 jumpserver 中指定的机器，而不是使用错误的会话信息。
 94. 还是不符合预期，新的会话已经切换了节点，还是错误的输出了 curl 访问到另一个后端 jumpserver 登录的节点不符合预期，这里需要复用已经登录的 tty 的会话对应的 ssh 链接，不能用旧的或者错误的会话继续修复并改造
 95. [@Image](zed:///agent/pasted-image?name=Image) 按照截图中的逻辑继续检查并修复，登录了 jumpserver（使用 tty 交互式的登录）没有正确的映射相关 ssh 会话给 API，需要继续修复。
-96.
+96. 集成https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B模型到本项目，支持小模型输出脚本模板或者 python 模板。
+97.
