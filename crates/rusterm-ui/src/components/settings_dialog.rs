@@ -412,13 +412,14 @@ fn settings_search_items(
     }
 
     let local_ai_section = crate::i18n::t("ai_runtime.local.enable");
-    for model in custom_models {
+    let builtin_models = rusterm_core::config::builtin_models();
+    for model in builtin_models.iter().chain(custom_models) {
         items.push(SettingsSearchItem {
             target: "settings-local-ai-model",
             title: model.name.clone(),
             section: local_ai_section.clone(),
             search_text: format!(
-                "{} {} {} custom model qwen huggingface 自定义 模型",
+                "{} {} {} model qwen huggingface 模型",
                 model.name, model.repo_id, model.id
             ),
         });
@@ -642,7 +643,11 @@ pub fn SettingsDialog(
                                                 key: "settings-search-{target}-{item.title}",
                                                 style: "display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;padding:6px 8px;text-align:left;background:var(--settings-bg);color:var(--settings-text);border:1px solid var(--settings-border);border-radius:4px;cursor:pointer;font-size:11px;",
                                                 onclick: move |_| {
+                                                    if target.starts_with("settings-color-") {
+                                                        skin_draft.write().kind = SkinKind::Custom;
+                                                    }
                                                     spawn(async move {
+                                                        tokio::task::yield_now().await;
                                                         let script = format!(
                                                             "const el=document.getElementById('{}');if(el){{el.scrollIntoView({{behavior:'smooth',block:'center'}});el.animate([{{outline:'2px solid var(--settings-accent)'}},{{outline:'2px solid transparent'}}],{{duration:1200}});}}",
                                                             target
@@ -1469,6 +1474,13 @@ mod tests {
             chinese
                 .iter()
                 .any(|item| item.target == "settings-suggestions")
+        );
+
+        let builtin_model = settings_search_matches("Qwen2.5-Coder-0.5B", &[]);
+        assert!(
+            builtin_model
+                .iter()
+                .any(|item| item.target == "settings-local-ai-model")
         );
 
         for action in KeybindingAction::ALL {
