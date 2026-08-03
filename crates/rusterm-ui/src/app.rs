@@ -99,7 +99,20 @@ fn sync_live_sessions(
         .ssh_sessions
         .iter()
         .filter_map(|(session_id, session)| {
-            let connection_id = app.session_configs.get(session_id)?.id.clone();
+            let config = app.session_configs.get(session_id)?;
+            let has_login_script = config
+                .login_script
+                .as_deref()
+                .is_some_and(|script| !script.trim().is_empty());
+            let login_ready = !has_login_script
+                || app
+                    .login_scripts
+                    .get(session_id)
+                    .is_some_and(|runtime| runtime.done && !runtime.steps.is_empty());
+            if !login_ready {
+                return None;
+            }
+            let connection_id = config.id.clone();
             let input_tx = senders.get(session_id)?.clone();
             Some(crate::relay_tunnel::LiveSessionEntry {
                 session: session.clone(),
@@ -1278,7 +1291,12 @@ fn drive_login_script(
             );
             if let Some(rt) = state.write().login_scripts.get_mut(session_id) {
                 rt.done = true;
+                // Empty steps distinguish a failed/aborted navigation from a
+                // successfully completed script when publishing live sessions
+                // to the relay registry.
+                rt.steps.clear();
             }
+            sync_live_sessions(&state, &input_senders);
             return;
         }
     }
@@ -1296,6 +1314,7 @@ fn drive_login_script(
             if let Some(rt) = state.write().login_scripts.get_mut(session_id) {
                 rt.done = true;
             }
+            sync_live_sessions(&state, &input_senders);
             tracing::info!("[LOGIN-SCRIPT] {} finished", session_id);
         }
         LoginScriptEvaluation::Advance { actions, next_idx } => {
@@ -1770,6 +1789,16 @@ fn dispatch_terminal_input_bytes_in_state(
 
     let mut sent = 0;
     for target_session_id in targets {
+        if state
+            .ssh_sessions
+            .get(target_session_id)
+            .is_some_and(rusterm_ssh::SshSession::relay_exec_active)
+        {
+            tracing::warn!(
+                "[INPUT] relay shadow command owns session {target_session_id}; manual input was not sent"
+            );
+            continue;
+        }
         if input_senders
             .get(target_session_id)
             .is_some_and(|sender| sender.send(data.to_vec()).is_ok())
@@ -9845,19 +9874,10 @@ fn start_ssh_connection(
 
                 // Background: import remote shell history into the local DB
                 // so suggestions can draw from both local + remote history.
-                // Retries up to 3 times to handle transient exec channel failures.
-                //
-                // A shared `exec_import_succeeded` flag coordinates with the
-                // interactive-shell fallback below: if the exec import succeeds,
-                // the fallback is skipped (it would otherwise capture + suppress
-                // 15s of terminal output for nothing — the "stuck" symptom the
-                // user reported, where commands ran but their output vanished
-                // into the capture buffer and the terminal appeared frozen).
-                let exec_import_succeeded =
-                    std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+                // Retries up to 3 times to handle transient failures, but uses
+                // only separate SSH channels and never the user's live PTY.
                 {
                     let ssh_session_for_history = ssh_session.clone();
-                    let exec_flag = exec_import_succeeded.clone();
                     let host_for_history = host_for_import.clone();
                     let sid_for_history = tab_id.clone();
                     let mut state_for_history = state;
@@ -9879,13 +9899,6 @@ fn start_ssh_connection(
                                         );
                                         result = cmds;
                                         success = true;
-                                        // Signal the interactive-shell fallback
-                                        // (if it hasn't started yet) that its
-                                        // capture is unnecessary — this skips
-                                        // the 15s output-suppression window
-                                        // that would otherwise freeze the
-                                        // terminal.
-                                        exec_flag.store(true, std::sync::atomic::Ordering::SeqCst);
                                         break;
                                     }
                                     Err(e) => {
@@ -10014,233 +10027,12 @@ fn start_ssh_connection(
 
                 let _conn_guard = ssh_session;
 
-                // Capture buffer for interactive-shell history import.
-                // When Some, the event loop accumulates raw output into it.
-                // Used by servers that only allow one channel (jump servers).
-                let capture_buffer: Arc<parking_lot::Mutex<Option<String>>> =
-                    Arc::new(parking_lot::Mutex::new(None));
-
-                // Interactive shell history import — sends a command through
-                // the user's own shell, captures the output, then clears the
-                // terminal. Used when exec + shell-channel fallbacks both fail.
-                //
-                // SKIPPED when the exec import above succeeded — in that case
-                // the history is already in the DB, and running this fallback
-                // would pointlessly suppress 15s of terminal output (the
-                // capture buffer swallows ALL SessionEvent::Output while it's
-                // Some), making the terminal appear frozen even though the
-                // user's commands are running fine on the remote.
-                {
-                    let input_tx_for_import = input_senders.read().get(&tab_id).cloned();
-                    let capture_buffer_clone = capture_buffer.clone();
-                    let host_for_shell_import = host_for_import.clone();
-                    let sid_for_shell_import = tab_id.clone();
-                    let mut state_for_shell_import = state;
-                    let exec_flag_for_shell_import = exec_import_succeeded.clone();
-                    spawn(async move {
-                        let input_tx = match input_tx_for_import {
-                            Some(tx) => tx,
-                            None => return,
-                        };
-
-                        // Wait for exec/shell import attempts to finish first.
-                        // The exec import waits 800ms then retries up to 3× with
-                        // 2s backoff, so worst case is 800ms + 3×2s = 6.8s.
-                        // We wait 8s (a safety margin) so we don't race ahead
-                        // of the exec import — if we check the flag before the
-                        // exec import has had a chance to set it, we'd start the
-                        // 15s capture window (which freezes the terminal) even
-                        // though the exec import is about to succeed.
-                        tokio::time::sleep(std::time::Duration::from_secs(8)).await;
-
-                        // If the exec import already succeeded, this fallback
-                        // is unnecessary — skip it to avoid the 15s capture
-                        // window that freezes the terminal.
-                        if exec_flag_for_shell_import.load(std::sync::atomic::Ordering::SeqCst) {
-                            tracing::info!(
-                                "[SSH] Skipping interactive shell import for {} — exec import succeeded",
-                                host_for_shell_import
-                            );
-                            return;
-                        }
-
-                        // Start capturing
-                        *capture_buffer_clone.lock() = Some(String::new());
-
-                        // Send the command. Leading space avoids shell history
-                        // recording (HIST_IGNORE_SPACE / HISTCONTROL=ignorespace).
-                        // Use variable expansion for markers so they DON'T appear
-                        // literally in the command echo — the echo shows ${S}_START
-                        // but the output shows _RUSTERM_START_ (after expansion).
-                        // This prevents the polling from matching the echo.
-                        let cmd = " S=RUSTERM; printf \"_${S}_START_\\n\"; for f in ~/.zsh_history ~/.bash_history ~/.history ~/.zhistory ~/.local/share/fish/fish_history; do if [ -f \"$f\" ]; then cat \"$f\" 2>/dev/null; fi; done; printf \"_${S}_END_\\n\"\n";
-                        let _ = input_tx.send(cmd.as_bytes().to_vec());
-
-                        // Poll for the end marker (up to 15 seconds)
-                        let mut found = false;
-                        for _ in 0..150 {
-                            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                            let buf = capture_buffer_clone.lock();
-                            if let Some(ref s) = *buf {
-                                if s.contains("_RUSTERM_END_") {
-                                    found = true;
-                                    break;
-                                }
-                            }
-                        }
-
-                        // Grab captured output and stop capturing
-                        let captured = capture_buffer_clone.lock().take().unwrap_or_default();
-                        *capture_buffer_clone.lock() = None;
-
-                        // NOTE: do NOT send a Ctrl+L (0x0c) here. The history
-                        // dump was captured (not rendered — see the `capturing`
-                        // guard in the Output handler), so the on-screen
-                        // MOTD/prompt is unaffected by it. A Ctrl+L would only
-                        // wipe that real content into scrollback → blank screen.
-                        if !found {
-                            tracing::warn!(
-                                "[SSH] Interactive shell import: end marker not found within 15s for {}",
-                                host_for_shell_import
-                            );
-                            return;
-                        }
-
-                        // Extract content between the start and end markers.
-                        // Markers use variable expansion so they only appear in
-                        // the actual output, not in the command echo.
-                        let start_m = "_RUSTERM_START_";
-                        let end_m = "_RUSTERM_END_";
-                        tracing::info!(
-                            "[SSH] Interactive shell import: captured {} bytes, first 500 chars: {:?}",
-                            captured.len(),
-                            &captured[..captured.len().min(500)]
-                        );
-                        let extracted = {
-                            if let Some(start_pos) = captured.find(start_m) {
-                                let after_start = start_pos + start_m.len();
-                                if let Some(end_pos) = captured[after_start..].find(end_m) {
-                                    captured[after_start..after_start + end_pos].to_string()
-                                } else {
-                                    tracing::warn!(
-                                        "[SSH] Interactive shell import: start marker found but no end marker after it"
-                                    );
-                                    String::new()
-                                }
-                            } else {
-                                tracing::warn!(
-                                    "[SSH] Interactive shell import: no start marker found in captured output"
-                                );
-                                String::new()
-                            }
-                        };
-                        tracing::info!(
-                            "[SSH] Interactive shell import: extracted {} bytes between markers, first 200 chars: {:?}",
-                            extracted.len(),
-                            &extracted[..extracted.len().min(200)]
-                        );
-
-                        let mut remote_commands = rusterm_ssh::parse_remote_history(&extracted);
-                        tracing::info!(
-                            "[SSH] Interactive shell import: parsed {} commands from {}",
-                            remote_commands.len(),
-                            host_for_shell_import
-                        );
-
-                        if remote_commands.is_empty() {
-                            return;
-                        }
-
-                        // Save to DB (replace previous import for this host).
-                        // Skip known-failed commands so typos like `pwdwd` don't
-                        // get re-introduced from `~/.bash_history` as
-                        // `exit_code = NULL` (which the HAVING clause would keep
-                        // as "unknown, assume success"). See the exec-import
-                        // path for the full rationale.
-                        let db_path = dirs::data_dir()
-                            .unwrap_or_default()
-                            .join("rusterm")
-                            .join("rusterm.db");
-
-                        // Fetch the known-failed set (async) BEFORE deleting
-                        // by hostname. The failure markers are stored with
-                        // hostname=NULL so `delete_history_by_hostname` won't
-                        // touch them, but we snapshot first for clarity.
-                        let mut failed_set: std::collections::HashSet<String> =
-                            std::collections::HashSet::new();
-                        if let Ok(db) = rusterm_db::Database::open(Some(db_path.clone())).await {
-                            failed_set = db.known_failed_commands().await.unwrap_or_default();
-                        }
-
-                        // Partition remote_commands into (keep, skip) based on
-                        // the known-failed set.
-                        let mut kept: Vec<String> = Vec::with_capacity(remote_commands.len());
-                        let mut skipped = 0usize;
-                        for cmd in remote_commands.drain(..) {
-                            if failed_set.contains(&cmd) {
-                                skipped += 1;
-                            } else {
-                                kept.push(cmd);
-                            }
-                        }
-                        if skipped > 0 {
-                            tracing::info!(
-                                "[SSH] Interactive shell import: skipped {} known-failed commands for {}",
-                                skipped,
-                                host_for_shell_import
-                            );
-                        }
-
-                        if let Ok(db) = rusterm_db::Database::open(Some(db_path)).await {
-                            let _ = db.delete_history_by_hostname(&host_for_shell_import).await;
-                            let entries: Vec<_> = kept
-                                .iter()
-                                .map(|cmd| rusterm_db::history::HistoryEntry {
-                                    id: uuid::Uuid::new_v4().to_string(),
-                                    command: cmd.clone(),
-                                    session_id: sid_for_shell_import.clone(),
-                                    cwd: None,
-                                    hostname: Some(host_for_shell_import.clone()),
-                                    exit_code: None,
-                                    duration_ms: None,
-                                    created_at: chrono::Utc::now().to_rfc3339(),
-                                })
-                                .collect();
-                            if let Err(e) = db.save_history_batch(entries).await {
-                                tracing::warn!("Failed to save shell-imported history: {}", e);
-                            }
-                        }
-
-                        // Merge the FILTERED list (not the original
-                        // `remote_commands`) into session command_history so
-                        // the in-memory popup source also skips known-failed
-                        // commands.
-                        let mut existing = state_for_shell_import
-                            .read()
-                            .sessions
-                            .iter()
-                            .find(|t| t.id == sid_for_shell_import)
-                            .map(|t| t.command_history.clone())
-                            .unwrap_or_default();
-                        for cmd in kept.into_iter().rev() {
-                            if !existing.contains(&cmd) {
-                                existing.insert(0, cmd);
-                            }
-                        }
-                        state_for_shell_import
-                            .write()
-                            .sessions
-                            .iter_mut()
-                            .find(|t| t.id == sid_for_shell_import)
-                            .map(|tab| tab.command_history = existing);
-                    });
-                }
-
-                // `pending_event` holds an event that was peeked off the
-                // channel by `drain_output_batch` but didn't belong to the
-                // current batch (a non-Output event or Output for a different
-                // session). It's processed first on the next loop iteration so
-                // nothing is dropped.
+                // Remote history import is deliberately limited to separate SSH
+                // channels. Never inject background commands into the user's live
+                // PTY: restricted bastions commonly reject extra channels, and the
+                // old fallback then swallowed all terminal output for up to 15s.
+                // Losing optional history import is safer than freezing an active
+                // interactive session.
                 let mut pending_event: Option<SessionEvent> = None;
                 loop {
                     // ── Render-throttle flush timer ──
@@ -10308,30 +10100,14 @@ fn start_ssh_connection(
                             // behind, and the unbounded channel grows without
                             // limit — eventually OOMing the session.
                             pending_event = drain_output_batch(&mut event_rx, &id, &mut data);
-                            // Reset the SSH login-output debounce before any
-                            // capture filtering; hidden history-import output is
-                            // still remote activity and must postpone injection.
+                            // Reset the SSH login-output debounce on every remote
+                            // output chunk so shell integration waits for a quiet PTY.
                             let _ = initial_output_activity_tx.send(());
                             let data = shell_integration_echo_filter.lock().filter(&data);
                             if data.is_empty() {
                                 continue;
                             }
-                            // Capture raw output for history import if active. While
-                            // capturing (the interactive history-import dump), SKIP
-                            // rendering/logging/matching: the ~77KB dump would
-                            // otherwise flash on screen and could spuriously trigger
-                            // OneKey/exit-code matching on old commands that happen
-                            // to contain "password" etc.
-                            let capturing = {
-                                let mut cap = capture_buffer.lock();
-                                if let Some(ref mut buf) = *cap {
-                                    buf.push_str(&String::from_utf8_lossy(&data));
-                                }
-                                cap.is_some()
-                            };
-                            if capturing {
-                                continue;
-                            }
+
                             // Shadow-sandbox capture starts only after explicit
                             // execution approval and is scoped to this session.
                             state.write().shadow_sandbox.record_output(&id, &data);

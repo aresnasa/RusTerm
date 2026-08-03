@@ -9,6 +9,20 @@ use rusterm_core::event::SessionEvent;
 use rusterm_core::session::{Session, SessionId, SessionType};
 use rusterm_core::terminal::TerminalSize;
 
+const INTERACTIVE_PTY_MODES: &[(Pty, u32)] = &[
+    (Pty::ECHO, 1),
+    (Pty::ICANON, 1),
+    (Pty::ISIG, 1),
+    (Pty::IEXTEN, 1),
+    (Pty::ICRNL, 1),
+    (Pty::OPOST, 1),
+    (Pty::ONLCR, 1),
+    (Pty::ECHOE, 1),
+    (Pty::ECHOK, 1),
+    (Pty::ECHOCTL, 1),
+    (Pty::ECHOKE, 1),
+];
+
 use crate::known_hosts::{HostKeyPolicy, verify_server_key};
 use crate::sftp::{SftpClient, map_sftp_error, map_ssh_error};
 use crate::transport::connect_transport;
@@ -115,7 +129,7 @@ impl SshClient {
         session_id: SessionId,
         size: TerminalSize,
     ) -> anyhow::Result<(Session, SshSession)> {
-        let config = Arc::new(client::Config::default());
+        let config = Arc::new(interactive_client_config());
 
         let handle = connect_authenticated(&self.config, config).await?;
         let handle = Arc::new(handle);
@@ -130,26 +144,10 @@ impl SshClient {
                 size.rows as u32,
                 0,
                 0,
-                &[
-                    // Standard cooked-terminal modes (what OpenSSH sends). The
-                    // remote sshd applies these to the PTY. ICRNL maps Enter's
-                    // \r to \n so line-oriented programs (shells, `read`,
-                    // interactive menus) see a newline — without it some servers
-                    // leave ICRNL off and \r doesn't terminate input, so the
-                    // program hangs / re-prompts (e.g. a login-account menu
-                    // ignoring a typed "2"). OPOST+ONLCR make output \n→\r\n.
-                    (Pty::ECHO, 1),
-                    (Pty::ICANON, 1),
-                    (Pty::ISIG, 1),
-                    (Pty::IEXTEN, 1),
-                    (Pty::ICRNL, 1),
-                    (Pty::OPOST, 1),
-                    (Pty::ONLCR, 1),
-                    (Pty::ECHOE, 1),
-                    (Pty::ECHOK, 1),
-                    (Pty::ECHOCTL, 1),
-                    (Pty::ECHOKE, 1),
-                ],
+                // Standard cooked-terminal modes (what OpenSSH sends). ICRNL
+                // makes Enter work for shells and bastion menus; OPOST+ONLCR
+                // preserves normal terminal output line endings.
+                INTERACTIVE_PTY_MODES,
             )
             .await?;
 
@@ -176,6 +174,9 @@ impl SshClient {
         // Optional output tap for relay exec reuse.
         let output_tap: Arc<parking_lot::RwLock<Option<mpsc::UnboundedSender<Vec<u8>>>>> =
             Arc::new(parking_lot::RwLock::new(None));
+        let output_tap_lock = Arc::new(tokio::sync::Mutex::new(()));
+        let relay_exec_active = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let relay_exec_reusable = Arc::new(std::sync::atomic::AtomicBool::new(true));
 
         // Output reader: forward data from SSH channel to event channel
         let sid_read = session_id.clone();
@@ -230,6 +231,10 @@ impl SshClient {
                     let _ = tap.send(bytes);
                 }
             }
+            // Close any active relay tap as soon as the SSH output stream
+            // ends. Otherwise the receiver remains open through the sender
+            // stored in `output_tap` and waits until its full request timeout.
+            *tap_read.write() = None;
             if disconnected_read
                 .compare_exchange(
                     false,
@@ -251,7 +256,7 @@ impl SshClient {
         let evt_write = self.event_tx.clone();
         let disconnected_write = disconnected.clone();
         tokio::spawn(async move {
-            let mut consecutive_errors = 0u32;
+            let mut disconnect_reason = "Session closed".to_string();
             loop {
                 tokio::select! {
                     Some(data) = input_rx.recv() => {
@@ -259,21 +264,19 @@ impl SshClient {
                         let ends_with_cr = data.last() == Some(&b'\r');
                         let sid_short = &sid_write[..sid_write.len().min(8)];
                         if let Err(e) = write_half.data_bytes(data).await {
-                            consecutive_errors += 1;
-                            tracing::warn!(
-                                "[SSH] write failed for {} payload_len={} ends_with_cr={} (attempt {consecutive_errors}): {e}",
+                            // A failed SSH channel write is definitive for this
+                            // interactive channel. Keeping the UI Connected would
+                            // accept and lose later keystrokes, which looks like a
+                            // locally echoed command that never runs remotely.
+                            disconnect_reason = format!("SSH input failed: {e}");
+                            tracing::error!(
+                                "[SSH] write failed for {} payload_len={} ends_with_cr={}: {e}",
                                 sid_short,
                                 payload_len,
                                 ends_with_cr
                             );
-                            if consecutive_errors >= 3 {
-                                tracing::error!("[SSH] too many write errors for {}, closing input writer", &sid_write[..sid_write.len().min(8)]);
-                                break;
-                            }
-                            // Brief pause before retrying to avoid tight error loop
-                            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                            break;
                         } else {
-                            consecutive_errors = 0;
                             // trace (not info): this fires on every keystroke,
                             // and `info`-level logging of every key would
                             // dominate the trace output during fast typing
@@ -308,10 +311,7 @@ impl SshClient {
                 )
                 .is_ok()
             {
-                let _ = evt_write.send(SessionEvent::Disconnected(
-                    sid_write,
-                    "Session closed".to_string(),
-                ));
+                let _ = evt_write.send(SessionEvent::Disconnected(sid_write, disconnect_reason));
             }
         });
 
@@ -327,6 +327,9 @@ impl SshClient {
                 event_tx: self.event_tx.clone(),
                 disconnected,
                 output_tap,
+                output_tap_lock,
+                relay_exec_active,
+                relay_exec_reusable,
             },
         ))
     }
@@ -352,6 +355,10 @@ pub fn client_config(
     config.keepalive_interval = keepalive_interval;
     config.keepalive_max = keepalive_max;
     config
+}
+
+fn interactive_client_config() -> client::Config {
+    client_config(Some(DEFAULT_KEEPALIVE_INTERVAL), DEFAULT_KEEPALIVE_MAX)
 }
 
 /// Establish transport + SSH handshake + user authentication, returning a
@@ -534,6 +541,30 @@ fn classify_subsystem_reply(reply: Option<ChannelMsg>) -> SubsystemReplyAction {
     }
 }
 
+/// Exclusive capture of an interactive session's output for one relay
+/// command. Holding this guard serializes relay commands per SSH session;
+/// dropping it removes the tap on every exit path.
+pub struct OutputTapGuard {
+    session: SshSession,
+    receiver: mpsc::UnboundedReceiver<Vec<u8>>,
+    _lock: tokio::sync::OwnedMutexGuard<()>,
+}
+
+impl OutputTapGuard {
+    pub async fn recv(&mut self) -> Option<Vec<u8>> {
+        self.receiver.recv().await
+    }
+}
+
+impl Drop for OutputTapGuard {
+    fn drop(&mut self) {
+        self.session.remove_output_tap();
+        self.session
+            .relay_exec_active
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+
 #[derive(Clone)]
 pub struct SshSession {
     handle: Arc<Handle>,
@@ -545,6 +576,16 @@ pub struct SshSession {
     /// output reader task forwards every data chunk here in addition to
     /// the normal UI event channel.
     output_tap: Arc<parking_lot::RwLock<Option<mpsc::UnboundedSender<Vec<u8>>>>>,
+    /// Serializes relay commands that share this interactive PTY.
+    output_tap_lock: Arc<tokio::sync::Mutex<()>>,
+    /// Lets the UI reject manual keystrokes while a relay transaction owns
+    /// the PTY, preventing a partially typed line from mixing with the API
+    /// command.
+    relay_exec_active: Arc<std::sync::atomic::AtomicBool>,
+    /// Cleared when a sent command finishes without a sentinel. The shell's
+    /// state is then unknown, so later API requests must not inject another
+    /// command into this PTY.
+    relay_exec_reusable: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl std::fmt::Debug for SshSession {
@@ -617,35 +658,79 @@ impl SshSession {
         &self.session_id
     }
 
-    /// Install a temporary output tap. Every data chunk the output reader
-    /// forwards to the UI event channel is also sent to the returned
-    /// receiver. Call [`remove_output_tap`] when done to stop forwarding.
-    ///
-    /// Only one tap may be active at a time; installing a new one replaces
-    /// the previous. The relay executor uses this to capture the output
-    /// of a sentinel-wrapped command injected into the live interactive PTY.
-    pub fn install_output_tap(&self) -> mpsc::UnboundedReceiver<Vec<u8>> {
-        let (tx, rx) = mpsc::unbounded_channel();
-        *self.output_tap.write() = Some(tx);
-        rx
+    /// Begin one exclusive relay transaction on this interactive PTY.
+    /// Concurrent relay calls wait for the previous guard to drop rather
+    /// than replacing its tap and stealing its output.
+    pub async fn begin_output_tap(&self) -> anyhow::Result<OutputTapGuard> {
+        let lock = self.output_tap_lock.clone().lock_owned().await;
+        if self.disconnected.load(std::sync::atomic::Ordering::Acquire) {
+            anyhow::bail!("SSH session is disconnected");
+        }
+        if !self
+            .relay_exec_reusable
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            anyhow::bail!("SSH session relay state is unknown after an incomplete command");
+        }
+
+        let (sender, receiver) = mpsc::unbounded_channel();
+        *self.output_tap.write() = Some(sender);
+        self.relay_exec_active
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        // Close the small race where the reader ended after the first check
+        // but before the tap was installed.
+        if self.disconnected.load(std::sync::atomic::Ordering::Acquire) {
+            self.remove_output_tap();
+            self.relay_exec_active
+                .store(false, std::sync::atomic::Ordering::Release);
+            anyhow::bail!("SSH session disconnected while installing output tap");
+        }
+
+        Ok(OutputTapGuard {
+            session: self.clone(),
+            receiver,
+            _lock: lock,
+        })
     }
 
-    /// Remove the output tap if one is installed.
-    pub fn remove_output_tap(&self) {
+    fn remove_output_tap(&self) {
         *self.output_tap.write() = None;
+    }
+
+    /// True while a relay command owns this PTY. UI input should be held
+    /// back during this brief interval to avoid mixing two command lines.
+    pub fn relay_exec_active(&self) -> bool {
+        self.relay_exec_active
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Prevent future API commands from reusing this PTY after a command was
+    /// sent but its completion marker could not be observed.
+    pub fn mark_relay_exec_unusable(&self) {
+        self.relay_exec_reusable
+            .store(false, std::sync::atomic::Ordering::Release);
     }
 
     /// Fetch remote shell history. Tries exec channel first, then falls back
     /// to a shell channel for restricted servers (jump servers / bastion hosts
     /// that block exec requests).
     pub async fn fetch_remote_history(&self) -> anyhow::Result<Vec<String>> {
-        match self.fetch_via_exec().await {
-            Ok(cmds) => return Ok(cmds),
-            Err(e) => {
-                tracing::warn!("[SSH] Exec channel failed ({}), trying shell fallback", e);
+        const ATTEMPT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+        match tokio::time::timeout(ATTEMPT_TIMEOUT, self.fetch_via_exec()).await {
+            Ok(Ok(cmds)) => return Ok(cmds),
+            Ok(Err(error)) => {
+                tracing::warn!("[SSH] Exec channel failed ({error}), trying PTY shell fallback");
+            }
+            Err(_) => {
+                tracing::warn!("[SSH] Exec history import timed out, trying PTY shell fallback");
             }
         }
-        self.fetch_via_shell().await
+
+        tokio::time::timeout(ATTEMPT_TIMEOUT, self.fetch_via_shell())
+            .await
+            .map_err(|_| anyhow::anyhow!("PTY shell history import timed out"))?
     }
 
     /// Try to fetch history via an exec channel (fast, non-interactive).
@@ -700,6 +785,9 @@ if [ -f ~/.local/share/fish/fish_history ]; then head -5000 ~/.local/share/fish/
     async fn fetch_via_shell(&self) -> anyhow::Result<Vec<String>> {
         tracing::info!("[SSH] Opening shell channel (fallback) to fetch remote history");
         let channel = self.handle.channel_open_session().await?;
+        channel
+            .request_pty(false, "xterm-256color", 80, 24, 0, 0, INTERACTIVE_PTY_MODES)
+            .await?;
         channel.request_shell(true).await?;
 
         // Wait for the shell to start, then send the command with markers.
@@ -707,7 +795,7 @@ if [ -f ~/.local/share/fish/fish_history ]; then head -5000 ~/.local/share/fish/
         // prompt and command echo.
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
 
-        let cmd = "echo __RUSTERM_HIST_START__; tail -5000 ~/.bash_history 2>/dev/null; tail -5000 ~/.zsh_history 2>/dev/null; head -5000 ~/.local/share/fish/fish_history 2>/dev/null; echo __RUSTERM_HIST_END__; exit\n";
+        let cmd = "echo __RUSTERM_HIST_START__; tail -5000 ~/.bash_history 2>/dev/null; tail -5000 ~/.zsh_history 2>/dev/null; head -5000 ~/.local/share/fish/fish_history 2>/dev/null; echo __RUSTERM_HIST_END__; exit\r";
         channel.data(cmd.as_bytes()).await?;
 
         let mut output = Vec::new();
@@ -834,6 +922,212 @@ fn flush_cmd(
             out.push(c);
         }
         current.clear();
+    }
+}
+
+#[cfg(test)]
+mod history_shell_tests {
+    use std::sync::{Arc, Mutex};
+
+    use russh::server;
+    use russh::{Channel, ChannelId};
+    use tokio::net::TcpListener;
+
+    use super::*;
+
+    const TEST_SERVER_KEY: &str = r#"-----BEGIN OPENSSH PRIVATE KEY-----
+b3BlbnNzaC1rZXktdjEAAAAABG5vbmUAAAAEbm9uZQAAAAAAAAABAAAAMwAAAAtzc2gtZW
+QyNTUxOQAAACDNotGW1Df1gWTlX1nm2z14o5dyI2dMk3NF8fWwunRfIAAAAKCLYE7bi2BO
+2wAAAAtzc2gtZWQyNTUxOQAAACDNotGW1Df1gWTlX1nm2z14o5dyI2dMk3NF8fWwunRfIA
+AAAEBRCDM1Phz340R2RR59Pc8j0B6x5FdNCpdW03IjTg3A6s2i0ZbUN/WBZOVfWebbPXij
+l3IjZ0yTc0Xx9bC6dF8gAAAAG2FyZXNuYXNhQEZyYW5rcy1NNU1heC5sb2NhbAEC
+-----END OPENSSH PRIVATE KEY-----"#;
+
+    #[derive(Clone)]
+    struct PtyRequiredHistoryServer {
+        events: Arc<Mutex<Vec<&'static str>>>,
+        pty_requested: bool,
+    }
+
+    impl server::Handler for PtyRequiredHistoryServer {
+        type Error = russh::Error;
+
+        async fn auth_none(&mut self, _user: &str) -> Result<server::Auth, Self::Error> {
+            Ok(server::Auth::Accept)
+        }
+
+        async fn channel_open_session(
+            &mut self,
+            _channel: Channel<server::Msg>,
+            _session: &mut server::Session,
+        ) -> Result<bool, Self::Error> {
+            self.events.lock().unwrap().push("open");
+            Ok(true)
+        }
+
+        async fn exec_request(
+            &mut self,
+            channel: ChannelId,
+            _command: &[u8],
+            session: &mut server::Session,
+        ) -> Result<(), Self::Error> {
+            self.events.lock().unwrap().push("exec-rejected");
+            session.channel_success(channel)?;
+            session.data(
+                channel,
+                b"exec request failed, try username/server/account as login name.\n".to_vec(),
+            )?;
+            session.eof(channel)?;
+            session.close(channel)?;
+            Ok(())
+        }
+
+        async fn pty_request(
+            &mut self,
+            channel: ChannelId,
+            term: &str,
+            cols: u32,
+            rows: u32,
+            _pixel_width: u32,
+            _pixel_height: u32,
+            modes: &[(Pty, u32)],
+            session: &mut server::Session,
+        ) -> Result<(), Self::Error> {
+            assert_eq!(term, "xterm-256color");
+            assert!(cols > 0 && rows > 0);
+            assert!(modes.contains(&(Pty::ICRNL, 1)));
+            self.events.lock().unwrap().push("pty");
+            self.pty_requested = true;
+            session.channel_success(channel)?;
+            Ok(())
+        }
+
+        async fn shell_request(
+            &mut self,
+            channel: ChannelId,
+            session: &mut server::Session,
+        ) -> Result<(), Self::Error> {
+            self.events.lock().unwrap().push("shell");
+            if self.pty_requested {
+                session.channel_success(channel)?;
+            } else {
+                session.channel_failure(channel)?;
+            }
+            Ok(())
+        }
+
+        async fn data(
+            &mut self,
+            channel: ChannelId,
+            _data: &[u8],
+            session: &mut server::Session,
+        ) -> Result<(), Self::Error> {
+            self.events.lock().unwrap().push("data");
+            session.data(
+                channel,
+                b"__RUSTERM_HIST_START__\necho from-history\n__RUSTERM_HIST_END__\n".to_vec(),
+            )?;
+            session.eof(channel)?;
+            session.close(channel)?;
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn interactive_sessions_enable_keepalive_detection() {
+        let config = interactive_client_config();
+
+        assert_eq!(config.keepalive_interval, Some(DEFAULT_KEEPALIVE_INTERVAL));
+        assert_eq!(config.keepalive_max, DEFAULT_KEEPALIVE_MAX);
+    }
+
+    #[tokio::test]
+    async fn history_shell_requests_pty_before_starting_restricted_shell() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let server_handler = PtyRequiredHistoryServer {
+            events: events.clone(),
+            pty_requested: false,
+        };
+
+        let mut server_config = server::Config::default();
+        server_config.auth_rejection_time = std::time::Duration::ZERO;
+        server_config
+            .keys
+            .push(russh::keys::ssh_key::PrivateKey::from_openssh(TEST_SERVER_KEY).unwrap());
+        let server_config = Arc::new(server_config);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            server::run_stream(server_config, socket, server_handler)
+                .await
+                .unwrap();
+        });
+
+        let client_handler = Handler::new(address.ip().to_string(), HostKeyPolicy::Disabled);
+        let mut handle =
+            client::connect(Arc::new(client::Config::default()), address, client_handler)
+                .await
+                .unwrap();
+        assert!(
+            handle
+                .authenticate_none("test-user")
+                .await
+                .unwrap()
+                .success()
+        );
+
+        let (event_tx, _event_rx) = mpsc::unbounded_channel();
+        let ssh_session = SshSession {
+            handle: Arc::new(handle),
+            session_id: "history-test".to_string(),
+            event_tx,
+            disconnected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            output_tap: Arc::new(parking_lot::RwLock::new(None)),
+            output_tap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            relay_exec_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            relay_exec_reusable: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+
+        let history = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            ssh_session.fetch_remote_history(),
+        )
+        .await
+        .expect("history shell timed out")
+        .expect("PTY-requiring history shell failed");
+
+        assert_eq!(history, vec!["echo from-history"]);
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["open", "exec-rejected", "open", "pty", "shell", "data"]
+        );
+
+        let first_tap = ssh_session.begin_output_tap().await.unwrap();
+        assert!(ssh_session.relay_exec_active());
+        let second_session = ssh_session.clone();
+        let second_tap =
+            tokio::spawn(async move { second_session.begin_output_tap().await.unwrap() });
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        assert!(
+            !second_tap.is_finished(),
+            "concurrent tap replaced the active tap"
+        );
+        drop(first_tap);
+        let second_tap = tokio::time::timeout(std::time::Duration::from_secs(1), second_tap)
+            .await
+            .expect("second tap did not acquire the session lock")
+            .unwrap();
+        assert!(ssh_session.relay_exec_active());
+        drop(second_tap);
+        assert!(!ssh_session.relay_exec_active());
+
+        ssh_session
+            .handle
+            .disconnect(russh::Disconnect::ByApplication, "", "en")
+            .await
+            .unwrap();
+        server_task.await.unwrap();
     }
 }
 

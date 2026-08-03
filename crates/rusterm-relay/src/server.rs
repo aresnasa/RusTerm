@@ -158,6 +158,10 @@ fn router(state: AppState) -> Router {
         .route("/api/v1/history", get(list_history))
         .route("/api/v1/history/{id}", delete(delete_history))
         .route("/api/v1/parse-curl", post(parse_curl_handler))
+        // Short-form endpoint: POST /r/{host_id} with plain-text body.
+        // Returns plain-text stdout. Designed for one-liner curl usage:
+        //   curl -s -u user:pass http://localhost:8877/r/jumpserver -d 'uname -a'
+        .route("/r/{host_id}", post(exec_shortform))
         .with_state(state)
 }
 
@@ -439,11 +443,52 @@ struct ExecResponse {
     duration_ms: u64,
 }
 
+#[derive(Clone, Copy)]
+enum ExecResponseFormat {
+    Json,
+    PlainText,
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct ShortExecParams {
+    elevated: Option<bool>,
+    timeout_ms: Option<u64>,
+}
+
 async fn exec(
     State(state): State<AppState>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
     Json(body): Json<ExecRequest>,
+) -> Response {
+    execute_request(state, addr, headers, body, ExecResponseFormat::Json).await
+}
+
+async fn exec_shortform(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    Path(host_id): Path<String>,
+    Query(params): Query<ShortExecParams>,
+    headers: HeaderMap,
+    body: String,
+) -> Response {
+    let request = ExecRequest {
+        host_id,
+        command: Some(body),
+        script: None,
+        script_base64: None,
+        elevated: params.elevated.unwrap_or(false),
+        timeout_ms: params.timeout_ms,
+    };
+    execute_request(state, addr, headers, request, ExecResponseFormat::PlainText).await
+}
+
+async fn execute_request(
+    state: AppState,
+    addr: SocketAddr,
+    headers: HeaderMap,
+    body: ExecRequest,
+    response_format: ExecResponseFormat,
 ) -> Response {
     let account = match require_account(&state, &headers, addr.ip()) {
         Ok(a) => a,
@@ -672,15 +717,46 @@ async fn exec(
                 Some(duration_ms),
                 timed_out,
             );
-            Json(ExecResponse {
-                exit_code,
-                stdout,
-                stderr,
-                timed_out,
-                truncated,
-                duration_ms,
-            })
-            .into_response()
+            match response_format {
+                ExecResponseFormat::Json => Json(ExecResponse {
+                    exit_code,
+                    stdout,
+                    stderr,
+                    timed_out,
+                    truncated,
+                    duration_ms,
+                })
+                .into_response(),
+                ExecResponseFormat::PlainText => {
+                    let mut response = stdout.into_response();
+                    let headers = response.headers_mut();
+                    headers.insert(
+                        header::CONTENT_TYPE,
+                        header::HeaderValue::from_static("text/plain; charset=utf-8"),
+                    );
+                    headers.insert(
+                        "x-rusterm-exit-code",
+                        header::HeaderValue::from_str(
+                            &exit_code.map_or_else(|| "unknown".to_string(), |code| code.to_string()),
+                        )
+                        .expect("exit code is a valid header value"),
+                    );
+                    headers.insert(
+                        "x-rusterm-duration-ms",
+                        header::HeaderValue::from_str(&duration_ms.to_string())
+                            .expect("duration is a valid header value"),
+                    );
+                    headers.insert(
+                        "x-rusterm-timed-out",
+                        header::HeaderValue::from_static(if timed_out { "true" } else { "false" }),
+                    );
+                    headers.insert(
+                        "x-rusterm-truncated",
+                        header::HeaderValue::from_static(if truncated { "true" } else { "false" }),
+                    );
+                    response
+                }
+            }
         }
         Err(err) => {
             if let ExecutorError::ElevationRequired(message) = &err {
@@ -955,6 +1031,8 @@ mod tests {
         elevated: std::sync::atomic::AtomicBool,
         fail_elevation: bool,
         fail_exec: Option<String>,
+        outcome: Option<ExecOutcome>,
+        commands: std::sync::Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
@@ -972,12 +1050,13 @@ mod tests {
         async fn exec(
             &self,
             _host_id: &str,
-            _command: &str,
+            command: &str,
             elevated: bool,
             _timeout: Duration,
         ) -> Result<ExecOutcome, ExecutorError> {
             self.elevated
                 .store(elevated, std::sync::atomic::Ordering::SeqCst);
+            self.commands.lock().unwrap().push(command.to_string());
             if elevated && self.fail_elevation {
                 return Err(ExecutorError::ElevationRequired(
                     "No reusable sudo authorization is available".to_string(),
@@ -986,14 +1065,14 @@ mod tests {
             if let Some(detail) = &self.fail_exec {
                 return Err(ExecutorError::Exec(detail.clone()));
             }
-            Ok(ExecOutcome {
+            Ok(self.outcome.clone().unwrap_or(ExecOutcome {
                 exit_code: Some(0),
                 stdout: String::new(),
                 stderr: String::new(),
                 timed_out: false,
                 truncated: false,
                 duration_ms: 1,
-            })
+            }))
         }
     }
 
@@ -1152,6 +1231,48 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn shortform_reuses_auth_validation_and_returns_plain_output_metadata() {
+        let executor = Arc::new(RecordingExecutor {
+            outcome: Some(ExecOutcome {
+                exit_code: Some(17),
+                stdout: "shadow-output\n".to_string(),
+                stderr: "ignored-for-plain-response".to_string(),
+                timed_out: false,
+                truncated: false,
+                duration_ms: 23,
+            }),
+            ..Default::default()
+        });
+        let handle = run(test_config(), executor.clone(), Arc::new(NullHistoryStore))
+            .await
+            .unwrap();
+        let url = format!("{}/r/prod?timeout_ms=500", handle.url());
+
+        let (status, _, _) = raw_text_request(&url, None, "uptime").await;
+        assert_eq!(status, 401);
+
+        let (status, _, _) = raw_text_request(&url, Some(("ops", "pw")), "rm -rf /").await;
+        assert_eq!(status, 403);
+        assert!(executor.commands.lock().unwrap().is_empty());
+
+        let (status, headers, body) =
+            raw_text_request(&url, Some(("ops", "pw")), "printf shadow-output").await;
+        assert_eq!(status, 200);
+        assert_eq!(body, "shadow-output\n");
+        assert_eq!(headers.get("content-type").unwrap(), "text/plain; charset=utf-8");
+        assert_eq!(headers.get("x-rusterm-exit-code").unwrap(), "17");
+        assert_eq!(headers.get("x-rusterm-duration-ms").unwrap(), "23");
+        assert_eq!(headers.get("x-rusterm-timed-out").unwrap(), "false");
+        assert_eq!(headers.get("x-rusterm-truncated").unwrap(), "false");
+        assert_eq!(
+            executor.commands.lock().unwrap().as_slice(),
+            ["printf shadow-output"]
+        );
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn parse_curl_roundtrip() {
         let executor: Arc<dyn RelayExecutor> = Arc::new(NullExecutor);
         let handle = run(test_config(), executor, Arc::new(NullHistoryStore))
@@ -1220,6 +1341,56 @@ mod tests {
         let body_text = &text[json_start..];
         let json = serde_json::from_str(body_text.trim_end_matches('\0')).unwrap_or_default();
         (status, json)
+    }
+
+    async fn raw_text_request(
+        url: &str,
+        auth: Option<(&str, &str)>,
+        body: &str,
+    ) -> (u16, std::collections::HashMap<String, String>, String) {
+        use base64::Engine;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let parsed = url::Url::parse(url).unwrap();
+        let host = parsed.host_str().unwrap().to_string();
+        let port = parsed.port().unwrap();
+        let path = if let Some(query) = parsed.query() {
+            format!("{}?{query}", parsed.path())
+        } else {
+            parsed.path().to_string()
+        };
+        let mut stream = tokio::net::TcpStream::connect((host.as_str(), port))
+            .await
+            .unwrap();
+        let mut request = format!(
+            "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: text/plain\r\nContent-Length: {}\r\n",
+            body.len()
+        );
+        if let Some((username, password)) = auth {
+            let credentials = base64::engine::general_purpose::STANDARD
+                .encode(format!("{username}:{password}"));
+            request.push_str(&format!("Authorization: Basic {credentials}\r\n"));
+        }
+        request.push_str("Connection: close\r\n\r\n");
+        request.push_str(body);
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let text = String::from_utf8(response).unwrap();
+        let (head, body) = text.split_once("\r\n\r\n").unwrap();
+        let status = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|value| value.parse().ok())
+            .unwrap();
+        let headers = head
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_string()))
+            .collect();
+        (status, headers, body.to_string())
     }
 
     async fn reqwest_get(url: &str, auth: Option<(&str, &str)>) -> serde_json::Value {
