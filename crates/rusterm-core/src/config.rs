@@ -2004,6 +2004,7 @@ mod tests {
             collect_usage_habits: false,
             language: Language::default(),
             api_custom_templates: Vec::new(),
+            qwen_local: QwenLocalSettings::default(),
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: PersistedConfig = serde_json::from_str(&json).unwrap();
