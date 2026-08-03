@@ -613,7 +613,7 @@ async fn exec_via_live_session(
     let stdout = if let Some((tag_idx, _)) = marker {
         let before = String::from_utf8_lossy(&raw[..tag_idx]);
         let before = before.trim_end_matches(['\r', '\n', ' ']);
-        strip_echoed_wrapper(before).into_owned()
+        strip_echoed_wrapper(before)
     } else {
         // No valid sentinel — return best-effort raw output.
         String::from_utf8_lossy(&raw).into_owned()
