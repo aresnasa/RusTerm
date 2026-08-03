@@ -22,7 +22,8 @@ pub use suggestion::{AiSuggestion, SuggestionEngine};
 // there directly. This avoids a re-export that would need feature-gating.
 #[cfg(feature = "qwen-local")]
 pub use qwen_local::{
-    HardwareCapability, QwenLocalModel, SetupProgress, detect_hardware, ensure_model,
+    HardwareCapability, ModelCachePaths, QwenLocalModel, SetupProgress, detect_hardware,
+    ensure_model, is_model_ready, model_cache_paths,
 };
 #[cfg(feature = "qwen-local")]
 pub use template_gen::{TemplateKind, build_prompt, parse_generated_response, parse_response};

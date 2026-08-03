@@ -345,6 +345,13 @@ fn settings_search_items(
             "qwen llm active model 当前 模型 选择",
         ),
         (
+            "settings-local-ai-download",
+            "ai_runtime.local.enable",
+            "ai_runtime.local.download_model",
+            Some("ai_runtime.local.download_hint"),
+            "download model weights quantize cache 下载 模型 权重 量化 缓存",
+        ),
+        (
             "settings-local-ai-custom",
             "ai_runtime.local.enable",
             "ai_runtime.local.custom_form_show",
@@ -514,6 +521,232 @@ fn SkinColorField(
     }
 }
 
+#[cfg_attr(not(feature = "qwen-local"), allow(dead_code))]
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ModelDownloadState {
+    Idle,
+    Starting,
+    Downloading(String),
+    Quantizing {
+        current: usize,
+        total: usize,
+        tensor: String,
+    },
+    Ready,
+    Failed(String),
+}
+
+#[cfg(feature = "qwen-local")]
+enum ModelDownloadEvent {
+    Progress(rusterm_ai::SetupProgress),
+    Finished(Result<(), String>),
+}
+
+#[cfg(feature = "qwen-local")]
+fn local_model_cache_dir() -> Option<std::path::PathBuf> {
+    dirs::data_dir()
+        .or_else(dirs::home_dir)
+        .map(|dir| dir.join("RusTerm").join("qwen-local"))
+}
+
+#[cfg(feature = "qwen-local")]
+fn model_download_status_for(
+    settings: &rusterm_core::config::QwenLocalSettings,
+) -> ModelDownloadState {
+    let Some(cache_dir) = local_model_cache_dir() else {
+        return ModelDownloadState::Idle;
+    };
+    let model = rusterm_core::config::resolve_model(settings);
+    if rusterm_ai::is_model_ready(&cache_dir, &model) {
+        ModelDownloadState::Ready
+    } else {
+        ModelDownloadState::Idle
+    }
+}
+
+#[cfg(not(feature = "qwen-local"))]
+fn model_download_status_for(
+    _settings: &rusterm_core::config::QwenLocalSettings,
+) -> ModelDownloadState {
+    ModelDownloadState::Idle
+}
+
+#[cfg(feature = "qwen-local")]
+fn render_model_download(
+    settings: rusterm_core::config::QwenLocalSettings,
+    qwen_local: Signal<rusterm_core::config::QwenLocalSettings>,
+    mut download_state: Signal<ModelDownloadState>,
+    mut download_task: Signal<Option<(String, String)>>,
+) -> Element {
+    let state = download_state();
+    let active_download = download_task();
+    let busy = active_download.is_some();
+    let ready = state == ModelDownloadState::Ready;
+    let button_label = if ready {
+        crate::i18n::t("ai_runtime.local.ready")
+    } else {
+        crate::i18n::t("ai_runtime.local.download_model")
+    };
+    let status_text = match &state {
+        ModelDownloadState::Idle | ModelDownloadState::Ready => String::new(),
+        ModelDownloadState::Starting => crate::i18n::t("ai_runtime.local.download_starting"),
+        ModelDownloadState::Downloading(file) => {
+            crate::i18n::tf("ai_runtime.local.downloading", &[("file", file)])
+        }
+        ModelDownloadState::Quantizing {
+            current,
+            total,
+            tensor,
+        } => crate::i18n::tf(
+            "ai_runtime.local.quantizing",
+            &[
+                ("current", &current.to_string()),
+                ("total", &total.to_string()),
+                ("tensor", tensor),
+            ],
+        ),
+        ModelDownloadState::Failed(error) => {
+            crate::i18n::tf("ai_runtime.local.download_failed", &[("error", error)])
+        }
+    };
+    let background_status = active_download
+        .as_ref()
+        .filter(|(model_id, _)| model_id != &settings.active_model_id)
+        .map(|(_, model_name)| {
+            crate::i18n::tf(
+                "ai_runtime.local.download_background",
+                &[("model", model_name)],
+            )
+        })
+        .unwrap_or_default();
+    let status_color = if matches!(state, ModelDownloadState::Failed(_)) {
+        "var(--settings-danger)"
+    } else {
+        "var(--settings-text-muted)"
+    };
+
+    rsx! {
+        div {
+            id: "settings-local-ai-download",
+            style: "margin-top:8px;",
+            button {
+                style: "background:var(--settings-accent);border:none;color:var(--settings-bg);border-radius:4px;padding:6px 12px;cursor:pointer;font-size:11px;font-weight:600;",
+                disabled: busy || ready,
+                onclick: move |_| {
+                    if download_task().is_some() {
+                        return;
+                    }
+                    let Some(cache_dir) = local_model_cache_dir() else {
+                        download_state.set(ModelDownloadState::Failed(
+                            crate::i18n::t("ai_runtime.local.cache_unavailable"),
+                        ));
+                        return;
+                    };
+                    let task_settings = settings.clone();
+                    let task_model = rusterm_core::config::resolve_model(&task_settings);
+                    let task_model_id = task_model.id.clone();
+                    download_task.set(Some((task_model_id.clone(), task_model.name.clone())));
+                    download_state.set(ModelDownloadState::Starting);
+
+                    spawn(async move {
+                        let (tx, rx) = std::sync::mpsc::channel::<ModelDownloadEvent>();
+                        std::thread::spawn(move || {
+                            let progress_tx = tx.clone();
+                            let result = rusterm_ai::ensure_model(
+                                &cache_dir,
+                                &task_model,
+                                &task_settings.mirror_url,
+                                move |progress| {
+                                    let _ = progress_tx.send(ModelDownloadEvent::Progress(progress));
+                                },
+                            )
+                            .map(|_| ())
+                            .map_err(|error| error.to_string());
+                            let _ = tx.send(ModelDownloadEvent::Finished(result));
+                        });
+
+                        loop {
+                            match rx.try_recv() {
+                                Ok(ModelDownloadEvent::Progress(progress)) => {
+                                    if qwen_local().active_model_id != task_model_id {
+                                        continue;
+                                    }
+                                    match progress {
+                                        rusterm_ai::SetupProgress::Downloading { file, .. } => {
+                                            download_state.set(ModelDownloadState::Downloading(file));
+                                        }
+                                        rusterm_ai::SetupProgress::Quantizing {
+                                            current,
+                                            total,
+                                            tensor,
+                                        } => download_state.set(ModelDownloadState::Quantizing {
+                                            current,
+                                            total,
+                                            tensor,
+                                        }),
+                                        rusterm_ai::SetupProgress::Done => {}
+                                    }
+                                }
+                                Ok(ModelDownloadEvent::Finished(result)) => {
+                                    download_task.set(None);
+                                    if qwen_local().active_model_id == task_model_id {
+                                        match result {
+                                            Ok(()) => download_state.set(ModelDownloadState::Ready),
+                                            Err(error) => {
+                                                download_state.set(ModelDownloadState::Failed(error))
+                                            }
+                                        }
+                                    }
+                                    return;
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                                }
+                                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                    download_task.set(None);
+                                    if qwen_local().active_model_id == task_model_id {
+                                        download_state.set(ModelDownloadState::Failed(
+                                            "model download thread stopped unexpectedly".to_string(),
+                                        ));
+                                    }
+                                    return;
+                                }
+                            }
+                        }
+                    });
+                },
+                {button_label}
+            }
+            div {
+                style: "font-size:10px;color:var(--settings-text-muted);margin-top:4px;line-height:1.5;",
+                { crate::i18n::t("ai_runtime.local.download_hint") }
+            }
+            if !status_text.is_empty() {
+                div {
+                    style: "font-size:10px;color:{status_color};margin-top:4px;line-height:1.5;overflow-wrap:anywhere;",
+                    {status_text}
+                }
+            }
+            if !background_status.is_empty() {
+                div {
+                    style: "font-size:10px;color:var(--settings-text-muted);margin-top:4px;line-height:1.5;overflow-wrap:anywhere;",
+                    {background_status}
+                }
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "qwen-local"))]
+fn render_model_download(
+    _settings: rusterm_core::config::QwenLocalSettings,
+    _qwen_local: Signal<rusterm_core::config::QwenLocalSettings>,
+    _download_state: Signal<ModelDownloadState>,
+    _download_task: Signal<Option<(String, String)>>,
+) -> Element {
+    rsx! {}
+}
+
 /// Settings dialog for appearance, suggestions, comparison warnings, keyboard
 /// shortcuts, and application skin. Each `on_save_*` callback lets the caller
 /// persist its setting group through the matching `ConfigManager` method.
@@ -580,7 +813,10 @@ pub fn SettingsDialog(
     let mut sug_count = use_signal(|| suggestion_count);
     let mut comparison_warning_enabled = use_signal(|| comparison_diff_warning_enabled);
     let mut usage_habits = use_signal(|| usage_habits_enabled);
+    let initial_model_download_state = model_download_status_for(&qwen_local_settings);
     let mut qwen_local = use_signal(|| qwen_local_settings.clone());
+    let mut model_download_state = use_signal(|| initial_model_download_state);
+    let model_download_task = use_signal(|| None::<(String, String)>);
     // Custom-model form state (collapsible "Add custom model" section).
     let mut show_custom_form = use_signal(|| false);
     let mut custom_name = use_signal(String::new);
@@ -1091,6 +1327,7 @@ pub fn SettingsDialog(
                         onchange: move |e| {
                             let mut s = qwen_local();
                             s.active_model_id = e.value();
+                            model_download_state.set(model_download_status_for(&s));
                             qwen_local.set(s);
                         },
                         {
@@ -1108,6 +1345,14 @@ pub fn SettingsDialog(
                                 }
                             }
                         }
+                    }
+                    if qwen_local().enabled {
+                        { render_model_download(
+                            qwen_local(),
+                            qwen_local,
+                            model_download_state,
+                            model_download_task,
+                        ) }
                     }
                 }
 
@@ -1228,6 +1473,7 @@ pub fn SettingsDialog(
                                         eos_token: eos,
                                     });
                                     s.active_model_id = id;
+                                    model_download_state.set(model_download_status_for(&s));
                                     qwen_local.set(s);
                                     custom_name.set(String::new());
                                     custom_repo.set(String::new());
@@ -1278,6 +1524,7 @@ pub fn SettingsDialog(
                                         if s.active_model_id == m.id {
                                             s.active_model_id = "qwen25-coder-1.5b".to_string();
                                         }
+                                        model_download_state.set(model_download_status_for(&s));
                                         qwen_local.set(s);
                                     },
                                     "✕"
@@ -1493,6 +1740,23 @@ mod tests {
                     .any(|item| item.target == keybinding_target(action))
             );
         }
+    }
+
+    #[test]
+    fn settings_search_includes_explicit_model_download_action() {
+        let english = settings_search_matches("download model", &[]);
+        assert!(
+            english
+                .iter()
+                .any(|item| item.target == "settings-local-ai-download")
+        );
+
+        let chinese = settings_search_matches("下载模型", &[]);
+        assert!(
+            chinese
+                .iter()
+                .any(|item| item.target == "settings-local-ai-download")
+        );
     }
 
     #[test]

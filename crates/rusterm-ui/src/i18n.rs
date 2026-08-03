@@ -595,6 +595,27 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
             ("The model returned an empty template", "模型返回了空模板")
         }
         "ai_runtime.local.ready" => ("Local model ready", "本地模型就绪"),
+        "ai_runtime.local.download_model" => ("Download model", "下载模型"),
+        "ai_runtime.local.download_hint" => (
+            "Downloads about 3 GB, then keeps an approximately 1 GB quantized model.",
+            "需下载约 3 GB，完成后保留约 1 GB 的量化模型。",
+        ),
+        "ai_runtime.local.download_starting" => ("Starting model download…", "正在启动模型下载…"),
+        "ai_runtime.local.download_background" => (
+            "{model} is still downloading in the background.",
+            "{model} 仍在后台下载。",
+        ),
+        "ai_runtime.local.download_failed" => {
+            ("Model download failed: {error}", "模型下载失败：{error}")
+        }
+        "ai_runtime.local.cache_unavailable" => (
+            "Cannot find a writable model cache directory.",
+            "无法找到可写的模型缓存目录。",
+        ),
+        "ai_runtime.local.model_not_ready" => (
+            "The current model has not been downloaded. Open Settings → Local AI Template Generation and download it first.",
+            "当前模型尚未下载，请前往设置 → 本地 AI 模板生成，先下载模型。",
+        ),
         "ai_runtime.local.ai_generate" => ("✨ AI Generate", "✨ AI 生成"),
         "ai_runtime.local.ai_generate_hint" => (
             "Describe the command or script template you want",

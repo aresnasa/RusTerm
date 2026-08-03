@@ -1644,14 +1644,26 @@ fn gen_curl(
     gen_curl_preview(url, default_user, sessions, payload, elevated).into_script()
 }
 
+#[cfg(feature = "qwen-local")]
+fn cached_model_paths_for_generation(
+    cache_dir: &std::path::Path,
+    model: &rusterm_core::config::ModelConfig,
+) -> Result<rusterm_ai::ModelCachePaths, String> {
+    if !rusterm_ai::is_model_ready(cache_dir, model) {
+        return Err(crate::i18n::t("ai_runtime.local.model_not_ready"));
+    }
+    Ok(rusterm_ai::model_cache_paths(cache_dir, model))
+}
+
 /// Background-thread worker for local AI template generation.
 ///
-/// Downloads + quantizes the model on first run (using the app data dir
-/// as cache), loads it, generates a script from `description`, and
-/// returns the raw model text. The caller ([`ApiPanel`]'s spawn closure)
-/// parses the response and fills the appropriate input field.
+/// Loads an explicitly downloaded model from the app data cache, generates a
+/// script from `description`, and returns the raw model text. This path never
+/// downloads or quantizes model files; missing files produce a settings prompt.
+/// The caller ([`ApiPanel`]'s spawn closure) parses the response and fills the
+/// appropriate input field.
 ///
-/// `settings` provides the mirror URL, active model, and custom models.
+/// `settings` provides the active model and custom models.
 /// The model is resolved via [`rusterm_core::config::resolve_model`].
 ///
 /// Returns `Err(message)` on any failure so the UI can show a friendly
@@ -1674,16 +1686,11 @@ fn run_local_generation(
     // Resolve which model to use (builtin preset or custom).
     let model = resolve_model(settings);
 
-    // Ensure the model is downloaded + quantized. This is a no-op if the
-    // GGUF is already cached.
-    rusterm_ai::ensure_model(&cache_dir, &model, &settings.mirror_url, |_| {})
-        .map_err(|e| e.to_string())?;
+    let paths = cached_model_paths_for_generation(&cache_dir, &model)?;
 
-    let gguf_path = cache_dir.join(format!("{}-q4k.gguf", model.id));
-    let tokenizer_path = cache_dir.join("tokenizer.json");
-
-    // Load the model into memory.
-    let mut model = rusterm_ai::QwenLocalModel::load(&gguf_path, &tokenizer_path, &model)
+    // Load the model into memory. Downloading is intentionally restricted to
+    // the explicit button in Settings.
+    let mut model = rusterm_ai::QwenLocalModel::load(&paths.gguf, &paths.tokenizer, &model)
         .map_err(|e| e.to_string())?;
 
     // Build the prompt and generate.
@@ -1782,7 +1789,7 @@ fn render_ai_section(
                         // thread doesn't touch the UI state.
                         let settings = qwen_settings.clone();
                         ai_busy.set(true);
-                        ai_status.set(crate::i18n::t("ai_runtime.local.preparing"));
+                        ai_status.set(crate::i18n::t("ai_runtime.local.loading"));
                         spawn(async move {
                             let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
                             let description_for_worker = desc.clone();
@@ -2072,6 +2079,23 @@ mod tests {
         assert_eq!(
             label.chars().count(),
             "AI · Shell · ".chars().count() + AI_TEMPLATE_DESCRIPTION_MAX_CHARS + 1
+        );
+    }
+
+    #[cfg(feature = "qwen-local")]
+    #[test]
+    fn local_generation_requires_an_explicitly_downloaded_model() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let model = rusterm_core::config::builtin_models().remove(0);
+
+        let error = cached_model_paths_for_generation(cache_dir.path(), &model).unwrap_err();
+
+        assert_eq!(error, crate::i18n::t("ai_runtime.local.model_not_ready"));
+        assert!(
+            std::fs::read_dir(cache_dir.path())
+                .unwrap()
+                .next()
+                .is_none()
         );
     }
 

@@ -440,10 +440,31 @@ const SAFETENSORS_INDEX_FILE: &str = "model.safetensors.index.json";
 const TOKENIZER_FILE: &str = "tokenizer.json";
 const CONFIG_FILE: &str = "config.json";
 
-/// Derive the GGUF cache filename from a model id. Each model gets its own
-/// file so switching models doesn't overwrite the cached GGUF of another.
-fn gguf_filename(model: &ModelConfig) -> String {
-    format!("{}-q4k.gguf", model.id)
+/// Predictable, model-specific files needed to load a cached local model.
+///
+/// The tokenizer is model-specific as well as the GGUF. Sharing a single
+/// `tokenizer.json` across models can silently load the wrong vocabulary after
+/// switching between built-in and custom repositories.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelCachePaths {
+    pub gguf: PathBuf,
+    pub tokenizer: PathBuf,
+    pub config: PathBuf,
+}
+
+/// Return the cache paths for `model` without touching the filesystem.
+pub fn model_cache_paths(cache_dir: &Path, model: &ModelConfig) -> ModelCachePaths {
+    ModelCachePaths {
+        gguf: cache_dir.join(format!("{}-q4k.gguf", model.id)),
+        tokenizer: cache_dir.join(format!("{}-tokenizer.json", model.id)),
+        config: cache_dir.join(format!("{}-config.json", model.id)),
+    }
+}
+
+/// Whether `model` has all files required for local inference.
+pub fn is_model_ready(cache_dir: &Path, model: &ModelConfig) -> bool {
+    let paths = model_cache_paths(cache_dir, model);
+    paths.gguf.is_file() && paths.tokenizer.is_file()
 }
 
 /// Ensure the quantized model exists in `cache_dir`. Downloads + quantizes
@@ -475,37 +496,49 @@ pub fn ensure_model(
     std::fs::create_dir_all(cache_dir)
         .with_context(|| format!("creating cache dir {cache_dir:?}"))?;
 
-    let gguf_name = gguf_filename(model);
-    let gguf_path = cache_dir.join(&gguf_name);
-    let tokenizer_path = cache_dir.join(TOKENIZER_FILE);
-    let config_path = cache_dir.join(CONFIG_FILE);
+    let paths = model_cache_paths(cache_dir, model);
 
-    // Fast path: GGUF already cached.
-    if gguf_path.exists() && tokenizer_path.exists() {
-        return Ok(gguf_path);
+    // Fast path: the files required for inference are already cached.
+    if is_model_ready(cache_dir, model) {
+        return Ok(paths.gguf);
     }
 
-    // Download tokenizer + config (small files, always needed).
-    download_file(
-        TOKENIZER_FILE,
-        &tokenizer_path,
-        &model.repo_id,
-        mirror_url,
-        &progress,
-    )?;
-    download_file(
-        CONFIG_FILE,
-        &config_path,
-        &model.repo_id,
-        mirror_url,
-        &progress,
-    )?;
+    // The tokenizer is small and model-specific. Download it before checking
+    // the GGUF so existing caches from older versions only need this small
+    // companion file, not another ~3 GB weights download and quantization.
+    if !paths.tokenizer.is_file() {
+        download_file(
+            TOKENIZER_FILE,
+            &paths.tokenizer,
+            &model.repo_id,
+            mirror_url,
+            &progress,
+        )?;
+    }
+    if paths.gguf.is_file() {
+        return Ok(paths.gguf);
+    }
 
-    // Download safetensors (single file or multi-file shards).
-    let safetensors_paths = download_safetensors(cache_dir, &model.repo_id, mirror_url, &progress)?;
+    if !paths.config.is_file() {
+        download_file(
+            CONFIG_FILE,
+            &paths.config,
+            &model.repo_id,
+            mirror_url,
+            &progress,
+        )?;
+    }
+
+    // Keep transient source weights isolated per model so downloads for two
+    // different selections cannot overwrite each other's shard files.
+    let source_dir = cache_dir.join(format!("{}-source", model.id));
+    std::fs::create_dir_all(&source_dir)
+        .with_context(|| format!("creating model source dir {source_dir:?}"))?;
+    let safetensors_paths =
+        download_safetensors(&source_dir, &model.repo_id, mirror_url, &progress)?;
 
     // Quantize BF16 → Q4_K GGUF.
-    quantize_to_gguf(&safetensors_paths, &config_path, &gguf_path, &progress)?;
+    quantize_to_gguf(&safetensors_paths, &paths.config, &paths.gguf, &progress)?;
 
     // Clean up the large safetensors file(s) to save disk space. The GGUF
     // is the permanent cache; if the user wants to re-quantize at a
@@ -513,8 +546,9 @@ pub fn ensure_model(
     for path in &safetensors_paths {
         let _ = std::fs::remove_file(path);
     }
+    let _ = std::fs::remove_dir_all(source_dir);
 
-    Ok(gguf_path)
+    Ok(paths.gguf)
 }
 
 /// Download a single file from the HuggingFace repo into `dest`.
@@ -535,6 +569,10 @@ fn download_file(
         .build()
         .map_err(|e| anyhow!("hf_hub init for {mirror_url}: {e}"))?;
     let repo = api.model(repo_id.to_string());
+    progress(SetupProgress::Downloading {
+        file: filename.to_string(),
+        progress: 0.0,
+    });
     let downloaded = repo
         .get(filename)
         .map_err(|e| anyhow!("downloading {filename} from {repo_id}: {e}"))?;
@@ -769,5 +807,56 @@ impl QwenLocalModel {
             .map_err(|e| anyhow!("decoding output: {e}"))?;
 
         Ok(text)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rusterm_core::config::builtin_models;
+
+    #[test]
+    fn model_is_ready_when_gguf_and_tokenizer_exist() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let model = builtin_models().remove(0);
+        let paths = model_cache_paths(cache_dir.path(), &model);
+
+        std::fs::write(&paths.gguf, b"gguf").unwrap();
+        std::fs::write(&paths.tokenizer, b"tokenizer").unwrap();
+
+        assert!(is_model_ready(cache_dir.path(), &model));
+    }
+
+    #[test]
+    fn model_is_not_ready_when_either_required_file_is_missing() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let model = builtin_models().remove(0);
+        let paths = model_cache_paths(cache_dir.path(), &model);
+
+        assert!(!is_model_ready(cache_dir.path(), &model));
+        std::fs::write(&paths.gguf, b"gguf").unwrap();
+        assert!(!is_model_ready(cache_dir.path(), &model));
+        std::fs::remove_file(&paths.gguf).unwrap();
+        std::fs::write(&paths.tokenizer, b"tokenizer").unwrap();
+        assert!(!is_model_ready(cache_dir.path(), &model));
+    }
+
+    #[test]
+    fn cached_files_are_isolated_by_model_id() {
+        let cache_dir = tempfile::tempdir().unwrap();
+        let mut models = builtin_models();
+        let first = models.remove(0);
+        let second = models.remove(0);
+        let first_paths = model_cache_paths(cache_dir.path(), &first);
+
+        std::fs::write(&first_paths.gguf, b"gguf").unwrap();
+        std::fs::write(&first_paths.tokenizer, b"tokenizer").unwrap();
+
+        assert!(is_model_ready(cache_dir.path(), &first));
+        assert!(!is_model_ready(cache_dir.path(), &second));
+        assert_ne!(
+            first_paths.tokenizer,
+            model_cache_paths(cache_dir.path(), &second).tokenizer
+        );
     }
 }

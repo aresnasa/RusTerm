@@ -40,3 +40,6 @@ candle-transformers = { workspace = true, optional = true }
 tokenizers = { workspace = true, optional = true }
 hf-hub = { workspace = true, optional = true }
 rayon = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile = "3"
