@@ -438,6 +438,16 @@ The `drag_over_pane` signal is shared between `single_pane_with_drop` and `multi
 - Native Gist upload via `reqwest` (the handoff suggested it; v1 ships file export only to keep the dependency surface unchanged and to avoid auto-transmission).
 - A dedicated analytics panel UI (the `behavior_summary` API has been ready since 2026-07-18; no panel exists yet).
 
+## Custom API-panel templates (2026-08-03)
+
+- **Feature**: the API panel's template chip row (命令/脚本/脚本 base64 tabs) supports user-defined templates in ALL three modes, next to the built-in `PRESET_TEMPLATES`.
+- **Types** (`rusterm-core/src/config.rs`): `ApiTemplateMode { Command, Script, ScriptBase64 }` (serde snake_case) + `CustomApiTemplate { label, mode, body }`. `PersistedConfig.api_custom_templates: Vec<CustomApiTemplate>` with `#[serde(default)]` (legacy settings → empty list).
+- **Persistence** (`config_manager.rs`): `load_api_templates()` / `save_api_templates(&[CustomApiTemplate])`. Save uses `read_persisted_for_update` (field-mutation pattern like `save_onekey_preferences`) — malformed settings.json is NOT clobbered. NOTE: adding a `PersistedConfig` field requires touching all ~13 full-constructor sites in config_manager.rs (they list every field explicitly) + the `suggestion_settings_roundtrip` test in config.rs.
+- **UI** (`rusterm-ui/src/components/api_panel.rs`): `template_mode_of(CurlMode) -> ApiTemplateMode` maps the panel's mode to the persisted mode. Signals: `custom_templates` (loaded once at mount from config_manager), `adding_template`, `new_template_label`, `new_template_body`, `template_error`. Custom chips render after built-ins, filtered by current mode, each with a red `×` delete button (persisted immediately). A `+ 新增模板` button (`api.add_template`) toggles an inline form row: name input + body input (single-line for Command, textarea for scripts) + 保存/取消. Empty name/body → `api.template_fill_required` error. The `persist_templates` closure is Copy (captures only `Signal`s) so it's moved into both add and delete handlers.
+- **Delete-by-index correctness**: chips iterate `custom_templates().into_iter().enumerate().filter(by mode)` — enumerate BEFORE filter so the index is valid in the unfiltered Vec for `list.remove(idx)`.
+- **i18n**: `api.add_template`, `api.template_name_placeholder`, `api.template_body_placeholder`, `api.template_save`, `api.template_cancel`, `api.template_delete`, `api.template_fill_required` (EN + 中文).
+- **Tests**: config.rs `api_custom_templates_default_empty_for_legacy_settings_and_roundtrip`, config_manager.rs `api_templates_roundtrip_and_survive_other_saves`, api_panel.rs `template_mode_maps_every_curl_mode_to_a_distinct_persisted_mode`. rusterm-core 176, rusterm-ui 645, all green. Committed as `5cc47f7`.
+
 ## Sudo credential lease refresh-on-use fix (2026-08-02)
 
 **Bug**: API requests with `elevated:true` returned `elevation_required` even though the user had just run `sudo` in a OneKey-enabled SSH session. Diagnosed via `relay-audit.jsonl` + `rusterm.log.2026-08-02`:

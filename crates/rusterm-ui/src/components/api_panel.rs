@@ -156,13 +156,23 @@ fn derive_active_host_id(state: &Signal<AppState>) -> Option<String> {
 
 /// Testable core of [`derive_active_host_id`] that works on a plain
 /// `AppState` reference, so unit tests don't need a Dioxus runtime.
+///
+/// Returns a composite selector `{connection_id}@{tab_id}` so the relay
+/// executor routes to this exact tab's PTY. With jumpserver/bastion hosts,
+/// two tabs of the same saved connection can sit on different target nodes;
+/// a bare connection id would let the executor pick an arbitrary sibling
+/// tab — and run the command on the wrong node.
 fn derive_active_host_id_from(app: &AppState) -> Option<String> {
     app.active_session.as_ref().and_then(|active_tab_id| {
         app.sessions
             .iter()
             .find(|t| &t.id == active_tab_id)
             .filter(|t| t.kind == rusterm_core::session::SessionType::Ssh)
-            .and_then(|tab| app.session_configs.get(&tab.id).map(|c| c.id.clone()))
+            .and_then(|tab| {
+                app.session_configs
+                    .get(&tab.id)
+                    .map(|c| format!("{}@{}", c.id, tab.id))
+            })
     })
 }
 
@@ -180,6 +190,11 @@ fn derive_sessions(state: &Signal<AppState>) -> Vec<(String, String)> {
 
 /// Testable core of [`derive_sessions`] that works on a plain `AppState`
 /// reference.
+///
+/// Host ids are composite selectors `{connection_id}@{tab_id}` (see
+/// [`derive_active_host_id_from`]) so each tab is individually addressable
+/// — both for exact PTY routing on the relay side and so two tabs of the
+/// same connection get distinct checkboxes in the picker.
 fn derive_sessions_from(app: &AppState) -> Vec<(String, String)> {
     app.sessions
         .iter()
@@ -198,7 +213,7 @@ fn derive_sessions_from(app: &AppState) -> Vec<(String, String)> {
                 _ => tab.name.clone(),
             };
             let host_id = conn
-                .map(|config| config.id.clone())
+                .map(|config| format!("{}@{}", config.id, tab.id))
                 .unwrap_or_else(|| tab.name.clone());
             (host_id, label)
         })
@@ -1976,12 +1991,42 @@ mod tests {
         );
 
         let sessions = derive_sessions_from(&state);
-        let web1 = sessions.iter().find(|(id, _)| id == "conn-a").unwrap();
-        let jump = sessions.iter().find(|(id, _)| id == "conn-b").unwrap();
+        let web1 = sessions
+            .iter()
+            .find(|(id, _)| id == "conn-a@tab-a")
+            .unwrap();
+        let jump = sessions
+            .iter()
+            .find(|(id, _)| id == "conn-b@tab-b")
+            .unwrap();
         // Plain session uses parentheses (no jump).
         assert_eq!(web1.1, "web-1 (web-1)");
         // Jumped session uses the arrow to flag the bastion → target hop.
         assert_eq!(jump.1, "jumpserver \u{279c} k8s-node-202-216");
+    }
+
+    /// Two tabs opened from the same jumpserver connection can sit on
+    /// different target nodes — each must get its own selector so relay
+    /// requests route to the exact tab (a bare connection id would let the
+    /// executor pick an arbitrary sibling tab and hit the wrong node).
+    #[test]
+    fn derive_sessions_gives_same_connection_tabs_distinct_selectors() {
+        let mut state = AppState::default();
+        state
+            .sessions
+            .push(ssh_tab("tab-a", "jumpserver", Some("k8s-master-0001")));
+        state
+            .sessions
+            .push(ssh_tab("tab-b", "jumpserver", Some("k8s-node-0002")));
+        let conn = ssh_conn("conn-j", "jumpserver", "jumpserver.example.com");
+        state
+            .session_configs
+            .insert("tab-a".to_string(), conn.clone());
+        state.session_configs.insert("tab-b".to_string(), conn);
+
+        let sessions = derive_sessions_from(&state);
+        let ids: Vec<&str> = sessions.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, vec!["conn-j@tab-a", "conn-j@tab-b"]);
     }
 
     #[test]
@@ -1993,7 +2038,10 @@ mod tests {
             .insert("tab-a".to_string(), ssh_conn("conn-a", "web-1", "web-1"));
 
         let sessions = derive_sessions_from(&state);
-        let entry = sessions.iter().find(|(id, _)| id == "conn-a").unwrap();
+        let entry = sessions
+            .iter()
+            .find(|(id, _)| id == "conn-a@tab-a")
+            .unwrap();
         // No live hostname yet → plain name, no parentheses/arrow.
         assert_eq!(entry.1, "web-1");
     }
@@ -2013,12 +2061,12 @@ mod tests {
         state
             .session_configs
             .insert("tab-b".to_string(), ssh_conn("conn-b", "web-2", "web-2"));
-        // Active tab is tab-b → connection id conn-b.
+        // Active tab is tab-b → session-qualified selector conn-b@tab-b.
         state.active_session = Some("tab-b".to_string());
 
         assert_eq!(
             derive_active_host_id_from(&state),
-            Some("conn-b".to_string())
+            Some("conn-b@tab-b".to_string())
         );
     }
 

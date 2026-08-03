@@ -62,7 +62,9 @@ pub use command_guard::{
 pub use config::{DEFAULT_PORT, RelayAccount, RelayConfig, hash_password, verify_password};
 pub use curl::{CurlParseError, ParsedCurl, parse_curl};
 pub use dcg::{DcgVerdict, probe as probe_dcg};
-pub use executor::{ExecOutcome, ExecutorError, HostInfo, NullExecutor, RelayExecutor};
+pub use executor::{
+    ExecOutcome, ExecutorError, HostInfo, NullExecutor, RelayExecutor, split_host_selector,
+};
 pub use history::{
     HistoryCursor, HistoryPage, HistoryQuery, NullHistoryStore, RecordingHistoryStore,
     RelayHistoryRecord, RelayHistoryStore, new_record_id as new_history_id,

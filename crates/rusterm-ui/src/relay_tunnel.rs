@@ -17,7 +17,7 @@ use rusterm_core::config::{ConnectionConfig, ConnectionKind, SshConfig};
 use rusterm_db::{Database, RelayHistoryEntry};
 use rusterm_relay::{
     ExecOutcome, ExecutorError, HistoryCursor, HistoryPage, HistoryQuery, HostInfo, RelayExecutor,
-    RelayHandle, RelayHistoryRecord, RelayHistoryStore, run as run_relay,
+    RelayHandle, RelayHistoryRecord, RelayHistoryStore, run as run_relay, split_host_selector,
 };
 use rusterm_ssh::{DirectConnectOptions, ExecResult, connect_direct};
 use rusterm_tunnel::{TunnelConnector, TunnelManager};
@@ -113,29 +113,62 @@ pub fn sync_session_registry(entries: Vec<LiveSessionEntry>) {
     }
 }
 
-/// Find a live connected session for the given `host_id` (matched against
-/// both connection id and connection name).
-fn find_live_session(host_id: &str) -> Option<LiveSessionEntry> {
+/// Find a live connected session for the given host selector.
+///
+/// Selectors of the form `{connection_id}@{session_id}` route to one exact
+/// terminal tab: with jumpserver/bastion hosts, several tabs of the same
+/// connection can sit on *different* target nodes, so a session-qualified
+/// selector must never fall back to a sibling tab — that is precisely how
+/// commands end up on the wrong node. If the exact tab is gone, we return
+/// `None` and the caller takes the fresh-connection slow path.
+///
+/// Plain selectors keep the legacy behaviour: first entry matching the
+/// connection id, then a fallback by connection name.
+fn find_live_session(host_selector: &str) -> Option<LiveSessionEntry> {
     let guard = session_registry().read().ok()?;
-    guard
+    let keys: Vec<(String, String)> = guard
         .iter()
-        .find(|entry| entry.connection_id == host_id)
-        .cloned()
+        .map(|entry| {
+            (
+                entry.connection_id.clone(),
+                entry.session.session_id().to_string(),
+            )
+        })
+        .collect();
+    let index = find_live_session_index(host_selector, &keys, &read_connections())?;
+    guard.get(index).cloned()
+}
+
+/// Testable core of [`find_live_session`]: resolves a selector to an index
+/// into `entries`, given as `(connection_id, session_id)` pairs (a plain
+/// projection of the registry, so tests don't need to construct a real
+/// [`rusterm_ssh::SshSession`]).
+fn find_live_session_index(
+    host_selector: &str,
+    entries: &[(String, String)],
+    connections: &[ConnectionConfig],
+) -> Option<usize> {
+    let (base, session_id) = split_host_selector(host_selector);
+    if let Some(session_id) = session_id {
+        return entries
+            .iter()
+            .position(|(conn_id, sess_id)| sess_id == session_id && conn_id == base);
+    }
+
+    entries
+        .iter()
+        .position(|(conn_id, _)| conn_id == host_selector)
         .or_else(|| {
             // Fall back to matching by connection name.
-            let connections = read_connections();
             let target_name = connections
                 .iter()
-                .find(|c| c.id == host_id)
+                .find(|c| c.id == host_selector)
                 .map(|c| c.name.clone())?;
-            guard
-                .iter()
-                .find(|entry| {
-                    connections
-                        .iter()
-                        .any(|c| c.id == entry.connection_id && c.name == target_name)
-                })
-                .cloned()
+            entries.iter().position(|(conn_id, _)| {
+                connections
+                    .iter()
+                    .any(|c| &c.id == conn_id && c.name == target_name)
+            })
         })
 }
 
@@ -712,10 +745,14 @@ impl RelayExecutor for AppRelayExecutor {
         }
 
         // ── Slow path: fresh SSH connection (existing behaviour). ──
+        // A session-qualified selector whose tab has closed lands here too:
+        // strip the suffix and connect to the base host directly (login
+        // scripts still replay the bastion navigation when configured).
+        let (base_host_id, _) = split_host_selector(host_id);
         let (credential_key, ssh, login_script) = read_connections()
             .into_iter()
             .find_map(|conn| {
-                if conn.id == host_id || conn.name == host_id {
+                if conn.id == base_host_id || conn.name == base_host_id {
                     let key = sudo_credential_key(&conn)?;
                     let script = conn.login_script.clone();
                     match conn.kind {
@@ -970,6 +1007,80 @@ pub fn stop_relay(runtime: RelayRuntime) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn conn(id: &str, name: &str) -> ConnectionConfig {
+        ConnectionConfig {
+            id: id.to_string(),
+            name: name.to_string(),
+            kind: ConnectionKind::Shell(rusterm_core::config::ShellConfig {
+                command: None,
+                args: Vec::new(),
+                env: Vec::new(),
+                working_dir: None,
+            }),
+            group: None,
+            tags: Vec::new(),
+            onekey: false,
+            login_script: None,
+        }
+    }
+
+    fn live_key(conn_id: &str, sess_id: &str) -> (String, String) {
+        (conn_id.to_string(), sess_id.to_string())
+    }
+
+    /// A session-qualified selector must resolve to the exact tab — never a
+    /// sibling tab of the same connection. Two jumpserver tabs of one
+    /// connection can sit on different target nodes; returning the "first"
+    /// tab is how commands land on the wrong node.
+    #[test]
+    fn session_qualified_selector_matches_exact_tab_only() {
+        let entries = vec![live_key("conn-j", "tab-a"), live_key("conn-j", "tab-b")];
+        let connections = vec![conn("conn-j", "jumpserver")];
+
+        assert_eq!(
+            find_live_session_index("conn-j@tab-b", &entries, &connections),
+            Some(1)
+        );
+        assert_eq!(
+            find_live_session_index("conn-j@tab-a", &entries, &connections),
+            Some(0)
+        );
+        // Tab closed → no silent fallback to the surviving sibling tab; the
+        // caller must take the fresh-connection slow path instead.
+        assert_eq!(
+            find_live_session_index("conn-j@tab-gone", &entries, &connections),
+            None
+        );
+        // Session id belonging to a different connection must not match.
+        assert_eq!(
+            find_live_session_index("conn-other@tab-a", &entries, &connections),
+            None
+        );
+    }
+
+    /// Plain (un-suffixed) selectors keep the legacy first-match and
+    /// name-fallback behaviour.
+    #[test]
+    fn plain_selector_keeps_legacy_connection_matching() {
+        let entries = vec![live_key("conn-a", "tab-1"), live_key("conn-b", "tab-2")];
+        let connections = vec![conn("conn-a", "web"), conn("conn-a2", "web")];
+
+        assert_eq!(
+            find_live_session_index("conn-b", &entries, &connections),
+            Some(1)
+        );
+        // Name fallback: conn-a2 shares the name "web" with conn-a, whose
+        // session is live.
+        assert_eq!(
+            find_live_session_index("conn-a2", &entries, &connections),
+            Some(0)
+        );
+        assert_eq!(
+            find_live_session_index("conn-z", &entries, &connections),
+            None
+        );
+    }
 
     #[test]
     fn live_exec_detects_completion_marker_after_output_cap() {

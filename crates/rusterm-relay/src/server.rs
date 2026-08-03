@@ -26,7 +26,7 @@ use crate::command_guard::BlocklistConfig;
 use crate::config::RelayConfig;
 #[cfg(test)]
 use crate::executor::NullExecutor;
-use crate::executor::{ExecOutcome, ExecutorError, HostInfo, RelayExecutor};
+use crate::executor::{ExecOutcome, ExecutorError, HostInfo, RelayExecutor, split_host_selector};
 use crate::history::{
     HistoryCursor, HistoryQuery, RelayHistoryRecord, RelayHistoryStore, new_record_id,
 };
@@ -658,13 +658,28 @@ async fn execute_request(
         }
     }
 
-    // Host authorization happens against the executor's host list.
+    // Host authorization happens against the executor's host list. The
+    // selector may carry a live-session suffix (`{host_id}@{session_id}`)
+    // that routes execution to one specific terminal tab; authorization is
+    // resolved against the base host, and the suffix is forwarded to the
+    // executor. A full-string match is attempted first so host names that
+    // happen to contain `@` keep working.
     let hosts = state.executor.list_hosts().await;
-    let host = match hosts
+    let (base_host_id, session_suffix) = split_host_selector(&body.host_id);
+    let resolved = hosts
         .iter()
         .find(|h| h.id == body.host_id || h.name == body.host_id)
-    {
-        Some(h) if host_allowed(&account, h) => h.clone(),
+        .map(|h| (h, None))
+        .or_else(|| {
+            session_suffix.and_then(|session| {
+                hosts
+                    .iter()
+                    .find(|h| h.id == base_host_id || h.name == base_host_id)
+                    .map(|h| (h, Some(session)))
+            })
+        });
+    let (host, live_session) = match resolved {
+        Some((h, session)) if host_allowed(&account, h) => (h.clone(), session),
         Some(_) => {
             state.audit.log(AuditEntry {
                 ts: now_iso(),
@@ -692,6 +707,14 @@ async fn execute_request(
             .min(config.request_timeout_ms),
     );
 
+    // Rebuild the selector from the *resolved* host id so name-based
+    // selectors are normalized, while the live-session suffix survives for
+    // the executor's tab routing.
+    let exec_selector = match live_session {
+        Some(session) => format!("{}@{session}", host.id),
+        None => host.id.clone(),
+    };
+
     state.audit.log(AuditEntry {
         ts: now_iso(),
         account: account.username.clone(),
@@ -714,7 +737,7 @@ async fn execute_request(
     let started = Instant::now();
     match state
         .executor
-        .exec(&host.id, &payload, body.elevated, timeout)
+        .exec(&exec_selector, &payload, body.elevated, timeout)
         .await
     {
         Ok(ExecOutcome {
@@ -1065,6 +1088,7 @@ mod tests {
         fail_exec: Option<String>,
         outcome: Option<ExecOutcome>,
         commands: std::sync::Mutex<Vec<String>>,
+        host_ids: std::sync::Mutex<Vec<String>>,
     }
 
     #[async_trait::async_trait]
@@ -1081,7 +1105,7 @@ mod tests {
 
         async fn exec(
             &self,
-            _host_id: &str,
+            host_id: &str,
             command: &str,
             elevated: bool,
             _timeout: Duration,
@@ -1089,6 +1113,7 @@ mod tests {
             self.elevated
                 .store(elevated, std::sync::atomic::Ordering::SeqCst);
             self.commands.lock().unwrap().push(command.to_string());
+            self.host_ids.lock().unwrap().push(host_id.to_string());
             if elevated && self.fail_elevation {
                 return Err(ExecutorError::ElevationRequired(
                     "No reusable sudo authorization is available".to_string(),
@@ -1184,6 +1209,80 @@ mod tests {
         .await;
         assert_eq!(status, 200);
         assert!(executor.elevated.load(std::sync::atomic::Ordering::SeqCst));
+        handle.shutdown().await;
+    }
+
+    /// A session-qualified selector (`{host_id}@{session_id}`) must authorize
+    /// against the base host but reach the executor intact so the app can
+    /// route to the exact terminal tab (jumpserver tabs of one connection can
+    /// sit on different target nodes).
+    #[tokio::test]
+    async fn exec_resolves_session_qualified_selector_against_base_host() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let handle = run(test_config(), executor.clone(), Arc::new(NullHistoryStore))
+            .await
+            .unwrap();
+        let (status, _) = post_json(
+            &format!("{}/api/v1/exec", handle.url()),
+            Some(("ops", "pw")),
+            &serde_json::json!({
+                "host_id": "host-1@tab-42",
+                "command": "uname -a",
+            }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            executor.host_ids.lock().unwrap().as_slice(),
+            ["host-1@tab-42"]
+        );
+        handle.shutdown().await;
+    }
+
+    /// Name-based selectors with a session suffix normalize the base to the
+    /// host id while keeping the suffix.
+    #[tokio::test]
+    async fn exec_normalizes_name_based_session_selector_to_host_id() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let handle = run(test_config(), executor.clone(), Arc::new(NullHistoryStore))
+            .await
+            .unwrap();
+        let (status, _) = post_json(
+            &format!("{}/api/v1/exec", handle.url()),
+            Some(("ops", "pw")),
+            &serde_json::json!({
+                "host_id": "prod@tab-42",
+                "command": "uname -a",
+            }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            executor.host_ids.lock().unwrap().as_slice(),
+            ["host-1@tab-42"]
+        );
+        handle.shutdown().await;
+    }
+
+    /// A session suffix must not smuggle an unknown base host past
+    /// resolution.
+    #[tokio::test]
+    async fn exec_rejects_session_selector_with_unknown_base_host() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let handle = run(test_config(), executor.clone(), Arc::new(NullHistoryStore))
+            .await
+            .unwrap();
+        let (status, _) = post_json(
+            &format!("{}/api/v1/exec", handle.url()),
+            Some(("ops", "pw")),
+            &serde_json::json!({
+                "host_id": "nope@tab-42",
+                "command": "uname -a",
+            }),
+        )
+        .await;
+        assert_eq!(status, 404);
+        assert!(executor.host_ids.lock().unwrap().is_empty());
         handle.shutdown().await;
     }
 

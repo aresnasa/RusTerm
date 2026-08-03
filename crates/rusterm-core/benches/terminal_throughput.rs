@@ -37,7 +37,11 @@ fn process_all(size: TerminalSize, data: &[u8]) -> Terminal {
 }
 
 fn bench_process_plain_text(c: &mut Criterion) {
-    let size = TerminalSize { cols: 80, rows: 24, ..Default::default() };
+    let size = TerminalSize {
+        cols: 80,
+        rows: 24,
+        ..Default::default()
+    };
     let mut group = c.benchmark_group("process_plain_text");
     for &lines in &[1_000usize, 5_000, 20_000] {
         let data = make_plain_text(lines, 80);
@@ -58,7 +62,11 @@ fn bench_process_plain_text(c: &mut Criterion) {
 /// The 20_000-line case runs well past the 10_000 default capacity and must stay
 /// roughly constant per-byte regardless of how full scrollback is.
 fn bench_sustained_scrollback_eviction(c: &mut Criterion) {
-    let size = TerminalSize { cols: 80, rows: 24, ..Default::default() };
+    let size = TerminalSize {
+        cols: 80,
+        rows: 24,
+        ..Default::default()
+    };
     let mut group = c.benchmark_group("sustained_scrollback_eviction");
     for &lines in &[5_000usize, 10_000, 20_000, 50_000] {
         let data = make_plain_text(lines, 80);
@@ -80,7 +88,11 @@ fn bench_sustained_scrollback_eviction(c: &mut Criterion) {
 /// Output interleaved with FinalTerm shell-integration markers (OSC 133;D).
 /// Exercises the scan_exit_codes hot path that runs on every process() call.
 fn bench_process_with_exit_codes(c: &mut Criterion) {
-    let size = TerminalSize { cols: 80, rows: 24, ..Default::default() };
+    let size = TerminalSize {
+        cols: 80,
+        rows: 24,
+        ..Default::default()
+    };
     let mut data = Vec::with_capacity(20_000 * 90);
     let row: Vec<u8> = (0..80).map(|i| b'a' + (i % 26) as u8).collect();
     for n in 0..20_000usize {
@@ -104,7 +116,11 @@ fn bench_process_with_exit_codes(c: &mut Criterion) {
 
 /// Render after the screen is full — the cost the UI pays per frame.
 fn bench_render(c: &mut Criterion) {
-    let size = TerminalSize { cols: 80, rows: 24, ..Default::default() };
+    let size = TerminalSize {
+        cols: 80,
+        rows: 24,
+        ..Default::default()
+    };
     let data = make_plain_text(100, 80);
     let term = process_all(size, &data);
 
