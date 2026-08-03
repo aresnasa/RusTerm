@@ -218,3 +218,4 @@ Linux gpu-muxi-001.x86.test.brainpp.dev 5.15.0-119-generic #1，将API 脚本放
 96. 集成https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B模型到本项目，支持小模型输出脚本模板或者 python 模板。
 97. 这里需要支持开关（配置差的电脑可能没法运行1.5b的模型，这里需要支持告知客户），同时需要使用 rust 对原始的 1.5b 模型进行量化处理，尽量保证性能。搜索相关的方案来完成这个任务
 98. 模型可以从https://hf-mirror.com/下载，同时还要预留更换不同小模型的接口，支持用户自定义小模型。
+99. [@Image](zed:///agent/pasted-image?name=Image) 需要在[@Image](zed:///agent/pasted-image?name=Image) 这个界面里显示建议，然后自动保存，同时需要强化 settings 的搜索功能，支持模糊搜索已有的所有功能
