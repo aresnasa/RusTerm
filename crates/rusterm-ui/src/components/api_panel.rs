@@ -134,6 +134,84 @@ fn base_url(running_url: &Option<String>, bind_addr: &str, port: u16) -> String 
     }
 }
 
+/// Read `AppState` once and return the host id (saved connection UUID) of the
+/// currently-active SSH tab, if any. Non-SSH tabs and missing configs yield
+/// `None`. Centralising this lookup keeps the auto-follow effect and the
+/// render-time default consistent — divergent reads were the root cause of the
+/// "switched to B but script still says A" bug.
+fn derive_active_host_id(state: &Signal<AppState>) -> Option<String> {
+    derive_active_host_id_from(&state.read())
+}
+
+/// Testable core of [`derive_active_host_id`] that works on a plain
+/// `AppState` reference, so unit tests don't need a Dioxus runtime.
+fn derive_active_host_id_from(app: &AppState) -> Option<String> {
+    app.active_session.as_ref().and_then(|active_tab_id| {
+        app.sessions
+            .iter()
+            .find(|t| &t.id == active_tab_id)
+            .filter(|t| t.kind == rusterm_core::session::SessionType::Ssh)
+            .and_then(|tab| app.session_configs.get(&tab.id).map(|c| c.id.clone()))
+    })
+}
+
+/// Read `AppState` once and derive the `(host_id, label)` pairs shown in the
+/// session picker. The label surfaces the live `hostname` reported by the
+/// shell integration so jumpserver users can see which target node a tab is
+/// currently sitting on. When the live hostname differs from the configured
+/// SSH host (the tell-tale sign of a bastion/jumpserver jump — the user has
+/// navigated the interactive menu to a backend node), the label uses an
+/// arrow (`jumpserver ➜ k8s-node-202-216`) instead of parentheses so it's
+/// unmistakable that commands will run on the target node, not the bastion.
+fn derive_sessions(state: &Signal<AppState>) -> Vec<(String, String)> {
+    derive_sessions_from(&state.read())
+}
+
+/// Testable core of [`derive_sessions`] that works on a plain `AppState`
+/// reference.
+fn derive_sessions_from(app: &AppState) -> Vec<(String, String)> {
+    app.sessions
+        .iter()
+        .filter(|tab| tab.kind == rusterm_core::session::SessionType::Ssh)
+        .map(|tab| {
+            let conn = app.session_configs.get(&tab.id);
+            let configured_host = conn.and_then(|c| match &c.kind {
+                rusterm_core::config::ConnectionKind::Ssh(ssh) => Some(ssh.host.clone()),
+                _ => None,
+            });
+            let label = match (&tab.hostname, &configured_host) {
+                (Some(live), Some(cfg)) if live != cfg => {
+                    format!("{} \u{279c} {}", tab.name, live)
+                }
+                (Some(host), _) => format!("{} ({})", tab.name, host),
+                _ => tab.name.clone(),
+            };
+            let host_id = conn
+                .map(|config| config.id.clone())
+                .unwrap_or_else(|| tab.name.clone());
+            (host_id, label)
+        })
+        .collect()
+}
+
+/// Compute the "follow the active session" selection: the active tab's host id
+/// when it is present in `sessions`, otherwise the first available session.
+/// Returns `None` when there are no sessions at all (the picker stays empty).
+fn derive_follow_selection(
+    active_host_id: &Option<String>,
+    sessions: &[(String, String)],
+) -> Option<Vec<String>> {
+    active_host_id
+        .as_ref()
+        .and_then(|id| {
+            sessions
+                .iter()
+                .find(|(sid, _)| sid == id)
+                .map(|(sid, _)| vec![sid.clone()])
+        })
+        .or_else(|| sessions.first().map(|(id, _)| vec![id.clone()]))
+}
+
 #[component]
 pub fn ApiPanel(state: Signal<AppState>) -> Element {
     let _lang = crate::i18n::LANGUAGE();
@@ -178,59 +256,29 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
     // Connected SSH sessions → (saved connection id, label) pairs for the
     // curl builder. IDs are unambiguous and are also the key used by the
     // host-bound sudo credential lease; connection names may be duplicated.
-    let sessions: Vec<(String, String)> = {
-        let app = state.read();
-        app.sessions
-            .iter()
-            .filter(|tab| tab.kind == rusterm_core::session::SessionType::Ssh)
-            .map(|tab| {
-                let label = if let Some(host) = &tab.hostname {
-                    format!("{} ({})", tab.name, host)
-                } else {
-                    tab.name.clone()
-                };
-                let host_id = app
-                    .session_configs
-                    .get(&tab.id)
-                    .map(|config| config.id.clone())
-                    .unwrap_or_else(|| tab.name.clone());
-                (host_id, label)
-            })
-            .collect()
-    };
+    // The shared `derive_sessions` helper is also used by the auto-follow
+    // effect so the two reads can never drift.
+    let sessions: Vec<(String, String)> = derive_sessions(&state);
     // Default to the currently-active session so the generated script targets
     // the tab the user is actually looking at, not an arbitrary first entry.
     // This prevents the "logged into A but curl ran on B" mismatch when the
     // session list order differs from the user's focus. Fall back to the first
     // available session when there is no active session or it isn't an SSH
     // session.
-    // Drop stale IDs when a selected session disconnects.
-    let active_host_id = {
-        let app = state.read();
-        app.active_session.as_ref().and_then(|active_tab_id| {
-            app.sessions
-                .iter()
-                .find(|t| &t.id == active_tab_id)
-                .filter(|t| t.kind == rusterm_core::session::SessionType::Ssh)
-                .and_then(|tab| {
-                    app.session_configs
-                        .get(&tab.id)
-                        .map(|config| config.id.clone())
-                })
-        })
-    };
-    let mut selected_sessions = use_signal(|| {
-        active_host_id
-            .as_ref()
-            .and_then(|id| {
-                sessions
-                    .iter()
-                    .find(|(sid, _)| sid == id)
-                    .map(|(sid, _)| vec![sid.clone()])
-            })
-            .or_else(|| sessions.first().map(|(id, _)| vec![id.clone()]))
-            .unwrap_or_default()
-    });
+    //
+    // `selected_sessions` follows the active session automatically until the
+    // user makes an explicit choice (checkbox toggle, Select All, or Clear).
+    // Once `user_overrode` is set, the auto-follow stops so the user's manual
+    // selection survives tab switches. The override resets when every selected
+    // session has disconnected, so the panel re-attaches to the active tab
+    // instead of going empty.
+    let active_host_id = derive_active_host_id(&state);
+    let mut selected_sessions =
+        use_signal(|| derive_follow_selection(&active_host_id, &sessions).unwrap_or_default());
+    let mut user_overrode = use_signal(|| false);
+    // Drop stale IDs when a selected session disconnects, and re-seed from the
+    // active session when the entire selection has gone stale. The latter
+    // also clears the override so auto-follow resumes.
     let current_selection = selected_sessions();
     let valid_selection: Vec<String> = current_selection
         .iter()
@@ -238,26 +286,52 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
         .cloned()
         .collect();
     if valid_selection != current_selection {
-        // If every previously-selected session disconnected, re-seed the
-        // selection with the currently-active session (or the first available)
-        // so the user doesn't have to manually re-pick after a disconnect.
-        let reseeded = if valid_selection.is_empty() {
-            active_host_id
-                .as_ref()
-                .and_then(|id| {
-                    sessions
-                        .iter()
-                        .find(|(sid, _)| sid == id)
-                        .map(|(sid, _)| vec![sid.clone()])
-                })
-                .or_else(|| sessions.first().map(|(id, _)| vec![id.clone()]))
-                .unwrap_or_default()
+        let (reseeded, reset_override) = if valid_selection.is_empty() {
+            (
+                derive_follow_selection(&active_host_id, &sessions).unwrap_or_default(),
+                true,
+            )
         } else {
-            valid_selection
+            (valid_selection, false)
         };
         selected_sessions.set(reseeded);
+        if reset_override {
+            user_overrode.set(false);
+        }
     }
+    // Auto-follow: when the user has not overridden the selection, track the
+    // active session. Reading `state` inside the effect registers a
+    // dependency on `active_session` (and the sessions list), so this fires
+    // whenever the user switches tabs or opens/closes an SSH session. The
+    // `user_overrode.peek()` read avoids subscribing to override changes
+    // (setting the override inside the effect would otherwise loop), and the
+    // value comparison guards against redundant writes.
+    use_effect(move || {
+        if *user_overrode.peek() {
+            return;
+        }
+        let host_id = derive_active_host_id(&state);
+        let live_sessions = derive_sessions(&state);
+        let followed = derive_follow_selection(&host_id, &live_sessions);
+        if let Some(new_selection) = followed {
+            if *selected_sessions.peek() != new_selection {
+                selected_sessions.set(new_selection);
+            }
+        }
+    });
     let all_session_ids: Vec<String> = sessions.iter().map(|(id, _)| id.clone()).collect();
+    // True when any selected session has "jumped" past a bastion — i.e. its
+    // live hostname differs from the configured SSH host. The picker marks
+    // such sessions with an arrow in the label; this drives the explanatory
+    // hint shown beneath the picker so the user understands why the baked-in
+    // host id is the bastion connection while commands actually run on the
+    // target node.
+    let jumped_selected = {
+        let sel = selected_sessions();
+        sessions
+            .iter()
+            .any(|(id, label)| sel.iter().any(|s| s == id) && label.contains('\u{279c}'))
+    };
 
     let default_user = config
         .read()
@@ -530,14 +604,42 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
                                     button {
                                         class: "api-btn",
                                         r#type: "button",
-                                        onclick: move |_| selected_sessions.set(all_session_ids.clone()),
+                                        onclick: move |_| {
+                                            selected_sessions.set(all_session_ids.clone());
+                                            user_overrode.set(true);
+                                        },
                                         { crate::i18n::t("api.select_all") }
                                     }
                                     button {
                                         class: "api-btn",
                                         r#type: "button",
-                                        onclick: move |_| selected_sessions.set(Vec::new()),
+                                        onclick: move |_| {
+                                            selected_sessions.set(Vec::new());
+                                            user_overrode.set(true);
+                                        },
                                         { crate::i18n::t("api.clear_selection") }
+                                    }
+                                    button {
+                                        class: "api-btn",
+                                        r#type: "button",
+                                        // Re-enable auto-follow: clears the
+                                        // override and re-seeds the selection
+                                        // from the active tab. Hidden while
+                                        // already following so it doesn't
+                                        // look like a no-op button.
+                                        disabled: !user_overrode(),
+                                        style: if user_overrode() { "" } else { "visibility:hidden;" },
+                                        onclick: move |_| {
+                                            user_overrode.set(false);
+                                            let host_id = derive_active_host_id(&state);
+                                            let live_sessions = derive_sessions(&state);
+                                            if let Some(new_selection) =
+                                                derive_follow_selection(&host_id, &live_sessions)
+                                            {
+                                                selected_sessions.set(new_selection);
+                                            }
+                                        },
+                                        { crate::i18n::t("api.follow_active") }
                                     }
                                 }
                             }
@@ -560,6 +662,8 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
                                                         } else {
                                                             selected.retain(|id| id != &id_for_toggle);
                                                         }
+                                                        drop(selected);
+                                                        user_overrode.set(true);
                                                     },
                                                 }
                                                 span { "{label}" }
@@ -572,6 +676,12 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
                     }
                     if selected_sessions().is_empty() {
                         div { class: "api-hint", style: "color:#e0af68;", { crate::i18n::t("api.select_session_hint") } }
+                    } else if jumped_selected {
+                        // Surface the jumpserver/bastion semantics so the user
+                        // understands why the host id baked into the script is
+                        // the bastion connection even though the live tab is
+                        // sitting on a backend node.
+                        div { class: "api-hint", style: "color:#7aa2f7;", { crate::i18n::t("api.jumpserver_hint") } }
                     }
                     // Mode toggle: Command | Script | Script (base64). Drives
                     // which JSON field the generated curl sends and which
@@ -1616,5 +1726,147 @@ mod tests {
                 String::from_utf8_lossy(&output.stderr),
             );
         }
+    }
+
+    // ── derive_sessions / derive_active_host_id / derive_follow_selection ──
+
+    use rusterm_core::config::{ConnectionConfig, ConnectionKind, SshAuth, SshConfig};
+    use rusterm_core::session::SessionType;
+    use rusterm_core::terminal::RenderOutput;
+    use std::collections::HashSet;
+
+    use crate::state::{CommandStatus, SessionTab};
+
+    fn ssh_tab(id: &str, name: &str, hostname: Option<&str>) -> SessionTab {
+        SessionTab {
+            id: id.to_string(),
+            name: name.to_string(),
+            kind: SessionType::Ssh,
+            render_output: RenderOutput::default(),
+            version: 0,
+            suggestion: None,
+            suggestions: Vec::new(),
+            suggestion_corrections: HashSet::new(),
+            suggestion_selected: 0,
+            suggestion_visible: false,
+            command_history: Vec::new(),
+            hostname: hostname.map(str::to_string),
+            cwd: None,
+            last_command_status: CommandStatus::default(),
+        }
+    }
+
+    fn ssh_conn(id: &str, name: &str, host: &str) -> ConnectionConfig {
+        ConnectionConfig {
+            id: id.to_string(),
+            name: name.to_string(),
+            kind: ConnectionKind::Ssh(SshConfig {
+                host: host.to_string(),
+                port: 22,
+                username: "root".to_string(),
+                auth: SshAuth::Agent,
+                terminal_type: "xterm-256color".to_string(),
+                proxy: None,
+                proxy_jump: None,
+                keepalive_interval: None,
+                host_key_policy: "accept-new".to_string(),
+            }),
+            group: None,
+            tags: Vec::new(),
+            onekey: false,
+            login_script: None,
+        }
+    }
+
+    #[test]
+    fn derive_sessions_marks_jumped_bastion_sessions_with_an_arrow() {
+        let mut state = AppState::default();
+        // Tab A: plain SSH to web-1, live hostname matches configured host.
+        state
+            .sessions
+            .push(ssh_tab("tab-a", "web-1", Some("web-1")));
+        state
+            .session_configs
+            .insert("tab-a".to_string(), ssh_conn("conn-a", "web-1", "web-1"));
+        // Tab B: jumpserver connection whose live tab is sitting on a backend
+        // node (k8s-node-202-216) — the configured host is the bastion.
+        state
+            .sessions
+            .push(ssh_tab("tab-b", "jumpserver", Some("k8s-node-202-216")));
+        state.session_configs.insert(
+            "tab-b".to_string(),
+            ssh_conn("conn-b", "jumpserver", "jumpserver.example.com"),
+        );
+
+        let sessions = derive_sessions_from(&state);
+        let web1 = sessions.iter().find(|(id, _)| id == "conn-a").unwrap();
+        let jump = sessions.iter().find(|(id, _)| id == "conn-b").unwrap();
+        // Plain session uses parentheses (no jump).
+        assert_eq!(web1.1, "web-1 (web-1)");
+        // Jumped session uses the arrow to flag the bastion → target hop.
+        assert_eq!(jump.1, "jumpserver \u{279c} k8s-node-202-216");
+    }
+
+    #[test]
+    fn derive_sessions_falls_back_to_name_when_hostname_unknown() {
+        let mut state = AppState::default();
+        state.sessions.push(ssh_tab("tab-a", "web-1", None));
+        state
+            .session_configs
+            .insert("tab-a".to_string(), ssh_conn("conn-a", "web-1", "web-1"));
+
+        let sessions = derive_sessions_from(&state);
+        let entry = sessions.iter().find(|(id, _)| id == "conn-a").unwrap();
+        // No live hostname yet → plain name, no parentheses/arrow.
+        assert_eq!(entry.1, "web-1");
+    }
+
+    #[test]
+    fn derive_active_host_id_resolves_active_ssh_tab_connection_id() {
+        let mut state = AppState::default();
+        state
+            .sessions
+            .push(ssh_tab("tab-a", "web-1", Some("web-1")));
+        state
+            .sessions
+            .push(ssh_tab("tab-b", "web-2", Some("web-2")));
+        state
+            .session_configs
+            .insert("tab-a".to_string(), ssh_conn("conn-a", "web-1", "web-1"));
+        state
+            .session_configs
+            .insert("tab-b".to_string(), ssh_conn("conn-b", "web-2", "web-2"));
+        // Active tab is tab-b → connection id conn-b.
+        state.active_session = Some("tab-b".to_string());
+
+        assert_eq!(
+            derive_active_host_id_from(&state),
+            Some("conn-b".to_string())
+        );
+    }
+
+    #[test]
+    fn derive_follow_selection_prefers_active_session_then_first() {
+        let sessions = vec![
+            ("conn-a".to_string(), "web-1".to_string()),
+            ("conn-b".to_string(), "web-2".to_string()),
+        ];
+        // Active host id present in sessions → that one.
+        assert_eq!(
+            derive_follow_selection(&Some("conn-b".to_string()), &sessions),
+            Some(vec!["conn-b".to_string()])
+        );
+        // Active host id not in sessions → fall back to first.
+        assert_eq!(
+            derive_follow_selection(&Some("conn-z".to_string()), &sessions),
+            Some(vec!["conn-a".to_string()])
+        );
+        // No active host id → first.
+        assert_eq!(
+            derive_follow_selection(&None, &sessions),
+            Some(vec!["conn-a".to_string()])
+        );
+        // No sessions at all → None.
+        assert_eq!(derive_follow_selection(&None, &[]), None);
     }
 }

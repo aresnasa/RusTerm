@@ -306,9 +306,14 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         "api.selected_count" => ("{count} selected", "已选择 {count} 个"),
         "api.select_all" => ("All", "全选"),
         "api.clear_selection" => ("Clear", "清空"),
+        "api.follow_active" => ("Follow active", "跟随活动"),
         "api.select_session_hint" => (
             "Select at least one session to generate a curl script.",
             "请至少选择一个会话以生成 curl 脚本。",
+        ),
+        "api.jumpserver_hint" => (
+            "Bastion session: commands run on the target node the live tab is currently on (shown by the arrow).",
+            "堡垒机会话：命令在当前标签页所在的目标节点上执行（由箭头标示）。",
         ),
         "api.copy" => ("Copy", "复制"),
         "api.copied" => ("Copied!", "已复制！"),
