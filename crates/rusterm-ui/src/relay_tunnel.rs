@@ -767,6 +767,15 @@ impl RelayExecutor for AppRelayExecutor {
                 match exec_via_live_session(&entry, command, timeout).await {
                     Ok(outcome) => return Ok(outcome),
                     Err(LiveExecError::BeforeSend(error)) => {
+                        if live_session_required(host_id, &read_connections()) {
+                            tracing::error!(
+                                "[relay] live session required for bastion selector {host_id} but unavailable before send: {error}; refusing bastion fallback"
+                            );
+                            return Err(ExecutorError::Exec(format!(
+                                "[live-session-required] {}: {error}",
+                                crate::i18n::t("relay.live_session_required"),
+                            )));
+                        }
                         tracing::warn!(
                             "[relay] live session unavailable before send for {host_id}: {error}; using a fresh connection"
                         );
@@ -780,13 +789,29 @@ impl RelayExecutor for AppRelayExecutor {
                         )));
                     }
                 }
+            } else if live_session_required(host_id, &read_connections()) {
+                // A session-qualified selector on a bastion host with no
+                // matching live tab: the tab was closed (or its selector is
+                // stale). A fresh connection would land on the bastion entry
+                // host — the exact wrong-node bug this guard exists for.
+                tracing::error!(
+                    "[relay] live session required for bastion selector {host_id} but no live tab matched; refusing bastion fallback"
+                );
+                return Err(ExecutorError::Exec(format!(
+                    "[live-session-required] {}",
+                    crate::i18n::t("relay.live_session_required"),
+                )));
             }
         }
 
         // ── Slow path: fresh SSH connection (existing behaviour). ──
-        // A session-qualified selector whose tab has closed lands here too:
-        // strip the suffix and connect to the base host directly (login
-        // scripts still replay the bastion navigation when configured).
+        // Reached by plain selectors, elevated execution, and
+        // session-qualified selectors on *direct* hosts whose tab has
+        // closed (strip the suffix and connect to the base host — a fresh
+        // connection reaches the same machine). Bastion selectors never
+        // reach this point without a live tab: the guard above rejects
+        // them, because a fresh connection would land on the bastion entry
+        // host instead of the node the tab had navigated to.
         let (base_host_id, _) = split_host_selector(host_id);
         let (credential_key, ssh, login_script) = read_connections()
             .into_iter()
