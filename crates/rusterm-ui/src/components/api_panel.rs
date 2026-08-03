@@ -745,7 +745,7 @@ rusterm() {{\n\
     export RUSTERM_API_PASSWORD\n\
   fi\n\n\
   if [ -z \"${{RUSTERM_HOSTS+x}}\" ]; then\n\
-    RUSTERM_HOSTS=$(curl --silent --fail \\\n      --user \"${{RUSTERM_API_USER}}:${{RUSTERM_API_PASSWORD}}\" \\\n      \"${{RUSTERM_API_URL}}/r\")\n\
+    RUSTERM_HOSTS=$(curl --silent --show-error --fail \\\n      --user \"${{RUSTERM_API_USER}}:${{RUSTERM_API_PASSWORD}}\" \\\n      \"${{RUSTERM_API_URL}}/r\" | tr -d '\\r')\n\
     if [ -n \"$RUSTERM_HOSTS\" ]; then\n\
       export RUSTERM_HOSTS\n\
     fi\n\
@@ -1030,7 +1030,7 @@ mod tests {
 
         // Discovery hits GET /r with the same credentials.
         assert!(
-            curl.contains("RUSTERM_HOSTS=$(curl --silent --fail"),
+            curl.contains("RUSTERM_HOSTS=$(curl --silent --show-error --fail"),
             "must discover hosts via curl: {curl}"
         );
         assert!(
@@ -1040,6 +1040,14 @@ mod tests {
         assert!(
             curl.contains("\"${RUSTERM_API_URL}/r\""),
             "discovery must hit /r (no host_id): {curl}"
+        );
+        assert!(
+            curl.contains("| tr -d '\\r'"),
+            "discovery must strip carriage returns (CRLF-safe): {curl}"
+        );
+        assert!(
+            curl.contains("RUSTERM_HOSTS=$(curl --silent --show-error --fail"),
+            "discovery must surface failures with --show-error: {curl}"
         );
 
         // --refresh support.
