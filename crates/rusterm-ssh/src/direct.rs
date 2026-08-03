@@ -51,9 +51,18 @@ impl Default for DirectConnectOptions {
 
 /// An authenticated SSH connection without a PTY/shell. Cheap to clone
 /// around; the underlying russh handle is shared via `Arc`.
+///
+/// The originating `SshConfig` + options are retained so that
+/// [`DirectHandle::reconnect`] can establish a fresh transport. This is
+/// needed by [`DirectHandle::exec_with_fallback`]: some bastion servers
+/// (JumpServer's TERM-SSHD) reject a second channel on the same connection
+/// after an exec request fails, so the PTY fallback must open a brand-new
+/// connection rather than reuse the one whose exec was rejected.
 #[derive(Clone)]
 pub struct DirectHandle {
     handle: Arc<client::Handle<Handler>>,
+    /// Config + options used to create this handle, kept for reconnect.
+    origin: Option<(SshConfig, DirectConnectOptions)>,
 }
 
 impl std::fmt::Debug for DirectHandle {
@@ -113,6 +122,7 @@ pub async fn connect_direct(
     })??;
     Ok(DirectHandle {
         handle: Arc::new(handle),
+        origin: Some((config.clone(), options)),
     })
 }
 
@@ -426,7 +436,23 @@ impl DirectHandle {
             "[relay] exec channel rejected ({}), retrying via PTY shell",
             first.stdout_string()
         );
-        self.exec_via_pty(command, stdin, timeout).await
+        // Bastion servers (JumpServer's TERM-SSHD) refuse to open a second
+        // channel on the same connection after an exec request is rejected —
+        // the subsequent `channel_open_session` in `exec_via_pty` fails with
+        // `ConnectFailed`. Open a brand-new connection for the PTY path so the
+        // shell channel is the first (and only) channel on that transport.
+        // If reconnect is unavailable (no origin stored), fall back to the
+        // old same-connection behaviour as a best-effort.
+        match self.reconnect().await {
+            Ok(fresh) => fresh.exec_via_pty(command, stdin, timeout).await,
+            Err(e) => {
+                tracing::warn!(
+                    "[relay] reconnect for PTY fallback failed ({e:#}); \
+                     attempting PTY on same connection"
+                );
+                self.exec_via_pty(command, stdin, timeout).await
+            }
+        }
     }
 
     async fn exec_inner(
@@ -505,6 +531,23 @@ impl DirectHandle {
             .disconnect(russh::Disconnect::ByApplication, "Bye", "")
             .await?;
         Ok(())
+    }
+
+    /// Establish a **fresh** SSH connection using the same config/options that
+    /// created this handle. Used by [`exec_with_fallback`](Self::exec_with_fallback)
+    /// to get a clean transport for the PTY path: bastion servers like JumpServer
+    /// reject a second channel on a connection whose exec was just refused.
+    ///
+    /// Returns a brand-new [`DirectHandle`] sharing the same `origin` (so it
+    /// too can reconnect). If this handle was constructed without an `origin`
+    /// (e.g. test stubs), returns `None` and the caller should fall back to the
+    /// same-connection PTY attempt.
+    pub async fn reconnect(&self) -> anyhow::Result<DirectHandle> {
+        let (config, options) = self
+            .origin
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("no origin config stored for reconnect"))?;
+        connect_direct(config, options.clone()).await
     }
 }
 
