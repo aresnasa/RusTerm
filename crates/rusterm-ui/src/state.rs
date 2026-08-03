@@ -1076,6 +1076,55 @@ impl AppState {
         }
     }
 
+    /// Remove workspace tabs whose anchor session now lives as a pane inside
+    /// a *different* tab's split layout.
+    ///
+    /// Called after [`apply_layout_state`] during session restore. The restore
+    /// flow creates one top-level tab per restored session, then re-attaches
+    /// saved split layouts. A session that was pane 1 of a split (not the
+    /// anchor) ends up with BOTH its own standalone tab AND a pane slot in the
+    /// anchor's tab — the user sees "two windows" for the same session. This
+    /// method drops the redundant standalone tabs so each session appears in
+    /// exactly one place.
+    ///
+    /// A tab is redundant when its anchor session id appears as a pane in some
+    /// *other* tab's layout. The anchor's own layout legitimately references
+    /// itself in pane 0 — that is not a duplicate.
+    pub fn dedup_pane_session_tabs(&mut self) {
+        let tabs_snapshot: Vec<(String, Option<String>)> = self
+            .tabs
+            .iter()
+            .map(|t| (t.id.clone(), t.anchor_session_id.clone()))
+            .collect();
+        let mut to_remove: Vec<String> = Vec::new();
+        for (tab_id, anchor) in &tabs_snapshot {
+            let Some(anchor) = anchor else { continue };
+            let is_pane_elsewhere = self.layouts.iter().any(|(other_tab_id, layout)| {
+                other_tab_id != tab_id && layout.panes.iter().any(|p| p.session_id == *anchor)
+            });
+            if is_pane_elsewhere {
+                to_remove.push(tab_id.clone());
+            }
+        }
+        if to_remove.is_empty() {
+            return;
+        }
+        tracing::info!(
+            "Removed {} duplicate tab(s) after layout restore",
+            to_remove.len()
+        );
+        for tab_id in &to_remove {
+            self.tabs.retain(|t| &t.id != tab_id);
+            self.layouts.remove(tab_id);
+        }
+        // Ensure active_tab still points to a valid tab after removal.
+        if let Some(active) = self.active_tab.clone() {
+            if !self.tabs.iter().any(|t| t.id == active) {
+                self.active_tab = self.tabs.first().map(|t| t.id.clone());
+            }
+        }
+    }
+
     /// Look up the active tab's anchor session id (the session occupying
     /// pane 0 of the active tab's layout). Returns `None` if there's no
     /// active tab or the tab has no anchor yet.
@@ -5464,6 +5513,63 @@ mod tests {
         // Pane session_ids are live ids again (in this test harness name==id).
         assert_eq!(layout.panes[0].session_id, "alpha");
         assert_eq!(layout.panes[1].session_id, "beta");
+    }
+
+    /// After session restore, each restored session gets its own top-level
+    /// workspace tab. `apply_layout_state` then re-attaches a saved split
+    /// layout that places "beta" as pane 1 inside "alpha"'s tab. Without
+    /// dedup, "beta" would appear BOTH as its own standalone tab AND as a
+    /// pane in alpha's split — the user sees "two windows".
+    /// `dedup_pane_session_tabs` removes the redundant standalone tab.
+    #[test]
+    fn dedup_pane_session_tabs_removes_redundant_standalone_tabs() {
+        // Simulate the post-restore state: alpha and beta each got their own
+        // workspace tab (restore_sessions creates one tab per session).
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        // Now re-attach a saved split layout that puts beta as pane 1 inside
+        // alpha's tab.
+        let saved = crate::layout_state::LayoutState {
+            schema_version: 1,
+            saved_at: None,
+            tabs: vec![crate::layout_state::PersistedTabLayout {
+                anchor_name: "alpha".to_string(),
+                layout: PaneLayout::from_preset(
+                    LayoutPreset::Split2H,
+                    &["alpha".to_string(), "beta".to_string()],
+                ),
+            }],
+        };
+        state.apply_layout_state(&saved);
+        // Before dedup: two tabs exist (alpha + beta), but beta is now a pane
+        // inside alpha's split layout.
+        assert_eq!(state.tabs.len(), 2);
+        assert!(state.layouts.get("alpha").is_some());
+
+        state.dedup_pane_session_tabs();
+
+        // After dedup: only alpha's tab remains. Beta lives as pane 1 in
+        // alpha's split layout, not as its own top-level tab.
+        assert_eq!(state.tabs.len(), 1);
+        assert_eq!(state.tabs[0].anchor_session_id.as_deref(), Some("alpha"));
+        // The split layout is preserved.
+        let layout = state.layouts.get("alpha").expect("layout preserved");
+        assert_eq!(layout.panes[0].session_id, "alpha");
+        assert_eq!(layout.panes[1].session_id, "beta");
+        // Beta's former tab layout entry is gone.
+        assert!(state.layouts.get("beta").is_none());
+    }
+
+    /// A session whose anchor is NOT a pane in any other tab's layout must
+    /// keep its own tab. This guards against over-removal when multiple
+    /// independent single-pane tabs exist.
+    #[test]
+    fn dedup_pane_session_tabs_keeps_independent_single_pane_tabs() {
+        // Two independent tabs, no split layouts.
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        // No layouts at all (single-pane tabs have no layout entry).
+        state.dedup_pane_session_tabs();
+        // Both tabs survive — neither anchor is a pane in another tab.
+        assert_eq!(state.tabs.len(), 2);
     }
 
     /// A pane whose session wasn't restored is cleared (rendered as an empty

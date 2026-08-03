@@ -12107,6 +12107,7 @@ fn restore_sessions(
                 saved_layout.tabs.len()
             );
             state.write().apply_layout_state(&saved_layout);
+            state.write().dedup_pane_session_tabs();
         }
     }
 }

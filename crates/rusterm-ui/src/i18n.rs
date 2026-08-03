@@ -324,6 +324,7 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         "api.mode_command" => ("Command", "命令"),
         "api.mode_script" => ("Script", "脚本"),
         "api.mode_script_base64" => ("Script (base64)", "脚本 (base64)"),
+        "api.templates_label" => ("Templates", "模板"),
         "api.script_label" => ("Script", "脚本"),
         "api.script_edit_hint" => (
             "↓ Multi-line shell script. Each line passes the hard-floor validator; the whole script is scanned by dcg if installed.",

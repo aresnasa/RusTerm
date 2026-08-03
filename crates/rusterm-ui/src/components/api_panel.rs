@@ -33,6 +33,78 @@ enum CurlMode {
     ScriptBase64,
 }
 
+/// A quick-pick template shown in the API panel. Selecting one loads its body
+/// into the matching input field for the current [`CurlMode`]. Templates are
+/// starting points — the user can edit the input afterwards. The generated
+/// script always bakes in the currently selected sessions, so templates never
+/// cause commands to run against historical sessions.
+struct PresetTemplate {
+    /// Button label. For commands this is the command itself; for scripts it is
+    /// a short description.
+    label: &'static str,
+    /// Which mode and input field this template targets.
+    mode: CurlMode,
+    /// The command or script body.
+    body: &'static str,
+}
+
+/// Built-in templates. Users pick one to pre-fill the command/script input,
+/// then edit as needed. The host-baking logic in `gen_curl_preview_for_language`
+/// ensures the generated script only targets sessions selected at copy time —
+/// templates never inject `GET /r` discovery or `${RUSTERM_HOSTS+x}` guards.
+const PRESET_TEMPLATES: &[PresetTemplate] = &[
+    PresetTemplate {
+        label: "uname -a",
+        mode: CurlMode::Command,
+        body: "uname -a",
+    },
+    PresetTemplate {
+        label: "uptime",
+        mode: CurlMode::Command,
+        body: "uptime",
+    },
+    PresetTemplate {
+        label: "df -h",
+        mode: CurlMode::Command,
+        body: "df -h",
+    },
+    PresetTemplate {
+        label: "free -h",
+        mode: CurlMode::Command,
+        body: "free -h",
+    },
+    PresetTemplate {
+        label: "hostname",
+        mode: CurlMode::Command,
+        body: "hostname",
+    },
+    PresetTemplate {
+        label: "nvidia-smi",
+        mode: CurlMode::Command,
+        body: "nvidia-smi",
+    },
+    PresetTemplate {
+        label: "docker ps",
+        mode: CurlMode::Command,
+        body: "docker ps",
+    },
+    PresetTemplate {
+        label: "kubectl get pods",
+        mode: CurlMode::Command,
+        body: "kubectl get pods",
+    },
+    PresetTemplate {
+        label: "health check",
+        mode: CurlMode::Script,
+        body: "#!/bin/sh\nset -e\nhostname\nuptime\nfree -h\ndf -h",
+    },
+    PresetTemplate {
+        label: "top disk usage",
+        mode: CurlMode::Script,
+        body: "#!/bin/sh\ndu -sh /var/log/* 2>/dev/null | sort -rh | head -20",
+    },
+];
+
 /// The payload to embed in the generated curl's JSON body. The UI produces
 /// one of these from the active [`CurlMode`]; the curl generator emits the
 /// corresponding JSON field.
@@ -126,12 +198,37 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
             })
             .collect()
     };
-    // Default to one target while allowing any number of connected sessions.
+    // Default to the currently-active session so the generated script targets
+    // the tab the user is actually looking at, not an arbitrary first entry.
+    // This prevents the "logged into A but curl ran on B" mismatch when the
+    // session list order differs from the user's focus. Fall back to the first
+    // available session when there is no active session or it isn't an SSH
+    // session.
     // Drop stale IDs when a selected session disconnects.
+    let active_host_id = {
+        let app = state.read();
+        app.active_session.as_ref().and_then(|active_tab_id| {
+            app.sessions
+                .iter()
+                .find(|t| &t.id == active_tab_id)
+                .filter(|t| t.kind == rusterm_core::session::SessionType::Ssh)
+                .and_then(|tab| {
+                    app.session_configs
+                        .get(&tab.id)
+                        .map(|config| config.id.clone())
+                })
+        })
+    };
     let mut selected_sessions = use_signal(|| {
-        sessions
-            .first()
-            .map(|(id, _)| vec![id.clone()])
+        active_host_id
+            .as_ref()
+            .and_then(|id| {
+                sessions
+                    .iter()
+                    .find(|(sid, _)| sid == id)
+                    .map(|(sid, _)| vec![sid.clone()])
+            })
+            .or_else(|| sessions.first().map(|(id, _)| vec![id.clone()]))
             .unwrap_or_default()
     });
     let current_selection = selected_sessions();
@@ -141,7 +238,24 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
         .cloned()
         .collect();
     if valid_selection != current_selection {
-        selected_sessions.set(valid_selection);
+        // If every previously-selected session disconnected, re-seed the
+        // selection with the currently-active session (or the first available)
+        // so the user doesn't have to manually re-pick after a disconnect.
+        let reseeded = if valid_selection.is_empty() {
+            active_host_id
+                .as_ref()
+                .and_then(|id| {
+                    sessions
+                        .iter()
+                        .find(|(sid, _)| sid == id)
+                        .map(|(sid, _)| vec![sid.clone()])
+                })
+                .or_else(|| sessions.first().map(|(id, _)| vec![id.clone()]))
+                .unwrap_or_default()
+        } else {
+            valid_selection
+        };
+        selected_sessions.set(reseeded);
     }
     let all_session_ids: Vec<String> = sessions.iter().map(|(id, _)| id.clone()).collect();
 
@@ -480,6 +594,29 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
                             style: if curl_mode() == CurlMode::ScriptBase64 { "font-weight:bold;" } else { "" },
                             onclick: move |_| curl_mode.set(CurlMode::ScriptBase64),
                             { crate::i18n::t("api.mode_script_base64") }
+                        }
+                    }
+                    // Quick-pick templates: clicking one loads its body into
+                    // the matching input for the current mode. Templates are
+                    // starting points; the user can edit the input afterwards.
+                    // The generated script always bakes in the currently
+                    // selected sessions — templates never reference historical
+                    // sessions.
+                    div { class: "api-row", style: "gap:4px;margin-bottom:8px;flex-wrap:wrap;align-items:center;",
+                        span { style: "font-size:11px;color:#9aa5ce;",
+                            { crate::i18n::t("api.templates_label") }
+                        }
+                        for tmpl in PRESET_TEMPLATES.iter().filter(|t| t.mode == curl_mode()) {
+                            button {
+                                class: "api-btn",
+                                style: "font-size:11px;padding:2px 8px;",
+                                onclick: move |_| match tmpl.mode {
+                                    CurlMode::Command => curl_command.set(tmpl.body.to_string()),
+                                    CurlMode::Script => curl_script.set(tmpl.body.to_string()),
+                                    CurlMode::ScriptBase64 => curl_script_base64.set(tmpl.body.to_string()),
+                                },
+                                { tmpl.label }
+                            }
                         }
                     }
                     div { class: "api-field api-command-field",
@@ -1405,5 +1542,79 @@ mod tests {
         assert_eq!(base_url(&None, "127.0.0.1", 8080), "http://127.0.0.1:8080");
         // 0.0.0.0 is shown as 127.0.0.1 so the local curl preview works.
         assert_eq!(base_url(&None, "0.0.0.0", 8080), "http://127.0.0.1:8080");
+    }
+
+    #[test]
+    fn preset_templates_generate_safe_scripts() {
+        use std::io::Write as _;
+        use std::process::{Command as StdCommand, Stdio};
+
+        assert!(!PRESET_TEMPLATES.is_empty(), "preset templates must exist");
+
+        let sessions = ["host-a".to_string(), "host-b".to_string()];
+        for tmpl in PRESET_TEMPLATES {
+            let payload = match tmpl.mode {
+                CurlMode::Command => CurlPayload::Command(tmpl.body.to_string()),
+                CurlMode::Script => CurlPayload::Script(tmpl.body.to_string()),
+                CurlMode::ScriptBase64 => CurlPayload::ScriptBase64(tmpl.body.to_string()),
+            };
+            let script = gen_curl(
+                "http://relay.example:8877",
+                "ops",
+                &sessions,
+                &payload,
+                false,
+            );
+
+            // No template may cause the generated script to discover
+            // historical sessions at runtime.
+            assert!(
+                !script.contains("\"${RUSTERM_API_URL}/r\""),
+                "template {:?} must not fetch all hosts: {script}",
+                tmpl.label,
+            );
+
+            // Command-mode templates must bake the selected host snapshot
+            // into the generated function.
+            if tmpl.mode == CurlMode::Command {
+                assert!(
+                    script.contains("RUSTERM_HOSTS='host-a\nhost-b'"),
+                    "template {:?} must bake selected hosts: {script}",
+                    tmpl.label,
+                );
+                assert!(
+                    !script.contains("RUSTERM_HOSTS=$(curl"),
+                    "template {:?} must not discover hosts at runtime: {script}",
+                    tmpl.label,
+                );
+                assert!(
+                    !script.contains("if [ -z \"${RUSTERM_HOSTS+x}\" ]; then"),
+                    "template {:?} must not guard with RUSTERM_HOSTS+x: {script}",
+                    tmpl.label,
+                );
+            }
+
+            // The generated script must be valid POSIX shell.
+            let mut child = StdCommand::new("/bin/sh")
+                .arg("-n")
+                .stdin(Stdio::piped())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .spawn()
+                .expect("/bin/sh must be available");
+            child
+                .stdin
+                .take()
+                .expect("piped stdin")
+                .write_all(script.as_bytes())
+                .expect("write generated shell template");
+            let output = child.wait_with_output().expect("wait for /bin/sh -n");
+            assert!(
+                output.status.success(),
+                "template {:?} failed /bin/sh -n: {}\n{script}",
+                tmpl.label,
+                String::from_utf8_lossy(&output.stderr),
+            );
+        }
     }
 }
