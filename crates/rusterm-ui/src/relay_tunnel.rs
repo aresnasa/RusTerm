@@ -545,6 +545,33 @@ impl std::fmt::Display for LiveExecError {
     }
 }
 
+const MAX_LIVE_EXEC_OUTPUT: usize = 1024 * 1024;
+
+/// Append one PTY chunk to the bounded response body while independently
+/// retaining enough tail bytes to detect a sentinel that arrives after the
+/// body cap.
+fn capture_live_exec_output(
+    raw: &mut Vec<u8>,
+    marker_scan: &mut Vec<u8>,
+    data: &[u8],
+    rc_tag: &str,
+) -> (Option<u32>, bool) {
+    let remaining_capacity = MAX_LIVE_EXEC_OUTPUT.saturating_sub(raw.len());
+    let truncated = data.len() > remaining_capacity;
+    raw.extend_from_slice(&data[..data.len().min(remaining_capacity)]);
+
+    marker_scan.extend_from_slice(data);
+    if let Some((_, code)) = rusterm_ssh::direct::find_complete_rc_marker(marker_scan, rc_tag) {
+        return (Some(code), truncated);
+    }
+
+    let scan_tail = rc_tag.len() + 32;
+    if marker_scan.len() > scan_tail {
+        marker_scan.drain(..marker_scan.len() - scan_tail);
+    }
+    (None, truncated)
+}
+
 async fn exec_via_live_session(
     entry: &LiveSessionEntry,
     command: &str,
@@ -587,9 +614,10 @@ async fn exec_via_live_session(
     let deadline = tokio::time::sleep(remaining);
     tokio::pin!(deadline);
     let mut raw = Vec::new();
+    let mut marker_scan = Vec::new();
+    let mut marker_code = None;
     let mut timed_out = false;
     let mut truncated = false;
-    const MAX_TAP_OUTPUT: usize = 1024 * 1024;
 
     loop {
         tokio::select! {
@@ -607,8 +635,18 @@ async fn exec_via_live_session(
                     truncated = true;
                 }
                 raw.extend_from_slice(&data[..data.len().min(remaining_capacity)]);
-                if find_complete_rc_marker(&raw, &rc_tag).is_some() {
+
+                // Keep scanning after the response body reaches its cap so a
+                // large-output command can still complete instead of timing
+                // out merely because its sentinel arrived after 1 MiB.
+                marker_scan.extend_from_slice(&data);
+                if let Some((_, code)) = find_complete_rc_marker(&marker_scan, &rc_tag) {
+                    marker_code = Some(code);
                     break;
+                }
+                let scan_tail = rc_tag.len() + 32;
+                if marker_scan.len() > scan_tail {
+                    marker_scan.drain(..marker_scan.len() - scan_tail);
                 }
             }
             _ = &mut deadline => {
@@ -620,13 +658,13 @@ async fn exec_via_live_session(
     }
 
     let marker = find_complete_rc_marker(&raw, &rc_tag);
-    let exit_code = marker.map(|(_, code)| code);
+    let exit_code = marker.map(|(_, code)| code).or(marker_code);
     let stdout = if let Some((tag_idx, _)) = marker {
         let before = String::from_utf8_lossy(&raw[..tag_idx]);
         let before = before.trim_end_matches(['\r', '\n', ' ']);
         strip_echoed_wrapper(before)
     } else {
-        String::from_utf8_lossy(&raw).into_owned()
+        strip_echoed_wrapper(&String::from_utf8_lossy(&raw))
     };
 
     Ok(ExecOutcome {
