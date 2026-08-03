@@ -737,7 +737,8 @@ async fn execute_request(
                     headers.insert(
                         "x-rusterm-exit-code",
                         header::HeaderValue::from_str(
-                            &exit_code.map_or_else(|| "unknown".to_string(), |code| code.to_string()),
+                            &exit_code
+                                .map_or_else(|| "unknown".to_string(), |code| code.to_string()),
                         )
                         .expect("exit code is a valid header value"),
                     );
@@ -1259,7 +1260,10 @@ mod tests {
             raw_text_request(&url, Some(("ops", "pw")), "printf shadow-output").await;
         assert_eq!(status, 200);
         assert_eq!(body, "shadow-output\n");
-        assert_eq!(headers.get("content-type").unwrap(), "text/plain; charset=utf-8");
+        assert_eq!(
+            headers.get("content-type").unwrap(),
+            "text/plain; charset=utf-8"
+        );
         assert_eq!(headers.get("x-rusterm-exit-code").unwrap(), "17");
         assert_eq!(headers.get("x-rusterm-duration-ms").unwrap(), "23");
         assert_eq!(headers.get("x-rusterm-timed-out").unwrap(), "false");
@@ -1367,8 +1371,8 @@ mod tests {
             body.len()
         );
         if let Some((username, password)) = auth {
-            let credentials = base64::engine::general_purpose::STANDARD
-                .encode(format!("{username}:{password}"));
+            let credentials =
+                base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
             request.push_str(&format!("Authorization: Basic {credentials}\r\n"));
         }
         request.push_str("Connection: close\r\n\r\n");
