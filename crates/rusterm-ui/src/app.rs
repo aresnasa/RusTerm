@@ -1311,8 +1311,15 @@ fn drive_login_script(
             }
         }
         LoginScriptEvaluation::Finished => {
-            if let Some(rt) = state.write().login_scripts.get_mut(session_id) {
-                rt.done = true;
+            {
+                let mut s = state.write();
+                if let Some(rt) = s.login_scripts.get_mut(session_id) {
+                    rt.done = true;
+                }
+                // Interactive jump-host sessions never emit OSC 133;D exit
+                // codes, so surface the completed scripted navigation as a
+                // green ✓ on the tab badge here.
+                s.mark_login_script_success(session_id);
             }
             sync_live_sessions(&state, &input_senders);
             tracing::info!("[LOGIN-SCRIPT] {} finished", session_id);
@@ -1353,6 +1360,7 @@ fn drive_login_script(
                 false
             };
             if finished {
+                state.write().mark_login_script_success(session_id);
                 sync_live_sessions(&state, &input_senders);
             }
         }

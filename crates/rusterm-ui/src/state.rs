@@ -1022,13 +1022,28 @@ impl AppState {
     pub fn apply_layout_state(&mut self, saved: &crate::layout_state::LayoutState) {
         use crate::layout_state::PersistedTabLayout;
 
+        // Map display name → the live session ids carrying that name, in
+        // session order. Ids are CONSUMED as panes claim them, so two
+        // sessions sharing a display name (e.g. the same connection opened
+        // twice) resolve to two different panes instead of both panes
+        // collapsing onto one session — the root cause of the "two
+        // identical panes after restore" bug. Consumption is global across
+        // tabs so a session never renders in more than one pane.
+        let mut name_to_ids: HashMap<String, Vec<String>> = HashMap::new();
+        for s in &self.sessions {
+            name_to_ids
+                .entry(s.name.clone())
+                .or_default()
+                .push(s.id.clone());
+        }
+
         for PersistedTabLayout {
             anchor_name,
             layout,
         } in &saved.tabs
         {
             // Find the workspace tab whose anchor session has this name.
-            let group_id =
+            let tab =
                 self.tabs
                     .iter()
                     .find(|t| {
@@ -1036,8 +1051,8 @@ impl AppState {
                             self.sessions.iter().find(|s| s.id == sid).map(|s| &s.name)
                         }) == Some(anchor_name)
                     })
-                    .map(|t| t.id.clone());
-            let Some(group_id) = group_id else {
+                    .map(|t| (t.id.clone(), t.anchor_session_id.clone()));
+            let Some((group_id, anchor_id)) = tab else {
                 tracing::debug!(
                     "layout restore: no restored tab matches anchor {:?} — skipping",
                     anchor_name
@@ -1045,28 +1060,57 @@ impl AppState {
                 continue;
             };
 
-            // Map display name → live session id for every restored session.
-            let name_to_id: HashMap<&str, &str> = self
-                .sessions
-                .iter()
-                .map(|s| (s.name.as_str(), s.id.as_str()))
-                .collect();
+            // The tab's own anchor session must claim the first pane that
+            // references the anchor name; otherwise a same-named sibling
+            // session could take it and leave the anchor orphaned.
+            if let (Some(anchor_id), Some(ids)) = (
+                anchor_id.as_ref(),
+                name_to_ids.get_mut(anchor_name.as_str()),
+            ) {
+                if let Some(pos) = ids.iter().position(|id| id == anchor_id) {
+                    ids.swap(0, pos);
+                }
+            }
 
             let mut restored = layout.clone();
-            for pane in &mut restored.panes {
+            let mut duplicate_panes: Vec<usize> = Vec::new();
+            for (idx, pane) in restored.panes.iter_mut().enumerate() {
                 if pane.session_id.is_empty() {
                     continue;
                 }
                 // session_id currently holds a display name (written at save
-                // time). Resolve it back to a live id; if not found, clear
-                // the pane so it renders as an empty drop target.
-                match name_to_id.get(pane.session_id.as_str()) {
-                    Some(live_id) => pane.session_id = live_id.to_string(),
+                // time). Resolve it back to a live id; if the name is
+                // unknown, clear the pane so it renders as an empty drop
+                // target; if the name is known but every session with that
+                // name is already shown elsewhere, the pane is a duplicate
+                // and gets removed below.
+                match name_to_ids.get_mut(pane.session_id.as_str()) {
+                    Some(ids) if !ids.is_empty() => {
+                        pane.session_id = ids.remove(0);
+                    }
+                    Some(_) => {
+                        tracing::info!(
+                            "layout restore: pane session {:?} already shown in another pane — dropping duplicate pane",
+                            pane.session_id
+                        );
+                        duplicate_panes.push(idx);
+                    }
                     None => {
                         tracing::info!(
                             "layout restore: pane session {:?} not found among restored sessions — leaving pane empty",
                             pane.session_id
                         );
+                        pane.session_id.clear();
+                    }
+                }
+            }
+            // Remove duplicate panes back-to-front so earlier indices stay
+            // valid. If the layout can't shrink (no split tree / last
+            // pane), fall back to clearing the pane instead of duplicating
+            // the session.
+            for idx in duplicate_panes.into_iter().rev() {
+                if restored.remove_pane(idx).is_none() {
+                    if let Some(pane) = restored.panes.get_mut(idx) {
                         pane.session_id.clear();
                     }
                 }
@@ -1121,6 +1165,22 @@ impl AppState {
         if let Some(active) = self.active_tab.clone() {
             if !self.tabs.iter().any(|t| t.id == active) {
                 self.active_tab = self.tabs.first().map(|t| t.id.clone());
+            }
+        }
+    }
+
+    /// Upgrade a session's tab badge to `Success` after its login script
+    /// completed.
+    ///
+    /// Interactive jump-host sessions (e.g. a jumpserver asset menu driven
+    /// by a login script) never emit OSC 133;D exit codes, so without this
+    /// the tab badge would stay `Idle` forever even though the scripted
+    /// navigation succeeded. A real command status (Success / Failed /
+    /// Disconnected) always wins — only an `Idle` badge is upgraded.
+    pub fn mark_login_script_success(&mut self, session_id: &str) {
+        if let Some(tab) = self.sessions.iter_mut().find(|t| t.id == session_id) {
+            if matches!(tab.last_command_status, CommandStatus::Idle) {
+                tab.last_command_status = CommandStatus::Success;
             }
         }
     }
@@ -5621,6 +5681,111 @@ mod tests {
         state.apply_layout_state(&saved);
         // No layout inserted for the ghost tab.
         assert!(state.layouts.is_empty());
+    }
+
+    /// Regression: a persisted split whose panes BOTH name the same session
+    /// (e.g. a snapshot corrupted by the old restore-duplication bug, when
+    /// only one "jumpserver" session was actually restored) must NOT come
+    /// back as two identical panes. The duplicate pane is removed and the
+    /// survivor keeps the live session.
+    #[test]
+    fn apply_layout_state_drops_duplicate_panes_for_single_session() {
+        let mut state = state_with_active_session(&["jumpserver"]);
+        state.layouts.clear();
+
+        let saved = crate::layout_state::LayoutState {
+            schema_version: 1,
+            saved_at: None,
+            tabs: vec![crate::layout_state::PersistedTabLayout {
+                anchor_name: "jumpserver".to_string(),
+                layout: PaneLayout::from_preset(
+                    LayoutPreset::Split2H,
+                    &["jumpserver".to_string(), "jumpserver".to_string()],
+                ),
+            }],
+        };
+
+        state.apply_layout_state(&saved);
+        let layout = state.layouts.get("jumpserver").expect("layout re-attached");
+        // The duplicate pane is gone; a single pane shows the session.
+        assert_eq!(layout.panes.len(), 1);
+        assert_eq!(layout.panes[0].session_id, "jumpserver");
+    }
+
+    /// Two restored sessions sharing a display name (the same connection
+    /// opened twice) fill a two-pane split with DISTINCT live ids — the
+    /// anchor session claims the first matching pane so it isn't orphaned
+    /// by its same-named sibling.
+    #[test]
+    fn apply_layout_state_assigns_distinct_sessions_to_same_named_panes() {
+        let mut state = AppState::default();
+        for id in ["js-1", "js-2"] {
+            state.sessions.push(SessionTab {
+                id: id.to_string(),
+                name: "jumpserver".to_string(),
+                kind: SessionType::Ssh,
+                render_output: Default::default(),
+                version: 0,
+                suggestion: None,
+                suggestions: Vec::new(),
+                suggestion_corrections: HashSet::new(),
+                suggestion_selected: 0,
+                suggestion_visible: false,
+                command_history: Vec::new(),
+                hostname: None,
+                cwd: None,
+                last_command_status: CommandStatus::default(),
+            });
+            state.tabs.push(WorkspaceTab {
+                id: format!("tab-{id}"),
+                anchor_session_id: Some(id.to_string()),
+            });
+        }
+
+        let saved = crate::layout_state::LayoutState {
+            schema_version: 1,
+            saved_at: None,
+            tabs: vec![crate::layout_state::PersistedTabLayout {
+                anchor_name: "jumpserver".to_string(),
+                layout: PaneLayout::from_preset(
+                    LayoutPreset::Split2H,
+                    &["jumpserver".to_string(), "jumpserver".to_string()],
+                ),
+            }],
+        };
+
+        state.apply_layout_state(&saved);
+        // The layout attaches to the first tab whose anchor name matches.
+        let layout = state.layouts.get("tab-js-1").expect("layout re-attached");
+        assert_eq!(layout.panes.len(), 2);
+        // The anchor session claims pane 0; the sibling gets pane 1.
+        assert_eq!(layout.panes[0].session_id, "js-1");
+        assert_eq!(layout.panes[1].session_id, "js-2");
+    }
+
+    /// Login-script completion upgrades an Idle tab badge to Success (jump
+    /// hosts never emit OSC 133;D exit codes), but never clobbers a real
+    /// command status.
+    #[test]
+    fn mark_login_script_success_upgrades_only_idle_badges() {
+        let mut state = state_with_tabs(&["jumpserver", "bidbot"]);
+
+        state.mark_login_script_success("jumpserver");
+        assert_eq!(
+            state.sessions[0].last_command_status,
+            CommandStatus::Success
+        );
+
+        // A real (failed) command status is preserved.
+        state.sessions[1].last_command_status = CommandStatus::Failed(2);
+        state.mark_login_script_success("bidbot");
+        assert_eq!(
+            state.sessions[1].last_command_status,
+            CommandStatus::Failed(2)
+        );
+
+        // Unknown session id is a no-op.
+        state.mark_login_script_success("ghost");
     }
 
     /// Task 15 contract: closing a pane's session and re-applying the
