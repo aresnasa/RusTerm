@@ -102,6 +102,15 @@ pub fn SettingsDialog(
     /// in app.rs builds the JSON report and writes it to the downloads dir.
     #[props(default)]
     on_export_usage_habits: EventHandler<()>,
+    /// Whether local AI template generation (Qwen2.5-Coder-1.5B) is enabled.
+    #[props(default)]
+    qwen_local_enabled: bool,
+    /// Hardware warning text for the local AI toggle (empty if OK).
+    #[props(default)]
+    qwen_local_warning: String,
+    /// Fires with the new enabled state when the user toggles local AI.
+    #[props(default)]
+    on_save_qwen_local: EventHandler<bool>,
     /// Current UI language.
     #[props(default)]
     language: Language,
@@ -123,6 +132,7 @@ pub fn SettingsDialog(
     let mut sug_count = use_signal(|| suggestion_count);
     let mut comparison_warning_enabled = use_signal(|| comparison_diff_warning_enabled);
     let mut usage_habits = use_signal(|| usage_habits_enabled);
+    let mut qwen_local = use_signal(|| qwen_local_enabled);
     let mut keybinding_draft = use_signal(|| keybindings.normalized());
     let mut skin_draft = use_signal(|| skin.normalized());
     let skin_preview = skin_draft().palette();
@@ -477,6 +487,42 @@ pub fn SettingsDialog(
                     { crate::i18n::t("settings.export_report_help") }
                 }
 
+                // ── Local AI template generation ───────────────────────────
+                h3 {
+                    style: "margin: 24px 0 6px; font-size: 16px;",
+                    { crate::i18n::t("ai_runtime.local.enable") }
+                }
+                p {
+                    style: "margin: 0 0 12px; color: var(--settings-text-muted); font-size: 12px; line-height: 1.5;",
+                    { crate::i18n::t("ai_runtime.local.enable_hint") }
+                }
+                div {
+                    style: "display: flex; align-items: center; justify-content: space-between; gap: 16px;",
+                    label {
+                        style: "font-size: 12px; color: var(--settings-text);",
+                        { crate::i18n::t("ai_runtime.local.enable") }
+                    }
+                    div {
+                        style: "display: flex; align-items: center; gap: 8px;",
+                        input {
+                            r#type: "checkbox",
+                            checked: "{qwen_local()}",
+                            style: "width: 16px; height: 16px; cursor: pointer; accent-color: var(--settings-accent);",
+                            onchange: move |e| qwen_local.set(e.checked()),
+                        }
+                        span {
+                            style: "font-size: 11px; color: var(--settings-text-muted);",
+                            {if qwen_local() { crate::i18n::t("settings.on") } else { crate::i18n::t("settings.off") }}
+                        }
+                    }
+                }
+                if !qwen_local_warning.is_empty() {
+                    div {
+                        style: "font-size: 11px; color: #e0af68; margin-top: 8px; line-height: 1.5;",
+                        { crate::i18n::tf("ai_runtime.local.hw_warning", &[("warning", &qwen_local_warning)]) }
+                    }
+                }
+
                 h3 {
                     style: "margin: 24px 0 6px; font-size: 16px;",
                     { crate::i18n::t("settings.keybindings") }
@@ -582,6 +628,7 @@ pub fn SettingsDialog(
                             sug_count.set(3);
                             comparison_warning_enabled.set(true);
                             usage_habits.set(false);
+                            qwen_local.set(false);
                             keybinding_draft.set(Keybindings::default());
                             skin_draft.set(SkinSettings::default());
                             capturing_keybinding.set(None);
@@ -605,6 +652,7 @@ pub fn SettingsDialog(
                                 on_save_keybindings.call(keybinding_draft().normalized());
                                 on_save_skin.call(skin_draft().normalized());
                                 on_save_usage_habits.call(usage_habits());
+                                on_save_qwen_local.call(qwen_local());
                             },
                             { crate::i18n::t("common.save") }
                         }

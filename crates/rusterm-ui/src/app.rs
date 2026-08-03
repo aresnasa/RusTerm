@@ -14705,6 +14705,18 @@ pub fn App() -> Element {
                 keybindings: state.read().keybindings.clone(),
                 skin: state.read().skin.clone(),
                 usage_habits_enabled: state.read().collect_usage_habits,
+                qwen_local_enabled: state.read().config_manager.as_ref()
+                    .map(|cm| cm.load_qwen_local_settings().enabled)
+                    .unwrap_or(false),
+                qwen_local_warning: {
+                    #[cfg(feature = "qwen-local")]
+                    {
+                        let hw = rusterm_ai::detect_hardware();
+                        if hw.can_run { String::new() } else { hw.warning }
+                    }
+                    #[cfg(not(feature = "qwen-local"))]
+                    { String::new() }
+                },
                 language: state.read().language,
                 on_save_language: move |lang: rusterm_core::config::Language| {
                     if let Some(cm) = state.read().config_manager.clone() {
