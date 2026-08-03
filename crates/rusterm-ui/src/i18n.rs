@@ -1246,6 +1246,10 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
             "The reusable sudo authorization for this host has expired (the local lease elapses 30 minutes after the last sudo submission or successful API use). Run sudo once more in its RusTerm session with OneKey enabled, then retry.",
             "此主机可复用的 sudo 授权已过期（本地租约在上一次提交 sudo 或成功 API 调用后 30 分钟失效）。请在其已启用 OneKey 的 RusTerm 会话中再次运行一次 sudo，然后重试。",
         ),
+        "relay.live_session_required" => (
+            "This host sits behind a bastion (login script configured), so the command must run inside the exact logged-in terminal tab — only that tab knows which target node it navigated to. The requested tab is not available (closed, disconnected, or the selector is stale). Keep the tab connected and re-copy the curl command from the API panel.",
+            "此主机位于堡垒机之后（已配置登录脚本），命令必须在已登录的那个终端标签页内执行——只有该标签页知道自己导航到了哪个目标节点。请求指定的标签页不可用（已关闭、已断开或选择器已过时）。请保持该标签页在线，并从 API 面板重新复制 curl 命令。",
+        ),
         "relay.start_timeout_or_runtime_wedged" => (
             "Relay start timed out or runtime is wedged: {error}",
             "中转启动超时或运行时卡死：{error}",
