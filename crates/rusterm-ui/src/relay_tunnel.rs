@@ -505,10 +505,17 @@ impl RelayExecutor for AppRelayExecutor {
             .await
             .map_err(|e| ExecutorError::Connect(format!("{e:#}")))?;
 
+        // All exec calls go through `exec_with_fallback`: a normal SSH host
+        // answers the exec channel and the fallback is a no-op. Bastion
+        // hosts (JumpServer etc.) reject exec requests with messages like
+        // "exec request failed, try username/server/account as login name";
+        // `exec_with_fallback` detects that and transparently retries the
+        // command through a PTY + shell channel with sentinel markers — the
+        // same interactive path a human operator would use.
         let result = if elevated {
             let non_interactive_command = sudo_command(command, false);
             let first = handle
-                .exec(&non_interactive_command, timeout)
+                .exec_with_fallback(&non_interactive_command, None, timeout)
                 .await
                 .map_err(|e| ExecutorError::Exec(format!("{e:#}")))?;
             if !sudo_authorization_failed(&first) {
@@ -533,7 +540,7 @@ impl RelayExecutor for AppRelayExecutor {
                 let stdin = Zeroizing::new(format!("{}\n", credential.as_str()));
                 let password_command = sudo_command(command, true);
                 let second = handle
-                    .exec_with_stdin(&password_command, stdin.as_bytes(), timeout)
+                    .exec_with_fallback(&password_command, Some(stdin.as_bytes()), timeout)
                     .await
                     .map_err(|e| ExecutorError::Exec(format!("{e:#}")))?;
                 if sudo_authorization_failed(&second) {
@@ -552,7 +559,7 @@ impl RelayExecutor for AppRelayExecutor {
             }
         } else {
             handle
-                .exec(command, timeout)
+                .exec_with_fallback(command, None, timeout)
                 .await
                 .map_err(|e| ExecutorError::Exec(format!("{e:#}")))?
         };
