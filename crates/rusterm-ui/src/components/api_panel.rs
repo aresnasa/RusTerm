@@ -83,6 +83,68 @@ fn template_form_prefill(
     (label, body)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AiSuggestionKind {
+    Shell,
+    Python,
+}
+
+impl AiSuggestionKind {
+    fn label_key(self) -> &'static str {
+        match self {
+            Self::Shell => "ai_runtime.local.kind_shell",
+            Self::Python => "ai_runtime.local.kind_python",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AiSuggestionSaveState {
+    Saved,
+    AlreadyExists,
+    Failed(String),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AiTemplateSuggestion {
+    label: String,
+    kind: AiSuggestionKind,
+    body: String,
+    save_state: AiSuggestionSaveState,
+}
+
+const AI_TEMPLATE_DESCRIPTION_MAX_CHARS: usize = 36;
+
+fn ai_template_label(description: &str, kind: AiSuggestionKind) -> String {
+    let description = description.trim();
+    let mut short = description
+        .chars()
+        .take(AI_TEMPLATE_DESCRIPTION_MAX_CHARS)
+        .collect::<String>();
+    if description.chars().count() > AI_TEMPLATE_DESCRIPTION_MAX_CHARS {
+        short.push('…');
+    }
+    let kind = match kind {
+        AiSuggestionKind::Shell => "Shell",
+        AiSuggestionKind::Python => "Python",
+    };
+    format!("AI · {kind} · {short}")
+}
+
+fn ai_custom_template(suggestion: &AiTemplateSuggestion) -> CustomApiTemplate {
+    CustomApiTemplate {
+        label: suggestion.label.clone(),
+        mode: ApiTemplateMode::Script,
+        body: suggestion.body.clone(),
+    }
+}
+
+fn has_same_ai_template(templates: &[CustomApiTemplate], body: &str) -> bool {
+    templates.iter().any(|template| {
+        template.mode == ApiTemplateMode::Script && template.body.trim() == body.trim()
+    })
+}
+
 /// A quick-pick template shown in the API panel. Selecting one loads its body
 /// into the matching input field for the current [`CurlMode`]. Templates are
 /// starting points — the user can edit the input afterwards. The generated
@@ -343,6 +405,7 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
     let ai_status = use_signal(String::new);
     #[cfg_attr(not(feature = "qwen-local"), allow(unused_variables))]
     let ai_busy = use_signal(|| false);
+    let mut ai_suggestion: Signal<Option<AiTemplateSuggestion>> = use_signal(|| None);
     // Persist the full template list. `Signal` is Copy, so this closure is
     // Copy and can be moved into several handlers.
     let persist_templates = move |templates: Vec<CustomApiTemplate>| {
@@ -912,8 +975,59 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
                             { crate::i18n::t("api.add_template") }
                         }
                     }
+                    if let Some(suggestion) = ai_suggestion() {
+                        {
+                            let suggestion_body = suggestion.body.clone();
+                            let save_message = match &suggestion.save_state {
+                                AiSuggestionSaveState::Saved => crate::i18n::t("ai_runtime.local.suggestion_saved"),
+                                AiSuggestionSaveState::AlreadyExists => crate::i18n::t("ai_runtime.local.suggestion_exists"),
+                                AiSuggestionSaveState::Failed(error) => crate::i18n::tf(
+                                    "ai_runtime.local.suggestion_save_failed",
+                                    &[("error", error)],
+                                ),
+                            };
+                            let save_color = if matches!(suggestion.save_state, AiSuggestionSaveState::Failed(_)) {
+                                "#f7768e"
+                            } else {
+                                "#9ece6a"
+                            };
+                            rsx! {
+                                div {
+                                    style: "border:1px solid #7dcfff;border-radius:6px;background:#1f2335;padding:8px 10px;margin:-2px 0 8px;",
+                                    div {
+                                        style: "display:flex;align-items:center;gap:8px;margin-bottom:5px;",
+                                        span { style: "font-size:11px;font-weight:bold;color:#7dcfff;", { crate::i18n::t("ai_runtime.local.suggestion_title") } }
+                                        span { style: "font-size:10px;color:#bb9af7;", { crate::i18n::t(suggestion.kind.label_key()) } }
+                                        span { style: "font-size:10px;color:{save_color};", "{save_message}" }
+                                        span { style: "flex:1;" }
+                                        button {
+                                            class: "api-btn",
+                                            style: "font-size:11px;padding:2px 8px;color:#7dcfff;",
+                                            onclick: move |_| {
+                                                curl_mode.set(CurlMode::Script);
+                                                curl_script.set(suggestion_body.clone());
+                                            },
+                                            { crate::i18n::t("ai_runtime.local.suggestion_apply") }
+                                        }
+                                        button {
+                                            class: "api-btn",
+                                            style: "font-size:11px;padding:2px 6px;color:#9aa5ce;",
+                                            title: crate::i18n::t("common.close"),
+                                            onclick: move |_| ai_suggestion.set(None),
+                                            "×"
+                                        }
+                                    }
+                                    div { style: "font-size:11px;color:#c0caf5;margin-bottom:5px;", "{suggestion.label}" }
+                                    pre {
+                                        style: "margin:0;max-height:96px;overflow:auto;white-space:pre-wrap;word-break:break-word;font-size:10px;line-height:1.45;color:#a9b1d6;font-family:monospace;",
+                                        "{suggestion.body}"
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if adding_template() {
-                        div { class: "api-row", style: "gap:4px;margin-bottom:8px;flex-wrap:wrap;align-items:flex-start;",
+                        div { class: "api-row", style: "gap:4px;margin-bottom:8px;flex-wrap:wrap;align-items:flex-start;"},{
                             input {
                                 class: "api-input",
                                 style: "font-size:11px;flex:0 0 140px;",
@@ -1041,14 +1155,15 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
                     { render_ai_section(
                         qwen_enabled,
                         qwen_settings.clone(),
+                        state,
                         ai_description,
                         ai_kind_python,
                         ai_status,
                         ai_busy,
+                        ai_suggestion,
+                        custom_templates,
                         curl_mode,
-                        curl_command,
                         curl_script,
-                        curl_script_base64,
                     ) }
 
                     label {
@@ -1516,14 +1631,15 @@ fn run_local_generation(
 fn render_ai_section(
     qwen_enabled: bool,
     qwen_settings: rusterm_core::config::QwenLocalSettings,
+    state: Signal<AppState>,
     mut ai_description: Signal<String>,
     mut ai_kind_python: Signal<bool>,
     mut ai_status: Signal<String>,
     mut ai_busy: Signal<bool>,
-    curl_mode: Signal<CurlMode>,
-    mut curl_command: Signal<String>,
+    mut ai_suggestion: Signal<Option<AiTemplateSuggestion>>,
+    mut custom_templates: Signal<Vec<CustomApiTemplate>>,
+    mut curl_mode: Signal<CurlMode>,
     mut curl_script: Signal<String>,
-    mut curl_script_base64: Signal<String>,
 ) -> Element {
     if !qwen_enabled {
         return rsx! {};
@@ -1568,12 +1684,15 @@ fn render_ai_section(
                     onclick: move |_| {
                         let desc = ai_description().trim().to_string();
                         if desc.is_empty() { return; }
-                        let kind = if ai_kind_python() {
-                            rusterm_ai::TemplateKind::PythonScript
+                        let suggestion_kind = if ai_kind_python() {
+                            AiSuggestionKind::Python
                         } else {
-                            rusterm_ai::TemplateKind::ShellScript
+                            AiSuggestionKind::Shell
                         };
-                        let mode = curl_mode();
+                        let kind = match suggestion_kind {
+                            AiSuggestionKind::Shell => rusterm_ai::TemplateKind::ShellScript,
+                            AiSuggestionKind::Python => rusterm_ai::TemplateKind::PythonScript,
+                        };
                         // Read the full local-AI settings (mirror URL, active
                         // model, custom models) before spawning so the worker
                         // thread doesn't touch the UI state.
@@ -1582,23 +1701,53 @@ fn render_ai_section(
                         ai_status.set(crate::i18n::t("ai_runtime.local.preparing"));
                         spawn(async move {
                             let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
+                            let description_for_worker = desc.clone();
                             std::thread::spawn(move || {
-                                let result = run_local_generation(&desc, kind, &settings);
+                                let result = run_local_generation(&description_for_worker, kind, &settings);
                                 let _ = tx.send(result);
                             });
                             loop {
                                 match rx.try_recv() {
                                     Ok(Ok(text)) => {
                                         let parsed = rusterm_ai::parse_response(&text);
-                                        match mode {
-                                            CurlMode::Command => curl_command.set(parsed),
-                                            CurlMode::Script => curl_script.set(parsed),
-                                            CurlMode::ScriptBase64 => {
-                                                use base64::Engine;
-                                                let b64 = base64::engine::general_purpose::STANDARD.encode(&parsed);
-                                                curl_script_base64.set(b64);
+                                        curl_mode.set(CurlMode::Script);
+                                        curl_script.set(parsed.clone());
+
+                                        let mut suggestion = AiTemplateSuggestion {
+                                            label: ai_template_label(&desc, suggestion_kind),
+                                            kind: suggestion_kind,
+                                            body: parsed,
+                                            save_state: AiSuggestionSaveState::Saved,
+                                        };
+                                        let current = custom_templates();
+                                        if has_same_ai_template(&current, &suggestion.body) {
+                                            suggestion.save_state = AiSuggestionSaveState::AlreadyExists;
+                                        } else {
+                                            let mut next = current;
+                                            next.push(ai_custom_template(&suggestion));
+                                            let save_result = state
+                                                .read()
+                                                .config_manager
+                                                .clone()
+                                                .ok_or_else(|| {
+                                                    crate::i18n::t(
+                                                        "ai_runtime.local.suggestion_config_unavailable",
+                                                    )
+                                                })
+                                                .and_then(|manager| {
+                                                    manager
+                                                        .save_api_templates(&next)
+                                                        .map_err(|error| error.to_string())
+                                                });
+                                            match save_result {
+                                                Ok(()) => custom_templates.set(next),
+                                                Err(error) => {
+                                                    suggestion.save_state =
+                                                        AiSuggestionSaveState::Failed(error);
+                                                }
                                             }
                                         }
+                                        ai_suggestion.set(Some(suggestion));
                                         ai_status.set(String::new());
                                         ai_busy.set(false);
                                         return;
@@ -1649,14 +1798,15 @@ fn render_ai_section(
 fn render_ai_section(
     _qwen_enabled: bool,
     _qwen_settings: rusterm_core::config::QwenLocalSettings,
+    _state: Signal<AppState>,
     _ai_description: Signal<String>,
     _ai_kind_python: Signal<bool>,
     _ai_status: Signal<String>,
     _ai_busy: Signal<bool>,
+    _ai_suggestion: Signal<Option<AiTemplateSuggestion>>,
+    _custom_templates: Signal<Vec<CustomApiTemplate>>,
     _curl_mode: Signal<CurlMode>,
-    _curl_command: Signal<String>,
     _curl_script: Signal<String>,
-    _curl_script_base64: Signal<String>,
 ) -> Element {
     rsx! {}
 }
@@ -1720,6 +1870,45 @@ mod tests {
         // Short commands are used verbatim, no ellipsis.
         let (label, _) = template_form_prefill(CurlMode::Command, "uptime", "", "");
         assert_eq!(label, "uptime");
+    }
+
+    #[test]
+    fn ai_templates_are_named_by_kind_and_saved_as_scripts() {
+        let suggestion = AiTemplateSuggestion {
+            label: ai_template_label("collect disk usage", AiSuggestionKind::Python),
+            kind: AiSuggestionKind::Python,
+            body: "#!/usr/bin/env python3\nprint('ok')".to_string(),
+            save_state: AiSuggestionSaveState::Saved,
+        };
+        let template = ai_custom_template(&suggestion);
+
+        assert_eq!(suggestion.label, "AI · Python · collect disk usage");
+        assert_eq!(template.mode, ApiTemplateMode::Script);
+        assert_eq!(template.body, suggestion.body);
+    }
+
+    #[test]
+    fn ai_template_duplicate_detection_uses_script_body_not_label() {
+        let templates = vec![CustomApiTemplate {
+            label: "an older name".to_string(),
+            mode: ApiTemplateMode::Script,
+            body: "#!/bin/sh\nuptime".to_string(),
+        }];
+
+        assert!(has_same_ai_template(&templates, "  #!/bin/sh\nuptime\n"));
+        assert!(!has_same_ai_template(&templates, "#!/bin/sh\ndf -h"));
+    }
+
+    #[test]
+    fn ai_template_label_truncates_unicode_without_splitting_chars() {
+        let description = "检查".repeat(AI_TEMPLATE_DESCRIPTION_MAX_CHARS);
+        let label = ai_template_label(&description, AiSuggestionKind::Shell);
+
+        assert!(label.ends_with('…'));
+        assert_eq!(
+            label.chars().count(),
+            "AI · Shell · ".chars().count() + AI_TEMPLATE_DESCRIPTION_MAX_CHARS + 1
+        );
     }
 
     #[test]

@@ -165,6 +165,8 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         "settings.what_is_collected" => ("What is collected", "收集内容"),
         "settings.never_collected" => ("Never collected", "绝不收集"),
         "settings.export_report" => ("Export privacy-safe report", "导出隐私安全报告"),
+        "settings.search_placeholder" => ("Search all settings…", "搜索所有设置…"),
+        "settings.search_no_results" => ("No matching settings", "没有匹配的设置"),
 
         // ── close_confirm.* — close confirmation dialog ─────────────────
         "close_confirm.title" => ("Close confirmation", "关闭确认"),
@@ -594,6 +596,16 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         "ai_runtime.local.ai_generate_hint" => ("Describe the script you want", "描述你想要的脚本"),
         "ai_runtime.local.kind_shell" => ("Shell", "Shell"),
         "ai_runtime.local.kind_python" => ("Python", "Python"),
+        "ai_runtime.local.suggestion_title" => ("AI suggestion", "AI 建议"),
+        "ai_runtime.local.suggestion_apply" => ("Apply", "应用"),
+        "ai_runtime.local.suggestion_saved" => ("Auto-saved", "已自动保存"),
+        "ai_runtime.local.suggestion_exists" => ("Already in templates", "模板中已存在"),
+        "ai_runtime.local.suggestion_save_failed" => {
+            ("Auto-save failed: {error}", "自动保存失败：{error}")
+        }
+        "ai_runtime.local.suggestion_config_unavailable" => {
+            ("Settings storage is unavailable", "设置存储不可用")
+        }
 
         // ── ai_runtime.local.* — mirror URL + model selector + custom models ─
         "ai_runtime.local.mirror_url" => ("Download mirror", "下载镜像"),

@@ -92,49 +92,307 @@ fn settings_search_items(
     custom_models: &[rusterm_core::config::ModelConfig],
 ) -> Vec<SettingsSearchItem> {
     let definitions = [
-        ("settings-language", "settings.language", "settings.language", Some("settings.language_help"), "english chinese 中文 英文 locale i18n"),
-        ("settings-appearance", "settings.appearance", "settings.appearance", Some("settings.appearance_help"), "focused tab pane outline 聚焦 标签 窗格 轮廓"),
-        ("settings-outline-color", "settings.appearance", "settings.outline_color", None, "border colour 边框 颜色"),
-        ("settings-outline-width", "settings.appearance", "settings.outline_width", None, "border thickness px 边框 粗细"),
-        ("settings-corner-radius", "settings.appearance", "settings.corner_radius", None, "rounded corners radius 圆角"),
-        ("settings-appearance-preview", "settings.appearance", "settings.preview", None, "focused session preview 预览 聚焦会话"),
-        ("settings-skin", "settings.skin", "settings.skin", Some("settings.skin_help"), "theme palette chrome 主题 配色 调色板"),
-        ("settings-skin-tokyo-night", "settings.skin", "settings.skin_tokyo_night", None, "theme 主题"),
-        ("settings-skin-one-dark", "settings.skin", "settings.skin_one_dark", None, "theme 主题"),
-        ("settings-skin-solarized-dark", "settings.skin", "settings.skin_solarized_dark", None, "theme 主题"),
-        ("settings-skin-custom", "settings.skin", "settings.skin_custom", None, "theme palette 自定义 主题 配色"),
-        ("settings-color-background", "settings.skin", "settings.color_background", None, "custom palette color 自定义 调色板 颜色"),
-        ("settings-color-surface", "settings.skin", "settings.color_surface", None, "custom palette color 自定义 调色板 颜色"),
-        ("settings-color-surface_hover", "settings.skin", "settings.color_surface_hover", None, "custom palette hover color 自定义 调色板 悬停 颜色"),
-        ("settings-color-border", "settings.skin", "settings.color_border", None, "custom palette color 自定义 调色板 边框 颜色"),
-        ("settings-color-border_strong", "settings.skin", "settings.color_border_strong", None, "custom palette color 自定义 调色板 强调边框 颜色"),
-        ("settings-color-text", "settings.skin", "settings.color_text", None, "custom palette foreground 自定义 调色板 前景 文本"),
-        ("settings-color-text_muted", "settings.skin", "settings.color_text_muted", None, "custom palette secondary text 自定义 调色板 弱化文本"),
-        ("settings-color-accent", "settings.skin", "settings.color_accent", None, "custom palette highlight 自定义 调色板 强调色"),
-        ("settings-color-accent_secondary", "settings.skin", "settings.color_accent_secondary", None, "custom palette highlight 自定义 调色板 次强调色"),
-        ("settings-color-success", "settings.skin", "settings.color_success", None, "custom palette status green 自定义 调色板 成功"),
-        ("settings-color-warning", "settings.skin", "settings.color_warning", None, "custom palette status yellow 自定义 调色板 警告"),
-        ("settings-color-danger", "settings.skin", "settings.color_danger", None, "custom palette status red 自定义 调色板 危险"),
-        ("settings-suggestions", "settings.suggestions", "settings.suggestions", Some("settings.suggestions_help"), "command history inline fish autocomplete 命令历史 行内 自动补全"),
-        ("settings-enable-suggestions", "settings.suggestions", "settings.enable_suggestions", Some("settings.suggestions_help"), "toggle command history autocomplete 开关 命令历史 自动补全"),
-        ("settings-suggestion-count", "settings.suggestions", "settings.suggestion_count", None, "3 5 10 compact balanced extensive 数量 紧凑 均衡"),
-        ("settings-comparison", "settings.comparison", "settings.comparison", Some("settings.comparison_help"), "compare diff synchronized input 比对 差异 同步输入"),
-        ("settings-comparison-warning", "settings.comparison", "settings.comparison_diff_warning", Some("settings.comparison_help"), "large diff highlight warning 大量 差异 高亮 警告"),
-        ("settings-usage-habits", "settings.usage_habits", "settings.usage_habits", Some("settings.usage_habits_help"), "privacy telemetry analytics duckdb 隐私 遥测 习惯 本地"),
-        ("settings-collect-usage", "settings.usage_habits", "settings.collect_usage_habits", Some("settings.usage_habits_help"), "opt in telemetry analytics 收集 开关 选择加入"),
-        ("settings-collected-data", "settings.usage_habits", "settings.what_is_collected", None, "command category activity corrections host count 收集内容 命令类别 活动 更正 主机数"),
-        ("settings-never-collected", "settings.usage_habits", "settings.never_collected", None, "password key token credential secret privacy 密码 私钥 令牌 凭据 机密"),
-        ("settings-export-report", "settings.usage_habits", "settings.export_report", Some("settings.export_report_help"), "json download sanitized privacy 导出 下载 清理 隐私报告"),
-        ("settings-local-ai", "ai_runtime.local.enable", "ai_runtime.local.enable", Some("ai_runtime.local.enable_hint"), "qwen llm offline template script 本地 模型 离线 模板 脚本"),
-        ("settings-local-ai-mirror", "ai_runtime.local.enable", "ai_runtime.local.mirror_url", Some("ai_runtime.local.mirror_url_hint"), "hf huggingface endpoint download mirror 下载 镜像 地址"),
-        ("settings-local-ai-model", "ai_runtime.local.enable", "ai_runtime.local.model_select", None, "qwen llm active model 当前 模型 选择"),
-        ("settings-local-ai-custom", "ai_runtime.local.enable", "ai_runtime.local.custom_form_show", None, "add custom model repo prompt eos 添加 自定义 模型 仓库 提示词 结束符"),
-        ("settings-local-ai-custom", "ai_runtime.local.enable", "ai_runtime.local.custom_name", None, "display name custom model 显示名称 自定义模型"),
-        ("settings-local-ai-custom", "ai_runtime.local.enable", "ai_runtime.local.custom_repo", None, "repository huggingface custom model 仓库 自定义模型"),
-        ("settings-local-ai-custom", "ai_runtime.local.enable", "ai_runtime.local.custom_template", None, "prompt chat template custom model 提示词 模板 自定义模型"),
-        ("settings-local-ai-custom", "ai_runtime.local.enable", "ai_runtime.local.custom_eos", None, "end token custom model 结束符 自定义模型"),
-        ("settings-keybindings", "settings.keybindings", "settings.keybindings", Some("settings.keybindings_help"), "keyboard hotkey shortcut 键盘 热键 快捷键"),
-        ("settings-reset-default", "settings.title", "settings.reset_default", None, "restore factory defaults reset 恢复 默认 重置"),
+        (
+            "settings-language",
+            "settings.language",
+            "settings.language",
+            Some("settings.language_help"),
+            "english chinese 中文 英文 locale i18n",
+        ),
+        (
+            "settings-appearance",
+            "settings.appearance",
+            "settings.appearance",
+            Some("settings.appearance_help"),
+            "focused tab pane outline 聚焦 标签 窗格 轮廓",
+        ),
+        (
+            "settings-outline-color",
+            "settings.appearance",
+            "settings.outline_color",
+            None,
+            "border colour 边框 颜色",
+        ),
+        (
+            "settings-outline-width",
+            "settings.appearance",
+            "settings.outline_width",
+            None,
+            "border thickness px 边框 粗细",
+        ),
+        (
+            "settings-corner-radius",
+            "settings.appearance",
+            "settings.corner_radius",
+            None,
+            "rounded corners radius 圆角",
+        ),
+        (
+            "settings-appearance-preview",
+            "settings.appearance",
+            "settings.preview",
+            None,
+            "focused session preview 预览 聚焦会话",
+        ),
+        (
+            "settings-skin",
+            "settings.skin",
+            "settings.skin",
+            Some("settings.skin_help"),
+            "theme palette chrome 主题 配色 调色板",
+        ),
+        (
+            "settings-skin-tokyo-night",
+            "settings.skin",
+            "settings.skin_tokyo_night",
+            None,
+            "theme 主题",
+        ),
+        (
+            "settings-skin-one-dark",
+            "settings.skin",
+            "settings.skin_one_dark",
+            None,
+            "theme 主题",
+        ),
+        (
+            "settings-skin-solarized-dark",
+            "settings.skin",
+            "settings.skin_solarized_dark",
+            None,
+            "theme 主题",
+        ),
+        (
+            "settings-skin-custom",
+            "settings.skin",
+            "settings.skin_custom",
+            None,
+            "theme palette 自定义 主题 配色",
+        ),
+        (
+            "settings-color-background",
+            "settings.skin",
+            "settings.color_background",
+            None,
+            "custom palette color 自定义 调色板 颜色",
+        ),
+        (
+            "settings-color-surface",
+            "settings.skin",
+            "settings.color_surface",
+            None,
+            "custom palette color 自定义 调色板 颜色",
+        ),
+        (
+            "settings-color-surface_hover",
+            "settings.skin",
+            "settings.color_surface_hover",
+            None,
+            "custom palette hover color 自定义 调色板 悬停 颜色",
+        ),
+        (
+            "settings-color-border",
+            "settings.skin",
+            "settings.color_border",
+            None,
+            "custom palette color 自定义 调色板 边框 颜色",
+        ),
+        (
+            "settings-color-border_strong",
+            "settings.skin",
+            "settings.color_border_strong",
+            None,
+            "custom palette color 自定义 调色板 强调边框 颜色",
+        ),
+        (
+            "settings-color-text",
+            "settings.skin",
+            "settings.color_text",
+            None,
+            "custom palette foreground 自定义 调色板 前景 文本",
+        ),
+        (
+            "settings-color-text_muted",
+            "settings.skin",
+            "settings.color_text_muted",
+            None,
+            "custom palette secondary text 自定义 调色板 弱化文本",
+        ),
+        (
+            "settings-color-accent",
+            "settings.skin",
+            "settings.color_accent",
+            None,
+            "custom palette highlight 自定义 调色板 强调色",
+        ),
+        (
+            "settings-color-accent_secondary",
+            "settings.skin",
+            "settings.color_accent_secondary",
+            None,
+            "custom palette highlight 自定义 调色板 次强调色",
+        ),
+        (
+            "settings-color-success",
+            "settings.skin",
+            "settings.color_success",
+            None,
+            "custom palette status green 自定义 调色板 成功",
+        ),
+        (
+            "settings-color-warning",
+            "settings.skin",
+            "settings.color_warning",
+            None,
+            "custom palette status yellow 自定义 调色板 警告",
+        ),
+        (
+            "settings-color-danger",
+            "settings.skin",
+            "settings.color_danger",
+            None,
+            "custom palette status red 自定义 调色板 危险",
+        ),
+        (
+            "settings-suggestions",
+            "settings.suggestions",
+            "settings.suggestions",
+            Some("settings.suggestions_help"),
+            "command history inline fish autocomplete 命令历史 行内 自动补全",
+        ),
+        (
+            "settings-enable-suggestions",
+            "settings.suggestions",
+            "settings.enable_suggestions",
+            Some("settings.suggestions_help"),
+            "toggle command history autocomplete 开关 命令历史 自动补全",
+        ),
+        (
+            "settings-suggestion-count",
+            "settings.suggestions",
+            "settings.suggestion_count",
+            None,
+            "3 5 10 compact balanced extensive 数量 紧凑 均衡",
+        ),
+        (
+            "settings-comparison",
+            "settings.comparison",
+            "settings.comparison",
+            Some("settings.comparison_help"),
+            "compare diff synchronized input 比对 差异 同步输入",
+        ),
+        (
+            "settings-comparison-warning",
+            "settings.comparison",
+            "settings.comparison_diff_warning",
+            Some("settings.comparison_help"),
+            "large diff highlight warning 大量 差异 高亮 警告",
+        ),
+        (
+            "settings-usage-habits",
+            "settings.usage_habits",
+            "settings.usage_habits",
+            Some("settings.usage_habits_help"),
+            "privacy telemetry analytics duckdb 隐私 遥测 习惯 本地",
+        ),
+        (
+            "settings-collect-usage",
+            "settings.usage_habits",
+            "settings.collect_usage_habits",
+            Some("settings.usage_habits_help"),
+            "opt in telemetry analytics 收集 开关 选择加入",
+        ),
+        (
+            "settings-collected-data",
+            "settings.usage_habits",
+            "settings.what_is_collected",
+            None,
+            "command category activity corrections host count 收集内容 命令类别 活动 更正 主机数",
+        ),
+        (
+            "settings-never-collected",
+            "settings.usage_habits",
+            "settings.never_collected",
+            None,
+            "password key token credential secret privacy 密码 私钥 令牌 凭据 机密",
+        ),
+        (
+            "settings-export-report",
+            "settings.usage_habits",
+            "settings.export_report",
+            Some("settings.export_report_help"),
+            "json download sanitized privacy 导出 下载 清理 隐私报告",
+        ),
+        (
+            "settings-local-ai",
+            "ai_runtime.local.enable",
+            "ai_runtime.local.enable",
+            Some("ai_runtime.local.enable_hint"),
+            "qwen llm offline template script 本地 模型 离线 模板 脚本",
+        ),
+        (
+            "settings-local-ai-mirror",
+            "ai_runtime.local.enable",
+            "ai_runtime.local.mirror_url",
+            Some("ai_runtime.local.mirror_url_hint"),
+            "hf huggingface endpoint download mirror 下载 镜像 地址",
+        ),
+        (
+            "settings-local-ai-model",
+            "ai_runtime.local.enable",
+            "ai_runtime.local.model_select",
+            None,
+            "qwen llm active model 当前 模型 选择",
+        ),
+        (
+            "settings-local-ai-custom",
+            "ai_runtime.local.enable",
+            "ai_runtime.local.custom_form_show",
+            None,
+            "add custom model repo prompt eos 添加 自定义 模型 仓库 提示词 结束符",
+        ),
+        (
+            "settings-local-ai-custom",
+            "ai_runtime.local.enable",
+            "ai_runtime.local.custom_name",
+            None,
+            "display name custom model 显示名称 自定义模型",
+        ),
+        (
+            "settings-local-ai-custom",
+            "ai_runtime.local.enable",
+            "ai_runtime.local.custom_repo",
+            None,
+            "repository huggingface custom model 仓库 自定义模型",
+        ),
+        (
+            "settings-local-ai-custom",
+            "ai_runtime.local.enable",
+            "ai_runtime.local.custom_template",
+            None,
+            "prompt chat template custom model 提示词 模板 自定义模型",
+        ),
+        (
+            "settings-local-ai-custom",
+            "ai_runtime.local.enable",
+            "ai_runtime.local.custom_eos",
+            None,
+            "end token custom model 结束符 自定义模型",
+        ),
+        (
+            "settings-keybindings",
+            "settings.keybindings",
+            "settings.keybindings",
+            Some("settings.keybindings_help"),
+            "keyboard hotkey shortcut 键盘 热键 快捷键",
+        ),
+        (
+            "settings-reset-default",
+            "settings.title",
+            "settings.reset_default",
+            None,
+            "restore factory defaults reset 恢复 默认 重置",
+        ),
     ];
     let mut items = definitions
         .into_iter()
@@ -239,6 +497,7 @@ fn SkinColorField(
 ) -> Element {
     rsx! {
         div {
+            id: "settings-color-{field}",
             "data-rusterm-skin-color": "{field}",
             style: "display:flex;align-items:center;justify-content:space-between;gap:12px;",
             label { style: "font-size:12px;color:var(--settings-text);", "{label}" }
@@ -335,6 +594,7 @@ pub fn SettingsDialog(
     let skin_preview = skin_draft().palette();
     let mut capturing_keybinding: Signal<Option<KeybindingAction>> = use_signal(|| None);
     let mut keybinding_error: Signal<Option<KeybindingValidationError>> = use_signal(|| None);
+    let mut search_query = use_signal(String::new);
     // Subscribe explicitly so every translated label updates with the global language.
     let _active_language = crate::i18n::LANGUAGE();
     // Current language code for the <select value=...> binding.
@@ -342,6 +602,7 @@ pub fn SettingsDialog(
         Language::Zh => "zh",
         Language::En => "en",
     };
+    let search_matches = settings_search_matches(&search_query(), &qwen_local().custom_models);
 
     rsx! {
         div {
@@ -356,10 +617,56 @@ pub fn SettingsDialog(
                 style: "background:var(--settings-surface);border:1px solid var(--settings-border-strong);border-radius:10px;padding:24px;width:min(520px,100%);max-height:calc(100vh - 48px);box-sizing:border-box;overflow-y:auto;color:var(--settings-text);color-scheme:dark;accent-color:var(--settings-accent);opacity:1;box-shadow:0 20px 64px rgba(0,0,0,0.72);",
 
                 h3 { style: "margin: 0 0 6px; font-size: 16px;", { crate::i18n::t("settings.title") } }
+                div {
+                    style: "position:sticky;top:-24px;z-index:3;background:var(--settings-surface);padding:8px 0 10px;margin-bottom:8px;border-bottom:1px solid var(--settings-border);",
+                    input {
+                        r#type: "search",
+                        value: "{search_query}",
+                        placeholder: crate::i18n::t("settings.search_placeholder"),
+                        "aria-label": crate::i18n::t("settings.search_placeholder"),
+                        style: "width:100%;box-sizing:border-box;padding:8px 10px;background:var(--settings-bg);color:var(--settings-text);border:1px solid var(--settings-border-strong);border-radius:5px;font-size:12px;",
+                        oninput: move |event| search_query.set(event.value()),
+                    }
+                    if !search_query().trim().is_empty() {
+                        div {
+                            style: "max-height:180px;overflow-y:auto;display:flex;flex-direction:column;gap:4px;margin-top:7px;",
+                            if search_matches.is_empty() {
+                                div {
+                                    style: "font-size:11px;color:var(--settings-text-muted);padding:6px 8px;",
+                                    { crate::i18n::t("settings.search_no_results") }
+                                }
+                            } else {
+                                for item in search_matches.clone() {
+                                    {
+                                        let target = item.target;
+                                        rsx! {
+                                            button {
+                                                key: "settings-search-{target}-{item.title}",
+                                                style: "display:flex;align-items:center;justify-content:space-between;gap:10px;width:100%;padding:6px 8px;text-align:left;background:var(--settings-bg);color:var(--settings-text);border:1px solid var(--settings-border);border-radius:4px;cursor:pointer;font-size:11px;",
+                                                onclick: move |_| {
+                                                    spawn(async move {
+                                                        let script = format!(
+                                                            "const el=document.getElementById('{}');if(el){{el.scrollIntoView({{behavior:'smooth',block:'center'}});el.animate([{{outline:'2px solid var(--settings-accent)'}},{{outline:'2px solid transparent'}}],{{duration:1200}});}}",
+                                                            target
+                                                        );
+                                                        let _ = dioxus::document::eval(&script).await;
+                                                    });
+                                                },
+                                                span { "{item.title}" }
+                                                span { style: "color:var(--settings-text-muted);font-size:10px;", "{item.section}" }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Language selector — top of the dialog since it affects how
                 // every other label reads. Applied immediately on change.
                 div {
+                    id: "settings-language",
                     style: "display:flex;align-items:center;justify-content:space-between;gap:16px;margin:0 0 20px;padding-bottom:16px;border-bottom:1px solid var(--settings-border);",
                     div {
                         label {
@@ -383,7 +690,7 @@ pub fn SettingsDialog(
                     }
                 }
 
-                h3 { style: "margin: 0 0 6px; font-size: 16px;", { crate::i18n::t("settings.appearance") } }
+                h3 { id: "settings-appearance", style: "margin: 0 0 6px; font-size: 16px;", { crate::i18n::t("settings.appearance") } }
                 p {
                     style: "margin: 0 0 20px; color: var(--settings-text-muted); font-size: 12px; line-height: 1.5;",
                     { crate::i18n::t("settings.appearance_help") }
@@ -393,6 +700,7 @@ pub fn SettingsDialog(
                     style: "display: flex; flex-direction: column; gap: 16px;",
 
                     div {
+                        id: "settings-outline-color",
                         style: "display: flex; align-items: center; justify-content: space-between; gap: 16px;",
                         label { style: "font-size: 12px; color: var(--settings-text);", { crate::i18n::t("settings.outline_color") } }
                         div {
@@ -411,6 +719,7 @@ pub fn SettingsDialog(
                     }
 
                     div {
+                        id: "settings-outline-width",
                         style: "display: flex; align-items: center; justify-content: space-between; gap: 16px;",
                         label { style: "font-size: 12px; color: var(--settings-text);", { crate::i18n::t("settings.outline_width") } }
                         div {
@@ -432,6 +741,7 @@ pub fn SettingsDialog(
                     }
 
                     div {
+                        id: "settings-corner-radius",
                         style: "display: flex; align-items: center; justify-content: space-between; gap: 16px;",
                         label { style: "font-size: 12px; color: var(--settings-text);", { crate::i18n::t("settings.corner_radius") } }
                         div {
@@ -453,6 +763,7 @@ pub fn SettingsDialog(
                     }
 
                     div {
+                        id: "settings-appearance-preview",
                         style: "background: var(--settings-bg); border: 1px solid var(--settings-border); border-radius: 6px; padding: 14px;",
                         div { style: "margin-bottom: 10px; color: var(--settings-text-muted); font-size: 11px;", { crate::i18n::t("settings.preview") } }
                         div {
@@ -467,7 +778,7 @@ pub fn SettingsDialog(
                 }
 
                 // ── Application skin ────────────────────────────────────────
-                h3 { style: "margin:24px 0 6px;font-size:16px;", { crate::i18n::t("settings.skin") } }
+                h3 { id: "settings-skin", style: "margin:24px 0 6px;font-size:16px;", { crate::i18n::t("settings.skin") } }
                 p {
                     style: "margin:0 0 12px;color:var(--settings-text-muted);font-size:12px;line-height:1.5;",
                     { crate::i18n::t("settings.skin_help") }
@@ -485,6 +796,12 @@ pub fn SettingsDialog(
                             rsx! {
                                 button {
                                     key: "skin-{key}",
+                                    id: match kind {
+                                        SkinKind::TokyoNight => "settings-skin-tokyo-night",
+                                        SkinKind::OneDark => "settings-skin-one-dark",
+                                        SkinKind::SolarizedDark => "settings-skin-solarized-dark",
+                                        SkinKind::Custom => "settings-skin-custom",
+                                    },
                                     style: "background:{background};color:{color};border:1px solid {border};border-radius:4px;padding:5px 9px;cursor:pointer;font-size:11px;",
                                     onclick: move |_| skin_draft.write().kind = kind,
                                     "{label}"
@@ -527,6 +844,7 @@ pub fn SettingsDialog(
 
                 // ── Suggestion preferences ──────────────────────────────────
                 h3 {
+                    id: "settings-suggestions",
                     style: "margin: 24px 0 6px; font-size: 16px;",
                     { crate::i18n::t("settings.suggestions") }
                 }
@@ -540,6 +858,7 @@ pub fn SettingsDialog(
 
                     // Enable / disable toggle
                     div {
+                        id: "settings-enable-suggestions",
                         style: "display: flex; align-items: center; justify-content: space-between; gap: 16px;",
                         label { style: "font-size: 12px; color: var(--settings-text);", { crate::i18n::t("settings.enable_suggestions") } }
                         div {
@@ -559,6 +878,7 @@ pub fn SettingsDialog(
 
                     // Suggestion count selector (3 / 5 / 10)
                     div {
+                        id: "settings-suggestion-count",
                         style: "display: flex; align-items: center; justify-content: space-between; gap: 16px;",
                         label { style: "font-size: 12px; color: var(--settings-text);", { crate::i18n::t("settings.suggestion_count") } }
                         div {
@@ -601,6 +921,7 @@ pub fn SettingsDialog(
 
                 // ── Comparison preferences ──────────────────────────────────
                 h3 {
+                    id: "settings-comparison",
                     style: "margin: 24px 0 6px; font-size: 16px;",
                     { crate::i18n::t("settings.comparison") }
                 }
@@ -609,6 +930,7 @@ pub fn SettingsDialog(
                     { crate::i18n::t("settings.comparison_help") }
                 }
                 div {
+                    id: "settings-comparison-warning",
                     style: "display: flex; align-items: center; justify-content: space-between; gap: 16px;",
                     label { style: "font-size: 12px; color: var(--settings-text);", { crate::i18n::t("settings.comparison_diff_warning") } }
                     div {
@@ -628,6 +950,7 @@ pub fn SettingsDialog(
 
                 // ── Usage habits (privacy) ────────────────────────────────
                 h3 {
+                    id: "settings-usage-habits",
                     style: "margin: 24px 0 6px; font-size: 16px;",
                     { crate::i18n::t("settings.usage_habits") }
                 }
@@ -636,6 +959,7 @@ pub fn SettingsDialog(
                     { crate::i18n::t("settings.usage_habits_help") }
                 }
                 div {
+                    id: "settings-collect-usage",
                     style: "display: flex; align-items: center; justify-content: space-between; gap: 16px;",
                     label {
                         style: "font-size: 12px; color: var(--settings-text);",
@@ -656,13 +980,14 @@ pub fn SettingsDialog(
                     }
                 }
                 div {
+                    id: "settings-collected-data",
                     style: "background: var(--settings-bg); border: 1px solid var(--settings-border); border-radius: 6px; padding: 12px; margin-top: 8px; font-size: 11px; color: var(--settings-text-muted); line-height: 1.6;",
                     div { style: "color: var(--settings-text); font-weight: 600; margin-bottom: 6px;", { crate::i18n::t("settings.what_is_collected") } }
                     div { { crate::i18n::t("settings.collected_command_category") } }
                     div { { crate::i18n::t("settings.collected_activity_counts") } }
                     div { { crate::i18n::t("settings.collected_corrections") } }
                     div { { crate::i18n::t("settings.collected_host_count") } }
-                    div { style: "color: var(--settings-text); font-weight: 600; margin: 10px 0 6px;", { crate::i18n::t("settings.never_collected") } }
+                    div { id: "settings-never-collected", style: "color: var(--settings-text); font-weight: 600; margin: 10px 0 6px;", { crate::i18n::t("settings.never_collected") } }
                     div { { crate::i18n::t("settings.never_collected_credentials") } }
                     div { { crate::i18n::t("settings.never_collected_onekey") } }
                     div { { crate::i18n::t("settings.never_collected_session_data") } }
@@ -672,6 +997,7 @@ pub fn SettingsDialog(
                 div {
                     style: "display: flex; gap: 8px; margin-top: 10px;",
                     button {
+                        id: "settings-export-report",
                         style: "background: var(--settings-bg); border: 1px solid var(--settings-border-strong); color: var(--settings-text); border-radius: 4px; padding: 6px 12px; cursor: pointer; font-size: 11px;",
                         disabled: "{!usage_habits()}",
                         onclick: move |_| on_export_usage_habits.call(()),
@@ -686,6 +1012,7 @@ pub fn SettingsDialog(
 
                 // ── Local AI template generation ───────────────────────
                 h3 {
+                    id: "settings-local-ai",
                     style: "margin: 24px 0 6px; font-size: 16px;",
                     { crate::i18n::t("ai_runtime.local.enable") }
                 }
@@ -726,6 +1053,7 @@ pub fn SettingsDialog(
 
                 // ── Mirror URL ───────────────────────────────────────────
                 div {
+                    id: "settings-local-ai-mirror",
                     style: "margin-top: 12px;",
                     label {
                         style: "font-size: 12px; color: var(--settings-text); display: block; margin-bottom: 4px;",
@@ -749,6 +1077,7 @@ pub fn SettingsDialog(
 
                 // ── Model selector ───────────────────────────────────────
                 div {
+                    id: "settings-local-ai-model",
                     style: "margin-top: 12px;",
                     label {
                         style: "font-size: 12px; color: var(--settings-text); display: block; margin-bottom: 4px;",
@@ -781,6 +1110,7 @@ pub fn SettingsDialog(
 
                 // ── Custom model form (collapsible) ──────────────────────
                 div {
+                    id: "settings-local-ai-custom",
                     style: "margin-top: 8px;",
                     button {
                         style: "background: transparent; border: 1px dashed var(--settings-border); color: var(--settings-text-muted); border-radius: 4px; padding: 6px 12px; cursor: pointer; font-size: 11px; width: 100%; box-sizing: border-box;",
@@ -955,6 +1285,7 @@ pub fn SettingsDialog(
                 }
 
                 h3 {
+                    id: "settings-keybindings",
                     style: "margin: 24px 0 6px; font-size: 16px;",
                     { crate::i18n::t("settings.keybindings") }
                 }
@@ -981,6 +1312,7 @@ pub fn SettingsDialog(
                             rsx! {
                                 div {
                                     key: "keybinding-{action_key}",
+                                    id: keybinding_target(action),
                                     style: "display: flex; align-items: center; justify-content: space-between; gap: 12px;",
                                     span { style: "font-size: 12px; color: var(--settings-text);", "{action_label}" }
                                     div { style: "display: flex; align-items: center; gap: 6px;",
@@ -1052,6 +1384,7 @@ pub fn SettingsDialog(
                 div {
                     style: "display: flex; justify-content: space-between; gap: 8px; margin-top: 20px;",
                     button {
+                        id: "settings-reset-default",
                         style: "background: transparent; border: 1px solid var(--settings-border-strong); color: var(--settings-text); border-radius: 4px; padding: 8px 12px; cursor: pointer; font-size: 12px;",
                         onclick: move |_| {
                             draft.set(FocusedTabAppearance::default());
@@ -1097,5 +1430,73 @@ pub fn SettingsDialog(
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fuzzy_score_prefers_exact_and_substring_matches() {
+        assert!(
+            fuzzy_score("skin", "skin").unwrap() > fuzzy_score("skin", "application skin").unwrap()
+        );
+        assert!(fuzzy_score("MIRROR", "download mirror url").is_some());
+    }
+
+    #[test]
+    fn fuzzy_score_supports_subsequence_and_chinese_queries() {
+        assert!(fuzzy_score("otln clr", "outline color border colour").is_some());
+        assert!(fuzzy_score("下载镜像", "HuggingFace 模型下载镜像地址").is_some());
+    }
+
+    #[test]
+    fn fuzzy_score_rejects_unrelated_queries() {
+        assert_eq!(fuzzy_score("zzqx", "outline color"), None);
+        assert_eq!(fuzzy_score("", "outline color"), None);
+    }
+
+    #[test]
+    fn settings_search_indexes_both_languages_and_every_keybinding_action() {
+        let mirror = settings_search_matches("download mirror", &[]);
+        assert!(
+            mirror
+                .iter()
+                .any(|item| item.target == "settings-local-ai-mirror")
+        );
+
+        let chinese = settings_search_matches("命令建议", &[]);
+        assert!(
+            chinese
+                .iter()
+                .any(|item| item.target == "settings-suggestions")
+        );
+
+        for action in KeybindingAction::ALL {
+            let key = keybinding_action_key(action);
+            let query = crate::i18n::t_for(key, Language::En);
+            let matches = settings_search_matches(&query, &[]);
+            assert!(
+                matches
+                    .iter()
+                    .any(|item| item.target == keybinding_target(action))
+            );
+        }
+    }
+
+    #[test]
+    fn settings_search_includes_custom_model_names_and_repositories() {
+        let model = rusterm_core::config::ModelConfig {
+            id: "ops-coder".to_string(),
+            name: "Ops Coder".to_string(),
+            repo_id: "Example/Ops-Coder".to_string(),
+            architecture: "qwen2".to_string(),
+            prompt_template: "{prompt}".to_string(),
+            eos_token: "</s>".to_string(),
+        };
+
+        let matches = settings_search_matches("Example/Ops-Coder", &[model]);
+        assert!(matches.iter().any(|item| item.title == "Ops Coder"));
     }
 }
