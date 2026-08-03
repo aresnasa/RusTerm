@@ -95,3 +95,53 @@
 83. 这里可以复用已有的会话链接，模拟交互式的提交即可，改造 API 的逻辑
 84. [@Image](zed:///agent/pasted-image?name=Image) 继续优化会话，会出现这种输入了命令无响应的情况，增加鲁棒性，调整相关会话代码，对于 jumpserver 这种必须使用 tty 交互的会话需要增加额外的鲁棒性代码来保证稳定性。
 85. 继续完善 API，可以创建一个影子子窗口（复用 ssh 登录的会话），减少 curl 命令的复杂度,这里可以创建一个 alias 到本地终端，减少类似的交互，比如创建一个单独的函数能让终端和其他智能体直接通过 curl 的方式来和真正的堡垒机终端交互，这样更加优雅
+86. 改造自动输出export RUSTERM_API_URL='http://127.0.0.1:8877'
+export RUSTERM_API_USER='aresnasa'
+if [ -z "${RUSTERM_API_PASSWORD+x}" ]; then
+printf 'RusTerm API 密码：' >&2
+RUSTERM_STTY=$(stty -g)
+trap 'stty "$RUSTERM_STTY"' 0 1 2 15
+stty -echo
+IFS= read -r RUSTERM_API_PASSWORD
+stty "$RUSTERM_STTY"
+trap - 0 1 2 15
+printf '\n' >&2
+export RUSTERM_API_PASSWORD
+fi
+
+rusterm_pretty_json() {
+if command -v jq >/dev/null 2>&1; then
+jq .
+elif command -v python3 >/dev/null 2>&1; then
+python3 -m json.tool
+else
+cat
+fi
+}
+
+rusterm_exec() {
+RUSTERM_TARGET=$1
+RUSTERM_BODY=$2
+printf '\n==> %s\n' "$RUSTERM_TARGET"
+RUSTERM_RESPONSE=$(curl --silent --show-error --fail-with-body \
+    --connect-timeout 10 --max-time 120 \
+    --request POST "${RUSTERM_API_URL}/api/v1/exec" \
+    --user "${RUSTERM_API_USER}:${RUSTERM_API_PASSWORD}" \
+    --header 'Accept: application/json' \
+    --header 'Content-Type: application/json' \
+    --data "$RUSTERM_BODY")
+RUSTERM_STATUS=$?
+printf '%s\n' "$RUSTERM_RESPONSE" | rusterm_pretty_json
+return "$RUSTERM_STATUS"
+}
+
+RUSTERM_FAILED=0
+# 在下方修改远程命令
+# 请替换 JSON 中的 "command" 值
+rusterm_exec '100eac5a-2ef7-427f-84e1-9e03e2b61820' '{"command":"uname -a","elevated":true,"host_id":"100eac5a-2ef7-427f-84e1-9e03e2b61820"}' || RUSTERM_FAILED=$?
+
+if [ "$RUSTERM_FAILED" -ne 0 ]; then
+printf '\n一个或多个 RusTerm API 请求失败（最后状态：%s）。\n' "$RUSTERM_FAILED" >&2
+fi
+的脚本模板，可以做成 alias，然后只保留用户需要输入的命令，可以改造为 rusterm "user cli"，不需要强制输入""这里可以直接生成一个 alias 的函数给到用户，后续可以直接复用。改造一下 API 的脚本模板。
+87.
