@@ -41,6 +41,195 @@ fn keybinding_error_text(error: KeybindingValidationError) -> String {
     }
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SettingsSearchItem {
+    target: &'static str,
+    title: String,
+    section: String,
+    search_text: String,
+}
+
+const fn keybinding_target(action: KeybindingAction) -> &'static str {
+    match action {
+        KeybindingAction::CloseFocusedPane => "settings-keybinding-close-focused-pane",
+        KeybindingAction::AppendPane => "settings-keybinding-append-pane",
+        KeybindingAction::ToggleComparison => "settings-keybinding-toggle-comparison",
+        KeybindingAction::TogglePaneZoom => "settings-keybinding-toggle-pane-zoom",
+    }
+}
+
+fn translated_search_item(
+    target: &'static str,
+    section_key: &'static str,
+    title_key: &'static str,
+    description_key: Option<&'static str>,
+    keywords: &'static str,
+) -> SettingsSearchItem {
+    let title = crate::i18n::t(title_key);
+    let section = crate::i18n::t(section_key);
+    let mut search_text = format!(
+        "{} {} {} {} {keywords}",
+        crate::i18n::t_for(title_key, Language::En),
+        crate::i18n::t_for(title_key, Language::Zh),
+        crate::i18n::t_for(section_key, Language::En),
+        crate::i18n::t_for(section_key, Language::Zh),
+    );
+    if let Some(key) = description_key {
+        search_text.push(' ');
+        search_text.push_str(&crate::i18n::t_for(key, Language::En));
+        search_text.push(' ');
+        search_text.push_str(&crate::i18n::t_for(key, Language::Zh));
+    }
+    SettingsSearchItem {
+        target,
+        title,
+        section,
+        search_text,
+    }
+}
+
+fn settings_search_items(
+    custom_models: &[rusterm_core::config::ModelConfig],
+) -> Vec<SettingsSearchItem> {
+    let definitions = [
+        ("settings-language", "settings.language", "settings.language", Some("settings.language_help"), "english chinese 中文 英文 locale i18n"),
+        ("settings-appearance", "settings.appearance", "settings.appearance", Some("settings.appearance_help"), "focused tab pane outline 聚焦 标签 窗格 轮廓"),
+        ("settings-outline-color", "settings.appearance", "settings.outline_color", None, "border colour 边框 颜色"),
+        ("settings-outline-width", "settings.appearance", "settings.outline_width", None, "border thickness px 边框 粗细"),
+        ("settings-corner-radius", "settings.appearance", "settings.corner_radius", None, "rounded corners radius 圆角"),
+        ("settings-appearance-preview", "settings.appearance", "settings.preview", None, "focused session preview 预览 聚焦会话"),
+        ("settings-skin", "settings.skin", "settings.skin", Some("settings.skin_help"), "theme palette chrome 主题 配色 调色板"),
+        ("settings-skin-tokyo-night", "settings.skin", "settings.skin_tokyo_night", None, "theme 主题"),
+        ("settings-skin-one-dark", "settings.skin", "settings.skin_one_dark", None, "theme 主题"),
+        ("settings-skin-solarized-dark", "settings.skin", "settings.skin_solarized_dark", None, "theme 主题"),
+        ("settings-skin-custom", "settings.skin", "settings.skin_custom", None, "theme palette 自定义 主题 配色"),
+        ("settings-color-background", "settings.skin", "settings.color_background", None, "custom palette color 自定义 调色板 颜色"),
+        ("settings-color-surface", "settings.skin", "settings.color_surface", None, "custom palette color 自定义 调色板 颜色"),
+        ("settings-color-surface_hover", "settings.skin", "settings.color_surface_hover", None, "custom palette hover color 自定义 调色板 悬停 颜色"),
+        ("settings-color-border", "settings.skin", "settings.color_border", None, "custom palette color 自定义 调色板 边框 颜色"),
+        ("settings-color-border_strong", "settings.skin", "settings.color_border_strong", None, "custom palette color 自定义 调色板 强调边框 颜色"),
+        ("settings-color-text", "settings.skin", "settings.color_text", None, "custom palette foreground 自定义 调色板 前景 文本"),
+        ("settings-color-text_muted", "settings.skin", "settings.color_text_muted", None, "custom palette secondary text 自定义 调色板 弱化文本"),
+        ("settings-color-accent", "settings.skin", "settings.color_accent", None, "custom palette highlight 自定义 调色板 强调色"),
+        ("settings-color-accent_secondary", "settings.skin", "settings.color_accent_secondary", None, "custom palette highlight 自定义 调色板 次强调色"),
+        ("settings-color-success", "settings.skin", "settings.color_success", None, "custom palette status green 自定义 调色板 成功"),
+        ("settings-color-warning", "settings.skin", "settings.color_warning", None, "custom palette status yellow 自定义 调色板 警告"),
+        ("settings-color-danger", "settings.skin", "settings.color_danger", None, "custom palette status red 自定义 调色板 危险"),
+        ("settings-suggestions", "settings.suggestions", "settings.suggestions", Some("settings.suggestions_help"), "command history inline fish autocomplete 命令历史 行内 自动补全"),
+        ("settings-enable-suggestions", "settings.suggestions", "settings.enable_suggestions", Some("settings.suggestions_help"), "toggle command history autocomplete 开关 命令历史 自动补全"),
+        ("settings-suggestion-count", "settings.suggestions", "settings.suggestion_count", None, "3 5 10 compact balanced extensive 数量 紧凑 均衡"),
+        ("settings-comparison", "settings.comparison", "settings.comparison", Some("settings.comparison_help"), "compare diff synchronized input 比对 差异 同步输入"),
+        ("settings-comparison-warning", "settings.comparison", "settings.comparison_diff_warning", Some("settings.comparison_help"), "large diff highlight warning 大量 差异 高亮 警告"),
+        ("settings-usage-habits", "settings.usage_habits", "settings.usage_habits", Some("settings.usage_habits_help"), "privacy telemetry analytics duckdb 隐私 遥测 习惯 本地"),
+        ("settings-collect-usage", "settings.usage_habits", "settings.collect_usage_habits", Some("settings.usage_habits_help"), "opt in telemetry analytics 收集 开关 选择加入"),
+        ("settings-collected-data", "settings.usage_habits", "settings.what_is_collected", None, "command category activity corrections host count 收集内容 命令类别 活动 更正 主机数"),
+        ("settings-never-collected", "settings.usage_habits", "settings.never_collected", None, "password key token credential secret privacy 密码 私钥 令牌 凭据 机密"),
+        ("settings-export-report", "settings.usage_habits", "settings.export_report", Some("settings.export_report_help"), "json download sanitized privacy 导出 下载 清理 隐私报告"),
+        ("settings-local-ai", "ai_runtime.local.enable", "ai_runtime.local.enable", Some("ai_runtime.local.enable_hint"), "qwen llm offline template script 本地 模型 离线 模板 脚本"),
+        ("settings-local-ai-mirror", "ai_runtime.local.enable", "ai_runtime.local.mirror_url", Some("ai_runtime.local.mirror_url_hint"), "hf huggingface endpoint download mirror 下载 镜像 地址"),
+        ("settings-local-ai-model", "ai_runtime.local.enable", "ai_runtime.local.model_select", None, "qwen llm active model 当前 模型 选择"),
+        ("settings-local-ai-custom", "ai_runtime.local.enable", "ai_runtime.local.custom_form_show", None, "add custom model repo prompt eos 添加 自定义 模型 仓库 提示词 结束符"),
+        ("settings-local-ai-custom", "ai_runtime.local.enable", "ai_runtime.local.custom_name", None, "display name custom model 显示名称 自定义模型"),
+        ("settings-local-ai-custom", "ai_runtime.local.enable", "ai_runtime.local.custom_repo", None, "repository huggingface custom model 仓库 自定义模型"),
+        ("settings-local-ai-custom", "ai_runtime.local.enable", "ai_runtime.local.custom_template", None, "prompt chat template custom model 提示词 模板 自定义模型"),
+        ("settings-local-ai-custom", "ai_runtime.local.enable", "ai_runtime.local.custom_eos", None, "end token custom model 结束符 自定义模型"),
+        ("settings-keybindings", "settings.keybindings", "settings.keybindings", Some("settings.keybindings_help"), "keyboard hotkey shortcut 键盘 热键 快捷键"),
+        ("settings-reset-default", "settings.title", "settings.reset_default", None, "restore factory defaults reset 恢复 默认 重置"),
+    ];
+    let mut items = definitions
+        .into_iter()
+        .map(|(target, section, title, description, keywords)| {
+            translated_search_item(target, section, title, description, keywords)
+        })
+        .collect::<Vec<_>>();
+
+    for action in KeybindingAction::ALL {
+        items.push(translated_search_item(
+            keybinding_target(action),
+            "settings.keybindings",
+            keybinding_action_key(action),
+            Some("settings.keybindings_help"),
+            "keyboard hotkey shortcut disable capture 键盘 热键 快捷键 禁用 录入",
+        ));
+    }
+
+    let local_ai_section = crate::i18n::t("ai_runtime.local.enable");
+    for model in custom_models {
+        items.push(SettingsSearchItem {
+            target: "settings-local-ai-model",
+            title: model.name.clone(),
+            section: local_ai_section.clone(),
+            search_text: format!(
+                "{} {} {} custom model qwen huggingface 自定义 模型",
+                model.name, model.repo_id, model.id
+            ),
+        });
+    }
+    items
+}
+
+fn subsequence_score(needle: &str, haystack: &str) -> Option<usize> {
+    let needle = needle.chars().collect::<Vec<_>>();
+    if needle.is_empty() {
+        return Some(0);
+    }
+    let mut matched = 0usize;
+    let mut first = None;
+    let mut last = 0usize;
+    for (index, ch) in haystack.chars().enumerate() {
+        if ch == needle[matched] {
+            first.get_or_insert(index);
+            last = index;
+            matched += 1;
+            if matched == needle.len() {
+                let span = last.saturating_sub(first.unwrap_or(0));
+                return Some(300usize.saturating_sub(span));
+            }
+        }
+    }
+    None
+}
+
+fn fuzzy_score(query: &str, candidate: &str) -> Option<usize> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return None;
+    }
+    let candidate = candidate.to_lowercase();
+    if candidate == query {
+        return Some(1_000);
+    }
+    if let Some(index) = candidate.find(&query) {
+        return Some(800usize.saturating_sub(index));
+    }
+
+    let mut total = 0usize;
+    for token in query.split_whitespace() {
+        if let Some(index) = candidate.find(token) {
+            total += 500usize.saturating_sub(index.min(400));
+        } else {
+            total += subsequence_score(token, &candidate)?;
+        }
+    }
+    Some(total)
+}
+
+fn settings_search_matches(
+    query: &str,
+    custom_models: &[rusterm_core::config::ModelConfig],
+) -> Vec<SettingsSearchItem> {
+    let mut matches = settings_search_items(custom_models)
+        .into_iter()
+        .filter_map(|item| fuzzy_score(query, &item.search_text).map(|score| (score, item)))
+        .collect::<Vec<_>>();
+    matches.sort_by(|(left_score, left), (right_score, right)| {
+        right_score
+            .cmp(left_score)
+            .then_with(|| left.title.cmp(&right.title))
+    });
+    matches.into_iter().map(|(_, item)| item).collect()
+}
+
 #[component]
 fn SkinColorField(
     field: &'static str,
