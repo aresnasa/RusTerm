@@ -162,6 +162,10 @@ fn router(state: AppState) -> Router {
         // Returns plain-text stdout. Designed for one-liner curl usage:
         //   curl -s -u user:pass http://localhost:8877/r/jumpserver -d 'uname -a'
         .route("/r/{host_id}", post(exec_shortform))
+        // Companion list endpoint: GET /r with no host_id returns a plain-text
+        // host list (one `id\tname` per line) for shell functions that need to
+        // discover hosts at runtime without pulling in jq/python.
+        .route("/r", get(list_hosts_shortform))
         .with_state(state)
 }
 
@@ -332,6 +336,35 @@ async fn list_hosts(
         .filter(|h| host_allowed(&account, h))
         .collect();
     Json(hosts).into_response()
+}
+
+/// Plain-text companion to [`list_hosts`]. Returns `id\tname` per line so a
+/// shell function can populate `RUSTERM_HOSTS` without jq/python. Auth and
+/// `allowed_hosts` filtering are identical to the JSON endpoint.
+async fn list_hosts_shortform(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> Response {
+    let account = match require_account(&state, &headers, addr.ip()) {
+        Ok(a) => a,
+        Err(r) => return r,
+    };
+    let hosts: Vec<HostInfo> = state
+        .executor
+        .list_hosts()
+        .await
+        .into_iter()
+        .filter(|h| host_allowed(&account, h))
+        .collect();
+    let mut body = String::new();
+    for host in &hosts {
+        body.push_str(&host.id);
+        body.push('\t');
+        body.push_str(&host.name);
+        body.push('\n');
+    }
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response()
 }
 
 #[derive(Debug, Deserialize)]
@@ -1277,6 +1310,102 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn list_hosts_shortform_returns_plain_text_with_auth_and_filter() {
+        let executor = Arc::new(RecordingExecutor::default());
+        let handle = run(test_config(), executor, Arc::new(NullHistoryStore))
+            .await
+            .unwrap();
+        let url = format!("{}/r", handle.url());
+
+        // No auth → 401, same as the JSON endpoint.
+        let (status, _, _) = raw_text_get(&url, None).await;
+        assert_eq!(status, 401);
+
+        // Wrong password → 401.
+        let (status, _, _) = raw_text_get(&url, Some(("ops", "wrong"))).await;
+        assert_eq!(status, 401);
+
+        // Authenticated → 200 with one `id\tname` line per host.
+        let (status, headers, body) = raw_text_get(&url, Some(("ops", "pw"))).await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            headers.get("content-type").unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        assert_eq!(body, "host-1\tprod\n");
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn list_hosts_shortform_respects_allowed_hosts() {
+        // The default test account has empty `allowed_hosts` (admin: sees all).
+        // Add a restricted account that may only reach host-1, plus a second
+        // host in the executor to prove filtering happens server-side.
+        #[derive(Debug)]
+        struct TwoHostExecutor;
+        #[async_trait::async_trait]
+        impl RelayExecutor for TwoHostExecutor {
+            async fn list_hosts(&self) -> Vec<HostInfo> {
+                vec![
+                    HostInfo {
+                        id: "host-1".to_string(),
+                        name: "prod".to_string(),
+                        host: "127.0.0.1".to_string(),
+                        port: 22,
+                        username: "ops".to_string(),
+                    },
+                    HostInfo {
+                        id: "host-2".to_string(),
+                        name: "staging".to_string(),
+                        host: "127.0.0.1".to_string(),
+                        port: 22,
+                        username: "ops".to_string(),
+                    },
+                ]
+            }
+            async fn exec(
+                &self,
+                _host_id: &str,
+                _command: &str,
+                _elevated: bool,
+                _timeout: Duration,
+            ) -> Result<ExecOutcome, ExecutorError> {
+                Ok(ExecOutcome {
+                    exit_code: Some(0),
+                    stdout: String::new(),
+                    stderr: String::new(),
+                    timed_out: false,
+                    truncated: false,
+                    duration_ms: 0,
+                })
+            }
+        }
+
+        let mut cfg = RelayConfig::default();
+        cfg.port = 0;
+        cfg.accounts.push(RelayAccount {
+            username: "ops".into(),
+            password_hash: hash_password("pw").unwrap(),
+            allowed_hosts: vec!["host-1".to_string()],
+            ..Default::default()
+        });
+
+        let executor: Arc<dyn RelayExecutor> = Arc::new(TwoHostExecutor);
+        let handle = run(cfg, executor, Arc::new(NullHistoryStore))
+            .await
+            .unwrap();
+        let url = format!("{}/r", handle.url());
+
+        let (status, _, body) = raw_text_get(&url, Some(("ops", "pw"))).await;
+        assert_eq!(status, 200);
+        // Only host-1 reaches the caller; host-2 is filtered out.
+        assert_eq!(body, "host-1\tprod\n");
+
+        handle.shutdown().await;
+    }
+
+    #[tokio::test]
     async fn parse_curl_roundtrip() {
         let executor: Arc<dyn RelayExecutor> = Arc::new(NullExecutor);
         let handle = run(test_config(), executor, Arc::new(NullHistoryStore))
@@ -1399,6 +1528,54 @@ mod tests {
 
     async fn reqwest_get(url: &str, auth: Option<(&str, &str)>) -> serde_json::Value {
         reqwest_get_status(url, auth).await.1
+    }
+
+    /// Plain-text GET helper used by the `/r` short-form host list tests. It
+    /// mirrors [`raw_text_request`] but emits a GET and does not assume a JSON
+    /// body, so callers can assert on the raw text and content-type header.
+    async fn raw_text_get(
+        url: &str,
+        auth: Option<(&str, &str)>,
+    ) -> (u16, std::collections::HashMap<String, String>, String) {
+        use base64::Engine;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let parsed = url::Url::parse(url).unwrap();
+        let host = parsed.host_str().unwrap().to_string();
+        let port = parsed.port().unwrap();
+        let path = if let Some(query) = parsed.query() {
+            format!("{}?{query}", parsed.path())
+        } else {
+            parsed.path().to_string()
+        };
+        let mut stream = tokio::net::TcpStream::connect((host.as_str(), port))
+            .await
+            .unwrap();
+        let mut request = format!("GET {path} HTTP/1.1\r\nHost: {host}:{port}\r\n");
+        if let Some((username, password)) = auth {
+            let credentials =
+                base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
+            request.push_str(&format!("Authorization: Basic {credentials}\r\n"));
+        }
+        request.push_str("Connection: close\r\n\r\n");
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let text = String::from_utf8(response).unwrap();
+        let (head, body) = text.split_once("\r\n\r\n").unwrap();
+        let status = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|value| value.parse().ok())
+            .unwrap();
+        let headers = head
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_string()))
+            .collect();
+        (status, headers, body.to_string())
     }
 
     async fn reqwest_get_status(url: &str, auth: Option<(&str, &str)>) -> (u16, serde_json::Value) {
