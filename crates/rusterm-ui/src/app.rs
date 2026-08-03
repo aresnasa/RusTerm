@@ -1338,15 +1338,22 @@ fn drive_login_script(
                     }
                 }
             }
-            if let Some(rt) = state.write().login_scripts.get_mut(session_id) {
+            let finished = if let Some(rt) = state.write().login_scripts.get_mut(session_id) {
                 rt.idx = next_idx;
                 if next_idx >= rt.steps.len() {
                     rt.done = true;
                     rt.wait_started = None;
                     tracing::info!("[LOGIN-SCRIPT] {} finished", session_id);
+                    true
                 } else {
                     rt.wait_started = Some(std::time::Instant::now());
+                    false
                 }
+            } else {
+                false
+            };
+            if finished {
+                sync_live_sessions(&state, &input_senders);
             }
         }
     }
