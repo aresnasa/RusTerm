@@ -23,6 +23,7 @@ arboard.workspace = true
 rfd.workspace = true
 zeroize.workspace = true
 sha2.workspace = true
+base64.workspace = true
 
 rusterm-core.workspace = true
 rusterm-ssh.workspace = true
@@ -48,6 +49,14 @@ default = []
 ## When disabled, analytics queries return empty results and no DuckDB
 ## connection is opened.
 analytics = ["dep:rusterm-analytics"]
+## Enable local on-device LLM template generation (Qwen2.5-Coder-1.5B).
+## Pulls in the candle dependency tree (~heavy). When disabled, the API
+## panel's "AI Generate" button is hidden.
+qwen-local = ["rusterm-ai/qwen-local"]
+## Metal GPU acceleration for the local model (macOS only).
+qwen-local-metal = ["qwen-local", "rusterm-ai/qwen-local-metal"]
+## CUDA GPU acceleration for the local model.
+qwen-local-cuda = ["qwen-local", "rusterm-ai/qwen-local-cuda"]
 
 [dev-dependencies]
 tempfile = "3"

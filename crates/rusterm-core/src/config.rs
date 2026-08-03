@@ -1267,6 +1267,12 @@ pub struct PersistedConfig {
     /// field and get an empty list.
     #[serde(default)]
     pub api_custom_templates: Vec<CustomApiTemplate>,
+    /// Settings for the local on-device LLM (Qwen2.5-Coder-1.5B-Instruct)
+    /// used to generate script/Python templates in the API panel.
+    /// Feature-gated behind `rusterm-ai/qwen-local`; legacy settings files
+    /// omit this field and get the disabled default.
+    #[serde(default)]
+    pub qwen_local: QwenLocalSettings,
 }
 
 /// Default for `PersistedConfig::confirm_close_on_exit`. Kept as a function
@@ -1293,6 +1299,34 @@ fn default_suggestion_enabled() -> bool {
 /// Valid values are 3, 5, or 10.
 fn default_suggestion_count() -> u8 {
     3
+}
+
+// ── Local LLM (Qwen2.5-Coder-1.5B-Instruct) ───────────────────────────
+
+/// Persisted settings for the local on-device template-generation model.
+/// The feature is opt-in and off by default — the 1.5B model needs ~1 GB
+/// RAM and a capable CPU or GPU. When disabled, the API panel's "AI
+/// Generate" button is hidden entirely.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct QwenLocalSettings {
+    /// Master toggle. When false, no local model is loaded and the UI
+    /// button is hidden.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Whether the user has acknowledged the hardware-capability warning.
+    /// Set to true when the user clicks "Enable anyway" on a low-spec
+    /// machine. The UI still shows the warning text but allows enabling.
+    #[serde(default)]
+    pub force_enabled: bool,
+}
+
+impl Default for QwenLocalSettings {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            force_enabled: false,
+        }
+    }
 }
 
 // --- OneKeys (ZOC-style Expect/Send auto-fill) ---

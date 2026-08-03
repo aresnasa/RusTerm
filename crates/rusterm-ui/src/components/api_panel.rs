@@ -323,6 +323,20 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
     let mut new_template_label = use_signal(String::new);
     let mut new_template_body = use_signal(String::new);
     let mut template_error = use_signal(String::new);
+
+    // ── Local AI template generation (Qwen2.5-Coder-1.5B) ───────────
+    // Feature-gated at compile time. When `qwen-local` is not enabled in
+    // rusterm-ai, the button is hidden and these signals are unused.
+    let qwen_enabled = state
+        .read()
+        .config_manager
+        .as_ref()
+        .map(|cm| cm.load_qwen_local_settings().enabled)
+        .unwrap_or(false);
+    let mut ai_description = use_signal(String::new);
+    let mut ai_kind_python = use_signal(|| false); // false = shell, true = python
+    let mut ai_status = use_signal(String::new);
+    let mut ai_busy = use_signal(|| false);
     // Persist the full template list. `Signal` is Copy, so this closure is
     // Copy and can be moved into several handlers.
     let persist_templates = move |templates: Vec<CustomApiTemplate>| {
@@ -1014,6 +1028,22 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
                             },
                         }
                     }
+
+                    // ── AI template generation (local Qwen2.5-Coder) ─────
+                    // Conditionally rendered via a feature-gated helper
+                    // function so the rsx! macro never sees `#[cfg]`.
+                    { render_ai_section(
+                        qwen_enabled,
+                        ai_description,
+                        ai_kind_python,
+                        ai_status,
+                        ai_busy,
+                        curl_mode,
+                        curl_command,
+                        curl_script,
+                        curl_script_base64,
+                    ) }
+
                     label {
                         style: "display:flex;align-items:center;gap:6px;font-size:11px;color:#9aa5ce;margin-bottom:8px;cursor:pointer;",
                         input {
@@ -1420,6 +1450,192 @@ fn gen_curl(
     elevated: bool,
 ) -> String {
     gen_curl_preview(url, default_user, sessions, payload, elevated).into_script()
+}
+
+/// Background-thread worker for local AI template generation.
+///
+/// Downloads + quantizes the model on first run (using the app data dir
+/// as cache), loads it, generates a script from `description`, and
+/// returns the raw model text. The caller ([`ApiPanel`]'s spawn closure)
+/// parses the response and fills the appropriate input field.
+///
+/// Returns `Err(message)` on any failure so the UI can show a friendly
+/// error string.
+#[cfg(feature = "qwen-local")]
+fn run_local_generation(
+    description: &str,
+    kind: rusterm_ai::TemplateKind,
+) -> Result<String, String> {
+    // Determine the cache directory (app data dir / qwen-local).
+    let cache_dir = dirs::data_dir()
+        .or_else(dirs::home_dir)
+        .ok_or_else(|| "Cannot find a writable data directory".to_string())?
+        .join("RusTerm")
+        .join("qwen-local");
+
+    // Ensure the model is downloaded + quantized. This is a no-op if the
+    // GGUF is already cached.
+    rusterm_ai::ensure_model(&cache_dir, |_| {}).map_err(|e| e.to_string())?;
+
+    let gguf_path = cache_dir.join("qwen25-coder-1.5b-q4k.gguf");
+    let tokenizer_path = cache_dir.join("tokenizer.json");
+
+    // Load the model into memory.
+    let mut model =
+        rusterm_ai::QwenLocalModel::load(&gguf_path, &tokenizer_path).map_err(|e| e.to_string())?;
+
+    // Build the prompt and generate.
+    let prompt = rusterm_ai::build_prompt(description, kind);
+    model.generate(&prompt).map_err(|e| e.to_string())
+}
+
+/// Render the AI template-generation section in the API panel.
+///
+/// This is the feature-gated entry point called from `ApiPanel`'s rsx.
+/// When `qwen-local` is compiled in, it renders the full UI (description
+/// input, shell/python toggle, generate button). When not, it renders
+/// nothing.
+#[cfg(feature = "qwen-local")]
+fn render_ai_section(
+    qwen_enabled: bool,
+    ai_description: Signal<String>,
+    ai_kind_python: Signal<bool>,
+    ai_status: Signal<String>,
+    ai_busy: Signal<bool>,
+    curl_mode: Signal<CurlMode>,
+    curl_command: Signal<String>,
+    curl_script: Signal<String>,
+    curl_script_base64: Signal<String>,
+) -> Element {
+    if !qwen_enabled {
+        return rsx! {};
+    }
+    rsx! {
+        div {
+            class: "api-field",
+            style: "border-top:1px solid #1a1b26;padding-top:8px;margin-top:4px;",
+            div {
+                style: "display:flex;align-items:center;gap:8px;margin-bottom:6px;",
+                span {
+                    style: "font-size:11px;font-weight:bold;color:#7dcfff;",
+                    { crate::i18n::t("ai_runtime.local.ai_generate") }
+                }
+                button {
+                    class: "api-btn",
+                    style: if !ai_kind_python() { "font-weight:bold;background:#283457;" } else { "" },
+                    onclick: move |_| ai_kind_python.set(false),
+                    { crate::i18n::t("ai_runtime.local.kind_shell") }
+                }
+                button {
+                    class: "api-btn",
+                    style: if ai_kind_python() { "font-weight:bold;background:#283457;" } else { "" },
+                    onclick: move |_| ai_kind_python.set(true),
+                    { crate::i18n::t("ai_runtime.local.kind_python") }
+                }
+            }
+            div {
+                style: "display:flex;gap:6px;",
+                input {
+                    class: "api-input",
+                    style: "flex:1;",
+                    value: "{ai_description}",
+                    placeholder: crate::i18n::t("ai_runtime.local.ai_generate_hint"),
+                    disabled: ai_busy(),
+                    oninput: move |e| ai_description.set(e.value()),
+                }
+                button {
+                    class: "api-btn",
+                    style: "background:#7dcfff;color:#1a1b26;font-weight:bold;",
+                    disabled: ai_busy() || ai_description().trim().is_empty(),
+                    onclick: move |_| {
+                        let desc = ai_description().trim().to_string();
+                        if desc.is_empty() { return; }
+                        let kind = if ai_kind_python() {
+                            rusterm_ai::TemplateKind::PythonScript
+                        } else {
+                            rusterm_ai::TemplateKind::ShellScript
+                        };
+                        let mode = curl_mode();
+                        ai_busy.set(true);
+                        ai_status.set(crate::i18n::t("ai_runtime.local.preparing"));
+                        spawn(async move {
+                            let (tx, rx) = std::sync::mpsc::channel::<Result<String, String>>();
+                            std::thread::spawn(move || {
+                                let result = run_local_generation(&desc, kind);
+                                let _ = tx.send(result);
+                            });
+                            loop {
+                                match rx.try_recv() {
+                                    Ok(Ok(text)) => {
+                                        let parsed = rusterm_ai::parse_response(&text);
+                                        match mode {
+                                            CurlMode::Command => curl_command.set(parsed),
+                                            CurlMode::Script => curl_script.set(parsed),
+                                            CurlMode::ScriptBase64 => {
+                                                use base64::Engine;
+                                                let b64 = base64::engine::general_purpose::STANDARD.encode(&parsed);
+                                                curl_script_base64.set(b64);
+                                            }
+                                        }
+                                        ai_status.set(String::new());
+                                        ai_busy.set(false);
+                                        return;
+                                    }
+                                    Ok(Err(e)) => {
+                                        ai_status.set(
+                                            crate::i18n::tf(
+                                                "ai_runtime.local.generate_failed",
+                                                &[("error", &e)],
+                                            )
+                                        );
+                                        ai_busy.set(false);
+                                        return;
+                                    }
+                                    Err(std::sync::mpsc::TryRecvError::Empty) => {
+                                        tokio::task::yield_now().await;
+                                    }
+                                    Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                                        ai_status.set(
+                                            crate::i18n::tf(
+                                                "ai_runtime.local.generate_failed",
+                                                &[("error", "thread panicked")],
+                                            )
+                                        );
+                                        ai_busy.set(false);
+                                        return;
+                                    }
+                                }
+                            }
+                        });
+                    },
+                    { crate::i18n::t("ai_runtime.local.ai_generate") }
+                }
+            }
+            if !ai_status().is_empty() {
+                div {
+                    style: "font-size:11px;color:#e0af68;margin-top:4px;",
+                    "{ai_status}"
+                }
+            }
+        }
+    }
+}
+
+/// Stub renderer when `qwen-local` is not compiled in — renders nothing.
+#[cfg(not(feature = "qwen-local"))]
+#[allow(clippy::too_many_arguments)]
+fn render_ai_section(
+    _qwen_enabled: bool,
+    _ai_description: Signal<String>,
+    _ai_kind_python: Signal<bool>,
+    _ai_status: Signal<String>,
+    _ai_busy: Signal<bool>,
+    _curl_mode: Signal<CurlMode>,
+    _curl_command: Signal<String>,
+    _curl_script: Signal<String>,
+    _curl_script_base64: Signal<String>,
+) -> Element {
+    rsx! {}
 }
 
 #[cfg(test)]

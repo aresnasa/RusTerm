@@ -68,6 +68,16 @@ bincode = "1"
 async-openai = "0.40"
 reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
 
+# Local AI inference (candle) — feature-gated under rusterm-ai/qwen-local.
+# candle-core 0.11.0 ships quantized_qwen2 + gguf_file::write + QTensor::quantize.
+# Renamed to `candle` so source code can use the short `candle::` path.
+candle = { version = "0.11", package = "candle-core" }
+candle-nn = "0.11"
+candle-transformers = "0.11"
+tokenizers = { version = "0.22", default-features = false }
+hf-hub = "0.5"
+rayon = "1.7"
+
 # Protocols
 serialport = "4.9"
 tokio-util = { version = "0.7", features = ["compat", "rt"] }

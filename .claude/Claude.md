@@ -217,4 +217,4 @@ Linux gpu-muxi-001.x86.test.brainpp.dev 5.15.0-119-generic #1，将API 脚本放
 95. [@Image](zed:///agent/pasted-image?name=Image) 按照截图中的逻辑继续检查并修复，登录了 jumpserver（使用 tty 交互式的登录）没有正确的映射相关 ssh 会话给 API，需要继续修复。
 96. 集成https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B模型到本项目，支持小模型输出脚本模板或者 python 模板。
 97. 这里需要支持开关（配置差的电脑可能没法运行1.5b的模型，这里需要支持告知客户），同时需要使用 rust 对原始的 1.5b 模型进行量化处理，尽量保证性能。搜索相关的方案来完成这个任务
-98.
+98. 模型可以从https://hf-mirror.com/下载，同时还要预留更换不同小模型的接口，支持用户自定义小模型。

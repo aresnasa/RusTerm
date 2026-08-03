@@ -3,6 +3,24 @@ name = "rusterm-ai"
 version.workspace = true
 edition.workspace = true
 
+[features]
+# Local on-device LLM inference via candle (Qwen2.5-Coder-1.5B-Instruct).
+# Disabled by default — the candle dependency tree is heavy and the 1.5B
+# model needs ~1.5 GB RAM at runtime. Enable explicitly in downstream
+# crates that want local template generation.
+qwen-local = [
+    "dep:candle",
+    "dep:candle-nn",
+    "dep:candle-transformers",
+    "dep:tokenizers",
+    "dep:hf-hub",
+    "dep:rayon",
+]
+# Metal GPU acceleration for the local model (macOS only). Implies qwen-local.
+qwen-local-metal = ["qwen-local", "candle/metal", "candle-nn/metal", "candle-transformers/metal"]
+# CUDA GPU acceleration for the local model. Implies qwen-local.
+qwen-local-cuda = ["qwen-local", "candle/cuda", "candle-nn/cuda", "candle-transformers/cuda"]
+
 [dependencies]
 reqwest.workspace = true
 tokio.workspace = true
@@ -12,3 +30,13 @@ anyhow.workspace = true
 thiserror.workspace = true
 
 rusterm-core.workspace = true
+
+# ── Local LLM inference (optional, feature-gated) ──────────────────────
+# The workspace renames `candle-core` → `candle` so the source code can
+# use the short `candle::` path, matching the upstream examples.
+candle = { workspace = true, optional = true }
+candle-nn = { workspace = true, optional = true }
+candle-transformers = { workspace = true, optional = true }
+tokenizers = { workspace = true, optional = true }
+hf-hub = { workspace = true, optional = true }
+rayon = { workspace = true, optional = true }

@@ -12,7 +12,7 @@ use crate::config::{
     EncryptedValue, FocusedTabAppearance, Keybindings, Language, OneKey, OneKeyPreference,
     OneKeyStep, PersistedConfig, PersistedConnection, PersistedConnectionKind, PersistedOneKey,
     PersistedOneKeyStep, PersistedProxyConfig, PersistedSshAuth, PersistedSshConfig, ProxyConfig,
-    SidebarPreferences, SkinSettings, SshAuth, SshConfig, WorkspacePreferences,
+    QwenLocalSettings, SidebarPreferences, SkinSettings, SshAuth, SshConfig, WorkspacePreferences,
 };
 use rusterm_crypto::{KeyringStore, decrypt_data, encrypt_data};
 
@@ -260,7 +260,8 @@ impl ConfigManager {
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
             language: existing.language,
-            api_custom_templates: existing.api_custom_templates,
+            api_custom_templates: existing.api_custom_templates.clone(),
+            qwen_local: existing.qwen_local.clone(),
         };
 
         let json =
@@ -296,7 +297,8 @@ impl ConfigManager {
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
             language: existing.language,
-            api_custom_templates: existing.api_custom_templates,
+            api_custom_templates: existing.api_custom_templates.clone(),
+            qwen_local: existing.qwen_local.clone(),
         };
 
         let json =
@@ -340,7 +342,8 @@ impl ConfigManager {
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
             language: existing.language,
-            api_custom_templates: existing.api_custom_templates,
+            api_custom_templates: existing.api_custom_templates.clone(),
+            qwen_local: existing.qwen_local.clone(),
         };
 
         let json =
@@ -381,7 +384,8 @@ impl ConfigManager {
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
             language: existing.language,
-            api_custom_templates: existing.api_custom_templates,
+            api_custom_templates: existing.api_custom_templates.clone(),
+            qwen_local: existing.qwen_local.clone(),
         };
 
         let json =
@@ -419,7 +423,8 @@ impl ConfigManager {
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
             language: existing.language,
-            api_custom_templates: existing.api_custom_templates,
+            api_custom_templates: existing.api_custom_templates.clone(),
+            qwen_local: existing.qwen_local.clone(),
         };
         let json =
             serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
@@ -457,7 +462,8 @@ impl ConfigManager {
             skin: skin.clone().normalized(),
             collect_usage_habits: existing.collect_usage_habits,
             language: existing.language,
-            api_custom_templates: existing.api_custom_templates,
+            api_custom_templates: existing.api_custom_templates.clone(),
+            qwen_local: existing.qwen_local.clone(),
         };
         let json =
             serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
@@ -503,7 +509,8 @@ impl ConfigManager {
             skin: existing.skin,
             collect_usage_habits: enabled,
             language: existing.language,
-            api_custom_templates: existing.api_custom_templates,
+            api_custom_templates: existing.api_custom_templates.clone(),
+            qwen_local: existing.qwen_local.clone(),
         };
 
         let json =
@@ -544,7 +551,8 @@ impl ConfigManager {
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
             language,
-            api_custom_templates: existing.api_custom_templates,
+            api_custom_templates: existing.api_custom_templates.clone(),
+            qwen_local: existing.qwen_local.clone(),
         };
 
         let json =
@@ -584,7 +592,8 @@ impl ConfigManager {
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
             language: existing.language,
-            api_custom_templates: existing.api_custom_templates,
+            api_custom_templates: existing.api_custom_templates.clone(),
+            qwen_local: existing.qwen_local.clone(),
         };
 
         let json =
@@ -624,7 +633,8 @@ impl ConfigManager {
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
             language: existing.language,
-            api_custom_templates: existing.api_custom_templates,
+            api_custom_templates: existing.api_custom_templates.clone(),
+            qwen_local: existing.qwen_local.clone(),
         };
 
         let json =
@@ -662,7 +672,8 @@ impl ConfigManager {
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
             language: existing.language,
-            api_custom_templates: existing.api_custom_templates,
+            api_custom_templates: existing.api_custom_templates.clone(),
+            qwen_local: existing.qwen_local.clone(),
         };
 
         let json =
@@ -742,7 +753,8 @@ impl ConfigManager {
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
             language: existing.language,
-            api_custom_templates: existing.api_custom_templates,
+            api_custom_templates: existing.api_custom_templates.clone(),
+            qwen_local: existing.qwen_local.clone(),
         };
 
         let json =
@@ -776,6 +788,7 @@ impl ConfigManager {
             collect_usage_habits: false,
             language: Language::default(),
             api_custom_templates: Vec::new(),
+            qwen_local: Default::default(),
         };
 
         let mut persisted = if self.config_path.exists() {
@@ -829,7 +842,8 @@ impl ConfigManager {
             skin: existing.skin,
             collect_usage_habits: existing.collect_usage_habits,
             language: existing.language,
-            api_custom_templates: existing.api_custom_templates,
+            api_custom_templates: existing.api_custom_templates.clone(),
+            qwen_local: existing.qwen_local.clone(),
         };
 
         let json =
@@ -892,6 +906,27 @@ impl ConfigManager {
         persisted.version = CONFIG_VERSION;
         persisted.master_password_hash = self.master_password_hash.clone();
         persisted.api_custom_templates = templates.to_vec();
+        let json =
+            serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
+        let temp_path = self.config_path.with_extension("json.tmp");
+        fs::write(&temp_path, &json).context("Failed to write config file")?;
+        fs::rename(&temp_path, &self.config_path).context("Failed to rename temp config file")?;
+        Ok(())
+    }
+
+    /// Local LLM (Qwen2.5-Coder-1.5B) settings. Legacy settings files load
+    /// the disabled default.
+    pub fn load_qwen_local_settings(&self) -> QwenLocalSettings {
+        self.read_persisted().qwen_local
+    }
+
+    /// Persist the local LLM settings. Read-modify-write preserves
+    /// encrypted credentials and every unrelated setting.
+    pub fn save_qwen_local_settings(&self, settings: &QwenLocalSettings) -> Result<()> {
+        let mut persisted = self.read_persisted_for_update()?;
+        persisted.version = CONFIG_VERSION;
+        persisted.master_password_hash = self.master_password_hash.clone();
+        persisted.qwen_local = settings.clone();
         let json =
             serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
         let temp_path = self.config_path.with_extension("json.tmp");

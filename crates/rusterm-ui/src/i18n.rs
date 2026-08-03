@@ -569,6 +569,32 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
             "结果授权已失效：{error}",
         ),
 
+        // ── ai_runtime.local.* — local LLM template generation ─────────
+        "ai_runtime.local.enable" => ("Local AI Template Generation", "本地 AI 模板生成"),
+        "ai_runtime.local.enable_hint" => (
+            "Run Qwen2.5-Coder-1.5B on this machine to generate scripts offline. ~1 GB RAM needed.",
+            "在本机运行 Qwen2.5-Coder-1.5B 离线生成脚本，需约 1 GB 内存。",
+        ),
+        "ai_runtime.local.hw_warning" => ("Hardware warning: {warning}", "硬件警告：{warning}"),
+        "ai_runtime.local.enable_anyway" => ("Enable anyway", "仍然启用"),
+        "ai_runtime.local.downloading" => ("Downloading {file}…", "正在下载 {file}…"),
+        "ai_runtime.local.quantizing" => (
+            "Quantizing tensor {current}/{total}: {tensor}",
+            "正在量化张量 {current}/{total}：{tensor}",
+        ),
+        "ai_runtime.local.preparing" => (
+            "Preparing local model (first run downloads ~3 GB)…",
+            "正在准备本地模型（首次运行需下载约 3 GB）…",
+        ),
+        "ai_runtime.local.loading" => ("Loading model into memory…", "正在加载模型到内存…"),
+        "ai_runtime.local.generating" => ("Generating template…", "正在生成模板…"),
+        "ai_runtime.local.generate_failed" => ("Generation failed: {error}", "生成失败：{error}"),
+        "ai_runtime.local.ready" => ("Local model ready", "本地模型就绪"),
+        "ai_runtime.local.ai_generate" => ("✨ AI Generate", "✨ AI 生成"),
+        "ai_runtime.local.ai_generate_hint" => ("Describe the script you want", "描述你想要的脚本"),
+        "ai_runtime.local.kind_shell" => ("Shell", "Shell"),
+        "ai_runtime.local.kind_python" => ("Python", "Python"),
+
         // ── send.* — additional send-panel state ───────────────────────
         "send.no_target" => ("No target", "无目标"),
 
