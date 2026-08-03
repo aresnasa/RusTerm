@@ -492,6 +492,32 @@ pub struct AppState {
     pub tunnel_manager: Option<std::sync::Arc<rusterm_tunnel::TunnelManager>>,
     #[serde(skip)]
     pub tunnel_panel_open: bool,
+
+    // ── Render throttle (PTY output performance) ──────────────────────────
+    //
+    // The terminal *model* (`TerminalEntry`) is updated on every PTY chunk
+    // so scrollback stays accurate and exit codes / OneKey matches fire
+    // promptly. But pushing a fresh `RenderOutput` into `tab.render_output` +
+    // bumping `tab.version` triggers a Dioxus re-render — and during a
+    // `tree`/`ls` flood the producer can emit hundreds of batches per
+    // second, each of which would otherwise rebuild row HTML for the whole
+    // visible viewport and run the vDOM diff. That keeps the CPU saturated
+    // and makes typing feel laggy even though the input path itself is
+    // unaffected.
+    //
+    // `pending_renders` holds the most recent `RenderOutput` per session
+    // that has NOT yet been flushed to `tab.render_output`. We coalesce:
+    // newer renders replace older ones so only the latest viewport matters.
+    // `next_render_allowed` is the earliest `Instant` a flush may run for a
+    // session — set to `now + RENDER_THROTTLE_INTERVAL` after each flush so
+    // we cap DOM updates at ~60 fps regardless of producer rate. The event
+    // loop's `tokio::select!` arm drains `pending_renders` when either a
+    // new event arrives (which re-checks the clock) or the throttle timer
+    // fires (which guarantees the final chunk is never stuck pending).
+    #[serde(skip)]
+    pub pending_renders: HashMap<String, RenderOutput>,
+    #[serde(skip)]
+    pub next_render_allowed: HashMap<String, std::time::Instant>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -765,6 +791,8 @@ impl Default for AppState {
             relay_status_message: None,
             tunnel_manager: None,
             tunnel_panel_open: false,
+            pending_renders: HashMap::new(),
+            next_render_allowed: HashMap::new(),
         }
     }
 }

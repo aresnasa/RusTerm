@@ -262,7 +262,11 @@ impl SshClient {
                             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
                         } else {
                             consecutive_errors = 0;
-                            tracing::info!(
+                            // trace (not info): this fires on every keystroke,
+                            // and `info`-level logging of every key would
+                            // dominate the trace output during fast typing
+                            // and add measurable overhead in debug builds.
+                            tracing::trace!(
                                 "[SSH] write succeeded for {} payload_len={} ends_with_cr={}",
                                 sid_short,
                                 payload_len,

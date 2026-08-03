@@ -1269,7 +1269,10 @@ pub fn TerminalView(
         let alt = mods.alt();
         let meta = mods.meta();
         let shift = mods.shift();
-        tracing::info!(
+        // trace (not info): fires on every keydown; info-level logging of
+        // every key would dominate the trace output during fast typing and
+        // add measurable overhead in debug builds.
+        tracing::trace!(
             "[KEYDOWN] session={:?} key={:?} code={:?} ctrl={} alt={} meta={} shift={}",
             &sid_for_keydown_log[..sid_for_keydown_log.len().min(8)],
             key,

@@ -201,6 +201,134 @@ const MAX_OUTPUT_BATCH_BYTES: usize = 1 * 1024 * 1024;
 /// never dropped — only sustained floods are.
 const MAX_BACKLOG_BYTES: usize = 8 * 1024 * 1024;
 
+/// Minimum interval between DOM-facing `tab.render_output` / `tab.version`
+/// flushes for the same session. See [`apply_throttled_render`] /
+/// [`flush_pending_renders`].
+///
+/// The terminal *model* (`TerminalEntry`) still ingests every batch so
+/// scrollback, exit codes, and OneKey matching stay accurate. Only the
+/// UI-facing snapshot is coalesced. ~16 ms ≈ 60 fps keeps typing responsive
+/// while preventing a `tree`/`ls` flood (hundreds of batches per second)
+/// from saturating the renderer with redundant row-HTML rebuilds.
+const RENDER_THROTTLE_INTERVAL: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// Apply a fresh [`RenderOutput`] for `session_id` through the render throttle.
+///
+/// The terminal model was already updated by `process_and_render` before this
+/// is called — `render_result` is just the viewport snapshot. We either flush
+/// it to `tab.render_output` immediately (if the per-session throttle window
+/// has elapsed) or stash it in `pending_renders` so the next
+/// [`flush_pending_renders`] (or the next call to this fn that wins the clock
+/// check) picks it up.
+///
+/// Stashing coalesces: a newer render for the same session replaces an older
+/// pending one, so only the latest viewport is ever flushed. This is what
+/// makes the throttle safe — we never lose the final state, we just defer it
+/// by at most `RENDER_THROTTLE_INTERVAL`.
+///
+/// Returns `true` if the render was flushed immediately, `false` if it's
+/// pending. Callers that need to force a flush (e.g. on disconnect) should
+/// call [`flush_pending_renders`] directly.
+fn apply_throttled_render(
+    state: &mut AppState,
+    session_id: &str,
+    render_result: rusterm_core::terminal::RenderOutput,
+) -> bool {
+    let now = std::time::Instant::now();
+    let allowed = state
+        .next_render_allowed
+        .get(session_id)
+        .copied()
+        .unwrap_or(now);
+    if now >= allowed {
+        // Flush immediately and arm the throttle window.
+        if let Some(tab) = state.sessions.iter_mut().find(|t| t.id == session_id) {
+            tab.render_output = render_result;
+            tab.version += 1;
+        }
+        state
+            .next_render_allowed
+            .insert(session_id.to_string(), now + RENDER_THROTTLE_INTERVAL);
+        state.pending_renders.remove(session_id);
+        true
+    } else {
+        // Defer: stash the latest viewport; it'll be flushed by the timer arm
+        // or the next output event that wins the clock check.
+        state
+            .pending_renders
+            .insert(session_id.to_string(), render_result);
+        false
+    }
+}
+
+/// Flush ALL pending renders to their tabs NOW, ignoring the throttle window.
+///
+/// Called by the event loop's `tokio::select!` timer arm (which fires at the
+/// earliest `next_render_allowed` deadline) and by force-flush paths
+/// (disconnect, app shutdown). This guarantees the final viewport after a
+/// burst is never stuck pending behind a closed throttle.
+///
+/// Only sessions whose deadline has actually elapsed are flushed here when
+/// called from the timer arm — pass `force_all = true` to bypass the clock
+/// (used on disconnect / close).
+fn flush_pending_renders(state: &mut AppState, force_all: bool) {
+    if state.pending_renders.is_empty() {
+        return;
+    }
+    let now = std::time::Instant::now();
+    // Collect the session IDs to flush first to avoid borrowing `state`
+    // across the `sessions` mutation below.
+    let to_flush: Vec<String> = state
+        .pending_renders
+        .keys()
+        .filter(|sid| {
+            if force_all {
+                true
+            } else {
+                let allowed = state.next_render_allowed.get(*sid).copied().unwrap_or(now);
+                now >= allowed
+            }
+        })
+        .cloned()
+        .collect();
+    if to_flush.is_empty() {
+        return;
+    }
+    for sid in &to_flush {
+        if let Some(render_result) = state.pending_renders.remove(sid)
+            && let Some(tab) = state.sessions.iter_mut().find(|t| t.id == *sid)
+        {
+            tab.render_output = render_result;
+            tab.version += 1;
+        }
+        // Re-arm the throttle window from the flush moment so the next burst
+        // is also coalesced. Skipped on force_all (disconnect/close path).
+        if !force_all {
+            state
+                .next_render_allowed
+                .insert(sid.clone(), now + RENDER_THROTTLE_INTERVAL);
+        }
+    }
+}
+
+/// Earliest deadline among pending renders, or `None` if nothing is pending.
+/// Used by the event loop's `tokio::select!` to pick the sleep duration for
+/// the flush-timer arm. When the timer fires we call `flush_pending_renders`
+/// which drains everything whose window has elapsed.
+///
+/// We return the *earliest* `next_render_allowed` among sessions that have a
+/// pending render — even if that deadline is in the past (the caller sleeps 0
+/// and flushes immediately on the next tick). Sessions with no pending render
+/// are ignored; their `next_render_allowed` is just a rate limiter for future
+/// flushes, not a deadline we need to wake for.
+fn earliest_pending_render_deadline(state: &AppState) -> Option<std::time::Instant> {
+    state
+        .pending_renders
+        .keys()
+        .filter_map(|sid| state.next_render_allowed.get(sid).copied())
+        .min()
+}
+
 /// Drains all immediately-available `SessionEvent::Output` events for
 /// `session_id` from `rx`, concatenating their payloads into `batch` (which
 /// already holds the first event's data). Stops when:
@@ -636,6 +764,282 @@ mod drain_output_batch_tests {
         assert!(
             batch.len() > MAX_OUTPUT_BATCH_BYTES,
             "batch should contain the processing cap + folded tail"
+        );
+    }
+}
+
+#[cfg(test)]
+mod render_throttle_tests {
+    use super::*;
+    use crate::state::SessionTab;
+    use rusterm_core::terminal::{RenderCell, RenderOutput, RenderRow};
+
+    /// Build a minimal `AppState` with one session tab so we can exercise the
+    /// render-throttle helpers without spinning up a real SSH connection.
+    fn make_state_with_session(sid: &str) -> AppState {
+        let mut state = AppState::default();
+        state.sessions.push(SessionTab {
+            id: sid.to_string(),
+            name: sid.to_string(),
+            kind: SessionType::Shell,
+            render_output: RenderOutput::default(),
+            version: 0,
+            suggestion: None,
+            suggestions: Vec::new(),
+            suggestion_corrections: std::collections::HashSet::new(),
+            suggestion_selected: 0,
+            suggestion_visible: false,
+            command_history: Vec::new(),
+            hostname: None,
+            cwd: None,
+            last_command_status: CommandStatus::default(),
+        });
+        state
+    }
+
+    /// Build a `RenderOutput` with a single row containing `text`, so we can
+    /// distinguish successive renders by their content.
+    fn make_render(text: &str) -> RenderOutput {
+        let mut out = RenderOutput::default();
+        out.rows.push(RenderRow {
+            cells: vec![RenderCell {
+                character: text.chars().next().unwrap_or(' '),
+                fg: rusterm_core::terminal::CellColor::Default,
+                bg: rusterm_core::terminal::CellColor::Default,
+                flags: rusterm_core::terminal::CellFlags::empty(),
+                wide: false,
+                wide_next: false,
+            }],
+            wrapped: false,
+        });
+        out
+    }
+
+    /// The first render for a session always flushes immediately (the throttle
+    /// window starts open), bumping `version` and writing `render_output`.
+    #[test]
+    fn first_render_flushes_immediately() {
+        let mut state = make_state_with_session("s1");
+        let render = make_render("A");
+        let flushed = apply_throttled_render(&mut state, "s1", render.clone());
+
+        assert!(flushed, "first render should flush immediately");
+        assert_eq!(state.sessions[0].version, 1);
+        assert_eq!(state.sessions[0].render_output.rows.len(), 1);
+        assert!(
+            state.pending_renders.is_empty(),
+            "nothing should be pending"
+        );
+    }
+
+    /// A second render arriving within the throttle window is deferred: it's
+    /// stashed in `pending_renders` and the tab's version stays unchanged.
+    #[test]
+    fn rapid_second_render_is_deferred() {
+        let mut state = make_state_with_session("s1");
+        let _ = apply_throttled_render(&mut state, "s1", make_render("A"));
+        let version_after_first = state.sessions[0].version;
+
+        let flushed = apply_throttled_render(&mut state, "s1", make_render("B"));
+
+        assert!(!flushed, "second render within window should be deferred");
+        assert_eq!(
+            state.sessions[0].version, version_after_first,
+            "version must not bump while deferred"
+        );
+        assert_eq!(
+            state.pending_renders.len(),
+            1,
+            "deferred render should be stashed"
+        );
+    }
+
+    /// A deferred render replaces an older pending one — only the latest
+    /// viewport survives. This is what makes the throttle safe: we never lose
+    /// the final state, we just defer it by at most RENDER_THROTTLE_INTERVAL.
+    #[test]
+    fn deferred_render_replaces_older_pending() {
+        let mut state = make_state_with_session("s1");
+        let _ = apply_throttled_render(&mut state, "s1", make_render("A"));
+
+        let _ = apply_throttled_render(&mut state, "s1", make_render("B"));
+        let _ = apply_throttled_render(&mut state, "s1", make_render("C"));
+
+        assert_eq!(state.pending_renders.len(), 1);
+        let pending = state.pending_renders.get("s1").unwrap();
+        assert_eq!(pending.rows[0].cells[0].character, 'C');
+    }
+
+    /// `flush_pending_renders(false)` flushes nothing when the throttle window
+    /// hasn't elapsed yet (simulates the timer arm firing too early).
+    #[test]
+    fn flush_pending_respects_throttle_window() {
+        let mut state = make_state_with_session("s1");
+        let _ = apply_throttled_render(&mut state, "s1", make_render("A"));
+        let _ = apply_throttled_render(&mut state, "s1", make_render("B"));
+        let version_before = state.sessions[0].version;
+
+        flush_pending_renders(&mut state, false);
+
+        assert_eq!(
+            state.sessions[0].version, version_before,
+            "no flush should happen within the window"
+        );
+        assert!(
+            !state.pending_renders.is_empty(),
+            "render should stay pending"
+        );
+    }
+
+    /// `flush_pending_renders(true)` ignores the throttle window and drains
+    /// everything — this is the disconnect / shutdown path.
+    #[test]
+    fn force_flush_ignores_throttle_window() {
+        let mut state = make_state_with_session("s1");
+        let _ = apply_throttled_render(&mut state, "s1", make_render("A"));
+        let _ = apply_throttled_render(&mut state, "s1", make_render("B"));
+        let version_before = state.sessions[0].version;
+
+        flush_pending_renders(&mut state, true);
+
+        assert_eq!(
+            state.sessions[0].version,
+            version_before + 1,
+            "force flush should bump version"
+        );
+        assert!(
+            state.pending_renders.is_empty(),
+            "force flush should drain pending"
+        );
+        assert_eq!(
+            state.sessions[0].render_output.rows[0].cells[0].character, 'B',
+            "force flush should land the latest deferred render"
+        );
+    }
+
+    /// After the throttle window elapses, `flush_pending_renders(false)`
+    /// drains the pending render and re-arms the window for the next burst.
+    #[test]
+    fn flush_pending_drains_after_window_elapses() {
+        let mut state = make_state_with_session("s1");
+        let _ = apply_throttled_render(&mut state, "s1", make_render("A"));
+        let _ = apply_throttled_render(&mut state, "s1", make_render("B"));
+
+        // Simulate the throttle window elapsing by backdating the deadline.
+        let past = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap();
+        state.next_render_allowed.insert("s1".to_string(), past);
+
+        flush_pending_renders(&mut state, false);
+
+        assert!(
+            state.pending_renders.is_empty(),
+            "pending should be drained"
+        );
+        assert_eq!(
+            state.sessions[0].render_output.rows[0].cells[0].character, 'B',
+            "latest deferred render should be landed"
+        );
+        // Window re-armed to a future instant.
+        let next = state.next_render_allowed.get("s1").copied().unwrap();
+        assert!(
+            next > std::time::Instant::now(),
+            "window should be re-armed to future"
+        );
+    }
+
+    /// `earliest_pending_render_deadline` returns `None` when nothing is
+    /// pending (no need to wake the timer arm).
+    #[test]
+    fn earliest_deadline_none_when_nothing_pending() {
+        let state = make_state_with_session("s1");
+        assert!(earliest_pending_render_deadline(&state).is_none());
+    }
+
+    /// `earliest_pending_render_deadline` returns the deadline when a render
+    /// is pending, so the timer arm knows when to wake.
+    #[test]
+    fn earliest_deadline_some_when_pending() {
+        let mut state = make_state_with_session("s1");
+        let _ = apply_throttled_render(&mut state, "s1", make_render("A"));
+        let _ = apply_throttled_render(&mut state, "s1", make_render("B"));
+
+        let deadline = earliest_pending_render_deadline(&state);
+        assert!(deadline.is_some(), "pending render should have a deadline");
+    }
+
+    /// Multiple sessions with pending renders: `earliest_pending_render_deadline`
+    /// returns the soonest one so the timer fires for the session that's been
+    /// waiting longest.
+    #[test]
+    fn earliest_deadline_picks_soonest_across_sessions() {
+        let mut state = make_state_with_session("s1");
+        state.sessions.push(SessionTab {
+            id: "s2".to_string(),
+            name: "s2".to_string(),
+            kind: SessionType::Shell,
+            render_output: RenderOutput::default(),
+            version: 0,
+            suggestion: None,
+            suggestions: Vec::new(),
+            suggestion_corrections: std::collections::HashSet::new(),
+            suggestion_selected: 0,
+            suggestion_visible: false,
+            command_history: Vec::new(),
+            hostname: None,
+            cwd: None,
+            last_command_status: CommandStatus::default(),
+        });
+
+        // s1 flushed first (arms window to now+16ms), then deferred.
+        let _ = apply_throttled_render(&mut state, "s1", make_render("A"));
+        let _ = apply_throttled_render(&mut state, "s1", make_render("B"));
+
+        // s2 flushed much earlier — backdate its window to 1s ago, then defer.
+        let past = std::time::Instant::now()
+            .checked_sub(std::time::Duration::from_secs(1))
+            .unwrap();
+        state.next_render_allowed.insert("s2".to_string(), past);
+        state
+            .pending_renders
+            .insert("s2".to_string(), make_render("Z"));
+
+        let deadline = earliest_pending_render_deadline(&state).unwrap();
+        let s1_deadline = state.next_render_allowed.get("s1").copied().unwrap();
+        assert!(
+            deadline <= s1_deadline,
+            "should pick s2's earlier deadline, not s1's"
+        );
+    }
+
+    /// After a flush lands, the next render is deferred again (window re-armed).
+    /// This confirms the throttle keeps coalescing across bursts, not just for
+    /// the first one.
+    #[test]
+    fn throttle_re_arms_after_flush() {
+        let mut state = make_state_with_session("s1");
+        let _ = apply_throttled_render(&mut state, "s1", make_render("A"));
+        let _ = apply_throttled_render(&mut state, "s1", make_render("B"));
+
+        // Force-flush to drain pending.
+        flush_pending_renders(&mut state, true);
+        assert!(state.pending_renders.is_empty());
+        let version_after_flush = state.sessions[0].version;
+
+        // Now a fresh render arrives immediately — it should be deferred
+        // because the window (re-armed by the flush) hasn't elapsed.
+        // NOTE: force-flush does NOT re-arm, so we manually arm the window here
+        // to simulate the post-flush state in the timer-arm path.
+        state.next_render_allowed.insert(
+            "s1".to_string(),
+            std::time::Instant::now() + RENDER_THROTTLE_INTERVAL,
+        );
+        let flushed = apply_throttled_render(&mut state, "s1", make_render("C"));
+        assert!(!flushed, "render right after flush should be deferred");
+        assert_eq!(
+            state.sessions[0].version, version_after_flush,
+            "version should not bump while deferred"
         );
     }
 }
@@ -2084,7 +2488,10 @@ fn render_terminal_pane(
                             &current_line,
                         );
                         let is_enter = data.contains(&0x0d);
-                        tracing::info!(
+                        // trace (not info): fires on every keystroke; info-level
+                        // would dominate logs + add measurable overhead during
+                        // fast typing.
+                        tracing::trace!(
                             "[INPUT] session={} is_enter={} data_len={}",
                             &sid_clone[..sid_clone.len().min(8)],
                             is_enter,
@@ -5749,13 +6156,19 @@ fn multi_pane_container(
                 .pane-accent-strip {{ transition: width 0.12s ease; }}
 
                 /* Pane splitter (col/row dividers) visibility.
-                   Default state shows a thin var(--skin-border-strong) line so
-                   users can discover the drag handle without scrubbing the edge.
-                   Hover/active lifts to the accent color with a soft glow so the
-                   affordance is unmistakable. `transition` keeps it tactile. */
+                   The outer `.pane-splitter` is an 18px-wide transparent hit area
+                   (easy to grab); the visible bar is a child `<div>`. Default
+                   state shows a `var(--skin-border-strong)` bar so users can
+                   discover the drag handle without scrubbing the edge. Hover/
+                   active lifts the bar (and grip dots) to the accent color with
+                   a soft glow so the affordance is unmistakable. `transition`
+                   keeps it tactile. */
                 .pane-splitter {{ transition: background 0.12s ease, box-shadow 0.12s ease; }}
-                .pane-splitter:hover,
-                .pane-splitter.active {{ background: var(--skin-accent) !important; box-shadow: 0 0 6px color-mix(in srgb, var(--skin-accent) 55%, transparent); }}
+                .pane-splitter > div:first-child {{ transition: background 0.12s ease, box-shadow 0.12s ease; }}
+                .pane-splitter:hover > div:first-child,
+                .pane-splitter.active > div:first-child {{ background: var(--skin-accent) !important; box-shadow: 0 0 6px color-mix(in srgb, var(--skin-accent) 55%, transparent); }}
+                .pane-splitter:hover > div:last-child div,
+                .pane-splitter.active > div:last-child div {{ background: var(--skin-accent) !important; opacity: 1 !important; }}
             " }
 
             // Comparison-mode indicator.
@@ -6408,13 +6821,18 @@ fn render_col_splitters(
         .collect();
     rsx! {
         for (splitter_idx, x_val, y_val, height, local_extent) in boundaries.into_iter() {
+            // Splitter hit area: a wide transparent strip (easy to grab) with
+            // a visible centered bar + grip dots so the affordance is obvious
+            // even when not hovered. Hover/active styling comes from the
+            // `.pane-splitter` CSS rule (accent color + soft glow).
             div {
                 key: "col-split-{splitter_idx}",
                 class: "pane-splitter",
                 style: format!(
-                    "position: absolute; left: {x_val}px; top: {y_val}px; height: {height}px; width: 10px; \
-                     margin-left: -5px; cursor: col-resize; background: var(--skin-border-strong); z-index: 50; \
-                     user-select: none; border-left: 1px solid var(--skin-border); border-right: 1px solid var(--skin-border);",
+                    "position: absolute; left: {x_val}px; top: {y_val}px; height: {height}px; \
+                     width: 18px; margin-left: -9px; cursor: col-resize; z-index: 50; \
+                     user-select: none; display: flex; flex-direction: column; \
+                     align-items: center; justify-content: center; gap: 2px;",
                 ),
                 onmousedown: move |e: MouseEvent| {
                     e.prevent_default();
@@ -6439,6 +6857,22 @@ fn render_col_splitters(
                     }
                 },
                 title: crate::i18n::t("layout.resize_left_right_split"),
+                // Visible bar (centered within the hit area). Width 4px so it's
+                // clearly visible without being visually heavy.
+                div {
+                    style: "width: 4px; height: 100%; background: var(--skin-border-strong); \
+                            border-radius: 2px; pointer-events: none;",
+                }
+                // Grip dots — a column of small dots centered on the bar so
+                // the user sees "this is draggable" without needing hover.
+                // Positioned absolutely over the bar via the parent flex centering.
+                div {
+                    style: "position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); \
+                            display: flex; flex-direction: column; gap: 3px; pointer-events: none;",
+                    div { style: "width: 2px; height: 2px; border-radius: 50%; background: var(--skin-accent); opacity: 0.7;" }
+                    div { style: "width: 2px; height: 2px; border-radius: 50%; background: var(--skin-accent); opacity: 0.7;" }
+                    div { style: "width: 2px; height: 2px; border-radius: 50%; background: var(--skin-accent); opacity: 0.7;" }
+                }
             }
         }
     }
@@ -6467,13 +6901,16 @@ fn render_row_splitters(
         .collect();
     rsx! {
         for (splitter_idx, x_val, y_val, width, local_extent) in boundaries.into_iter() {
+            // Same hit-area + visible-bar + grip pattern as the col splitter,
+            // rotated 90°. See `render_col_splitters` for the full rationale.
             div {
                 key: "row-split-{splitter_idx}",
                 class: "pane-splitter",
                 style: format!(
-                    "position: absolute; top: {y_val}px; left: {x_val}px; width: {width}px; height: 10px; \
-                     margin-top: -5px; cursor: row-resize; background: var(--skin-border-strong); z-index: 50; \
-                     user-select: none; border-top: 1px solid var(--skin-border); border-bottom: 1px solid var(--skin-border);",
+                    "position: absolute; top: {y_val}px; left: {x_val}px; width: {width}px; \
+                     height: 18px; margin-top: -9px; cursor: row-resize; z-index: 50; \
+                     user-select: none; display: flex; flex-direction: row; \
+                     align-items: center; justify-content: center; gap: 2px;",
                 ),
                 onmousedown: move |e: MouseEvent| {
                     e.prevent_default();
@@ -6498,6 +6935,17 @@ fn render_row_splitters(
                     }
                 },
                 title: crate::i18n::t("layout.resize_top_bottom_split"),
+                div {
+                    style: "height: 4px; width: 100%; background: var(--skin-border-strong); \
+                            border-radius: 2px; pointer-events: none;",
+                }
+                div {
+                    style: "position: absolute; top: 50%; left: 50%; transform: translate(-50%, -50%); \
+                            display: flex; flex-direction: row; gap: 3px; pointer-events: none;",
+                    div { style: "width: 2px; height: 2px; border-radius: 50%; background: var(--skin-accent); opacity: 0.7;" }
+                    div { style: "width: 2px; height: 2px; border-radius: 50%; background: var(--skin-accent); opacity: 0.7;" }
+                    div { style: "width: 2px; height: 2px; border-radius: 50%; background: var(--skin-accent); opacity: 0.7;" }
+                }
             }
         }
     }
@@ -9722,6 +10170,51 @@ fn start_ssh_connection(
                 // nothing is dropped.
                 let mut pending_event: Option<SessionEvent> = None;
                 loop {
+                    // ── Render-throttle flush timer ──
+                    //
+                    // While output is flooding, `apply_throttled_render` defers
+                    // DOM-facing `tab.render_output` updates by up to
+                    // [`RENDER_THROTTLE_INTERVAL`] (~16 ms). We can't rely on
+                    // the next `event_rx.recv()` to wake us up in time — during
+                    // a burst events ARE arriving constantly, but between the
+                    // last burst chunk and the next idle period the latest
+                    // viewport would be stuck pending behind the closed
+                    // throttle. This `select!` arm races `event_rx.recv()` against
+                    // the earliest pending-render deadline so the final flush
+                    // always lands within ~16 ms of the last chunk, even when no
+                    // more events follow. When events ARE arriving, the timer arm
+                    // is a no-op (it just re-loops into the `select!`).
+                    if pending_event.is_none() {
+                        let flush_deadline = earliest_pending_render_deadline(&state.read());
+                        let event_or_timeout: Result<Option<SessionEvent>, ()> =
+                            if let Some(deadline) = flush_deadline {
+                                tokio::select! {
+                                    ev = event_rx.recv() => Ok(ev),
+                                    _ = tokio::time::sleep_until(deadline.into()) => {
+                                        // Timer fired — flush whatever has been
+                                        // deferred past its deadline. Then loop to
+                                        // re-evaluate (there may be more pending
+                                        // with later deadlines, or the channel may
+                                        // have a new event by now).
+                                        flush_pending_renders(&mut state.write(), false);
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                Ok(event_rx.recv().await)
+                            };
+                        let event = match event_or_timeout {
+                            Ok(Some(ev)) => ev,
+                            Ok(None) => break,
+                            Err(()) => continue,
+                        };
+                        // Re-check the throttle on every event arrival too —
+                        // if the window has elapsed since the last flush, drain
+                        // pending renders BEFORE processing the new event so the
+                        // viewport doesn't lag an extra event behind.
+                        flush_pending_renders(&mut state.write(), false);
+                        pending_event = Some(event);
+                    }
                     let event = match pending_event.take() {
                         Some(ev) => ev,
                         None => match event_rx.recv().await {
@@ -9987,9 +10480,16 @@ fn start_ssh_connection(
                                 };
                                 {
                                     let mut s = state.write();
+                                    // Throttle the DOM-facing render snapshot: the
+                                    // terminal model is already up to date (via
+                                    // `process_and_render` above), so deferring the
+                                    // `tab.render_output` / `tab.version` bump by up
+                                    // to ~16 ms doesn't lose any state — it just
+                                    // coalesces redundant re-renders during a
+                                    // `tree`/`ls` flood. The cwd mirror below is
+                                    // independent of the render snapshot.
+                                    apply_throttled_render(&mut s, &id, render_result);
                                     if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
-                                        tab.render_output = render_result;
-                                        tab.version += 1;
                                         // Mirror the shell's last-reported cwd (OSC 7)
                                         // into the tab so the session-state save
                                         // path can read it without taking the
@@ -10114,6 +10614,10 @@ fn start_ssh_connection(
                             check_onekey_match(state, input_senders, &id, &data);
                         }
                         SessionEvent::Disconnected(id, reason) => {
+                            // Force-flush any deferred render so the user sees the
+                            // final viewport immediately, then the disconnect banner
+                            // (rendered below) layers on top.
+                            flush_pending_renders(&mut state.write(), true);
                             {
                                 let mut app = state.write();
                                 let _ = app.shadow_sandbox.fail_execution(
@@ -10359,6 +10863,32 @@ fn start_shell_connection(
             spawn(async move {
                 let mut pending_event: Option<SessionEvent> = None;
                 loop {
+                    // Render-throttle flush timer (see the SSH loop for the full
+                    // rationale). Coalesces deferred `tab.render_output` flushes
+                    // so the final viewport after an output burst lands within
+                    // ~16 ms even when no more events follow.
+                    if pending_event.is_none() {
+                        let flush_deadline = earliest_pending_render_deadline(&state.read());
+                        let event_or_timeout: Result<Option<SessionEvent>, ()> =
+                            if let Some(deadline) = flush_deadline {
+                                tokio::select! {
+                                    ev = event_rx.recv() => Ok(ev),
+                                    _ = tokio::time::sleep_until(deadline.into()) => {
+                                        flush_pending_renders(&mut state.write(), false);
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                Ok(event_rx.recv().await)
+                            };
+                        let event = match event_or_timeout {
+                            Ok(Some(ev)) => ev,
+                            Ok(None) => break,
+                            Err(()) => continue,
+                        };
+                        flush_pending_renders(&mut state.write(), false);
+                        pending_event = Some(event);
+                    }
                     let event = match pending_event.take() {
                         Some(ev) => ev,
                         None => match event_rx.recv().await {
@@ -10557,9 +11087,16 @@ fn start_shell_connection(
                                 };
                                 {
                                     let mut s = state.write();
+                                    // Throttle the DOM-facing render snapshot: the
+                                    // terminal model is already up to date (via
+                                    // `process_and_render` above), so deferring the
+                                    // `tab.render_output` / `tab.version` bump by up
+                                    // to ~16 ms doesn't lose any state — it just
+                                    // coalesces redundant re-renders during a
+                                    // `tree`/`ls` flood. The cwd mirror below is
+                                    // independent of the render snapshot.
+                                    apply_throttled_render(&mut s, &id, render_result);
                                     if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
-                                        tab.render_output = render_result;
-                                        tab.version += 1;
                                         // Mirror the shell's last-reported cwd (OSC 7)
                                         // into the tab so the session-state save
                                         // path can read it without taking the
@@ -10815,6 +11352,32 @@ fn start_serial_connection(
                 // the connection state and render a reconnect hint.
                 let mut pending_event: Option<SessionEvent> = None;
                 loop {
+                    // Render-throttle flush timer (see the SSH loop for the full
+                    // rationale). Coalesces deferred `tab.render_output` flushes
+                    // so the final viewport after an output burst lands within
+                    // ~16 ms even when no more events follow.
+                    if pending_event.is_none() {
+                        let flush_deadline = earliest_pending_render_deadline(&state.read());
+                        let event_or_timeout: Result<Option<SessionEvent>, ()> =
+                            if let Some(deadline) = flush_deadline {
+                                tokio::select! {
+                                    ev = event_rx.recv() => Ok(ev),
+                                    _ = tokio::time::sleep_until(deadline.into()) => {
+                                        flush_pending_renders(&mut state.write(), false);
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                Ok(event_rx.recv().await)
+                            };
+                        let event = match event_or_timeout {
+                            Ok(Some(ev)) => ev,
+                            Ok(None) => break,
+                            Err(()) => continue,
+                        };
+                        flush_pending_renders(&mut state.write(), false);
+                        pending_event = Some(event);
+                    }
                     let event = match pending_event.take() {
                         Some(ev) => ev,
                         None => match event_rx.recv().await {
@@ -10838,10 +11401,10 @@ fn start_serial_connection(
                                     entry.process_and_render(&data)
                                 };
                                 let mut s = state.write();
-                                if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
-                                    tab.render_output = render_result;
-                                    tab.version += 1;
-                                }
+                                // Throttle the DOM-facing snapshot for serial/
+                                // telnet output floods. The model is already
+                                // updated; this coalesces re-renders.
+                                apply_throttled_render(&mut s, &id, render_result);
                             }
                             check_onekey_match(state, input_senders, &id, &data);
                         }
@@ -10851,6 +11414,9 @@ fn start_serial_connection(
                                 &id[..id.len().min(8)],
                                 reason
                             );
+                            // Force-flush any deferred render so the user sees
+                            // the final viewport immediately.
+                            flush_pending_renders(&mut state.write(), true);
                             clear_onekey_session_runtime(&mut state.write(), &id);
                             let failed = crate::i18n::t("session.disconnected_short");
                             let reconnect = crate::i18n::t("session.reconnect_hint");
@@ -10954,6 +11520,32 @@ fn start_telnet_connection(
 
                 let mut pending_event: Option<SessionEvent> = None;
                 loop {
+                    // Render-throttle flush timer (see the SSH loop for the full
+                    // rationale). Coalesces deferred `tab.render_output` flushes
+                    // so the final viewport after an output burst lands within
+                    // ~16 ms even when no more events follow.
+                    if pending_event.is_none() {
+                        let flush_deadline = earliest_pending_render_deadline(&state.read());
+                        let event_or_timeout: Result<Option<SessionEvent>, ()> =
+                            if let Some(deadline) = flush_deadline {
+                                tokio::select! {
+                                    ev = event_rx.recv() => Ok(ev),
+                                    _ = tokio::time::sleep_until(deadline.into()) => {
+                                        flush_pending_renders(&mut state.write(), false);
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                Ok(event_rx.recv().await)
+                            };
+                        let event = match event_or_timeout {
+                            Ok(Some(ev)) => ev,
+                            Ok(None) => break,
+                            Err(()) => continue,
+                        };
+                        flush_pending_renders(&mut state.write(), false);
+                        pending_event = Some(event);
+                    }
                     let event = match pending_event.take() {
                         Some(ev) => ev,
                         None => match event_rx.recv().await {
@@ -10977,10 +11569,10 @@ fn start_telnet_connection(
                                     entry.process_and_render(&data)
                                 };
                                 let mut s = state.write();
-                                if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
-                                    tab.render_output = render_result;
-                                    tab.version += 1;
-                                }
+                                // Throttle the DOM-facing snapshot for serial/
+                                // telnet output floods. The model is already
+                                // updated; this coalesces re-renders.
+                                apply_throttled_render(&mut s, &id, render_result);
                             }
                             check_onekey_match(state, input_senders, &id, &data);
                         }
@@ -10990,6 +11582,9 @@ fn start_telnet_connection(
                                 &id[..id.len().min(8)],
                                 reason
                             );
+                            // Force-flush any deferred render so the user sees
+                            // the final viewport immediately.
+                            flush_pending_renders(&mut state.write(), true);
                             clear_onekey_session_runtime(&mut state.write(), &id);
                             let failed = crate::i18n::t("session.disconnected_short");
                             let reconnect = crate::i18n::t("session.reconnect_hint");
