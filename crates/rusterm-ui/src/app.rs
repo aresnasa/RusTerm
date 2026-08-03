@@ -5747,6 +5747,15 @@ fn multi_pane_container(
                 .pane-title-text {{ transition: color 0.12s ease; }}
                 .pane-title-bar:hover .pane-title-text {{ color: #ffffff; }}
                 .pane-accent-strip {{ transition: width 0.12s ease; }}
+
+                /* Pane splitter (col/row dividers) visibility.
+                   Default state shows a thin var(--skin-border-strong) line so
+                   users can discover the drag handle without scrubbing the edge.
+                   Hover/active lifts to the accent color with a soft glow so the
+                   affordance is unmistakable. `transition` keeps it tactile. */
+                .pane-splitter {{ transition: background 0.12s ease, box-shadow 0.12s ease; }}
+                .pane-splitter:hover,
+                .pane-splitter.active {{ background: var(--skin-accent) !important; box-shadow: 0 0 6px color-mix(in srgb, var(--skin-accent) 55%, transparent); }}
             " }
 
             // Comparison-mode indicator.
@@ -6401,10 +6410,11 @@ fn render_col_splitters(
         for (splitter_idx, x_val, y_val, height, local_extent) in boundaries.into_iter() {
             div {
                 key: "col-split-{splitter_idx}",
+                class: "pane-splitter",
                 style: format!(
                     "position: absolute; left: {x_val}px; top: {y_val}px; height: {height}px; width: 10px; \
-                     margin-left: -5px; cursor: col-resize; background: #2a2b3d; z-index: 50; \
-                     transition: background 0.1s; user-select: none;",
+                     margin-left: -5px; cursor: col-resize; background: var(--skin-border-strong); z-index: 50; \
+                     user-select: none; border-left: 1px solid var(--skin-border); border-right: 1px solid var(--skin-border);",
                 ),
                 onmousedown: move |e: MouseEvent| {
                     e.prevent_default();
@@ -6459,10 +6469,11 @@ fn render_row_splitters(
         for (splitter_idx, x_val, y_val, width, local_extent) in boundaries.into_iter() {
             div {
                 key: "row-split-{splitter_idx}",
+                class: "pane-splitter",
                 style: format!(
                     "position: absolute; top: {y_val}px; left: {x_val}px; width: {width}px; height: 10px; \
-                     margin-top: -5px; cursor: row-resize; background: #2a2b3d; z-index: 50; \
-                     transition: background 0.1s; user-select: none;",
+                     margin-top: -5px; cursor: row-resize; background: var(--skin-border-strong); z-index: 50; \
+                     user-select: none; border-top: 1px solid var(--skin-border); border-bottom: 1px solid var(--skin-border);",
                 ),
                 onmousedown: move |e: MouseEvent| {
                     e.prevent_default();

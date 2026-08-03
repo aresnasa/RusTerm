@@ -422,13 +422,13 @@ pub fn DockZoneView(
     };
     let handle_style = match zone {
         DockZone::Left => {
-            "position:absolute;right:-3px;top:0;width:6px;height:100%;z-index:80;cursor:col-resize;background:transparent;"
+            "position:absolute;right:-4px;top:0;width:8px;height:100%;z-index:80;cursor:col-resize;background:var(--skin-border-strong);transition:background 0.12s ease,box-shadow 0.12s ease;"
         }
         DockZone::Right => {
-            "position:absolute;left:-3px;top:0;width:6px;height:100%;z-index:80;cursor:col-resize;background:transparent;"
+            "position:absolute;left:-4px;top:0;width:8px;height:100%;z-index:80;cursor:col-resize;background:var(--skin-border-strong);transition:background 0.12s ease,box-shadow 0.12s ease;"
         }
         DockZone::Bottom => {
-            "position:absolute;left:0;top:-3px;width:100%;height:6px;z-index:80;cursor:row-resize;background:transparent;"
+            "position:absolute;left:0;top:-4px;width:100%;height:8px;z-index:80;cursor:row-resize;background:var(--skin-border-strong);transition:background 0.12s ease,box-shadow 0.12s ease;"
         }
     };
     let target_index = drag
@@ -447,6 +447,7 @@ pub fn DockZoneView(
             .dock-close {{ margin-left:auto;margin-right:5px;border:0;background:transparent;color:var(--skin-text-muted);cursor:pointer;padding:4px 7px;font-size:14px; }}
             .dock-close:hover {{ color:var(--skin-text);background:var(--skin-surface-hover); }}
             .dock-insertion {{ width:2px;align-self:stretch;flex:0 0 2px;background:var(--skin-accent);box-shadow:0 0 6px color-mix(in srgb,var(--skin-accent) 75%,transparent); }}
+            .dock-resize-handle {{ transition: background 0.12s ease, box-shadow 0.12s ease; }}
             .dock-resize-handle:hover,.dock-resize-handle.active {{ background:var(--skin-accent);box-shadow:0 0 6px color-mix(in srgb,var(--skin-accent) 55%,transparent); }}
         "# }
         div {
