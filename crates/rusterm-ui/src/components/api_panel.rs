@@ -863,14 +863,29 @@ pub fn ApiPanel(state: Signal<AppState>) -> Element {
                             }
                         }
                         // "+ Add template" opens the inline form below; the
-                        // new template is saved for the CURRENT mode.
+                        // new template is saved for the CURRENT mode. Opening
+                        // the form pre-fills it from the current input so the
+                        // user can save what they just typed in one click.
                         button {
                             class: "api-btn",
                             style: "font-size:11px;padding:2px 8px;color:#7aa2f7;",
                             onclick: move |_| {
                                 let now_adding = !adding_template();
                                 adding_template.set(now_adding);
-                                if !now_adding {
+                                if now_adding {
+                                    if new_template_body().trim().is_empty() {
+                                        let (label, body) = template_form_prefill(
+                                            curl_mode(),
+                                            &curl_command(),
+                                            &curl_script(),
+                                            &curl_script_base64(),
+                                        );
+                                        if new_template_label().trim().is_empty() {
+                                            new_template_label.set(label);
+                                        }
+                                        new_template_body.set(body);
+                                    }
+                                } else {
                                     template_error.set(String::new());
                                 }
                             },
