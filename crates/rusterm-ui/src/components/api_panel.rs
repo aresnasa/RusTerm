@@ -1077,6 +1077,25 @@ mod tests {
             "must guard against an empty host list: {curl}"
         );
 
+        // Sanitization: even if RUSTERM_HOSTS or RUSTERM_API_URL were
+        // poisoned by a previous bad discovery (e.g. CRLF from a 502 page),
+        // the function strips carriage returns before use.
+        assert!(
+            curl.contains("RUSTERM_HOSTS=$(printf '%s' \"$RUSTERM_HOSTS\" | tr -d '\\r')"),
+            "must sanitize RUSTERM_HOSTS of carriage returns: {curl}"
+        );
+        assert!(
+            curl.contains("RUSTERM_API_URL=$(printf '%s' \"$RUSTERM_API_URL\" | tr -d '\\r')"),
+            "must sanitize RUSTERM_API_URL of carriage returns: {curl}"
+        );
+
+        // Execution loop must skip empty targets (defensive against trailing
+        // newlines or whitespace in the host list).
+        assert!(
+            curl.contains("[ -z \"$RUSTERM_TARGET\" ] && continue"),
+            "execution loop must skip empty targets: {curl}"
+        );
+
         // Elevated query is still applied per-target.
         assert!(
             curl.contains("\"${RUSTERM_API_URL}/r/${RUSTERM_TARGET}?elevated=true\""),
