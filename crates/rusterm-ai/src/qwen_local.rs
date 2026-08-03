@@ -368,7 +368,7 @@ fn quantize_to_gguf(
     safetensors_path: &Path,
     config_path: &Path,
     output_path: &Path,
-    progress: &mut impl FnMut(SetupProgress),
+    progress: &(impl Fn(SetupProgress) + Sync),
 ) -> Result<()> {
     // 1. Parse config.json for the metadata fields.
     let config_text = std::fs::read_to_string(config_path)
@@ -383,13 +383,16 @@ fn quantize_to_gguf(
             .with_context(|| format!("loading safetensors at {safetensors_path:?}"))?;
 
     // 3. Map names + quantize in parallel (rayon).
+    //    Progress is tracked via an atomic counter because rayon's
+    //    parallel map requires `Send + Sync` closures — a `&mut FnMut`
+    //    callback doesn't satisfy that.
     let total = tensors.len();
     let indexed: Vec<(String, candle::Tensor)> = tensors.into_iter().collect();
+    let counter = std::sync::atomic::AtomicUsize::new(0);
 
     let qtensors: Vec<(String, QTensor)> = indexed
         .par_iter()
-        .enumerate()
-        .map(|(i, (hf_name, tensor))| {
+        .map(|(hf_name, tensor)| {
             let gguf_name = map_tensor_name(hf_name).unwrap_or_else(|| {
                 // Keep unrecognized tensors under their original name so
                 // nothing is silently dropped. They'll be ignored by
@@ -398,15 +401,16 @@ fn quantize_to_gguf(
             });
             let dtype = dtype_for(&gguf_name, tensor.rank());
 
-            // Report progress (best-effort — rayon may reorder).
+            let qtensor = QTensor::quantize(tensor, dtype)
+                .map_err(|e| anyhow!("quantizing {gguf_name}: {e}"))?;
+
+            let i = counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             progress(SetupProgress::Quantizing {
                 current: i + 1,
                 total,
                 tensor: gguf_name.clone(),
             });
 
-            let qtensor = QTensor::quantize(tensor, dtype)
-                .map_err(|e| anyhow!("quantizing {gguf_name}: {e}"))?;
             Ok((gguf_name, qtensor))
         })
         .collect::<Result<Vec<_>>>()?;
@@ -440,8 +444,11 @@ const GGUF_FILE: &str = "qwen25-coder-1.5b-q4k.gguf";
 /// **Expensive** — must be called from a background thread, not the UI
 /// thread. The `progress` callback is invoked throughout so the UI can
 /// show a progress bar / status text.
-pub fn ensure_model(cache_dir: &Path, progress: impl FnMut(SetupProgress)) -> Result<PathBuf> {
-    let mut progress = progress;
+pub fn ensure_model(
+    cache_dir: &Path,
+    progress: impl Fn(SetupProgress) + Sync,
+) -> Result<PathBuf> {
+    let progress = progress;
     std::fs::create_dir_all(cache_dir)
         .with_context(|| format!("creating cache dir {cache_dir:?}"))?;
 
@@ -456,16 +463,16 @@ pub fn ensure_model(cache_dir: &Path, progress: impl FnMut(SetupProgress)) -> Re
     }
 
     // Download tokenizer + config (small files, always needed).
-    download_file(TOKENIZER_FILE, &tokenizer_path, &mut progress)?;
-    download_file(CONFIG_FILE, &config_path, &mut progress)?;
+    download_file($1, $2, &progress)?;
+    download_file($1, $2, &progress)?;
 
     // Download the BF16 safetensors (large, ~3 GB) if not already present.
     if !safetensors_path.exists() {
-        download_file(SAFETENSORS_FILE, &safetensors_path, &mut progress)?;
+        download_file($1, $2, &progress)?;
     }
 
     // Quantize BF16 → Q4_K GGUF.
-    quantize_to_gguf(&safetensors_path, &config_path, &gguf_path, &mut progress)?;
+    quantize_to_gguf(&safetensors_path, &config_path, &gguf_path, &progress)?;
 
     // Clean up the 3 GB safetensors to save disk space. The GGUF is the
     // permanent cache; if the user wants to re-quantize at a different
@@ -483,7 +490,7 @@ pub fn ensure_model(cache_dir: &Path, progress: impl FnMut(SetupProgress)) -> Re
 fn download_file(
     filename: &str,
     dest: &Path,
-    progress: &mut impl FnMut(SetupProgress),
+    progress: &(impl Fn(SetupProgress) + Sync),
 ) -> Result<()> {
     let api = hf_hub::api::sync::Api::new().map_err(|e| anyhow!("hf_hub init: {e}"))?;
     let repo = api.model(HF_REPO.to_string());
