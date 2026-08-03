@@ -87,7 +87,14 @@ fn save_config(state: &Signal<AppState>) {
 /// connected sessions for command reuse.
 ///
 /// Only sessions with a matching `session_configs` entry (which maps
-/// session_id → connection_id) are included.
+/// session_id → connection_id) are included. Sessions whose login script is
+/// still mid-navigation are excluded (injecting a command would interleave
+/// with the scripted menu answers), but sessions whose script finished —
+/// successfully or not — are published: on a failed/absent script the
+/// operator may have navigated the bastion menu manually, and that tab's
+/// PTY is the only place "currently on node X" exists. Whether a plain
+/// (un-suffixed) selector may pick the session is captured in
+/// `login_script_completed`.
 fn sync_live_sessions(
     state: &Signal<AppState>,
     input_senders: &Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
@@ -100,24 +107,27 @@ fn sync_live_sessions(
         .iter()
         .filter_map(|(session_id, session)| {
             let config = app.session_configs.get(session_id)?;
+            let script_runtime = app.login_scripts.get(session_id);
+            // Mid-script sessions are unsafe for command injection.
+            if script_runtime.is_some_and(|runtime| !runtime.done) {
+                return None;
+            }
             let has_login_script = config
                 .login_script
                 .as_deref()
                 .is_some_and(|script| !script.trim().is_empty());
-            let login_ready = !has_login_script
-                || app
-                    .login_scripts
-                    .get(session_id)
-                    .is_some_and(|runtime| runtime.done && !runtime.steps.is_empty());
-            if !login_ready {
-                return None;
-            }
+            // Empty steps after `done` mark a failed/aborted navigation
+            // (see `drive_login_script`); such tabs stay reachable via
+            // their exact session-qualified selector only.
+            let login_script_completed = !has_login_script
+                || script_runtime.is_some_and(|runtime| runtime.done && !runtime.steps.is_empty());
             let connection_id = config.id.clone();
             let input_tx = senders.get(session_id)?.clone();
             Some(crate::relay_tunnel::LiveSessionEntry {
                 session: session.clone(),
                 input_tx,
                 connection_id,
+                login_script_completed,
             })
         })
         .collect();
