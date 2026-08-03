@@ -630,23 +630,15 @@ async fn exec_via_live_session(
                             .to_string(),
                     ));
                 };
-                let remaining_capacity = MAX_TAP_OUTPUT.saturating_sub(raw.len());
-                if data.len() > remaining_capacity {
-                    truncated = true;
-                }
-                raw.extend_from_slice(&data[..data.len().min(remaining_capacity)]);
-
                 // Keep scanning after the response body reaches its cap so a
                 // large-output command can still complete instead of timing
                 // out merely because its sentinel arrived after 1 MiB.
-                marker_scan.extend_from_slice(&data);
-                if let Some((_, code)) = find_complete_rc_marker(&marker_scan, &rc_tag) {
-                    marker_code = Some(code);
+                let (code, chunk_truncated) =
+                    capture_live_exec_output(&mut raw, &mut marker_scan, &data, &rc_tag);
+                truncated |= chunk_truncated;
+                if code.is_some() {
+                    marker_code = code;
                     break;
-                }
-                let scan_tail = rc_tag.len() + 32;
-                if marker_scan.len() > scan_tail {
-                    marker_scan.drain(..marker_scan.len() - scan_tail);
                 }
             }
             _ = &mut deadline => {
