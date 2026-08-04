@@ -37,7 +37,7 @@ pub use onekey_manager::OneKeyManager;
 pub use onekey_popup::OneKeyPopup;
 pub use relay_panel::RelayPanel;
 pub use remote_files_panel::RemoteFilesPanel;
-pub use restore_session_dialog::RestoreSessionDialog;
+pub use restore_session_dialog::{RestoreSessionDialog, RestoreSessionSummary};
 pub use right_tool_panel::RightToolPanel;
 pub use send_panel::SendPanel;
 pub use settings_dialog::SettingsDialog;

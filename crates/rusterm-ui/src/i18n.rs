@@ -190,16 +190,21 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
             "After restoring, each session will cd into its last working directory",
             "✓ 恢复后会自动 cd 到上次的工作目录",
         ),
+        "restore.will_replay" => (
+            "Interactive sessions (e.g. jumpserver) replay their recorded setup steps",
+            "✓ 交互式会话（如堡垒机）将回放已记录的建立操作",
+        ),
         "restore.no_history_run" => (
             "No history commands or scripts will be executed",
             "✗ 不会执行任何历史命令或脚本",
         ),
         "restore.skip_hint" => (
-            "Choose \"Skip\" to start with blank sessions; \"Don't ask again\" disables this permanently.",
-            "选择“跳过”可使用空白会话开始；选择“不再询问”将永久禁用此功能。",
+            "Choose \"Skip\" to start with blank sessions; you'll be asked again next time a snapshot exists.",
+            "选择“跳过”可使用空白会话开始；下次存在会话快照时仍会询问。",
         ),
         "restore.restore" => ("Restore", "恢复"),
         "restore.skip_blank" => ("Skip (start blank)", "跳过（开始空白会话）"),
+        "restore.replay_badge" => ("replay", "回放"),
 
         // ── cmd_status.* — command status badge ─────────────────────────
         "cmd_status.success" => ("✓ Success", "✓ 成功"),

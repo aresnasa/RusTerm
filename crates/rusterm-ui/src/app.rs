@@ -32,6 +32,8 @@ use crate::components::DockZoneView;
 use crate::components::MasterPasswordDialog;
 use crate::components::OneKeyManager;
 use crate::components::RelayPanel;
+use crate::components::RestoreSessionDialog;
+use crate::components::RestoreSessionSummary;
 use crate::components::SettingsDialog;
 use crate::components::ShadowExecutionDialog;
 use crate::components::ShadowResultDialog;
@@ -8316,7 +8318,7 @@ mod session_startup_tests {
     }
 
     #[test]
-    fn legacy_never_ask_flag_does_not_block_automatic_startup_restore() {
+    fn legacy_never_ask_flag_does_not_block_startup_restore_prompt() {
         let snapshot = rusterm_core::SessionState {
             schema_version: 1,
             saved_at: chrono::Utc::now(),
@@ -8339,12 +8341,12 @@ mod session_startup_tests {
 
         assert!(
             candidate.is_some(),
-            "legacy prompt preference must not disable recovery"
+            "legacy prompt preference must not disable the restore prompt"
         );
     }
 
     #[test]
-    fn empty_snapshot_does_not_trigger_startup_restore() {
+    fn empty_snapshot_does_not_trigger_startup_restore_prompt() {
         let snapshot = rusterm_core::SessionState {
             schema_version: 1,
             saved_at: chrono::Utc::now(),
@@ -8354,6 +8356,53 @@ mod session_startup_tests {
         };
 
         assert!(startup_restore_candidate(false, Some(snapshot)).is_none());
+    }
+
+    #[test]
+    fn restore_prompt_items_summarize_kind_host_and_replay() {
+        let snapshot = rusterm_core::SessionState {
+            schema_version: 1,
+            saved_at: chrono::Utc::now(),
+            active_session: None,
+            sessions: vec![
+                rusterm_core::PersistedSession {
+                    id: "jump".to_string(),
+                    name: "ops@jumpserver".to_string(),
+                    kind: SessionType::Ssh,
+                    hostname: Some("jump.example.test".to_string()),
+                    connection_id: Some("conn-1".to_string()),
+                    cwd: None,
+                    command_history_tail: Vec::new(),
+                    terminal_size: None,
+                    replay_ops: vec!["web-01".to_string(), "1".to_string()],
+                },
+                rusterm_core::PersistedSession {
+                    id: "local".to_string(),
+                    name: "Local".to_string(),
+                    kind: SessionType::Shell,
+                    hostname: None,
+                    connection_id: None,
+                    cwd: Some("/tmp".to_string()),
+                    command_history_tail: Vec::new(),
+                    terminal_size: None,
+                    replay_ops: Vec::new(),
+                },
+            ],
+            theme: None,
+        };
+
+        let items = restore_prompt_items(&snapshot);
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].name, "ops@jumpserver");
+        assert_eq!(items[0].detail, "SSH · jump.example.test");
+        assert!(
+            items[0].has_replay,
+            "interactive session with recorded ops must carry the replay badge"
+        );
+        assert_eq!(items[1].name, "Local");
+        assert_eq!(items[1].detail, "Shell");
+        assert!(!items[1].has_replay);
     }
 
     #[test]
@@ -12655,11 +12704,15 @@ fn open_local_terminal(
     start_shell_connection(state, input_senders, session_id, shell_config);
 }
 
-/// Return the non-empty snapshot that should be restored immediately after
-/// unlock.
+/// Return the non-empty snapshot that should be offered for restore (via the
+/// startup confirmation dialog) immediately after unlock.
+///
+/// The prompt appears regardless of how the previous run ended: a normal exit
+/// persists the snapshot on the close path, and a crash / force-kill leaves
+/// behind the 30 s periodic save.
 ///
 /// `restore_disabled` is intentionally ignored. It is a legacy preference for
-/// the removed confirmation modal, not a durable logout signal. Whether a
+/// the removed "never ask" choice, not a durable logout signal. Whether a
 /// terminal should return is recorded by snapshot membership instead.
 
 fn startup_restore_candidate(
@@ -12667,6 +12720,35 @@ fn startup_restore_candidate(
     loaded: Option<rusterm_core::SessionState>,
 ) -> Option<rusterm_core::SessionState> {
     loaded.filter(|snapshot| !snapshot.sessions.is_empty())
+}
+
+/// Build the per-session summary rows shown in the startup restore dialog so
+/// the user can see exactly what "恢复" brings back: the tab name, the kind +
+/// host, and whether recorded interactive establishment ops (jumpserver-style
+/// menu navigation) will be replayed for that session.
+fn restore_prompt_items(snapshot: &rusterm_core::SessionState) -> Vec<RestoreSessionSummary> {
+    snapshot
+        .sessions
+        .iter()
+        .map(|ps| {
+            let kind = match ps.kind {
+                SessionType::Ssh => "SSH",
+                SessionType::Telnet => "Telnet",
+                SessionType::Serial => "Serial",
+                SessionType::Shell => "Shell",
+                SessionType::Tcp => "TCP",
+            };
+            let detail = match ps.hostname.as_deref().filter(|h| !h.is_empty()) {
+                Some(host) => format!("{kind} · {host}"),
+                None => kind.to_string(),
+            };
+            RestoreSessionSummary {
+                name: ps.name.clone(),
+                detail,
+                has_replay: !ps.replay_ops.is_empty(),
+            }
+        })
+        .collect()
 }
 
 /// Restore sessions from a saved `SessionState` snapshot.
@@ -12974,6 +13056,14 @@ fn save_layout_snapshot(state: &Signal<AppState>) {
 /// closed every terminal.
 fn save_session_state_snapshot(state: &Signal<AppState>) {
     let s = state.read();
+    // While the startup restore prompt is undecided, the on-disk snapshot
+    // still holds the previous run's sessions. Overwriting it now (with the
+    // current, typically empty, session list) would destroy the very state
+    // the user is being asked about — e.g. when the app is closed with the
+    // dialog still open, the next launch must ask again.
+    if s.restore_pending.is_some() {
+        return;
+    }
     let Some(cm) = s.config_manager.as_ref() else {
         return;
     };
@@ -14890,6 +14980,14 @@ pub fn App() -> Element {
             if s.unlock_state != UnlockState::Unlocked {
                 continue;
             }
+            // Don't overwrite the on-disk snapshot while the startup restore
+            // prompt is still undecided: the file holds the previous run's
+            // sessions, and the user may take longer than one save interval
+            // to answer. See `save_session_state_snapshot` for the same guard
+            // on the exit path.
+            if s.restore_pending.is_some() {
+                continue;
+            }
             let Some(cm) = s.config_manager.as_ref() else {
                 continue;
             };
@@ -15062,26 +15160,33 @@ pub fn App() -> Element {
                                     }
                                 }
 
-                                // Automatic startup recovery. The legacy
-                                // `restore_disabled` flag controlled the old modal;
-                                // it must not permanently suppress saving/loading.
-                                // An empty snapshot means no terminal was logged in
-                                // at exit and therefore intentionally does nothing.
+                                // Startup recovery prompt. Whether the
+                                // previous run exited normally (close-path
+                                // save) or crashed (30s periodic save), a
+                                // non-empty snapshot is offered to the user
+                                // via the restore-confirmation dialog instead
+                                // of being restored automatically. The legacy
+                                // `restore_disabled` flag controlled the old
+                                // modal's "never ask" choice; it must not
+                                // permanently suppress saving/loading. An
+                                // empty snapshot means no terminal was logged
+                                // in at exit and therefore intentionally asks
+                                // nothing.
                                 let startup_restore = startup_restore_candidate(
                                     s.restore_disabled,
                                     loaded_session_state,
                                 );
-                                drop(s);
                                 if let Some(to_restore) = startup_restore {
                                     tracing::info!(
-                                        "Automatically restoring {} logged-in session(s), saved at {}",
+                                        "Prompting to restore {} logged-in session(s), saved at {}",
                                         to_restore.sessions.len(),
                                         to_restore.saved_at
                                     );
-                                    restore_sessions(state, input_senders, to_restore);
+                                    s.restore_pending = Some(to_restore);
                                 } else {
                                     tracing::debug!("No logged-in session state found for startup restore");
                                 }
+                                drop(s);
                             }
                             Err(e) => {
                                 let msg = if e.to_string().contains("Invalid") {
@@ -15105,6 +15210,20 @@ pub fn App() -> Element {
     }
 
     let skin_style = css_variables(&state.read().skin, system_is_dark());
+
+    // ── Startup restore prompt display data ───────────────────────────
+    // Precomputed outside rsx! (rsx bodies can't contain `let`). Present only
+    // while the startup restore prompt is undecided.
+    let restore_prompt = state.read().restore_pending.as_ref().map(|snap| {
+        (
+            snap.sessions.len(),
+            snap.saved_at
+                .with_timezone(&chrono::Local)
+                .format("%Y-%m-%d %H:%M")
+                .to_string(),
+            restore_prompt_items(snap),
+        )
+    });
 
     rsx! {
         div {
@@ -16575,7 +16694,31 @@ pub fn App() -> Element {
             }
         }
 
-        // ── Last-window close confirmation modal ────────────────────────────
+        // ── Startup session-restore confirmation modal ───────────────────
+        // Shown after unlock whenever a non-empty session snapshot was loaded
+        // from disk — whether the previous run exited normally or crashed.
+        // 恢复 re-opens every persisted session (reconnect + `cd <cwd>` for
+        // integrated shells, replay of recorded establishment ops for
+        // interactive jumpserver-style sessions); 跳过 starts blank. Either
+        // choice clears `restore_pending`, which re-enables snapshot saves.
+        if let Some((restore_count, restore_saved_at, restore_items)) = restore_prompt {
+            RestoreSessionDialog {
+                session_count: restore_count,
+                saved_at: restore_saved_at,
+                sessions: restore_items,
+                on_restore: move |_| {
+                    let snapshot = state.write().restore_pending.take();
+                    if let Some(snapshot) = snapshot {
+                        restore_sessions(state, input_senders, snapshot);
+                    }
+                },
+                on_skip: move |_| {
+                    state.write().restore_pending = None;
+                },
+            }
+        }
+
+        // ── Last-window close confirmation modal ────────────────────
         // Shown when the user closes the last window and `confirm_close_on_exit`
         // is true (the safe default). The wry event handler above sets
         // `close_dialog_visible = true`; the reshow `use_future` re-shows the

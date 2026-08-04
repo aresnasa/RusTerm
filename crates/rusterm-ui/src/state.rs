@@ -364,12 +364,20 @@ pub struct AppState {
 
     // ── Session-state restore (feature #17) ─────────────────────────────
     //
-    // Recovery is automatic after unlock. The snapshot contains only sessions
-    // that were `Connected` at the last save; restore never re-executes past
-    // commands or scripts — only a safe `cd` to the last reported directory.
+    // The snapshot contains only sessions that were `Connected` at the last
+    // save; restore never re-executes past shell commands — only a safe `cd`
+    // to the last reported directory, or (for interactive jumpserver-style
+    // sessions) a replay of the recorded establishment ops.
     //
-    // Kept for deserialization/API compatibility with the old confirmation
-    // modal. It is no longer populated by the startup path.
+    /// Snapshot loaded at startup and awaiting the user's decision in the
+    /// restore-confirmation dialog. Set by the unlock path whenever a
+    /// non-empty session snapshot exists on disk — written on normal exit
+    /// by the close-path save, or (after a crash / force-kill) by the 30 s
+    /// periodic save — so the prompt appears regardless of how the previous
+    /// run ended. Cleared when the user picks 恢复 (restore) or 跳过 (skip).
+    /// While set, session-snapshot saves are deferred so the undecided
+    /// on-disk state can't be overwritten by the current (blank) session
+    /// list.
     #[serde(skip)]
     pub restore_pending: Option<rusterm_core::SessionState>,
     /// Legacy "don't ask again" preference. Automatic recovery deliberately
