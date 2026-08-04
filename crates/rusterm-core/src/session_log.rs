@@ -60,8 +60,6 @@ enum LogCommand {
         direction: &'static str,
         data: Vec<u8>,
     },
-    /// Flush the underlying file and close. Sent by `close()` / `Drop`.
-    Close,
 }
 
 /// An encrypted session-log writer.
@@ -296,10 +294,8 @@ impl SessionLog {
 /// output loop. The key is held in `Zeroizing` so it is wiped when this
 /// function returns (thread exit).
 ///
-/// The loop terminates when:
-/// - a `LogCommand::Close` is received (drains remaining entries first), or
-/// - the sender is dropped (channel returns `None`), which happens on
-///   `close()` / `Drop`.
+/// The loop terminates when the sender is dropped (channel returns `None`),
+/// which happens on `close()` / `Drop`.
 fn background_writer(mut file: fs::File, key: Zeroizing<[u8; 32]>, rx: Receiver<LogCommand>) {
     let write_entry = |direction: &str, data: &[u8], file: &mut fs::File| {
         let timestamp = Local::now().to_rfc3339();
@@ -332,25 +328,11 @@ fn background_writer(mut file: fs::File, key: Zeroizing<[u8; 32]>, rx: Receiver<
         let _ = file.flush();
     };
 
-    while let Ok(cmd) = rx.recv() {
-        match cmd {
-            LogCommand::Entry { direction, data } => {
-                write_entry(direction, &data, &mut file);
-            }
-            LogCommand::Close => {
-                // Drain any entries that were enqueued before the Close,
-                // then break so the file is flushed one last time on drop.
-                while let Ok(cmd) = rx.try_recv() {
-                    match cmd {
-                        LogCommand::Entry { direction, data } => {
-                            write_entry(direction, &data, &mut file);
-                        }
-                        LogCommand::Close => {}
-                    }
-                }
-                break;
-            }
-        }
+    // Drain all entries until the sender is dropped (channel returns `None`).
+    // The sender is dropped by `close()` / `Drop`, after which the loop exits,
+    // the final flush runs, and the key is wiped.
+    while let Ok(LogCommand::Entry { direction, data }) = rx.recv() {
+        write_entry(direction, &data, &mut file);
     }
     // Final flush (file is dropped on function return, but flush explicitly
     // so any OS-buffered data is pushed to disk).
@@ -478,7 +460,32 @@ mod tests {
         // the file path. Instead, we create the SessionLog, log a few
         // entries, close it, then find the file it created and decrypt it.
         let key = test_key();
-        let session_id = format!("rusterm_test_bg_{}", std::process::id());
+        // Unique per run: PID + a monotonically increasing counter avoids
+        // collisions with stale files from previous test runs.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let session_id = format!("rusterm_test_bg_{}_{}", std::process::id(), nonce);
+
+        // Clean up any stale files with the test prefix so the search below
+        // can only find the file this run creates.
+        let log_dir = dirs::data_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("rusterm")
+            .join("session_logs");
+        if let Ok(entries) = fs::read_dir(&log_dir) {
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("rusterm_test_bg_") && n.ends_with(".rusl"))
+                {
+                    let _ = fs::remove_file(&path);
+                }
+            }
+        }
+
         let log = SessionLog::new(&session_id, key).unwrap();
 
         log.log_output(b"hello background");
@@ -488,10 +495,6 @@ mod tests {
 
         // The file lives under <data_dir>/rusterm/session_logs/. Find it by
         // session_id prefix + .rusl extension.
-        let log_dir = dirs::data_dir()
-            .unwrap_or_else(|| PathBuf::from("."))
-            .join("rusterm")
-            .join("session_logs");
         let candidate = fs::read_dir(&log_dir)
             .ok()
             .into_iter()
