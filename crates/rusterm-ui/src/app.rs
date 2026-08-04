@@ -14095,7 +14095,16 @@ fn restore_sessions(
 /// even if it changed within the last 30s periodic-save window. Best-effort:
 /// failures are logged but never block the exit.
 fn save_layout_snapshot(state: &Signal<AppState>) {
-    let snapshot = state.read().build_layout_state();
+    let s = state.read();
+    // Same guards as the session-state snapshot: while the startup restore
+    // prompt is undecided (or the app was never unlocked), the on-disk file
+    // still holds the previous run's layout — deleting it now would destroy
+    // the very arrangement the restore flow is about to re-apply.
+    if s.restore_pending.is_some() || s.unlock_state != UnlockState::Unlocked {
+        return;
+    }
+    let snapshot = s.build_layout_state();
+    drop(s);
     if snapshot.tabs.is_empty() {
         // Nothing custom to persist: remove any previous snapshot so a stale
         // split layout can't be fossilised and re-applied on the next launch
@@ -16696,6 +16705,13 @@ pub fn App() -> Element {
             // (single-session tabs have no layout entry).
             let snapshot = {
                 let s = state_for_layout_save.read();
+                // While the startup restore prompt is undecided (or the app
+                // hasn't been unlocked yet), the on-disk file still holds the
+                // previous run's layout — it must not be deleted. Mirrors the
+                // session-state save loop above.
+                if s.restore_pending.is_some() || s.unlock_state != UnlockState::Unlocked {
+                    continue;
+                }
                 if s.layouts.is_empty() {
                     None
                 } else {
