@@ -310,6 +310,11 @@ fn spawn_save_dialog(
     state_handle: Arc<Mutex<ZmodemSessions>>,
     input_sender: mpsc::UnboundedSender<Vec<u8>>,
 ) {
+    tracing::info!(
+        "[ZMODEM] spawning save dialog for {} (name={:?})",
+        &session_id[..session_id.len().min(8)],
+        default_name
+    );
     tokio::spawn(async move {
         let mut dialog =
             rfd::AsyncFileDialog::new().set_title("保存接收的文件 / Save received file");
@@ -317,14 +322,33 @@ fn spawn_save_dialog(
             dialog = dialog.set_file_name(&default_name);
         }
         let file = dialog.save_file().await;
+        tracing::info!(
+            "[ZMODEM] save dialog result for {}: {}",
+            &session_id[..session_id.len().min(8)],
+            if file.is_some() {
+                "picked"
+            } else {
+                "cancelled/failed"
+            }
+        );
         if let Some(file) = file {
             let path = file.path().to_path_buf();
+            tracing::info!(
+                "[ZMODEM] save path chosen for {}: {:?}",
+                &session_id[..session_id.len().min(8)],
+                path
+            );
             {
                 let mut s = state_handle.lock();
                 s.install_receive_path(&session_id, path);
                 if let Some(bytes) = s.sessions.get_mut(&session_id).map(|s| s.take_pty_output())
                     && !bytes.is_empty()
                 {
+                    tracing::info!(
+                        "[ZMODEM] sending ZRPOS ({} bytes) to PTY for {}",
+                        bytes.len(),
+                        &session_id[..session_id.len().min(8)]
+                    );
                     let _ = input_sender.send(bytes);
                 }
             }

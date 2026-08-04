@@ -192,6 +192,10 @@ impl Detector {
                     ZBIN32 => self.begin_frame(FrameCollect::Bin32, b),
                     _ => {
                         // False alarm — not a ZMODEM leader.
+                        tracing::debug!(
+                            "[ZMODEM-DETECT] false alarm: ZPAD ZDLE followed by 0x{:02x} (not ZHEX/ZBIN/ZBIN32)",
+                            b
+                        );
                         if !self.armed {
                             // Flush whatever pads we accumulated.
                             passthrough.push(ZPAD);
@@ -262,6 +266,12 @@ impl Detector {
     }
 
     fn begin_frame(&mut self, kind: FrameCollect, fmt: u8) {
+        tracing::info!(
+            "[ZMODEM-DETECT] entering InFrame: kind={:?} fmt=0x{:02x} (was in state {:?})",
+            kind,
+            fmt,
+            self.state
+        );
         self.collector = Collector {
             buf: Vec::new(),
             kind: Some(kind),
@@ -292,11 +302,20 @@ impl Detector {
         // Must end with CR (optionally followed by LF or 0x80).
         let cr_idx = buf.iter().position(|&b| b == b'\r')?;
         if cr_idx < 14 || cr_idx % 2 != 0 {
+            tracing::debug!(
+                "[ZMODEM-DETECT] complete_hex: cr_idx={} is invalid (need >=14, even), buf_len={}",
+                cr_idx,
+                buf.len()
+            );
             return None;
         }
         let hex_end = cr_idx;
         let hex_bytes = &buf[..hex_end];
         if hex_bytes.len() != 14 {
+            tracing::debug!(
+                "[ZMODEM-DETECT] complete_hex: hex_bytes.len()={} (need 14)",
+                hex_bytes.len()
+            );
             return None;
         }
         let decoded = decode_hex(hex_bytes)?;
@@ -306,6 +325,13 @@ impl Detector {
         let expected_crc = u16::from_be_bytes([decoded[5], decoded[6]]);
         let actual_crc = crc16_init(&decoded[..5]);
         if expected_crc != actual_crc {
+            tracing::warn!(
+                "[ZMODEM-DETECT] complete_hex: CRC mismatch! type={:?} data={:?} expected=0x{:04x} actual=0x{:04x}",
+                frame_type,
+                data,
+                expected_crc,
+                actual_crc
+            );
             return None;
         }
         // Consumed = 14 hex bytes + CR + optional LF/0x80.
@@ -317,9 +343,19 @@ impl Detector {
             return None; // need at least one more byte after CR
         }
         let mut consumed = cr_idx + 1; // hex + CR
-        if buf[consumed] == b'\n' || buf[consumed] == 0x80 {
+        // lrzsz terminates hex headers with CR LF, but some implementations
+        // send CR 0x8A (high-bit LF variant) or CR 0x80. Accept all.
+        let next = buf[consumed];
+        if next == b'\n' || next == 0x80 || next == 0x8A {
             consumed += 1;
         }
+        tracing::info!(
+            "[ZMODEM-DETECT] complete_hex: detected {:?} data={:?} crc=0x{:04x} consumed={}",
+            frame_type,
+            data,
+            actual_crc,
+            consumed
+        );
         Some((
             ZmodemFrame::Header(HeaderFrame {
                 frame_type,

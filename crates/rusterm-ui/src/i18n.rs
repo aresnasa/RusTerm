@@ -682,6 +682,15 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         "session.reconnecting" => ("Reconnecting…", "正在重新连接…"),
         "session.shell_failed" => ("Failed to start shell: {error}", "启动 shell 失败：{error}"),
         "session.starting_shell" => ("Starting local shell…", "正在启动本地终端…"),
+        // Tab-bar context-menu actions (Task: disconnect/reconnect/copy session).
+        "session.disconnect" => ("Disconnect", "断开连接"),
+        "session.reconnect" => ("Reconnect", "重新连接"),
+        "session.copy_session" => ("Copy Session", "复制会话"),
+        "session.disconnected_by_user" => ("Disconnected by user", "已由用户断开"),
+        "session.no_config_for_copy" => (
+            "This session has no stored login config and cannot be copied",
+            "此会话没有已保存的登录配置，无法复制",
+        ),
 
         // ── sessions.* — sessions panel ────────────────────────────────
         "sessions.empty_pane" => ("Empty pane", "空白窗格"),

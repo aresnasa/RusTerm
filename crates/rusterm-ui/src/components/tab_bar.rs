@@ -1,9 +1,10 @@
 use dioxus::prelude::*;
 
 use crate::components::CommandStatusBadge;
-use crate::state::{CommandStatus, SessionTab, WorkspaceTab};
+use crate::state::{CommandStatus, SessionConnectionState, SessionTab, WorkspaceTab};
 use rusterm_core::FocusedTabAppearance;
 use rusterm_core::session::SessionType;
+use std::collections::HashMap;
 
 // `MouseButton` lives in `dioxus::html::input_data` (not re-exported by
 // `dioxus::prelude::*`). Used by the tab's `onmousedown` handler to
@@ -80,6 +81,13 @@ fn resolve_tab_display<'a>(
 /// `sessions` is passed alongside `tabs` so the bar can resolve each tab's
 /// anchor session for its display name + type indicator dot. The bar never
 /// shows a session that isn't a tab anchor.
+///
+/// Right-clicking a tab opens a context menu with Disconnect / Reconnect /
+/// Copy Session actions (Task: 会话支持断开和重连 + 复制会话). The actions
+/// operate on the tab's ANCHOR session. `connection_states` is consulted to
+/// enable/disable Disconnect (only when Connected) and Reconnect (only when
+/// Disconnected); Copy Session is always available as long as the session has
+/// a stored login config (the App-side handler logs a warning if not).
 #[component]
 pub fn TabBar(
     tabs: Vec<WorkspaceTab>,
@@ -87,6 +95,9 @@ pub fn TabBar(
     active: Option<String>,
     focused_session: Option<String>,
     focused_appearance: FocusedTabAppearance,
+    /// Per-session connection state, used to enable/disable the Disconnect
+    /// and Reconnect context-menu items.
+    connection_states: HashMap<String, SessionConnectionState>,
     on_select: EventHandler<String>,
     on_close: EventHandler<String>,
     /// Manual mouse-based tab drag (Task 22). Fired on `mousedown` with
@@ -108,9 +119,49 @@ pub fn TabBar(
     /// pane is therefore semantically "drag the anchor session" —
     /// which matches the legacy behaviour the drop handlers expect.
     on_drag_start: EventHandler<(String, String, f64, f64)>,
+    /// Context-menu: disconnect the tab's anchor session. Fired with the
+    /// anchor session id. The App-side handler is a no-op if the session
+    /// is not currently Connected/Reconnecting.
+    on_disconnect: EventHandler<String>,
+    /// Context-menu: reconnect the tab's anchor session. Fired with the
+    /// anchor session id. The App-side handler is a no-op if the session
+    /// is not Disconnected.
+    on_reconnect: EventHandler<String>,
+    /// Context-menu: copy the tab's anchor session. Fired with the anchor
+    /// session id. The App-side handler clones the stored login config and
+    /// opens a new independent session via `open_connection`.
+    on_copy_session: EventHandler<String>,
 ) -> Element {
     let mut hover_tab = use_signal(|| None::<String>);
+    // `(session_id, client_x, client_y)` for the tab whose context menu is
+    // open. `None` when the menu is closed. Mirrors the Sidebar's context-menu
+    // signal pattern.
+    let mut context_menu = use_signal(|| None::<(String, f64, f64)>);
     let focused_appearance = focused_appearance.normalized();
+
+    // Pre-compute the context-menu enable flags by reading the signals once.
+    // dioxus rsx! `{}` formatted segments don't accept `matches!` macro calls,
+    // so we derive plain `bool`s here and reference them inside the rsx!.
+    let menu_snapshot = context_menu();
+    let menu_state = menu_snapshot
+        .as_ref()
+        .and_then(|(sid, _, _)| connection_states.get(sid).copied())
+        .unwrap_or(SessionConnectionState::Connected);
+    let can_disconnect = matches!(
+        menu_state,
+        SessionConnectionState::Connected | SessionConnectionState::Reconnecting
+    );
+    let can_reconnect = matches!(menu_state, SessionConnectionState::Disconnected);
+    let disconnect_style = if can_disconnect {
+        "cursor:pointer;".to_string()
+    } else {
+        "opacity:0.4;cursor:default;".to_string()
+    };
+    let reconnect_style = if can_reconnect {
+        "cursor:pointer;".to_string()
+    } else {
+        "opacity:0.4;cursor:default;".to_string()
+    };
 
     rsx! {
         div {
@@ -157,6 +208,8 @@ pub fn TabBar(
                     let tab_id_for_drag = tab.id.clone();
                     let session_id_for_drag = session_id.clone();
                     let session_name_for_drag = session_name.to_string();
+                    // Clone for the right-click context menu handler.
+                    let session_id_for_ctx = session_id.clone();
 
                     rsx! {
                         div {
@@ -213,6 +266,19 @@ pub fn TabBar(
                             },
                             onmouseenter: move |_| hover_tab.set(Some(tab_id2.clone())),
                             onmouseleave: move |_| hover_tab.set(None),
+                            // Right-click opens the Disconnect / Reconnect /
+                            // Copy Session context menu. `prevent_default`
+                            // suppresses the native browser context menu so
+                            // only ours shows.
+                            oncontextmenu: move |e: MouseEvent| {
+                                e.prevent_default();
+                                let c = e.client_coordinates();
+                                context_menu.set(Some((
+                                    session_id_for_ctx.clone(),
+                                    c.x,
+                                    c.y,
+                                )));
+                            },
 
                             // Type indicator dot
                             span {
@@ -257,6 +323,56 @@ pub fn TabBar(
                                 }
                             }
                         }
+                    }
+                }
+            }
+
+            // ── Right-click context menu (Disconnect / Reconnect / Copy Session) ──
+            // Mirrors the Sidebar's context-menu pattern: a full-viewport
+            // click-away backdrop + a fixed-position menu. The menu reads the
+            // anchor session id from the `context_menu` signal, so it doesn't
+            // need per-tab clones.
+            if let Some((menu_sid, menu_x, menu_y)) = menu_snapshot {
+                // Click-away backdrop.
+                div {
+                    style: "position:fixed;inset:0;z-index:2999;",
+                    onclick: move |_| context_menu.set(None),
+                }
+                div {
+                    style: "position:fixed;top:{menu_y}px;left:{menu_x}px;z-index:3000;background:var(--skin-surface);border:1px solid var(--skin-border-strong);border-radius:5px;padding:4px 0;min-width:170px;box-shadow:0 6px 18px rgba(0,0,0,.5);",
+                    // Disconnect (enabled only when Connected/Reconnecting).
+                    div {
+                        style: "padding:6px 12px;font-size:12px;display:flex;align-items:center;gap:8px;white-space:nowrap;color:var(--skin-text);{disconnect_style}",
+                        onclick: move |_| {
+                            if can_disconnect {
+                                on_disconnect.call(menu_sid.clone());
+                            }
+                            context_menu.set(None);
+                        },
+                        "⏏  {crate::i18n::t(\"session.disconnect\")}"
+                    }
+                    // Reconnect (enabled only when Disconnected).
+                    div {
+                        style: "padding:6px 12px;font-size:12px;display:flex;align-items:center;gap:8px;white-space:nowrap;color:var(--skin-text);{reconnect_style}",
+                        onclick: move |_| {
+                            if can_reconnect {
+                                on_reconnect.call(menu_sid.clone());
+                            }
+                            context_menu.set(None);
+                        },
+                        "⟳  {crate::i18n::t(\"session.reconnect\")}"
+                    }
+                    // Separator.
+                    div { style: "height:1px;background:var(--skin-border-strong);margin:4px 0;" }
+                    // Copy Session (always available; App-side handler warns
+                    // if there's no stored config).
+                    div {
+                        style: "padding:6px 12px;font-size:12px;cursor:pointer;color:var(--skin-text);display:flex;align-items:center;gap:8px;white-space:nowrap;",
+                        onclick: move |_| {
+                            on_copy_session.call(menu_sid.clone());
+                            context_menu.set(None);
+                        },
+                        "⧉  {crate::i18n::t(\"session.copy_session\")}"
                     }
                 }
             }

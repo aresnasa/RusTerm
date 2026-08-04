@@ -1181,6 +1181,14 @@ pub fn TerminalView(
     on_scroll_up: EventHandler<usize>,
     on_scroll_down: EventHandler<usize>,
     on_scroll_to_bottom: EventHandler<()>,
+    /// Copy the entire terminal session (scrollback + visible grid) to the
+    /// clipboard. Called by Cmd+A / Ctrl+Shift+A (SelectAll) — the handler
+    /// in `app.rs` renders the full scrollback via `render_with_scroll`
+    /// and copies the resulting text. This is necessary because
+    /// `render_output.rows` only contains the current viewport; without this
+    /// callback, SelectAll would only copy the visible rows, not the entire
+    /// session history.
+    on_copy_all: EventHandler<()>,
     on_suggestion_navigate: EventHandler<Option<usize>>,
     on_suggestion_accept: EventHandler<String>,
     on_history_completion: EventHandler<()>,
@@ -1396,28 +1404,10 @@ pub fn TerminalView(
             TerminalOverlayKeyAction::SelectAll => {
                 e.prevent_default();
                 e.stop_propagation();
-                // Select all visible rows: anchor at (0, 0), head at the last
-                // row's last cell. Then extract and copy the text.
-                if !copy_rows.is_empty() {
-                    let last_row = copy_rows.len() - 1;
-                    let last_col = copy_rows[last_row].cells.len().saturating_sub(1);
-                    let ts = TextSelection {
-                        anchor: (0, 0),
-                        head: (last_row, last_col),
-                    };
-                    selection.set(Some(ts));
-                    selecting.set(false);
-                    let text = extract_selection(&copy_rows, ts.anchor, ts.head);
-                    if !text.is_empty() {
-                        selection_text.set(text.clone());
-                        if let ClipboardCopyOutcome::Copied(n) = copy_text_to_clipboard(text) {
-                            tracing::info!(
-                                "[COPY] SelectAll copied {n} chars for session {:?}",
-                                &sid_for_copy[..sid_for_copy.len().min(8)]
-                            );
-                        }
-                    }
-                }
+                // Copy the entire session (scrollback + visible grid) via the
+                // callback. The handler in app.rs renders the full scrollback
+                // and copies all text to the clipboard.
+                on_copy_all.call(());
                 return;
             }
         }

@@ -583,8 +583,30 @@ fn intercept_zmodem(
     let Some(sender) = sender else {
         // No input sender → can't inject ZMODEM responses; fall through to
         // normal rendering so the user at least sees the raw bytes.
+        tracing::warn!(
+            "[ZMODEM] no input sender for session {} ({} bytes will pass through)",
+            &session_id[..session_id.len().min(8)],
+            data.len()
+        );
         return data.to_vec();
     };
+
+    // Log potential ZMODEM traffic when ZPAD (0x2A) is present in the data —
+    // this is the telltale sign of a ZMODEM frame leader.
+    if data.iter().any(|&b| b == 0x2A) {
+        let hex_preview: String = data
+            .iter()
+            .take(40)
+            .map(|b| format!("{:02x}", b))
+            .collect::<Vec<_>>()
+            .join(" ");
+        tracing::info!(
+            "[ZMODEM] ZPAD in data for {} ({} bytes): {}",
+            &session_id[..session_id.len().min(8)],
+            data.len(),
+            hex_preview
+        );
+    }
 
     let processed = {
         let mut z = zmodem_handle.lock();
@@ -593,13 +615,37 @@ fn intercept_zmodem(
 
     // Inject ZMODEM protocol response bytes back to the PTY.
     if !processed.to_pty.is_empty() {
-        let _ = sender.send(processed.to_pty);
+        let pty_len = processed.to_pty.len();
+        tracing::info!(
+            "[ZMODEM] sending {} bytes to PTY for {}",
+            pty_len,
+            &session_id[..session_id.len().min(8)]
+        );
+        if let Err(_) = sender.send(processed.to_pty) {
+            tracing::warn!(
+                "[ZMODEM] failed to send {} bytes to PTY for {} (channel closed?)",
+                pty_len,
+                &session_id[..session_id.len().min(8)]
+            );
+        }
+    }
+
+    if processed.zmodem_active {
+        tracing::info!(
+            "[ZMODEM] session active for {}",
+            &session_id[..session_id.len().min(8)]
+        );
     }
 
     // Dispatch UI events (file dialogs, progress, completion). Each event
     // may spawn an async task; Done/Cancelled return true to signal the
     // session is finished.
     for event in processed.events {
+        tracing::info!(
+            "[ZMODEM] event for {}: {:?}",
+            &session_id[..session_id.len().min(8)],
+            event
+        );
         crate::zmodem::dispatch_event(session_id, event, zmodem_handle.clone(), sender.clone());
     }
 
@@ -2509,6 +2555,7 @@ fn render_terminal_pane(
             let sid_for_scroll_up = tab.id.clone();
             let sid_for_scroll_down = tab.id.clone();
             let sid_for_scroll_bottom = tab.id.clone();
+            let sid_for_copy_all = tab.id.clone();
             let sid_for_sug_nav = tab.id.clone();
             let sid_for_history_completion = tab.id.clone();
             let sid_for_sug_accept = tab.id.clone();
@@ -3056,6 +3103,37 @@ fn render_terminal_pane(
                             if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == sid_for_scroll_bottom) {
                                 tab.render_output = render_result;
                                 tab.version += 1;
+                            }
+                        }
+                    },
+                    on_copy_all: move |_: ()| {
+                        // Render the full scrollback + visible grid, extract all
+                        // text, and copy to clipboard. This gives the user the
+                        // entire session history, not just the visible viewport.
+                        let terminals = state_for_cmd.read().terminals.clone();
+                        if let Some(handle) = terminals.get(&sid_for_copy_all) {
+                            let entry = handle.lock();
+                            let max_scroll = entry.terminal.scrollback_len();
+                            let full_render = entry.terminal.render_with_scroll(max_scroll);
+                            let last_row = full_render.rows.len();
+                            if last_row > 0 {
+                                let last_col = full_render.rows[last_row - 1].cells.len().saturating_sub(1);
+                                let text = rusterm_core::terminal::extract_selection(
+                                    &full_render.rows,
+                                    (0, 0),
+                                    (last_row - 1, last_col),
+                                );
+                                if !text.is_empty() {
+                                    match crate::components::terminal_view::copy_text_to_clipboard_pub(text) {
+                                        crate::components::terminal_view::ClipboardCopyOutcome::Copied(n) => {
+                                            tracing::info!(
+                                                "[COPY] SelectAll (full session) copied {n} chars for session {:?}",
+                                                &sid_for_copy_all[..sid_for_copy_all.len().min(8)]
+                                            );
+                                        }
+                                        _ => {}
+                                    }
+                                }
                             }
                         }
                     },
@@ -11936,6 +12014,31 @@ fn open_local_terminal(
     {
         let mut app = state.write();
         push_workspace_tab(&mut app, &session_id);
+        // Store a ConnectionConfig so this local-shell session supports
+        // user-initiated disconnect / reconnect / copy-session just like
+        // sessions opened via `open_connection`. The connection id is the
+        // session id (local shells have no saved-connection entry).
+        app.session_configs.insert(
+            session_id.clone(),
+            ConnectionConfig {
+                id: session_id.clone(),
+                name: crate::i18n::t("shell.local_session_name"),
+                kind: ConnectionKind::Shell(ShellConfig {
+                    command: None,
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    working_dir: None,
+                }),
+                group: None,
+                tags: Vec::new(),
+                onekey: false,
+                login_script: None,
+            },
+        );
+        // A freshly-opened local terminal is Connected until the shell task
+        // reports otherwise.
+        app.session_connection_states
+            .insert(session_id.clone(), SessionConnectionState::Connected);
     }
     let shell_config = ShellConfig {
         command: None,
@@ -12762,6 +12865,100 @@ fn open_connection(
         session_id: tab_id,
         assigned_to_target,
     }
+}
+
+/// User-initiated disconnect (Task: 会话支持断开和重连).
+///
+/// Tears down the live transport for `tab_id` but KEEPS the session tab,
+/// the terminal model (so scrollback stays visible), and the stored
+/// `session_configs` entry (so [`reconnect_session`] can bring the session
+/// back). Mirrors the state mutations performed by the
+/// `SessionEvent::Disconnected` handler in each `start_*_connection` task
+/// so the UI lands in the same `Disconnected` state regardless of whether
+/// the disconnect was user-initiated or transport-initiated.
+///
+/// The background task is signalled to terminate via its close sender; it
+/// may emit a trailing `SessionEvent::Disconnected` whose handler re-runs
+/// the (idempotent) mutations. We do NOT remove `close_senders` /
+/// `terminals` / `session_configs` / `sessions` — those are exactly what
+/// reconnect needs.
+fn disconnect_session(
+    mut state: Signal<AppState>,
+    mut input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    tab_id: String,
+) {
+    // Guard: only disconnect a session that is currently Connected (or
+    // mid-Reconnecting). Already-Disconnected / unknown sessions are a no-op
+    // so the button is safe to click repeatedly.
+    let can_disconnect = matches!(
+        state.read().session_connection_states.get(&tab_id),
+        Some(SessionConnectionState::Connected) | Some(SessionConnectionState::Reconnecting)
+    );
+    if !can_disconnect {
+        tracing::debug!(
+            "[DISCONNECT] session={} not connected; skipping",
+            &tab_id[..tab_id.len().min(8)]
+        );
+        return;
+    }
+
+    flush_pending_renders(&mut state.write(), true);
+    let reason = crate::i18n::t("session.disconnected_by_user");
+    {
+        let mut app = state.write();
+        let _ = app.shadow_sandbox.fail_execution(&tab_id, &reason);
+        app.ssh_sessions.remove(&tab_id);
+        app.sftp_clients.remove(&tab_id);
+        app.transfers.cancel_for_session(&tab_id);
+        app.zmodem.lock().remove(&tab_id);
+        let job_ids = app
+            .transfers
+            .jobs
+            .iter()
+            .filter(|job| job.session == tab_id)
+            .map(|job| job.id.clone())
+            .collect::<Vec<_>>();
+        for job_id in job_ids {
+            if let Some((_, token)) = app.transfer_cancellations.remove(&job_id) {
+                token.cancel();
+            }
+        }
+        app.session_connection_states
+            .insert(tab_id.clone(), SessionConnectionState::Disconnected);
+        app.onekey_popups.remove(&tab_id);
+        app.onekey_submission_feedback.remove(&tab_id);
+        app.onekey_submission_cooldown.remove(&tab_id);
+        app.onekey_output_since_submission.remove(&tab_id);
+        app.onekey_preference_attempts.remove(&tab_id);
+        app.login_scripts.remove(&tab_id);
+        if let Some(tab) = app.sessions.iter_mut().find(|t| t.id == tab_id) {
+            tab.last_command_status = CommandStatus::Disconnected(reason);
+        }
+    }
+    input_senders.write().remove(&tab_id);
+
+    // Signal the background task to terminate. We remove the spent
+    // close_sender + resize_sender so a later reconnect can install fresh
+    // ones, but we deliberately keep `terminals`, `session_configs`, and
+    // the `sessions` entry so the tab + scrollback + login config survive.
+    {
+        let mut app = state.write();
+        if let Some((_, tx)) = app
+            .close_senders
+            .iter()
+            .find(|(sid, _)| sid == &tab_id)
+            .cloned()
+        {
+            let _ = tx.send(());
+        }
+        app.close_senders.retain(|(sid, _)| sid != &tab_id);
+        app.resize_senders.remove(&tab_id);
+    }
+    sync_live_sessions(&state, &input_senders);
+    tracing::info!(
+        "[DISCONNECT] session={} disconnected by user",
+        &tab_id[..tab_id.len().min(8)]
+    );
 }
 
 fn reconnect_session(
@@ -14128,6 +14325,7 @@ pub fn App() -> Element {
                     active: state.read().active_tab.clone(),
                     focused_session: focused_pane_session(&state.read()),
                     focused_appearance: state.read().focused_tab_appearance.clone(),
+                    connection_states: state.read().session_connection_states.clone(),
                     on_select: move |id: String| {
                         // Switching the top TabBar entry: update active_tab
                         // and derive active_session from the new tab's anchor.
@@ -14158,6 +14356,40 @@ pub fn App() -> Element {
                     // pane, and calls `finish_tab_drag` on `mouseup`.
                     on_drag_start: move |(sid, name, x, y): (String, String, f64, f64)| {
                         start_tab_drag(tab_drag, DragKind::Session(sid), name, x, y);
+                    },
+                    // Context-menu: user-initiated disconnect. Tears down the
+                    // transport but keeps the tab + scrollback + login config
+                    // so Reconnect works afterwards.
+                    on_disconnect: move |sid: String| {
+                        disconnect_session(state, input_senders, sid);
+                    },
+                    // Context-menu: reconnect a disconnected session. Reuses
+                    // the existing reconnect path (also triggered by Enter /
+                    // right-click on the terminal surface).
+                    on_reconnect: move |sid: String| {
+                        reconnect_session(state, input_senders, sid);
+                    },
+                    // Context-menu: copy session. Clones the stored login
+                    // config and opens a new independent session via
+                    // `open_connection`. Works for all connection kinds that
+                    // `open_connection` supports (SSH / Shell / Telnet /
+                    // Serial); the new session gets a fresh id and a
+                    // "{name} 副本" display name.
+                    on_copy_session: move |sid: String| {
+                        let conn = state.read().session_configs.get(&sid).cloned();
+                        if let Some(conn) = conn {
+                            let mut new_conn = conn.clone();
+                            new_conn.name = crate::i18n::tf(
+                                "connection.copy_name",
+                                &[("name", &conn.name)],
+                            );
+                            open_connection(state, input_senders, new_conn, None);
+                        } else {
+                            tracing::warn!(
+                                "[COPY-SESSION] no stored config for session {}; cannot copy",
+                                &sid[..sid.len().min(8)]
+                            );
+                        }
                     },
                 }
 
