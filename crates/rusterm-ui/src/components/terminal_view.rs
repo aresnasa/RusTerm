@@ -1201,6 +1201,27 @@ fn popup_fallback_top_px(cursor_row: usize) -> f64 {
     TERMINAL_PADDING_TOP_PX + (cursor_row as f64 + 1.0) * TERMINAL_ROW_HEIGHT_PX
 }
 
+/// The row the suggestion/OneKey popup should anchor BELOW: the last row at
+/// or after the cursor row that still contains visible content.
+///
+/// Rationale: after a scrollback-heavy command the prompt often reappears
+/// mid-screen while older output is still painted on the rows below it
+/// (e.g. prompt on row 114, stale output on rows 115+). Anchoring the popup
+/// to the cursor row would cover that output. Anchoring to the last content
+/// row keeps the popup below everything the user can still read; when the
+/// prompt is the final content (the common case) this degrades to exactly
+/// the old cursor-row behavior. If the new anchor leaves no room below, the
+/// existing flip-above / internal-scroll logic applies unchanged.
+fn popup_anchor_row(rows: &[RenderRow], cursor_row: usize) -> usize {
+    rows.iter()
+        .enumerate()
+        .skip(cursor_row.saturating_add(1))
+        .filter(|(_, row)| row.cells.iter().any(|cell| !cell.character.is_whitespace()))
+        .map(|(idx, _)| idx)
+        .next_back()
+        .unwrap_or(cursor_row)
+}
+
 // ── Draggable popup placement (user habit) ─────────────────────────
 
 /// User-adjusted vertical offset (px) applied to the suggestion / OneKey
@@ -1336,6 +1357,21 @@ pub(crate) fn build_install_popup_drag_script(container_id: &str, start_y: f64) 
             window.addEventListener('blur', blurHandler, true);\n\
             window._rusterm_popup_drag_remove = function() {{ removeListeners(); }};\n\
         }})()"
+    )
+}
+
+/// Builds the periodic (100ms) measurement script: terminal cols/rows sizing
+/// plus popup anchor geometry. `--suggestion-top` (below-the-prompt placement)
+/// and the free space below (`popupBelow`) are measured from the popup ANCHOR
+/// row — the last content row at/after the cursor, marked
+/// `data-popup-anchor="1"` — falling back to the cursor row when no anchor is
+/// marked, so an open popup never covers output still painted below the
+/// prompt. The flip-above values (`--suggestion-bottom`, `popupAbove`) stay
+/// relative to the CURSOR row so an above-popup still opens directly over the
+/// prompt.
+fn build_terminal_measure_script(measure_cid: &str, scroll_cid: &str) -> String {
+    format!(
+        "return (function() {{ const el = document.getElementById('{measure_cid}'); if (!el) return 'no-el'; const rect = el.getBoundingClientRect(); if (rect.width <= 0 || rect.height <= 0) return 'zero'; const cs = getComputedStyle(el); const padH = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight); const padV = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom); const bw = parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth); const bh = parseFloat(cs.borderTopWidth) + parseFloat(cs.borderBottomWidth); const h = rect.height - padV - bh; if (h <= 0) return 'small'; const sd = document.getElementById('{scroll_cid}'); if (!sd) return 'no-scroll'; const sdRect = sd.getBoundingClientRect(); if (sdRect.width <= 0) return 'small'; let w = sdRect.width; if (sd.firstElementChild) {{ const gutterW = sd.firstElementChild.getBoundingClientRect().width; w = Math.max(0, sdRect.width - gutterW); }} if (w <= 0) return 'small'; const test = document.createElement('span'); test.textContent = 'M'; test.style.cssText = 'font-family:JetBrains Mono,Fira Code,Cascadia Code,monospace;font-size:13px;line-height:1.5;position:absolute;visibility:hidden;white-space:pre;'; document.body.appendChild(test); const tr = test.getBoundingClientRect(); document.body.removeChild(test); const cw = Math.max(1, tr.width); const ch = Math.max(1, tr.height); const cols = Math.max(1, Math.floor(w / cw)); const rows = Math.max(1, Math.floor(h / ch)); let popupAbove = -1; let popupBelow = -1; let popupDesired = -1; const cr_sug = el.querySelector('[data-cursor-row=\"1\"]'); if (cr_sug) {{ const anchor_sug = el.querySelector('[data-popup-anchor=\"1\"]') || cr_sug; const tr_sug = el.getBoundingClientRect(); const cr_r_sug = cr_sug.getBoundingClientRect(); const an_r_sug = anchor_sug.getBoundingClientRect(); el.style.setProperty('--suggestion-bottom', (tr_sug.bottom - cr_r_sug.top) + 'px'); el.style.setProperty('--suggestion-top', (an_r_sug.bottom - tr_sug.top) + 'px'); const popup = el.querySelector('[data-rusterm-terminal-popup=\"true\"]'); if (popup) {{ popupAbove = Math.max(0, cr_r_sug.top - tr_sug.top); popupBelow = Math.max(0, tr_sug.bottom - an_r_sug.bottom); popupDesired = Math.max(1, popup.scrollHeight); }} }} return cols + ',' + rows + ',' + cw.toFixed(2) + ',' + ch.toFixed(2) + ',' + popupAbove.toFixed(2) + ',' + popupBelow.toFixed(2) + ',' + popupDesired.toFixed(2); }})()"
     )
 }
 
@@ -2045,9 +2081,11 @@ pub fn TerminalView(
                 // (e.g. 207 → 203 within 100ms) that visibly re-wrapped remote
                 // output. Reading both children's bounding rects explicitly
                 // avoids that race.
-                let result = dioxus::document::eval(&format!(
-                    "return (function() {{ const el = document.getElementById('{measure_cid}'); if (!el) return 'no-el'; const rect = el.getBoundingClientRect(); if (rect.width <= 0 || rect.height <= 0) return 'zero'; const cs = getComputedStyle(el); const padH = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight); const padV = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom); const bw = parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth); const bh = parseFloat(cs.borderTopWidth) + parseFloat(cs.borderBottomWidth); const h = rect.height - padV - bh; if (h <= 0) return 'small'; const sd = document.getElementById('{scroll_cid}'); if (!sd) return 'no-scroll'; const sdRect = sd.getBoundingClientRect(); if (sdRect.width <= 0) return 'small'; let w = sdRect.width; if (sd.firstElementChild) {{ const gutterW = sd.firstElementChild.getBoundingClientRect().width; w = Math.max(0, sdRect.width - gutterW); }} if (w <= 0) return 'small'; const test = document.createElement('span'); test.textContent = 'M'; test.style.cssText = 'font-family:JetBrains Mono,Fira Code,Cascadia Code,monospace;font-size:13px;line-height:1.5;position:absolute;visibility:hidden;white-space:pre;'; document.body.appendChild(test); const tr = test.getBoundingClientRect(); document.body.removeChild(test); const cw = Math.max(1, tr.width); const ch = Math.max(1, tr.height); const cols = Math.max(1, Math.floor(w / cw)); const rows = Math.max(1, Math.floor(h / ch)); let popupAbove = -1; let popupBelow = -1; let popupDesired = -1; const cr_sug = el.querySelector('[data-cursor-row=\"1\"]'); if (cr_sug) {{ const tr_sug = el.getBoundingClientRect(); const cr_r_sug = cr_sug.getBoundingClientRect(); el.style.setProperty('--suggestion-bottom', (tr_sug.bottom - cr_r_sug.top) + 'px'); el.style.setProperty('--suggestion-top', (cr_r_sug.bottom - tr_sug.top) + 'px'); const popup = el.querySelector('[data-rusterm-terminal-popup=\"true\"]'); if (popup) {{ popupAbove = Math.max(0, cr_r_sug.top - tr_sug.top); popupBelow = Math.max(0, tr_sug.bottom - cr_r_sug.bottom); popupDesired = Math.max(1, popup.scrollHeight); }} }} return cols + ',' + rows + ',' + cw.toFixed(2) + ',' + ch.toFixed(2) + ',' + popupAbove.toFixed(2) + ',' + popupBelow.toFixed(2) + ',' + popupDesired.toFixed(2); }})()"
-                )).await;
+                let result = dioxus::document::eval(&build_terminal_measure_script(
+                    &measure_cid,
+                    &scroll_cid,
+                ))
+                .await;
                 if let Ok(value) = result {
                     if let Some(s) = value.as_str() {
                         if s == "no-el"
@@ -2188,10 +2226,17 @@ pub fn TerminalView(
     let line_number_start = render_output.line_number_start;
     let total_rows = render_output.rows.len();
 
+    // Popup anchor: the last content row at/after the cursor (see
+    // `popup_anchor_row`). Popups open below THIS row so they never cover
+    // output still painted under the prompt.
+    let popup_anchor = popup_anchor_row(&render_output.rows, cursor_row);
+
     // Deterministic below-the-prompt fallback for popup positioning, used
     // until (or whenever) the DOM measurement loop hasn't provided
-    // `--suggestion-top`. See `popup_fallback_top_px`.
-    let popup_fallback_top = format!("{:.0}px", popup_fallback_top_px(cursor_row));
+    // `--suggestion-top`. Anchored to `popup_anchor` (not the cursor row) so
+    // the unmeasured popup also avoids covering output below the prompt.
+    // See `popup_fallback_top_px`.
+    let popup_fallback_top = format!("{:.0}px", popup_fallback_top_px(popup_anchor));
 
     // Scroll-position indicator: a small "thumb" on the right edge showing
     // where the visible window sits within (scrollback + grid). Only shown when
@@ -2662,6 +2707,7 @@ pub fn TerminalView(
         .enumerate()
         .map(|(row_idx, row)| {
             let is_cursor_row = row_idx == cursor_row && cursor_visible;
+            let is_popup_anchor_row = row_idx == popup_anchor && cursor_visible;
             let cur_col = if is_cursor_row {
                 Some(cursor_col)
             } else {
@@ -2711,6 +2757,9 @@ pub fn TerminalView(
             html.push_str(row_bg);
             if is_cursor_row {
                 html.push_str("\" data-cursor-row=\"1");
+            }
+            if is_popup_anchor_row {
+                html.push_str("\" data-popup-anchor=\"1");
             }
             html.push_str("\">");
             html.push_str(&content_html);
@@ -3101,11 +3150,12 @@ mod tests {
         ClipboardCopyOutcome, CopyShortcut, OneKeyKeyAction, PopupDirection, PopupDragPoll,
         SEARCH_CURRENT_BG, SEARCH_MATCH_BG, TerminalOverlayKeyAction, TextSelection,
         accepts_history_completion, accepts_inline_suggestion, app_owns_mouse,
-        build_install_popup_drag_script, build_manual_popup_layout_script, cell_style,
-        color_to_css, copy_text_to_clipboard, cursor_key_seq, event_cell_from_coords,
-        finalize_selection_on_mouse_up, find_search_matches, is_find_shortcut,
-        is_history_completion_shortcut, onekey_popup_key_action, online_search_url,
-        parse_popup_drag_poll_response, popup_fallback_top_px, popup_layout, scroll_thumb_geometry,
+        build_install_popup_drag_script, build_manual_popup_layout_script,
+        build_terminal_measure_script, cell_style, color_to_css, copy_text_to_clipboard,
+        cursor_key_seq, event_cell_from_coords, finalize_selection_on_mouse_up,
+        find_search_matches, is_find_shortcut, is_history_completion_shortcut,
+        onekey_popup_key_action, online_search_url, parse_popup_drag_poll_response,
+        popup_anchor_row, popup_fallback_top_px, popup_layout, scroll_thumb_geometry,
         search_query_from_selection, suggestion_navigation_index, terminal_key_bytes,
         terminal_overlay_key_action, terminal_selection_text, word_range_in_row,
     };
@@ -3170,6 +3220,67 @@ mod tests {
         // A prompt further down the screen: the fallback must track it so an
         // unmeasured popup never jumps back to the top of the terminal.
         assert_eq!(popup_fallback_top_px(20), 8.0 + 21.0 * 19.0);
+    }
+
+    #[test]
+    fn popup_anchor_row_is_cursor_row_when_prompt_is_last_content() {
+        // Common case: prompt at the end of the screen, only blank rows (or
+        // nothing) below it — behavior must match the old cursor-row anchor.
+        let rows = vec![row_from("output"), row_from("user@host$ ls"), row_from("")];
+        assert_eq!(popup_anchor_row(&rows, 1), 1);
+        // Cursor on the very last row.
+        assert_eq!(popup_anchor_row(&rows, 2), 2);
+    }
+
+    #[test]
+    fn popup_anchor_row_moves_to_last_content_row_below_cursor() {
+        // Screenshot scenario: prompt re-drawn mid-screen (row 1) with stale
+        // output still painted below it — the popup must anchor below the
+        // LAST content row so it never covers that output.
+        let rows = vec![
+            row_from("old output"),
+            row_from("root@host# docker ps"),
+            row_from("CONTAINER ID   IMAGE"),
+            row_from("abc123   postgres:15"),
+            row_from(""),
+            row_from(""),
+        ];
+        assert_eq!(popup_anchor_row(&rows, 1), 3);
+    }
+
+    #[test]
+    fn popup_anchor_row_treats_whitespace_only_rows_as_empty() {
+        let rows = vec![
+            row_from("$ cmd"),
+            row_from("result"),
+            row_from("   \t "),
+            row_from(""),
+        ];
+        // The whitespace-only row 2 must not become the anchor.
+        assert_eq!(popup_anchor_row(&rows, 0), 1);
+    }
+
+    #[test]
+    fn popup_anchor_row_ignores_content_above_the_cursor() {
+        let rows = vec![row_from("earlier output"), row_from("$ prompt")];
+        assert_eq!(popup_anchor_row(&rows, 1), 1);
+    }
+
+    #[test]
+    fn measure_script_anchors_suggestion_top_to_popup_anchor_row() {
+        let script = build_terminal_measure_script("terminal-input-x", "terminal-scroll-x");
+        // The below-placement anchor prefers the marked anchor row and falls
+        // back to the cursor row when none is marked.
+        assert!(script.contains("el.querySelector('[data-popup-anchor=\"1\"]') || cr_sug"));
+        // `--suggestion-top` and the free space below come from the anchor
+        // row's rect...
+        assert!(script.contains("'--suggestion-top', (an_r_sug.bottom - tr_sug.top)"));
+        assert!(script.contains("popupBelow = Math.max(0, tr_sug.bottom - an_r_sug.bottom)"));
+        // ...while flip-above stays relative to the cursor row.
+        assert!(script.contains("'--suggestion-bottom', (tr_sug.bottom - cr_r_sug.top)"));
+        assert!(script.contains("popupAbove = Math.max(0, cr_r_sug.top - tr_sug.top)"));
+        assert!(script.contains("terminal-input-x"));
+        assert!(script.contains("terminal-scroll-x"));
     }
 
     #[test]
