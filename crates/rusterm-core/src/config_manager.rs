@@ -274,6 +274,7 @@ impl ConfigManager {
             api_custom_templates: existing.api_custom_templates.clone(),
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
+            otp_webhook: existing.otp_webhook.clone(),
         };
 
         let json =
@@ -312,6 +313,7 @@ impl ConfigManager {
             api_custom_templates: existing.api_custom_templates.clone(),
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
+            otp_webhook: existing.otp_webhook.clone(),
         };
 
         let json =
@@ -358,6 +360,7 @@ impl ConfigManager {
             api_custom_templates: existing.api_custom_templates.clone(),
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
+            otp_webhook: existing.otp_webhook.clone(),
         };
 
         let json =
@@ -401,6 +404,7 @@ impl ConfigManager {
             api_custom_templates: existing.api_custom_templates.clone(),
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
+            otp_webhook: existing.otp_webhook.clone(),
         };
 
         let json =
@@ -441,6 +445,7 @@ impl ConfigManager {
             api_custom_templates: existing.api_custom_templates.clone(),
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
+            otp_webhook: existing.otp_webhook.clone(),
         };
         let json =
             serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
@@ -481,6 +486,7 @@ impl ConfigManager {
             api_custom_templates: existing.api_custom_templates.clone(),
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
+            otp_webhook: existing.otp_webhook.clone(),
         };
         let json =
             serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
@@ -529,6 +535,7 @@ impl ConfigManager {
             api_custom_templates: existing.api_custom_templates.clone(),
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
+            otp_webhook: existing.otp_webhook.clone(),
         };
 
         let json =
@@ -618,6 +625,7 @@ impl ConfigManager {
             api_custom_templates: existing.api_custom_templates.clone(),
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
+            otp_webhook: existing.otp_webhook.clone(),
         };
 
         let json =
@@ -660,6 +668,7 @@ impl ConfigManager {
             api_custom_templates: existing.api_custom_templates.clone(),
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
+            otp_webhook: existing.otp_webhook.clone(),
         };
 
         let json =
@@ -702,6 +711,7 @@ impl ConfigManager {
             api_custom_templates: existing.api_custom_templates.clone(),
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
+            otp_webhook: existing.otp_webhook.clone(),
         };
 
         let json =
@@ -742,6 +752,7 @@ impl ConfigManager {
             api_custom_templates: existing.api_custom_templates.clone(),
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
+            otp_webhook: existing.otp_webhook.clone(),
         };
 
         let json =
@@ -824,6 +835,7 @@ impl ConfigManager {
             api_custom_templates: existing.api_custom_templates.clone(),
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
+            otp_webhook: existing.otp_webhook.clone(),
         };
 
         let json =
@@ -859,6 +871,7 @@ impl ConfigManager {
             api_custom_templates: Vec::new(),
             qwen_local: Default::default(),
             suggestion_popup_offset_y: 0.0,
+            otp_webhook: None,
         };
 
         let mut persisted = if self.config_path.exists() {
@@ -915,6 +928,7 @@ impl ConfigManager {
             api_custom_templates: existing.api_custom_templates.clone(),
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
+            otp_webhook: existing.otp_webhook.clone(),
         };
 
         let json =
