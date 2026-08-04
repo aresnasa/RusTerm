@@ -20742,6 +20742,7 @@ mod tab_drag_tests {
 
 #[cfg(test)]
 mod command_status_tests {
+    use crate::app::decide_command_status;
     use crate::state::CommandStatus;
 
     #[test]

@@ -2850,10 +2850,10 @@ mod tests {
         accepts_inline_suggestion, app_owns_mouse, cell_style, color_to_css,
         copy_text_to_clipboard, cursor_key_seq, event_cell_from_coords,
         finalize_selection_on_mouse_up, find_search_matches, is_find_shortcut,
-        is_history_completion_shortcut, onekey_popup_key_action, online_search_url, popup_layout,
-        scroll_thumb_geometry, search_query_from_selection, suggestion_navigation_index,
-        terminal_key_bytes, terminal_overlay_key_action, terminal_selection_text,
-        word_range_in_row,
+        is_history_completion_shortcut, onekey_popup_key_action, online_search_url,
+        popup_fallback_top_px, popup_layout, scroll_thumb_geometry, search_query_from_selection,
+        suggestion_navigation_index, terminal_key_bytes, terminal_overlay_key_action,
+        terminal_selection_text, word_range_in_row,
     };
     use dioxus::prelude::{Code, Key};
     use rusterm_core::terminal::{CellColor, RenderCell, RenderRow};
@@ -2906,6 +2906,16 @@ mod tests {
 
         let above = popup_layout(30.0, 10.0, 120.0);
         assert_eq!(above.direction, PopupDirection::Above);
+    }
+
+    #[test]
+    fn popup_fallback_top_sits_below_the_cursor_row() {
+        // Row 0: 8px container padding + one 19px row — the popup's top edge
+        // lands exactly on the bottom edge of the prompt row.
+        assert_eq!(popup_fallback_top_px(0), 27.0);
+        // A prompt further down the screen: the fallback must track it so an
+        // unmeasured popup never jumps back to the top of the terminal.
+        assert_eq!(popup_fallback_top_px(20), 8.0 + 21.0 * 19.0);
     }
 
     #[test]

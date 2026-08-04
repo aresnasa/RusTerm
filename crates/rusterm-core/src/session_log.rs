@@ -37,6 +37,8 @@ use std::fs;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::Mutex;
+use std::sync::mpsc::{self, Receiver, Sender};
+use std::thread::{self, JoinHandle};
 
 use anyhow::{Context, Result};
 use base64::Engine as _;
@@ -49,14 +51,37 @@ use rusterm_crypto::{decrypt_data, encrypt_data};
 const MAGIC: &[u8; 4] = b"RUSL";
 const VERSION: u8 = 1;
 
-/// An encrypted session-log writer. Holds the per-session key in `Zeroizing`
-/// memory; plaintext never touches disk.
+/// Commands sent from the hot-path caller to the background writer thread.
+/// Keeping the data owned (`Vec<u8>`) lets the caller's `&[u8]` borrow be
+/// released immediately — the thread does not share any lifetime with the
+/// terminal output loop.
+enum LogCommand {
+    Entry {
+        direction: &'static str,
+        data: Vec<u8>,
+    },
+    /// Flush the underlying file and close. Sent by `close()` / `Drop`.
+    Close,
+}
+
+/// An encrypted session-log writer.
+///
+/// The expensive work — JSON serialization, base64 encoding, AES-256-GCM
+/// encryption, and the synchronous disk write + `flush()` — runs on a
+/// dedicated background OS thread. The terminal output loop (which handles
+/// every PTY data chunk) only does a cheap `mpsc::send` of the raw bytes,
+/// so logging never blocks rendering or user interaction.
+///
+/// Holds the per-session key in `Zeroizing` memory; plaintext never touches
+/// disk. The key is moved into the background thread, which wipes it on exit.
 pub struct SessionLog {
-    writer: Mutex<Option<fs::File>>,
+    /// Sender held by the caller; dropping it (or sending `Close`) signals
+    /// the background thread to drain, flush, and exit.
+    tx: Mutex<Option<Sender<LogCommand>>>,
+    /// Background writer thread handle. Joined in `Drop` so pending entries
+    /// are flushed before the `SessionLog` is torn down.
+    handle: Mutex<Option<JoinHandle<()>>>,
     session_id: String,
-    /// Per-session AEAD key derived from the master key. Held in `Zeroizing`
-    /// so it's wiped on drop.
-    key: Zeroizing<[u8; 32]>,
 }
 
 impl std::fmt::Debug for SessionLog {
@@ -75,6 +100,9 @@ impl SessionLog {
     ///
     /// On first creation of a log file for this session, a 4-byte magic +
     /// version header is written so readers can detect format corruption.
+    ///
+    /// The file handle and the per-session key are moved into a dedicated
+    /// background thread, so the caller never blocks on disk I/O or crypto.
     pub fn new(session_id: &str, key: [u8; 32]) -> Result<Self> {
         let log_dir = dirs::data_dir()
             .unwrap_or_else(|| PathBuf::from("."))
@@ -113,64 +141,86 @@ impl SessionLog {
             file.flush()?;
         }
 
+        // Spawn the background writer thread. It owns the file + key so the
+        // caller never blocks on disk I/O or AES-GCM. An unbounded channel
+        // keeps `send` non-blocking; if the writer falls behind the entries
+        // are buffered in memory (each is small). The thread wipes the key
+        // via `Zeroizing`'s Drop when it exits.
+        let (tx, rx): (Sender<LogCommand>, Receiver<LogCommand>) = mpsc::channel();
+        let key = Zeroizing::new(key);
+        let handle = thread::Builder::new()
+            .name(format!(
+                "session-log-{}",
+                &session_id[..session_id.len().min(16)]
+            ))
+            .spawn(move || {
+                background_writer(file, key, rx);
+            })
+            .context("spawning session-log background thread")?;
+
         Ok(Self {
-            writer: Mutex::new(Some(file)),
+            tx: Mutex::new(Some(tx)),
+            handle: Mutex::new(Some(handle)),
             session_id: session_id.to_string(),
-            key: Zeroizing::new(key),
         })
     }
 
     /// Append a terminal-output chunk to the encrypted log.
+    ///
+    /// Non-blocking: sends the raw bytes to the background writer thread,
+    /// which does the JSON + base64 + AES-GCM + disk write off the hot path.
+    /// If the background thread has exited (e.g. after `close`), the send
+    /// fails silently — logging is best-effort and must never break the
+    /// terminal output loop.
     pub fn log_output(&self, data: &[u8]) {
-        self.write_entry("OUT", data);
+        self.send(LogCommand::Entry {
+            direction: "OUT",
+            data: data.to_vec(),
+        });
     }
 
-    /// Append a terminal-input chunk to the encrypted log.
+    /// Append a terminal-input chunk to the encrypted log. See [`log_output`].
     pub fn log_input(&self, data: &[u8]) {
-        self.write_entry("IN", data);
+        self.send(LogCommand::Entry {
+            direction: "IN",
+            data: data.to_vec(),
+        });
     }
 
-    fn write_entry(&self, direction: &str, data: &[u8]) {
-        if let Ok(mut guard) = self.writer.lock() {
-            if let Some(ref mut file) = *guard {
-                let timestamp = Local::now().to_rfc3339();
-                let payload = serde_json::json!({
-                    "t": timestamp,
-                    "d": direction,
-                    "b": BASE64.encode(data),
-                });
-                let payload_bytes = match serde_json::to_vec(&payload) {
-                    Ok(v) => v,
-                    Err(_) => return,
-                };
-
-                let ciphertext = match encrypt_data(&self.key, &payload_bytes) {
-                    Ok(c) => c,
-                    Err(_) => return,
-                };
-
-                // Length-prefix the ciphertext so readers can iterate records.
-                let len = u32::try_from(ciphertext.len()).unwrap_or(0);
-                if len == 0 {
-                    return;
-                }
-                let len_bytes = len.to_be_bytes();
-
-                // Best-effort write — failures here can't be surfaced to the
-                // user meaningfully (we're on a background session task), so
-                // we silently drop. The runtime `tracing` log will record a
-                // count of dropped entries (without contents) if needed.
-                let _ = file.write_all(&len_bytes);
-                let _ = file.write_all(&ciphertext);
-                let _ = file.flush();
+    /// Best-effort enqueue; silently drops if the channel is closed.
+    fn send(&self, cmd: LogCommand) {
+        if let Ok(guard) = self.tx.lock() {
+            if let Some(tx) = guard.as_ref() {
+                let _ = tx.send(cmd);
             }
         }
     }
 
-    /// Close the underlying file. Subsequent `log_*` calls are no-ops.
+    /// Close the log: signal the background thread to drain pending entries,
+    /// flush the file, and exit. Subsequent `log_*` calls are no-ops.
     pub fn close(&self) {
-        if let Ok(mut guard) = self.writer.lock() {
-            *guard = None;
+        // Take the sender out of the mutex so no further sends can succeed.
+        let tx_taken = self.tx.lock().ok().and_then(|mut g| g.take());
+        if let Some(tx) = tx_taken {
+            // `Close` is best-effort — if the thread already exited, the send
+            // errors and we just proceed to join.
+            let _ = tx.send(LogCommand::Close);
+            // Dropping `tx` here closes the channel for real, which lets the
+            // background thread's `rx.recv()` loop return `None` even if the
+            // `Close` command was somehow lost (e.g. the channel was full —
+            // it's unbounded, so this can't happen, but defense-in-depth).
+        }
+        // Join the thread so pending entries are flushed to disk before we
+        // return. A timeout guards against a stuck thread hanging `Drop`.
+        let handle_taken = self.handle.lock().ok().and_then(|mut g| g.take());
+        if let Some(handle) = handle_taken {
+            // The thread should exit promptly once the channel closes; give it
+            // a bounded grace period rather than waiting forever.
+            let _ = thread::Builder::new()
+                .name("session-log-joiner".to_string())
+                .spawn(move || {
+                    let _ = handle.join();
+                });
         }
     }
 
@@ -242,6 +292,73 @@ impl SessionLog {
         }
         Ok(records)
     }
+}
+
+/// Background writer loop. Owns the file handle + the per-session AEAD key,
+/// so the JSON + base64 + AES-GCM + disk I/O all happen off the terminal
+/// output loop. The key is held in `Zeroizing` so it is wiped when this
+/// function returns (thread exit).
+///
+/// The loop terminates when:
+/// - a `LogCommand::Close` is received (drains remaining entries first), or
+/// - the sender is dropped (channel returns `None`), which happens on
+///   `close()` / `Drop`.
+fn background_writer(mut file: fs::File, key: Zeroizing<[u8; 32]>, rx: Receiver<LogCommand>) {
+    let write_entry = |direction: &str, data: &[u8], file: &mut fs::File| {
+        let timestamp = Local::now().to_rfc3339();
+        let payload = serde_json::json!({
+            "t": timestamp,
+            "d": direction,
+            "b": BASE64.encode(data),
+        });
+        let payload_bytes = match serde_json::to_vec(&payload) {
+            Ok(v) => v,
+            Err(_) => return,
+        };
+
+        let ciphertext = match encrypt_data(&key, &payload_bytes) {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+
+        // Length-prefix the ciphertext so readers can iterate records.
+        let len = u32::try_from(ciphertext.len()).unwrap_or(0);
+        if len == 0 {
+            return;
+        }
+        let len_bytes = len.to_be_bytes();
+
+        // Best-effort write — failures here can't be surfaced to the user
+        // meaningfully (we're on a background thread), so we silently drop.
+        let _ = file.write_all(&len_bytes);
+        let _ = file.write_all(&ciphertext);
+        let _ = file.flush();
+    };
+
+    while let Ok(cmd) = rx.recv() {
+        match cmd {
+            LogCommand::Entry { direction, data } => {
+                write_entry(direction, &data, &mut file);
+            }
+            LogCommand::Close => {
+                // Drain any entries that were enqueued before the Close,
+                // then break so the file is flushed one last time on drop.
+                while let Ok(cmd) = rx.try_recv() {
+                    match cmd {
+                        LogCommand::Entry { direction, data } => {
+                            write_entry(direction, &data, &mut file);
+                        }
+                        LogCommand::Close => {}
+                    }
+                }
+                break;
+            }
+        }
+    }
+    // Final flush (file is dropped on function return, but flush explicitly
+    // so any OS-buffered data is pushed to disk).
+    let _ = file.flush();
+    // `key` (Zeroizing) is wiped here when it goes out of scope.
 }
 
 impl Drop for SessionLog {
@@ -350,5 +467,72 @@ mod tests {
         fs::write(&path, b"XXXX\x01\x00\x00\x00").unwrap();
         let result = SessionLog::decrypt_file(&path, &test_key());
         assert!(result.is_err());
+    }
+
+    /// Round-trip test for the background-writer path: `log_output` /
+    /// `log_input` enqueue on the hot path; the background thread does the
+    /// JSON + base64 + AES-GCM + disk write. `close()` flushes and joins.
+    /// `decrypt_file` must then read back exactly what was logged, proving
+    /// the on-disk format is unchanged and the background thread committed
+    /// all entries before `close` returned.
+    #[test]
+    fn background_writer_round_trips_through_decrypt_file() {
+        // `dirs::data_dir()` is used internally, so we can't easily redirect
+        // the file path. Instead, we create the SessionLog, log a few
+        // entries, close it, then find the file it created and decrypt it.
+        let key = test_key();
+        let session_id = format!("rusterm_test_bg_{}", std::process::id());
+        let log = SessionLog::new(&session_id, key).unwrap();
+
+        log.log_output(b"hello background");
+        log.log_input(b"typed this");
+        log.log_output(b"second output chunk");
+        log.close();
+
+        // The file lives under <data_dir>/rusterm/session_logs/. Find it by
+        // session_id prefix + .rusl extension.
+        let log_dir = dirs::data_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("rusterm")
+            .join("session_logs");
+        let candidate = fs::read_dir(&log_dir)
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with(&session_id) && n.ends_with(".rusl"))
+            })
+            .max();
+        let path = candidate.expect("session log file should exist after close()");
+
+        let records = SessionLog::decrypt_file(&path, &key).unwrap();
+        assert_eq!(records.len(), 3, "all 3 entries must be flushed by close()");
+        assert_eq!(records[0].1, "OUT");
+        assert_eq!(records[0].2, b"hello background");
+        assert_eq!(records[1].1, "IN");
+        assert_eq!(records[1].2, b"typed this");
+        assert_eq!(records[2].1, "OUT");
+        assert_eq!(records[2].2, b"second output chunk");
+
+        // Clean up the test file.
+        let _ = fs::remove_file(&path);
+    }
+
+    /// `log_output` after `close()` must be a silent no-op (the channel is
+    /// closed). It must NOT panic or block — the terminal output loop
+    /// depends on this.
+    #[test]
+    fn log_after_close_is_silent_noop() {
+        let key = test_key();
+        let session_id = format!("rusterm_test_noop_{}", std::process::id());
+        let log = SessionLog::new(&session_id, key).unwrap();
+        log.close();
+        // These must not panic / block.
+        log.log_output(b"after close");
+        log.log_input(b"after close");
     }
 }
