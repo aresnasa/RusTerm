@@ -119,11 +119,32 @@ impl client::Handler for Handler {
 pub struct SshClient {
     config: SshConfig,
     event_tx: mpsc::UnboundedSender<SessionEvent>,
+    otp_provider: OtpProvider,
 }
 
 impl SshClient {
     pub fn new(config: SshConfig, event_tx: mpsc::UnboundedSender<SessionEvent>) -> Self {
-        Self { config, event_tx }
+        Self {
+            config,
+            event_tx,
+            otp_provider: OtpProvider::Manual,
+        }
+    }
+
+    /// Replace the OTP / MFA code provider used during keyboard-interactive
+    /// authentication. Defaults to [`OtpProvider::Manual`]. Call this before
+    /// [`connect`](Self::connect) with a provider built from the user's
+    /// `otp_webhook` setting to enable automatic OTP auto-fill.
+    pub fn with_otp_provider(mut self, provider: OtpProvider) -> Self {
+        self.otp_provider = provider;
+        self
+    }
+
+    /// Mutable setter for the OTP provider — used when the app updates the
+    /// setting after the client has been constructed (e.g. the user edits
+    /// the webhook config while a reconnect is queued).
+    pub fn set_otp_provider(&mut self, provider: OtpProvider) {
+        self.otp_provider = provider;
     }
 
     pub async fn connect(
@@ -133,7 +154,7 @@ impl SshClient {
     ) -> anyhow::Result<(Session, SshSession)> {
         let config = Arc::new(interactive_client_config());
 
-        let handle = connect_authenticated(&self.config, config).await?;
+        let handle = connect_authenticated(&self.config, config, self.otp_provider.clone()).await?;
         let handle = Arc::new(handle);
 
         let channel = handle.channel_open_session().await?;
@@ -395,6 +416,7 @@ pub async fn connect_authenticated(
 async fn authenticate(
     handle: &mut client::Handle<Handler>,
     config: &SshConfig,
+    otp_provider: &OtpProvider,
 ) -> anyhow::Result<()> {
     match &config.auth {
         SshAuth::Password { password } => {
@@ -413,7 +435,8 @@ async fn authenticate(
                     config.host
                 );
                 let ki_result =
-                    auth_keyboard_interactive(handle, &config.username, password).await?;
+                    auth_keyboard_interactive(handle, &config.username, password, otp_provider)
+                        .await?;
                 if !matches!(ki_result, client::AuthResult::Success) {
                     anyhow::bail!(
                         "SSH authentication failed (tried password then keyboard-interactive)"
@@ -488,10 +511,18 @@ async fn authenticate(
 /// keyboard-interactive" pattern: the server sends one prompt (e.g.
 /// "Password: ") and we reply with the password. Loops because some servers
 /// send multiple (empty) prompts before the real one.
+///
+/// When an OTP / MFA prompt is detected (see [`looks_like_otp_prompt`]) and
+/// `otp_provider` is an automatic provider, the code is fetched and submitted
+/// instead of the password. If the provider returns `None` (e.g. `Manual` or
+/// no fresh code available), the password is sent as before so the server
+/// can reject it explicitly — the interactive UI then surfaces the prompt
+/// through the OneKey credential popup for manual entry.
 async fn auth_keyboard_interactive(
     handle: &mut client::Handle<Handler>,
     username: &str,
     password: &str,
+    otp_provider: &OtpProvider,
 ) -> anyhow::Result<client::AuthResult> {
     use client::KeyboardInteractiveAuthResponse;
     let mut response = handle
@@ -512,18 +543,78 @@ async fn auth_keyboard_interactive(
                 });
             }
             KeyboardInteractiveAuthResponse::InfoRequest { prompts, .. } => {
-                // Reply with the password for every prompt the server sends.
-                // Most PAM keyboard-interactive flows use a single "Password:"
-                // prompt, but some servers (e.g. Google's) send a second OTP
-                // prompt we cannot answer — sending the password there is
-                // harmless and lets the server reject it explicitly.
-                let answers: Vec<String> = prompts.iter().map(|_p| password.to_string()).collect();
+                // Reply to each prompt. Most PAM keyboard-interactive flows use
+                // a single "Password:" prompt — we answer with the password.
+                //
+                // OTP / MFA prompts (sent as a second factor by JumpServer and
+                // other bastions) are answered with a code fetched from the
+                // configured webhook provider. If no automatic provider is
+                // configured (or it returns no code), we send the password so
+                // the server rejects the auth explicitly and the interactive
+                // UI can surface a manual OTP prompt through the OneKey popup.
+                let mut answers: Vec<String> = Vec::with_capacity(prompts.len());
+                for p in &prompts {
+                    if looks_like_otp_prompt(&p.prompt) {
+                        match otp_provider.fetch_code().await {
+                            Ok(Some(code)) => {
+                                tracing::info!(
+                                    "[SSH] OTP prompt {:?} answered via webhook provider",
+                                    p.prompt
+                                );
+                                answers.push(code);
+                                continue;
+                            }
+                            Ok(None) => {
+                                tracing::info!(
+                                    "[SSH] OTP prompt {:?} but provider returned no code; falling back to password",
+                                    p.prompt
+                                );
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "[SSH] OTP provider fetch failed for prompt {:?}: {}",
+                                    p.prompt,
+                                    e
+                                );
+                            }
+                        }
+                    }
+                    answers.push(password.to_string());
+                }
                 response = handle
                     .authenticate_keyboard_interactive_respond(answers)
                     .await?;
             }
         }
     }
+}
+
+/// Heuristic to decide whether a keyboard-interactive prompt is asking for
+/// an OTP / MFA code rather than a password. JumpServer's MFA prompt is
+/// typically `"MFA code:"` or `"请输入MFA认证码"`; other bastions use
+/// `"OTP:"`, `"Verification code:"`, etc. We match case-insensitively on
+/// the common keywords. A `false` result means "treat it as a password
+/// prompt" (the safe default — sending the password to an OTP prompt is
+/// harmless because the server will reject it).
+fn looks_like_otp_prompt(prompt: &str) -> bool {
+    let lower = prompt.to_ascii_lowercase();
+    // Strong OTP markers — a prompt containing any of these is an OTP prompt.
+    const OTP_MARKERS: &[&str] = &[
+        "otp",
+        "mfa",
+        "totp",
+        "verification code",
+        "verify code",
+        "authenticator",
+        "2fa",
+        "two-factor",
+        "two factor",
+        "二次验证",
+        "动态密码",
+        "验证码",
+        "认证码",
+    ];
+    OTP_MARKERS.iter().any(|m| lower.contains(m))
 }
 
 #[derive(Debug, PartialEq, Eq)]
