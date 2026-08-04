@@ -1296,13 +1296,15 @@ impl Handler for Terminal {
         let erased = Self::make_erased_cell(self.attrs_bg);
         let row = &mut self.grid[self.cursor_row];
         let col = self.cursor_col;
-        // Shift cells right from the end
-        for i in (col..cols).rev() {
-            if i >= count {
-                row.cells[i] = std::mem::take(&mut row.cells[i - count]);
-            } else {
-                row.cells[i] = erased.clone();
-            }
+        // Shift cells right from the end. Destinations start at `col + count`
+        // so reads start at `col` — cells LEFT of the cursor must never be
+        // touched. (A previous version iterated down to `col`, which `take`d
+        // and blanked the `count` cells before the cursor: readline inserts a
+        // character mid-line as `CSI @` + char, so every insertion swallowed
+        // the previously typed character, leaving a blank gap in the prompt
+        // line.)
+        for i in (col + count..cols).rev() {
+            row.cells[i] = std::mem::take(&mut row.cells[i - count]);
         }
         // Fill the inserted blank cells with current bg
         for i in col..col.saturating_add(count).min(cols) {
