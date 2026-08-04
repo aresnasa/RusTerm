@@ -2569,6 +2569,7 @@ mod tests {
             api_custom_templates: Vec::new(),
             qwen_local: QwenLocalSettings::default(),
             suggestion_popup_offset_y: -38.5,
+            otp_webhook: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: PersistedConfig = serde_json::from_str(&json).unwrap();
