@@ -1,7 +1,9 @@
 use dioxus::prelude::*;
 
 use rusterm_core::FocusedTabAppearance;
-use rusterm_core::config::{KeybindingAction, Keybindings, Language, SkinKind, SkinSettings};
+use rusterm_core::config::{
+    KeybindingAction, Keybindings, Language, SkinKind, SkinSettings, ThemeMode,
+};
 
 use crate::keybindings::{event_chord, format_key_chord};
 
@@ -17,6 +19,14 @@ const fn skin_kind_key(kind: SkinKind) -> &'static str {
         SkinKind::OneDark => "settings.skin_one_dark",
         SkinKind::SolarizedDark => "settings.skin_solarized_dark",
         SkinKind::Custom => "settings.skin_custom",
+    }
+}
+
+const fn theme_mode_key(mode: ThemeMode) -> &'static str {
+    match mode {
+        ThemeMode::Dark => "settings.theme_dark",
+        ThemeMode::Light => "settings.theme_light",
+        ThemeMode::System => "settings.theme_system",
     }
 }
 
@@ -133,6 +143,13 @@ fn settings_search_items(
             "settings.preview",
             None,
             "focused session preview 预览 聚焦会话",
+        ),
+        (
+            "settings-theme-system",
+            "settings.skin",
+            "settings.theme_system",
+            Some("settings.theme_mode_help"),
+            "dark light system 暗色 亮色 系统 主题模式 外观",
         ),
         (
             "settings-skin",
@@ -826,7 +843,19 @@ pub fn SettingsDialog(
     let mut custom_error = use_signal(String::new);
     let mut keybinding_draft = use_signal(|| keybindings.normalized());
     let mut skin_draft = use_signal(|| skin.normalized());
-    let skin_preview = skin_draft().palette();
+    // Resolve the OS dark/light preference so `ThemeMode::System` previews
+    // correctly inside the dialog. Read fresh on every render; this is cheap
+    // (a tao window property read) and keeps the preview in sync if the user
+    // switches OS theme while the dialog is open.
+    let system_is_dark =
+        *dioxus::desktop::window().theme() == dioxus::desktop::tao::window::Theme::Dark;
+    let skin_preview = skin_draft().palette(system_is_dark);
+    // When editing the Custom skin, toggles whether the color fields below
+    // edit the dark (`custom`) or light (`custom_light`) variant. Defaults to
+    // whichever variant the current mode resolves to so the user lands on the
+    // palette they're most likely to see.
+    let mut custom_editing_light: Signal<bool> =
+        use_signal(|| skin_draft().mode.resolve(system_is_dark) == ThemeMode::Light);
     let mut capturing_keybinding: Signal<Option<KeybindingAction>> = use_signal(|| None);
     let mut keybinding_error: Signal<Option<KeybindingValidationError>> = use_signal(|| None);
     let mut search_query = use_signal(String::new);
@@ -1022,6 +1051,39 @@ pub fn SettingsDialog(
                     style: "margin:0 0 12px;color:var(--settings-text-muted);font-size:12px;line-height:1.5;",
                     { crate::i18n::t("settings.skin_help") }
                 }
+                // Appearance mode (Dark / Light / System). Orthogonal to the
+                // skin family above: each built-in skin has a paired light
+                // variant, and `System` follows the OS preference live.
+                div {
+                    style: "display:flex;align-items:center;gap:8px;margin-bottom:12px;",
+                    span { style: "font-size:12px;color:var(--settings-text);", { crate::i18n::t("settings.theme_mode") } }
+                    div {
+                        style: "display:flex;flex-wrap:wrap;gap:6px;",
+                        for mode in ThemeMode::ALL {
+                            {
+                                let selected = skin_draft().mode == mode;
+                                let background = if selected { "var(--settings-accent)" } else { "var(--settings-bg)" };
+                                let color = if selected { "var(--settings-bg)" } else { "var(--settings-text)" };
+                                let border = if selected { "var(--settings-accent)" } else { "var(--settings-border-strong)" };
+                                let key = theme_mode_key(mode);
+                                let label = crate::i18n::t(key);
+                                rsx! {
+                                    button {
+                                        key: "theme-{key}",
+                                        id: match mode {
+                                            ThemeMode::Dark => "settings-theme-dark",
+                                            ThemeMode::Light => "settings-theme-light",
+                                            ThemeMode::System => "settings-theme-system",
+                                        },
+                                        style: "background:{background};color:{color};border:1px solid {border};border-radius:4px;padding:5px 9px;cursor:pointer;font-size:11px;",
+                                        onclick: move |_| skin_draft.write().mode = mode,
+                                        "{label}"
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 div {
                     style: "display:flex;flex-wrap:wrap;gap:6px;margin-bottom:12px;",
                     for kind in SkinKind::ALL {
@@ -1066,18 +1128,57 @@ pub fn SettingsDialog(
                 if skin_draft().kind == SkinKind::Custom {
                     div {
                         style: "display:flex;flex-direction:column;gap:8px;background:var(--settings-bg);border:1px solid var(--settings-border);border-radius:6px;padding:12px;margin-bottom:12px;",
-                        SkinColorField { field: "background", label: crate::i18n::t("settings.color_background"), value: skin_draft().custom.background.clone(), on_change: move |value| skin_draft.write().custom.background = value }
-                        SkinColorField { field: "surface", label: crate::i18n::t("settings.color_surface"), value: skin_draft().custom.surface.clone(), on_change: move |value| skin_draft.write().custom.surface = value }
-                        SkinColorField { field: "surface_hover", label: crate::i18n::t("settings.color_surface_hover"), value: skin_draft().custom.surface_hover.clone(), on_change: move |value| skin_draft.write().custom.surface_hover = value }
-                        SkinColorField { field: "border", label: crate::i18n::t("settings.color_border"), value: skin_draft().custom.border.clone(), on_change: move |value| skin_draft.write().custom.border = value }
-                        SkinColorField { field: "border_strong", label: crate::i18n::t("settings.color_border_strong"), value: skin_draft().custom.border_strong.clone(), on_change: move |value| skin_draft.write().custom.border_strong = value }
-                        SkinColorField { field: "text", label: crate::i18n::t("settings.color_text"), value: skin_draft().custom.text.clone(), on_change: move |value| skin_draft.write().custom.text = value }
-                        SkinColorField { field: "text_muted", label: crate::i18n::t("settings.color_text_muted"), value: skin_draft().custom.text_muted.clone(), on_change: move |value| skin_draft.write().custom.text_muted = value }
-                        SkinColorField { field: "accent", label: crate::i18n::t("settings.color_accent"), value: skin_draft().custom.accent.clone(), on_change: move |value| skin_draft.write().custom.accent = value }
-                        SkinColorField { field: "accent_secondary", label: crate::i18n::t("settings.color_accent_secondary"), value: skin_draft().custom.accent_secondary.clone(), on_change: move |value| skin_draft.write().custom.accent_secondary = value }
-                        SkinColorField { field: "success", label: crate::i18n::t("settings.color_success"), value: skin_draft().custom.success.clone(), on_change: move |value| skin_draft.write().custom.success = value }
-                        SkinColorField { field: "warning", label: crate::i18n::t("settings.color_warning"), value: skin_draft().custom.warning.clone(), on_change: move |value| skin_draft.write().custom.warning = value }
-                        SkinColorField { field: "danger", label: crate::i18n::t("settings.color_danger"), value: skin_draft().custom.danger.clone(), on_change: move |value| skin_draft.write().custom.danger = value }
+                        // Variant switch: edit the dark or light custom palette.
+                        // Defaults to the variant the current mode resolves to.
+                        div {
+                            style: "display:flex;align-items:center;gap:6px;margin-bottom:4px;",
+                            span { style: "font-size:11px;color:var(--settings-text-muted);", { crate::i18n::t("settings.custom_variant") } }
+                            button {
+                                style: if !custom_editing_light() {
+                                    "background:var(--settings-accent);color:var(--settings-bg);border:1px solid var(--settings-accent);border-radius:4px;padding:3px 8px;cursor:pointer;font-size:11px;"
+                                } else {
+                                    "background:var(--settings-bg);color:var(--settings-text);border:1px solid var(--settings-border-strong);border-radius:4px;padding:3px 8px;cursor:pointer;font-size:11px;"
+                                },
+                                onclick: move |_| custom_editing_light.set(false),
+                                { crate::i18n::t("settings.theme_dark") }
+                            }
+                            button {
+                                style: if custom_editing_light() {
+                                    "background:var(--settings-accent);color:var(--settings-bg);border:1px solid var(--settings-accent);border-radius:4px;padding:3px 8px;cursor:pointer;font-size:11px;"
+                                } else {
+                                    "background:var(--settings-bg);color:var(--settings-text);border:1px solid var(--settings-border-strong);border-radius:4px;padding:3px 8px;cursor:pointer;font-size:11px;"
+                                },
+                                onclick: move |_| custom_editing_light.set(true),
+                                { crate::i18n::t("settings.theme_light") }
+                            }
+                        }
+                        if !custom_editing_light() {
+                            SkinColorField { field: "background", label: crate::i18n::t("settings.color_background"), value: skin_draft().custom.background.clone(), on_change: move |value| skin_draft.write().custom.background = value }
+                            SkinColorField { field: "surface", label: crate::i18n::t("settings.color_surface"), value: skin_draft().custom.surface.clone(), on_change: move |value| skin_draft.write().custom.surface = value }
+                            SkinColorField { field: "surface_hover", label: crate::i18n::t("settings.color_surface_hover"), value: skin_draft().custom.surface_hover.clone(), on_change: move |value| skin_draft.write().custom.surface_hover = value }
+                            SkinColorField { field: "border", label: crate::i18n::t("settings.color_border"), value: skin_draft().custom.border.clone(), on_change: move |value| skin_draft.write().custom.border = value }
+                            SkinColorField { field: "border_strong", label: crate::i18n::t("settings.color_border_strong"), value: skin_draft().custom.border_strong.clone(), on_change: move |value| skin_draft.write().custom.border_strong = value }
+                            SkinColorField { field: "text", label: crate::i18n::t("settings.color_text"), value: skin_draft().custom.text.clone(), on_change: move |value| skin_draft.write().custom.text = value }
+                            SkinColorField { field: "text_muted", label: crate::i18n::t("settings.color_text_muted"), value: skin_draft().custom.text_muted.clone(), on_change: move |value| skin_draft.write().custom.text_muted = value }
+                            SkinColorField { field: "accent", label: crate::i18n::t("settings.color_accent"), value: skin_draft().custom.accent.clone(), on_change: move |value| skin_draft.write().custom.accent = value }
+                            SkinColorField { field: "accent_secondary", label: crate::i18n::t("settings.color_accent_secondary"), value: skin_draft().custom.accent_secondary.clone(), on_change: move |value| skin_draft.write().custom.accent_secondary = value }
+                            SkinColorField { field: "success", label: crate::i18n::t("settings.color_success"), value: skin_draft().custom.success.clone(), on_change: move |value| skin_draft.write().custom.success = value }
+                            SkinColorField { field: "warning", label: crate::i18n::t("settings.color_warning"), value: skin_draft().custom.warning.clone(), on_change: move |value| skin_draft.write().custom.warning = value }
+                            SkinColorField { field: "danger", label: crate::i18n::t("settings.color_danger"), value: skin_draft().custom.danger.clone(), on_change: move |value| skin_draft.write().custom.danger = value }
+                        } else {
+                            SkinColorField { field: "light_background", label: crate::i18n::t("settings.color_background"), value: skin_draft().custom_light.background.clone(), on_change: move |value| skin_draft.write().custom_light.background = value }
+                            SkinColorField { field: "light_surface", label: crate::i18n::t("settings.color_surface"), value: skin_draft().custom_light.surface.clone(), on_change: move |value| skin_draft.write().custom_light.surface = value }
+                            SkinColorField { field: "light_surface_hover", label: crate::i18n::t("settings.color_surface_hover"), value: skin_draft().custom_light.surface_hover.clone(), on_change: move |value| skin_draft.write().custom_light.surface_hover = value }
+                            SkinColorField { field: "light_border", label: crate::i18n::t("settings.color_border"), value: skin_draft().custom_light.border.clone(), on_change: move |value| skin_draft.write().custom_light.border = value }
+                            SkinColorField { field: "light_border_strong", label: crate::i18n::t("settings.color_border_strong"), value: skin_draft().custom_light.border_strong.clone(), on_change: move |value| skin_draft.write().custom_light.border_strong = value }
+                            SkinColorField { field: "light_text", label: crate::i18n::t("settings.color_text"), value: skin_draft().custom_light.text.clone(), on_change: move |value| skin_draft.write().custom_light.text = value }
+                            SkinColorField { field: "light_text_muted", label: crate::i18n::t("settings.color_text_muted"), value: skin_draft().custom_light.text_muted.clone(), on_change: move |value| skin_draft.write().custom_light.text_muted = value }
+                            SkinColorField { field: "light_accent", label: crate::i18n::t("settings.color_accent"), value: skin_draft().custom_light.accent.clone(), on_change: move |value| skin_draft.write().custom_light.accent = value }
+                            SkinColorField { field: "light_accent_secondary", label: crate::i18n::t("settings.color_accent_secondary"), value: skin_draft().custom_light.accent_secondary.clone(), on_change: move |value| skin_draft.write().custom_light.accent_secondary = value }
+                            SkinColorField { field: "light_success", label: crate::i18n::t("settings.color_success"), value: skin_draft().custom_light.success.clone(), on_change: move |value| skin_draft.write().custom_light.success = value }
+                            SkinColorField { field: "light_warning", label: crate::i18n::t("settings.color_warning"), value: skin_draft().custom_light.warning.clone(), on_change: move |value| skin_draft.write().custom_light.warning = value }
+                            SkinColorField { field: "light_danger", label: crate::i18n::t("settings.color_danger"), value: skin_draft().custom_light.danger.clone(), on_change: move |value| skin_draft.write().custom_light.danger = value }
+                        }
                     }
                 }
 

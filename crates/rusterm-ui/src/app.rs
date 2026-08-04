@@ -13382,6 +13382,14 @@ pub fn App() -> Element {
     // happens here so destructive actions can't be fired by a stray click.
     let mut delete_target: Signal<Option<ConnectionConfig>> = use_signal(|| None);
 
+    // OS-level dark/light preference. Read from the native window's current
+    // theme and kept in sync via a wry `ThemeChanged` event handler below so
+    // that `ThemeMode::System` follows the OS live. Seeded synchronously here
+    // so the very first render already uses the correct variant.
+    let mut system_is_dark: Signal<bool> = use_signal(|| {
+        *dioxus::desktop::window().theme() == dioxus::desktop::tao::window::Theme::Dark
+    });
+
     // Pane index currently being hovered by a drag operation, or `None` when
     // no drag is in progress. Used by `multi_pane_container` to highlight the
     // drop-target pane. Reads happen inside the pane `for` loop (subscribing
@@ -14057,6 +14065,22 @@ pub fn App() -> Element {
         s.close_dialog_dont_ask_again = true;
     });
 
+    // Live system-theme tracking. When the OS switches between dark and light
+    // (e.g. macOS auto night-shift, GNOME Settings), tao emits a
+    // `ThemeChanged` event. We mirror it into `system_is_dark` so any skin with
+    // `ThemeMode::System` re-resolves and re-renders immediately. The signal's
+    // equality check means a no-op event (same theme) doesn't trigger work.
+    use_wry_event_handler(move |event, _| {
+        let WryEvent::WindowEvent {
+            event: WryWindowEvent::ThemeChanged(theme),
+            ..
+        } = event
+        else {
+            return;
+        };
+        system_is_dark.set(*theme == dioxus::desktop::tao::window::Theme::Dark);
+    });
+
     // Re-show the window when the close-confirmation dialog becomes visible.
     // The wry handler above sets `close_dialog_visible = true`, and dioxus's
     // `handle_close_requested` then hides the window (because the close
@@ -14399,7 +14423,7 @@ pub fn App() -> Element {
         UnlockState::Unlocked => {}
     }
 
-    let skin_style = css_variables(&state.read().skin);
+    let skin_style = css_variables(&state.read().skin, system_is_dark());
 
     rsx! {
         div {
