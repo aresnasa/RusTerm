@@ -2388,6 +2388,55 @@ mod tests {
         assert!(term.scrollback_len() >= 2);
     }
 
+    /// ICH (`CSI n @`) must only shift cells at/after the cursor — cells to
+    /// the LEFT of the cursor must be untouched. A previous version shifted
+    /// with destinations down to the cursor column itself, which `take`d and
+    /// blanked the `count` cells before the cursor.
+    #[test]
+    fn insert_blank_preserves_cells_left_of_cursor() {
+        // "# world", cursor to column 3 (1-based) = on 'w', insert 2 blanks.
+        let term = term_from_bytes(b"# world\x1b[3G\x1b[2@");
+        let line: String = term.render().rows[0]
+            .cells
+            .iter()
+            .map(|c| c.character)
+            .collect();
+        assert!(
+            line.starts_with("#   world"),
+            "prompt before the cursor must survive ICH, got {line:?}"
+        );
+    }
+
+    /// Regression for the "typed command partially disappears" bug: readline
+    /// echoes a mid-line insertion as `CSI @` + the character, one pair per
+    /// keystroke. Every insertion used to swallow the previously inserted
+    /// character, so typing "du -s" in front of "h /var/…" left a blank gap
+    /// after the prompt with only the trailing text visible.
+    #[test]
+    fn readline_mid_line_insertion_keeps_previously_typed_prefix() {
+        let mut term = Terminal::new(TerminalSize {
+            cols: 80,
+            rows: 24,
+            ..Default::default()
+        });
+        let mut parser = vte::ansi::Processor::new();
+        // Prompt + existing tail, cursor back to column 3 (on 'h').
+        term.process(b"# h /var/lib/containerd/\x1b[3G", &mut parser);
+        for ch in "du -s".bytes() {
+            term.process(b"\x1b[@", &mut parser);
+            term.process(&[ch], &mut parser);
+        }
+        let line: String = term.render().rows[0]
+            .cells
+            .iter()
+            .map(|c| c.character)
+            .collect();
+        assert!(
+            line.starts_with("# du -sh /var/lib/containerd/"),
+            "mid-line insertion must keep every typed character, got {line:?}"
+        );
+    }
+
     // ── OSC 7 cwd tracking ─────────────────────────────────────────────
 
     #[test]
