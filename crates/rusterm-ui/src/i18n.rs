@@ -680,6 +680,14 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         ),
         "session.press_enter_to_reconnect" => ("Press Enter to reconnect", "按 Enter 重新连接"),
         "session.reconnecting" => ("Reconnecting…", "正在重新连接…"),
+        "session.replaying_ops" => (
+            "Replaying {count} recorded operation(s) to restore the session state…",
+            "正在回放 {count} 条已记录的操作以恢复会话状态…",
+        ),
+        "session.replay_skipped_unsafe" => (
+            "Skipped {count} potentially dangerous operation(s) during replay",
+            "回放时已跳过 {count} 条潜在危险操作",
+        ),
         "session.shell_failed" => ("Failed to start shell: {error}", "启动 shell 失败：{error}"),
         "session.starting_shell" => ("Starting local shell…", "正在启动本地终端…"),
         // Tab-bar context-menu actions (Task: disconnect/reconnect/copy session).

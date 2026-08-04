@@ -406,6 +406,13 @@ pub struct AppState {
     /// Keyed by session id; removed when the script finishes or the session closes.
     #[serde(skip)]
     pub login_scripts: std::collections::HashMap<String, LoginScriptRuntime>,
+    /// Per-session interactive-operation recorders for session-recovery
+    /// replay (see [`SessionReplayRecorder`]). Keyed by live session id.
+    /// Deliberately preserved across a disconnect — the recorded operations
+    /// are what a reconnect replays to restore jumpserver-style interactive
+    /// state — and removed only when the session/tab itself closes.
+    #[serde(skip)]
+    pub session_replays: HashMap<String, SessionReplayRecorder>,
     /// Whether the close-confirmation dialog is currently visible. This is a
     /// transient UI flag (not persisted) — it's set by the `CloseRequested`
     /// wry event handler and cleared by the dialog's "取消" / "确认" buttons.
@@ -782,6 +789,7 @@ impl Default for AppState {
             collect_usage_habits: false,
             language: rusterm_core::config::Language::default(),
             login_scripts: std::collections::HashMap::new(),
+            session_replays: HashMap::new(),
             close_dialog_visible: false,
             close_dialog_dont_ask_again: true,
             pending_dangerous_command: None,
@@ -896,6 +904,11 @@ impl AppState {
                     cwd: tab.cwd.clone(),
                     command_history_tail: history_tail,
                     terminal_size,
+                    // Establishment-phase interactive ops (jumpserver menu
+                    // navigation). Empty for integrated shells — evidence
+                    // clears the recorder — so plain shell commands are never
+                    // persisted here.
+                    replay_ops: replayable_ops(self, &tab.id),
                 }
             })
             .collect();
@@ -2632,6 +2645,7 @@ pub fn close_session(
     state.session_configs.remove(id);
     state.pending_exit_check.remove(id);
     state.terminal_command_lines.remove(id);
+    state.session_replays.remove(id);
     state.ssh_sessions.remove(id);
     state.sftp_clients.remove(id);
     state.transfers.cancel_for_session(id);
@@ -2800,6 +2814,7 @@ pub fn close_workspace(
         state.session_configs.remove(sid);
         state.pending_exit_check.remove(sid);
         state.terminal_command_lines.remove(sid);
+        state.session_replays.remove(sid);
         state.ssh_sessions.remove(sid);
         state.sftp_clients.remove(sid);
         state.transfers.cancel_for_session(sid);
@@ -3184,6 +3199,62 @@ mod tests {
             .get_mut("nonexistent")
             .and_then(|q| q.pop_front());
         assert_eq!(popped, None);
+    }
+
+    /// All four session backends (SSH / Shell / Telnet / Serial) share the
+    /// same `pending_exit_check` queue via `enqueue_pending_exit`. This test
+    /// verifies the queue works identically for every `SessionType` — the
+    /// invariant that lets `process_session_exit_code` drain the queue
+    /// uniformly regardless of which backend produced the exit code.
+    #[test]
+    fn pending_exit_check_works_for_all_session_backends() {
+        let mut state = AppState::default();
+        let backends = [
+            ("ssh-session", SessionType::Ssh),
+            ("shell-session", SessionType::Shell),
+            ("telnet-session", SessionType::Telnet),
+            ("serial-session", SessionType::Serial),
+        ];
+
+        for (sid, _kind) in &backends {
+            enqueue_pending_exit(&mut state, sid, format!("ls-{sid}"), format!("dbid-{sid}"));
+        }
+
+        // Each session has exactly one queued command.
+        for (sid, _kind) in &backends {
+            let queue = state
+                .pending_exit_check
+                .get(*sid)
+                .expect("queue must exist");
+            assert_eq!(
+                queue.len(),
+                1,
+                "session {sid} should have 1 pending command"
+            );
+            assert_eq!(queue.front().unwrap().0, format!("ls-{sid}"));
+        }
+
+        // Drain each queue (simulating OSC 133;D exit-code processing).
+        for (sid, _kind) in &backends {
+            let popped = state
+                .pending_exit_check
+                .get_mut(*sid)
+                .and_then(|q| q.pop_front());
+            assert_eq!(
+                popped.map(|(cmd, _)| cmd),
+                Some(format!("ls-{sid}")),
+                "session {sid} should pop its queued command"
+            );
+        }
+
+        // All queues are now empty.
+        for (sid, _kind) in &backends {
+            let queue = state.pending_exit_check.get(*sid);
+            assert!(
+                queue.map_or(true, |q| q.is_empty()),
+                "session {sid} queue should be empty after drain"
+            );
+        }
     }
 
     /// The pending queue is capped to prevent unbounded growth when the shell
@@ -7300,6 +7371,291 @@ pub struct LoginScriptRuntime {
     /// the first wait. Used by the driver to abort a stuck script after
     /// `LOGIN_SCRIPT_EXPECT_TIMEOUT_SECS`.
     pub wait_started: Option<std::time::Instant>,
+}
+
+/// Maximum number of establishment-phase operations recorded per session for
+/// recovery replay. Recording stops once the window is full — the prefix
+/// semantics are deliberate: only the inputs that *established* the remote
+/// interactive state (bastion menu navigation) are replay candidates.
+/// Steady-state shell commands typed later are never recorded, so a reconnect
+/// can never replay an unbounded tail of arbitrary (possibly destructive)
+/// shell work.
+pub const REPLAY_MAX_OPS: usize = 10;
+
+/// Records the interactive inputs that established a remote session's state
+/// (e.g. jumpserver menu navigation: host names/numbers + Enter) so a
+/// reconnect or startup restore can replay them and land the user back in the
+/// same interactive state instead of at the bastion's menu.
+///
+/// Lifecycle:
+/// - Created lazily on the first recorded op after a session connects.
+/// - Recording is gated to interactive remote kinds (SSH / Telnet) and stops
+///   at [`REPLAY_MAX_OPS`] (establishment prefix only).
+/// - The first OSC 133;D exit code observed on the session is evidence of a
+///   real integrated shell (interactive bastion menus never emit it). At that
+///   point the recorded ops are dropped and recording is disabled: cwd-based
+///   restore already covers integrated shells, and replaying regular shell
+///   commands on reconnect would be wrong.
+/// - Preserved across disconnects (that's the whole point); removed when the
+///   session closes.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SessionReplayRecorder {
+    /// Submitted input lines, in submission order (establishment prefix).
+    pub ops: Vec<String>,
+    /// True once shell-integration evidence (OSC 133;D) was observed. From
+    /// then on `ops` stays empty and recording is disabled for this session.
+    pub shell_integrated: bool,
+}
+
+/// Records one submitted input line into the session's replay recorder.
+/// Returns `true` if the op was recorded.
+///
+/// Guards (in order):
+/// - empty/whitespace-only input is ignored;
+/// - only SSH and Telnet sessions record (local shells are restored via cwd,
+///   serial ports have no login flow to replay);
+/// - a session with shell-integration evidence never records;
+/// - the establishment window is capped at [`REPLAY_MAX_OPS`].
+///
+/// Credential filtering is the caller's job: input typed at a detected
+/// credential prompt (password/token/username) must NOT be passed here — see
+/// the `on_input` Enter branch in `app.rs`.
+pub fn record_replay_op(state: &mut AppState, session_id: &str, op: &str) -> bool {
+    let op = op.trim();
+    if op.is_empty() {
+        return false;
+    }
+    let is_interactive_remote = matches!(
+        state.session_configs.get(session_id).map(|c| &c.kind),
+        Some(rusterm_core::config::ConnectionKind::Ssh(_))
+            | Some(rusterm_core::config::ConnectionKind::Telnet(_))
+    );
+    if !is_interactive_remote {
+        return false;
+    }
+    let rec = state
+        .session_replays
+        .entry(session_id.to_string())
+        .or_default();
+    if rec.shell_integrated || rec.ops.len() >= REPLAY_MAX_OPS {
+        return false;
+    }
+    rec.ops.push(op.to_string());
+    true
+}
+
+/// Marks the session as having a real, shell-integrated remote (OSC 133;D
+/// exit code observed). Drops any ops recorded so far and permanently
+/// disables recording for this session — an interactive bastion menu never
+/// emits OSC 133, so this evidence means the recorded lines were regular
+/// shell commands, which must not be replayed on reconnect (cwd restore
+/// covers integrated shells already).
+pub fn note_shell_integration_evidence(state: &mut AppState, session_id: &str) {
+    let rec = state
+        .session_replays
+        .entry(session_id.to_string())
+        .or_default();
+    if !rec.shell_integrated {
+        rec.shell_integrated = true;
+        rec.ops.clear();
+    }
+}
+
+/// The operations a reconnect should replay for this session, in order.
+/// Empty when nothing was recorded or the session proved to be an
+/// integrated shell.
+pub fn replayable_ops(state: &AppState, session_id: &str) -> Vec<String> {
+    state
+        .session_replays
+        .get(session_id)
+        .filter(|rec| !rec.shell_integrated)
+        .map(|rec| rec.ops.clone())
+        .unwrap_or_default()
+}
+
+#[cfg(test)]
+mod session_replay_tests {
+    use super::*;
+    use rusterm_core::config::{
+        ConnectionConfig, ConnectionKind, SerialConfig, ShellConfig, SshAuth, SshConfig,
+        TelnetConfig,
+    };
+
+    fn config_of(kind: ConnectionKind) -> ConnectionConfig {
+        ConnectionConfig {
+            id: "conn-1".to_string(),
+            name: "conn".to_string(),
+            kind,
+            group: None,
+            tags: Vec::new(),
+            onekey: false,
+            login_script: None,
+        }
+    }
+
+    fn ssh_kind() -> ConnectionKind {
+        ConnectionKind::Ssh(SshConfig {
+            host: "jump.example.com".to_string(),
+            port: 22,
+            username: "ops".to_string(),
+            auth: SshAuth::Agent,
+            terminal_type: "xterm-256color".to_string(),
+            proxy: None,
+            proxy_jump: None,
+            keepalive_interval: None,
+            host_key_policy: rusterm_core::config::default_host_key_policy(),
+        })
+    }
+
+    fn state_with_session(session_id: &str, kind: ConnectionKind) -> AppState {
+        let mut state = AppState::default();
+        state
+            .session_configs
+            .insert(session_id.to_string(), config_of(kind));
+        state
+    }
+
+    /// The core jumpserver flow: menu-navigation inputs are recorded in order
+    /// and come back verbatim as replayable ops for a reconnect.
+    #[test]
+    fn records_interactive_ops_in_order_for_ssh_session() {
+        let mut state = state_with_session("sess", ssh_kind());
+        assert!(record_replay_op(&mut state, "sess", "p"));
+        assert!(record_replay_op(&mut state, "sess", "web-server-01"));
+        assert!(!record_replay_op(&mut state, "sess", "   ")); // bare Enter / whitespace
+        assert_eq!(
+            replayable_ops(&state, "sess"),
+            vec!["p".to_string(), "web-server-01".to_string()]
+        );
+    }
+
+    /// Recording is an establishment *prefix*: once the window is full,
+    /// later (steady-state) inputs are never recorded, so a reconnect can
+    /// never replay an unbounded tail of arbitrary shell commands.
+    #[test]
+    fn recording_window_is_capped_at_establishment_prefix() {
+        let mut state = state_with_session("sess", ssh_kind());
+        for i in 0..REPLAY_MAX_OPS {
+            assert!(record_replay_op(&mut state, "sess", &format!("op-{i}")));
+        }
+        assert!(!record_replay_op(&mut state, "sess", "rm -rf /tmp/scratch"));
+        let ops = replayable_ops(&state, "sess");
+        assert_eq!(ops.len(), REPLAY_MAX_OPS);
+        assert_eq!(ops[0], "op-0");
+        assert!(!ops.contains(&"rm -rf /tmp/scratch".to_string()));
+    }
+
+    /// OSC 133;D evidence means the remote is a real integrated shell (a
+    /// bastion menu never emits it): recorded ops are dropped and recording
+    /// is permanently disabled — cwd restore covers this session instead.
+    #[test]
+    fn shell_integration_evidence_clears_ops_and_disables_recording() {
+        let mut state = state_with_session("sess", ssh_kind());
+        assert!(record_replay_op(&mut state, "sess", "ls"));
+        note_shell_integration_evidence(&mut state, "sess");
+        assert!(replayable_ops(&state, "sess").is_empty());
+        assert!(!record_replay_op(&mut state, "sess", "cd /var/log"));
+        assert!(replayable_ops(&state, "sess").is_empty());
+    }
+
+    /// Only interactive remote kinds (SSH / Telnet) record. Local shells are
+    /// restored via cwd; serial ports have no login flow to replay.
+    #[test]
+    fn only_ssh_and_telnet_sessions_record() {
+        let mut shell = state_with_session(
+            "sh",
+            ConnectionKind::Shell(ShellConfig {
+                command: None,
+                args: Vec::new(),
+                env: Vec::new(),
+                working_dir: None,
+            }),
+        );
+        assert!(!record_replay_op(&mut shell, "sh", "htop"));
+
+        let mut serial = state_with_session(
+            "ser",
+            ConnectionKind::Serial(SerialConfig {
+                port: "/dev/ttyUSB0".to_string(),
+                baud_rate: 115200,
+                data_bits: 8,
+                parity: "none".to_string(),
+                stop_bits: 1,
+                flow_control: "none".to_string(),
+            }),
+        );
+        assert!(!record_replay_op(&mut serial, "ser", "enable"));
+
+        let mut telnet = state_with_session(
+            "tel",
+            ConnectionKind::Telnet(TelnetConfig {
+                host: "bbs.example.com".to_string(),
+                port: 23,
+            }),
+        );
+        assert!(record_replay_op(&mut telnet, "tel", "guest"));
+
+        // Unknown session (no stored config) never records.
+        let mut unknown = AppState::default();
+        assert!(!record_replay_op(&mut unknown, "nope", "anything"));
+    }
+
+    /// The recorder must survive a disconnect — it is exactly what the
+    /// reconnect replays — and be removed when the session closes.
+    #[test]
+    fn recorder_survives_disconnect_state_but_is_removed_on_close() {
+        let mut state = state_with_session("sess", ssh_kind());
+        assert!(record_replay_op(&mut state, "sess", "web-server-01"));
+
+        // Mirror what a disconnect does to connection state: the replays map
+        // is untouched (disconnect_session_state never clears it).
+        state
+            .session_connection_states
+            .insert("sess".to_string(), SessionConnectionState::Disconnected);
+        assert_eq!(replayable_ops(&state, "sess").len(), 1);
+
+        // Closing the session drops the recorder with the rest of the
+        // session-scoped maps.
+        state.session_replays.remove("sess");
+        assert!(replayable_ops(&state, "sess").is_empty());
+    }
+
+    /// The persisted snapshot carries replay ops for non-integrated sessions
+    /// and an empty list once integration evidence was seen.
+    #[test]
+    fn build_session_state_includes_replay_ops_only_without_integration_evidence() {
+        let mut state = state_with_session("sess", ssh_kind());
+        state.sessions.push(SessionTab {
+            id: "sess".to_string(),
+            name: "conn".to_string(),
+            kind: SessionType::Ssh,
+            render_output: Default::default(),
+            version: 1,
+            suggestion: None,
+            suggestions: Vec::new(),
+            suggestion_corrections: std::collections::HashSet::new(),
+            suggestion_selected: 0,
+            suggestion_visible: false,
+            command_history: Vec::new(),
+            hostname: Some("jump.example.com".to_string()),
+            cwd: None,
+            last_command_status: CommandStatus::default(),
+        });
+        state
+            .session_connection_states
+            .insert("sess".to_string(), SessionConnectionState::Connected);
+        assert!(record_replay_op(&mut state, "sess", "web-server-01"));
+
+        let snapshot = state.build_session_state("Dark");
+        assert_eq!(
+            snapshot.sessions[0].replay_ops,
+            vec!["web-server-01".to_string()]
+        );
+
+        note_shell_integration_evidence(&mut state, "sess");
+        let snapshot = state.build_session_state("Dark");
+        assert!(snapshot.sessions[0].replay_ops.is_empty());
+    }
 }
 
 #[cfg(test)]

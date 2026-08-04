@@ -145,6 +145,19 @@ pub struct PersistedSession {
     /// `TerminalSize::default()`.
     #[serde(default)]
     pub terminal_size: Option<PersistedTerminalSize>,
+
+    /// Interactive operations (submitted input lines) that established the
+    /// session's remote state — e.g. jumpserver/bastion menu navigation to a
+    /// target host. Recorded only while the session showed no
+    /// shell-integration evidence (no OSC 133 exit codes — an interactive
+    /// menu, not a real shell), capped at a small establishment prefix, and
+    /// never containing input typed at a credential prompt. On restore these
+    /// ARE replayed (safety-checked and output-paced) so the user lands back
+    /// in the same interactive state instead of at the bastion's menu.
+    /// Empty for regular shell sessions. Legacy snapshots deserialize to an
+    /// empty list.
+    #[serde(default)]
+    pub replay_ops: Vec<String>,
 }
 
 /// Serializable terminal grid size. Mirrors `TerminalSize` but is
@@ -317,6 +330,7 @@ mod tests {
                 cwd: Some("/home/user/projects".to_string()),
                 command_history_tail: vec!["ls -la".to_string(), "cd src".to_string()],
                 terminal_size: None,
+                replay_ops: vec!["opt-1".to_string(), "web-server-01".to_string()],
             }],
             theme: Some("Dark".to_string()),
         }
@@ -412,6 +426,7 @@ mod tests {
                 cwd: Some("/home/user/secret-project".to_string()),
                 command_history_tail: vec!["ssh production-db".to_string()],
                 terminal_size: None,
+                replay_ops: vec!["jump-to-secret-target".to_string()],
             }],
             theme: Some("Dark".to_string()),
         };
@@ -426,6 +441,7 @@ mod tests {
             "conn-secret",
             "/home/user/secret-project",
             "ssh production-db",
+            "jump-to-secret-target",
         ] {
             assert!(
                 !raw.windows(needle.len()).any(|w| w == needle.as_bytes()),
@@ -498,6 +514,7 @@ mod tests {
                     cwd: Some("/tmp".to_string()),
                     command_history_tail: vec![],
                     terminal_size: None,
+                    replay_ops: vec![],
                 },
                 PersistedSession {
                     id: "sess-2".to_string(),
@@ -513,6 +530,7 @@ mod tests {
                         pixel_width: 1440,
                         pixel_height: 768,
                     }),
+                    replay_ops: vec![],
                 },
                 PersistedSession {
                     id: "sess-3".to_string(),
@@ -523,6 +541,7 @@ mod tests {
                     cwd: None, // serial sessions don't report cwd
                     command_history_tail: vec![],
                     terminal_size: None,
+                    replay_ops: vec![],
                 },
             ],
             theme: Some("Light".to_string()),

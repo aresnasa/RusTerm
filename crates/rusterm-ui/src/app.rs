@@ -56,10 +56,11 @@ use crate::state::{
     clear_terminal_command_lines, close_pane, close_session, close_workspace, command_send_targets,
     distribute_sessions_across_panes, enqueue_pending_exit, execute_tab_drop_on_pane,
     execute_tab_drop_on_pane_at, focus_pane_for_layout, focused_pane_session, invert_send_targets,
-    move_floating_pane_for_active, move_session_to_leftmost, prepare_split_for_sidebar_drop,
-    prepare_split_for_sidebar_drop_at, push_workspace_tab, resize_layout_split,
-    rollback_pending_exit, scroll_sync_targets, select_all_send_targets, selected_send_target_ids,
-    set_active_tab, set_pane_session_for_layout, set_send_target_selected, source_pane_for_copy,
+    move_floating_pane_for_active, move_session_to_leftmost, note_shell_integration_evidence,
+    prepare_split_for_sidebar_drop, prepare_split_for_sidebar_drop_at, push_workspace_tab,
+    record_replay_op, replayable_ops, resize_layout_split, rollback_pending_exit,
+    scroll_sync_targets, select_all_send_targets, selected_send_target_ids, set_active_tab,
+    set_pane_session_for_layout, set_send_target_selected, source_pane_for_copy,
     suppress_comparison_diff_warning, toggle_comparison_mode, toggle_pane_zoom, toggle_split_mode,
     track_terminal_input, tracked_terminal_command,
 };
@@ -2699,14 +2700,38 @@ fn render_terminal_pane(
                                 strip_prompt(line.trim()).to_string()
                             });
                             if !command.is_empty() {
+                                // Session-recovery replay: remember interactive
+                                // establishment inputs (jumpserver menu navigation)
+                                // so a reconnect can land back in the same remote
+                                // state. Input typed at a credential prompt is
+                                // never recorded — secrets must not live in the
+                                // replay log (nor be re-sent blindly on reconnect;
+                                // OneKey/login scripts own that flow).
+                                let prompt_is_credential =
+                                    credential_kind(&current_line).is_some();
                                 let sent = request_command_submission(
                                     state_for_cmd,
                                     senders,
-                                    command,
+                                    command.clone(),
                                     input_targets.clone(),
                                     PendingCommandPayload::EnterOnly(data),
                                 );
                                 if sent > 0 {
+                                    if !prompt_is_credential {
+                                        let mut app = state_for_cmd.write();
+                                        for target in &input_targets {
+                                            if record_replay_op(&mut app, target, &command) {
+                                                tracing::debug!(
+                                                    "[REPLAY] recorded op for session={} ops_len={}",
+                                                    &target[..target.len().min(8)],
+                                                    app.session_replays
+                                                        .get(target)
+                                                        .map(|r| r.ops.len())
+                                                        .unwrap_or(0)
+                                                );
+                                            }
+                                        }
+                                    }
                                     clear_terminal_command_lines(
                                         &mut state_for_cmd.write(),
                                         &input_targets,
@@ -8305,6 +8330,7 @@ mod session_startup_tests {
                 cwd: None,
                 command_history_tail: Vec::new(),
                 terminal_size: None,
+                replay_ops: Vec::new(),
             }],
             theme: None,
         };
@@ -10552,6 +10578,12 @@ fn start_ssh_connection(
                                 // failed commands can never appear in suggestions, because
                                 // they were never recorded in the first place.
                                 if exit_code.is_some() {
+                                    // A real OSC 133;D exit code proves this is an
+                                    // integrated shell, not an interactive bastion
+                                    // menu — drop any recorded session-recovery
+                                    // replay ops and stop recording (cwd-based
+                                    // restore covers integrated shells).
+                                    note_shell_integration_evidence(&mut state.write(), &id);
                                     tracing::info!(
                                         "[OUTPUT-SSH] session={} exit_code={:?} queue_len={}",
                                         &id[..id.len().min(8)],
@@ -10976,6 +11008,244 @@ fn start_ssh_connection(
             }
         }
     });
+}
+
+/// Process a shell-reported exit code for a session: pop the pending command
+/// from the `pending_exit_check` queue, commit it to history + DuckDB
+/// analytics on success (or compound command), or mark it as failed on
+/// non-zero exit. Also updates the tab's `last_command_status` badge.
+///
+/// Shared by all session backends (SSH / Shell / Telnet / Serial) so command
+/// recording is uniform across protocols. The `log_tag` parameter ("SSH",
+/// "LOCAL", "TELNET", "SERIAL") is used in log messages for diagnostics.
+///
+/// This is a no-op when `exit_code` is `None` — the shell hasn't reported an
+/// exit code (e.g. a serial device that doesn't support OSC 133, or a telnet
+/// target whose shell wasn't configured with shell integration). In that case
+/// the command stays in the `pending_exit_check` queue until the shell reports
+/// an exit code or the session is closed.
+fn process_session_exit_code(
+    mut state: Signal<AppState>,
+    session_id: &str,
+    exit_code: Option<i32>,
+    log_tag: &str,
+) {
+    let Some(rc) = exit_code else {
+        return;
+    };
+
+    // A real OSC 133;D exit code proves this is an integrated shell, not an
+    // interactive bastion menu — drop any recorded session-recovery replay
+    // ops and stop recording (cwd-based restore covers integrated shells).
+    note_shell_integration_evidence(&mut state.write(), session_id);
+
+    // Log the queue depth for diagnostics (mirrors the SSH/Shell inline paths).
+    if tracing::enabled!(tracing::Level::INFO) {
+        let queue_len = state
+            .read()
+            .pending_exit_check
+            .get(session_id)
+            .map(|q| q.len())
+            .unwrap_or(0);
+        tracing::info!(
+            "[OUTPUT-{}] session={} exit_code={:?} queue_len={}",
+            log_tag,
+            &session_id[..session_id.len().min(8)],
+            exit_code,
+            queue_len
+        );
+    }
+
+    // ── Commit decision: pop the pending command and decide commit vs fail ──
+    let committed: Option<(String, String, Option<String>, Option<String>)> = {
+        let mut s = state.write();
+        let popped = s
+            .pending_exit_check
+            .get_mut(session_id)
+            .and_then(|q| q.pop_front());
+        tracing::info!(
+            "[OUTPUT-{}] rc={} popped={:?}",
+            log_tag,
+            rc,
+            popped.as_ref().map(|(c, _)| c.clone())
+        );
+        // Decide whether to commit the command to history or mark it as
+        // failed. `rc == 0` is the simple-command case. For compound commands
+        // (containing `|`, `||`, `&&`, `;`) the shell reports only the *last*
+        // segment's exit code, so a non-zero rc does NOT mean the line as a
+        // whole failed — we commit the full line regardless of rc so operators
+        // are preserved.
+        if rc == 0
+            || popped
+                .as_ref()
+                .is_some_and(|(cmd, _)| contains_shell_operator(cmd))
+        {
+            // Successful: commit to history + DB (with exit_code=Some(0) so
+            // search_history's HAVING clause treats it as a known-good command).
+            if let Some((cmd, db_id)) = popped {
+                let learned_typo = crate::command_correction::take_correction_for_success(
+                    &mut s.last_failed_command_by_session,
+                    session_id,
+                    &cmd,
+                );
+                let hostname = s
+                    .sessions
+                    .iter()
+                    .find(|t| t.id == session_id)
+                    .and_then(|t| t.hostname.clone());
+                if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == session_id) {
+                    if tab.command_history.last() != Some(&cmd) {
+                        tab.command_history.push(cmd.clone());
+                    }
+                }
+                Some((cmd, db_id, hostname, learned_typo))
+            } else {
+                None
+            }
+        } else {
+            // Failed: mark the command as known-failed in the DB so it stops
+            // being suggested AND so that subsequent history imports skip it.
+            //
+            // TIMING WINDOW GUARD: insert into `recent_failed_commands`
+            // synchronously here so the suggestion query filters it out during
+            // the async `mark_command_failed` window (when the DB still has the
+            // prior NULL import row that HAVING would keep). The spawn removes
+            // the entry once the DB write commits.
+            if let Some((cmd, _db_id)) = popped {
+                crate::command_correction::remember_failed_command(
+                    &mut s.last_failed_command_by_session,
+                    session_id,
+                    &cmd,
+                );
+                if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == session_id) {
+                    tab.command_history.retain(|c| c != &cmd);
+                }
+                s.recent_failed_commands.insert(cmd.clone());
+                let cmd_for_mark = cmd.clone();
+                let rc_for_mark = rc;
+                let sid_log = session_id.to_string();
+                let log_tag_owned = log_tag.to_string();
+                drop(s);
+                let mut state_for_mark = state.clone();
+                spawn(async move {
+                    let db_path = dirs::data_dir()
+                        .unwrap_or_default()
+                        .join("rusterm")
+                        .join("rusterm.db");
+                    let mark_ok = if let Ok(db) = rusterm_db::Database::open(Some(db_path)).await {
+                        match db.mark_command_failed(&cmd_for_mark, rc_for_mark).await {
+                            Ok(()) => {
+                                tracing::info!(
+                                    "[{}] marked command as failed in history DB: \
+                                     {:?} rc={} (session={})",
+                                    log_tag_owned,
+                                    cmd_for_mark,
+                                    rc_for_mark,
+                                    &sid_log[..sid_log.len().min(8)],
+                                );
+                                true
+                            }
+                            Err(e) => {
+                                tracing::warn!(
+                                    "Failed to mark command as failed in history DB: {}",
+                                    e
+                                );
+                                false
+                            }
+                        }
+                    } else {
+                        false
+                    };
+                    if mark_ok {
+                        state_for_mark
+                            .write()
+                            .recent_failed_commands
+                            .remove(&cmd_for_mark);
+                    }
+                });
+            }
+            None
+        }
+    };
+
+    // ── Recording: if a command was committed, persist to history DB + analytics ──
+    if let Some((cmd, db_id, hostname, learned_typo)) = committed {
+        let sid = session_id.to_string();
+        // Clone for the analytics record (the original `cmd` is moved into the
+        // DB entry below). When the `analytics` feature is off, the spawned
+        // analytics task below is cfg-gated out entirely.
+        let _analytics_cmd = cmd.clone();
+        let _analytics_host = hostname.clone();
+        if state.read().collect_usage_habits && learned_typo.is_some() {
+            let typo = learned_typo.clone().unwrap();
+            let analytics_handle = state.read().analytics.clone();
+            let correction = cmd.clone();
+            spawn(async move {
+                if let Err(error) = analytics_handle.record_command_correction(&typo, &correction) {
+                    tracing::warn!(
+                        "[CORRECTION] failed to record {:?} -> {:?}: {}",
+                        typo,
+                        correction,
+                        error
+                    );
+                }
+            });
+        }
+        let analytics_created = chrono::Utc::now().to_rfc3339();
+        let analytics_created_for_db = analytics_created.clone();
+        spawn(async move {
+            let db_path = dirs::data_dir()
+                .unwrap_or_default()
+                .join("rusterm")
+                .join("rusterm.db");
+            if let Ok(db) = rusterm_db::Database::open(Some(db_path)).await {
+                let entry = rusterm_db::history::HistoryEntry {
+                    id: db_id,
+                    command: cmd,
+                    session_id: sid,
+                    cwd: None,
+                    hostname,
+                    exit_code: Some(0),
+                    duration_ms: None,
+                    created_at: analytics_created_for_db,
+                };
+                if let Err(e) = db.save_history(entry).await {
+                    tracing::warn!("Failed to save history: {}", e);
+                }
+            }
+        });
+        // Incremental analytics mirror: record the successful command into
+        // DuckDB so the analytics DB stays current without a full re-mirror
+        // on every command. Spawned separately so a slow DuckDB insert doesn't
+        // block the output loop. Errors are logged but non-fatal.
+        #[cfg(feature = "analytics")]
+        {
+            let analytics_handle = state.read().analytics.clone();
+            spawn(async move {
+                let analytics_entry = rusterm_analytics::AnalyticsCommand {
+                    command: _analytics_cmd,
+                    hostname: _analytics_host,
+                    exit_code: Some(0),
+                    created_at: analytics_created,
+                };
+                if let Err(e) = analytics_handle.record_command(&analytics_entry) {
+                    tracing::warn!("[ANALYTICS] failed to record command: {}", e);
+                }
+            });
+        }
+    }
+
+    // ── Update the tab's exit-code badge ──
+    {
+        let mut s = state.write();
+        if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == session_id) {
+            tab.last_command_status = if rc == 0 {
+                CommandStatus::Success
+            } else {
+                CommandStatus::Failed(rc)
+            };
+        }
+    }
 }
 
 fn start_shell_connection(
@@ -11656,6 +11926,7 @@ fn start_serial_connection(
                     match event {
                         SessionEvent::Output(id, mut data) => {
                             pending_event = drain_output_batch(&mut event_rx, &id, &mut data);
+                            state.write().shadow_sandbox.record_output(&id, &data);
                             {
                                 let logs = state.read().session_logs.clone();
                                 if let Some(log) = logs.get(&id) {
@@ -11664,15 +11935,43 @@ fn start_serial_connection(
                             }
                             let terminals = state.read().terminals.clone();
                             if let Some(handle) = terminals.get(&id) {
-                                let render_result = {
+                                let (render_result, exit_code, new_cwd) = {
                                     let mut entry = handle.lock();
-                                    entry.process_and_render(&data)
+                                    (
+                                        entry.process_and_render(&data),
+                                        entry.terminal.take_exit_code(),
+                                        entry.terminal.cwd().map(|p| p.to_path_buf()),
+                                    )
                                 };
-                                let mut s = state.write();
-                                // Throttle the DOM-facing snapshot for serial/
-                                // telnet output floods. The model is already
-                                // updated; this coalesces re-renders.
-                                apply_throttled_render(&mut s, &id, render_result);
+                                if let Some(exit_code) = exit_code {
+                                    let _ = state
+                                        .write()
+                                        .shadow_sandbox
+                                        .finish_execution(&id, exit_code);
+                                }
+                                // Shell integration (OSC 133;D): deferred
+                                // recording. Serial lines don't get the
+                                // integration script injected (the target could
+                                // be a bootloader or microcontroller REPL
+                                // where injecting shell commands would be
+                                // disruptive), but if the user's serial shell
+                                // happens to send OSC 133 markers (e.g. a
+                                // manually-configured bash over serial), the
+                                // exit code is processed here. Shared helper —
+                                // same path as SSH / Shell / Telnet.
+                                process_session_exit_code(state, &id, exit_code, "SERIAL");
+                                {
+                                    let mut s = state.write();
+                                    // Throttle the DOM-facing snapshot for serial
+                                    // output floods. The model is already
+                                    // updated; this coalesces re-renders.
+                                    apply_throttled_render(&mut s, &id, render_result);
+                                    if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
+                                        if let Some(cwd) = &new_cwd {
+                                            tab.cwd = Some(cwd.to_string_lossy().into_owned());
+                                        }
+                                    }
+                                }
                             }
                             check_onekey_match(state, input_senders, &id, &data);
                         }
@@ -11685,6 +11984,10 @@ fn start_serial_connection(
                             // Force-flush any deferred render so the user sees
                             // the final viewport immediately.
                             flush_pending_renders(&mut state.write(), true);
+                            let _ = state.write().shadow_sandbox.fail_execution(
+                                &id,
+                                crate::i18n::tf("session.disconnected", &[("reason", &reason)]),
+                            );
                             clear_onekey_session_runtime(&mut state.write(), &id);
                             let failed = crate::i18n::t("session.disconnected_short");
                             let reconnect = crate::i18n::t("session.reconnect_hint");
@@ -11784,6 +12087,25 @@ fn start_telnet_connection(
                     let mut entry = handle.lock();
                     entry.terminal.set_input_sender(session.input_tx.clone());
                 }
+
+                // Install OSC 133/OSC 7 shell integration after the remote's
+                // initial output has stayed quiet — same pattern as SSH. Most
+                // telnet targets (Linux login shells on routers, switches,
+                // BMCs) run bash or busybox-ash, which support the precmd hook.
+                // Devices that don't (raw serial-over-network, custom CLIs)
+                // simply ignore the script and no exit codes are reported —
+                // `process_session_exit_code` is a no-op in that case.
+                let (initial_output_activity_tx, initial_output_activity_rx) =
+                    mpsc::unbounded_channel();
+                let shell_integration_echo_filter =
+                    Arc::new(Mutex::new(ShellIntegrationEchoFilter::default()));
+                spawn(inject_shell_integration_when_quiet(
+                    initial_output_activity_rx,
+                    session.input_tx.clone(),
+                    shell_integration_echo_filter.clone(),
+                    tab_id.clone(),
+                ));
+
                 let _session_guard = session;
 
                 let mut pending_event: Option<SessionEvent> = None;
@@ -11824,6 +12146,16 @@ fn start_telnet_connection(
                     match event {
                         SessionEvent::Output(id, mut data) => {
                             pending_event = drain_output_batch(&mut event_rx, &id, &mut data);
+                            // Reset the shell-integration quiet-period timer on
+                            // every remote output chunk (same as SSH).
+                            let _ = initial_output_activity_tx.send(());
+                            // Hide the echoed shell-integration setup line
+                            // (the remote PTY echoes injected input).
+                            let data = shell_integration_echo_filter.lock().filter(&data);
+                            if data.is_empty() {
+                                continue;
+                            }
+                            state.write().shadow_sandbox.record_output(&id, &data);
                             {
                                 let logs = state.read().session_logs.clone();
                                 if let Some(log) = logs.get(&id) {
@@ -11832,17 +12164,41 @@ fn start_telnet_connection(
                             }
                             let terminals = state.read().terminals.clone();
                             if let Some(handle) = terminals.get(&id) {
-                                let render_result = {
+                                let (render_result, exit_code, new_cwd) = {
                                     let mut entry = handle.lock();
-                                    entry.process_and_render(&data)
+                                    (
+                                        entry.process_and_render(&data),
+                                        entry.terminal.take_exit_code(),
+                                        entry.terminal.cwd().map(|p| p.to_path_buf()),
+                                    )
                                 };
-                                let mut s = state.write();
-                                // Throttle the DOM-facing snapshot for serial/
-                                // telnet output floods. The model is already
-                                // updated; this coalesces re-renders.
-                                apply_throttled_render(&mut s, &id, render_result);
+                                if let Some(exit_code) = exit_code {
+                                    let _ = state
+                                        .write()
+                                        .shadow_sandbox
+                                        .finish_execution(&id, exit_code);
+                                }
+                                // Shell integration (OSC 133;D): deferred
+                                // recording. Commands are queued in
+                                // `pending_exit_check` when Enter is pressed
+                                // (see dispatch_approved_command). Only now,
+                                // when the shell reports the exit code, do we
+                                // commit to history + DuckDB analytics (rc==0)
+                                // or mark as failed (rc!=0). Shared helper —
+                                // same path as SSH / Shell / Serial.
+                                process_session_exit_code(state, &id, exit_code, "TELNET");
+                                {
+                                    let mut s = state.write();
+                                    apply_throttled_render(&mut s, &id, render_result);
+                                    if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
+                                        if let Some(cwd) = &new_cwd {
+                                            tab.cwd = Some(cwd.to_string_lossy().into_owned());
+                                        }
+                                    }
+                                }
                             }
                             check_onekey_match(state, input_senders, &id, &data);
+                            drive_login_script(state, input_senders, &id, &data);
                         }
                         SessionEvent::Disconnected(id, reason) => {
                             tracing::info!(
@@ -11853,6 +12209,10 @@ fn start_telnet_connection(
                             // Force-flush any deferred render so the user sees
                             // the final viewport immediately.
                             flush_pending_renders(&mut state.write(), true);
+                            let _ = state.write().shadow_sandbox.fail_execution(
+                                &id,
+                                crate::i18n::tf("session.disconnected", &[("reason", &reason)]),
+                            );
                             clear_onekey_session_runtime(&mut state.write(), &id);
                             let failed = crate::i18n::t("session.disconnected_short");
                             let reconnect = crate::i18n::t("session.reconnect_hint");
@@ -12423,6 +12783,7 @@ fn restore_sessions(
                     })
                     .cloned();
                 if let Some(conn) = conn {
+                    let conn_for_replay = conn.clone();
                     open_connection(state.clone(), input_senders.clone(), conn, None);
                     // Find the tab we just created (it's the last one pushed).
                     let tab_id = state
@@ -12451,8 +12812,41 @@ fn restore_sessions(
                         if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == tab_id) {
                             tab.command_history = ps.command_history_tail.clone();
                         }
+                        // Re-seed the interactive-replay recorder so future
+                        // reconnects of the restored session replay the same
+                        // establishment ops.
+                        if !ps.replay_ops.is_empty() {
+                            s.session_replays.insert(
+                                tab_id.clone(),
+                                crate::state::SessionReplayRecorder {
+                                    ops: ps.replay_ops.clone(),
+                                    shell_integrated: false,
+                                },
+                            );
+                        }
                     }
-                    if let Some(cwd) = &ps.cwd {
+                    // Interactive sessions (jumpserver menus) are restored by
+                    // replaying the recorded establishment ops; integrated
+                    // shells by `cd`-ing back to the last cwd. The two are
+                    // mutually exclusive by construction (shell-integration
+                    // evidence clears the replay ops), but replay wins
+                    // defensively if a snapshot ever carries both.
+                    if should_schedule_replay(
+                        conn_for_replay.login_script.as_deref(),
+                        &ps.replay_ops,
+                    ) {
+                        tracing::info!(
+                            "[REPLAY] restored session {} scheduling {} recorded op(s)",
+                            &tab_id[..tab_id.len().min(8)],
+                            ps.replay_ops.len()
+                        );
+                        schedule_replay_after_reconnect(
+                            state.clone(),
+                            input_senders.clone(),
+                            tab_id.clone(),
+                            ps.replay_ops.clone(),
+                        );
+                    } else if let Some(cwd) = &ps.cwd {
                         schedule_cd_after_restore(
                             state.clone(),
                             input_senders.clone(),
@@ -13227,6 +13621,277 @@ fn disconnect_session(
     );
 }
 
+/// How long the replay task waits for the reconnect to reach `Connected`
+/// before giving up. Slightly above the reconnect watchdog so the watchdog's
+/// Disconnected flip (which aborts the replay cleanly) always fires first.
+const REPLAY_CONNECT_WAIT_SECS: u64 = 60;
+/// Poll interval for both the connected-wait and the output-quiescence wait.
+const REPLAY_POLL_MS: u64 = 200;
+/// Number of consecutive unchanged-output polls (× [`REPLAY_POLL_MS`]) before
+/// the remote is considered quiescent and the next op may be sent. 4 × 200ms
+/// = 800ms of silence — the same heuristic budget `schedule_cd_after_restore`
+/// uses for "the shell printed its prompt".
+const REPLAY_QUIESCENT_POLLS: u32 = 4;
+/// Per-op ceiling on the quiescence wait. If the remote keeps streaming
+/// output for this long (e.g. a replayed op started a pager or log tail),
+/// the replay aborts rather than typing into an unknown remote state.
+const REPLAY_OP_TIMEOUT_SECS: u64 = 20;
+
+/// Splits recorded replay ops into (safe-to-replay, skipped) using the same
+/// safety checker that gates live command submission. Only `Safe` verdicts
+/// are replayed — `Warn`/`Block` ops are skipped instead of prompting,
+/// because an automatic recovery flow must never re-run a potentially
+/// destructive command without the user watching for a dialog.
+fn filter_replayable_ops(
+    ops: &[String],
+    checker: &rusterm_core::CommandSafetyChecker,
+) -> (Vec<String>, Vec<String>) {
+    let mut safe = Vec::new();
+    let mut skipped = Vec::new();
+    for op in ops {
+        match checker.check(op) {
+            rusterm_core::SafetyVerdict::Safe => safe.push(op.clone()),
+            rusterm_core::SafetyVerdict::Warn(_) | rusterm_core::SafetyVerdict::Block(_) => {
+                skipped.push(op.clone());
+            }
+        }
+    }
+    (safe, skipped)
+}
+
+/// Whether a reconnect/restore should schedule interactive-operation replay
+/// for this connection. A configured login script owns the establishment
+/// flow (expect/send navigation) — replaying recorded ops on top of it would
+/// double-drive the remote menu.
+fn should_schedule_replay(login_script: Option<&str>, ops: &[String]) -> bool {
+    !ops.is_empty() && login_script.is_none_or(|s| s.trim().is_empty())
+}
+
+#[cfg(test)]
+mod session_replay_engine_tests {
+    use super::*;
+
+    fn ops(items: &[&str]) -> Vec<String> {
+        items.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Jumpserver-style navigation inputs pass the safety filter verbatim
+    /// and in order — that's what gets replayed on reconnect.
+    #[test]
+    fn filter_keeps_interactive_navigation_ops_in_order() {
+        let checker = rusterm_core::CommandSafetyChecker::new();
+        let recorded = ops(&["p", "web-server-01", "2"]);
+        let (safe, skipped) = filter_replayable_ops(&recorded, &checker);
+        assert_eq!(safe, recorded);
+        assert!(skipped.is_empty());
+    }
+
+    /// Ops the safety checker flags (Warn/Block) are skipped, never queued
+    /// for automatic replay — an unattended recovery flow must not re-run
+    /// destructive commands.
+    #[test]
+    fn filter_skips_dangerous_ops() {
+        let checker = rusterm_core::CommandSafetyChecker::new();
+        let recorded = ops(&["web-server-01", "rm -rf /", "ls"]);
+        let (safe, skipped) = filter_replayable_ops(&recorded, &checker);
+        assert!(safe.contains(&"web-server-01".to_string()));
+        assert!(safe.contains(&"ls".to_string()));
+        assert_eq!(skipped, ops(&["rm -rf /"]));
+    }
+
+    /// A configured login script owns session establishment — replay must
+    /// not double-drive the remote menu. Blank scripts don't count.
+    #[test]
+    fn replay_is_skipped_when_a_login_script_is_configured() {
+        let recorded = ops(&["web-server-01"]);
+        assert!(should_schedule_replay(None, &recorded));
+        assert!(should_schedule_replay(Some("   "), &recorded));
+        assert!(!should_schedule_replay(
+            Some("expect Opt>\nsend web-server-01"),
+            &recorded
+        ));
+        assert!(!should_schedule_replay(None, &[]));
+    }
+}
+
+/// Waits until the session's terminal stops producing output: the tab's
+/// render `version` must stay unchanged for [`REPLAY_QUIESCENT_POLLS`]
+/// consecutive polls. Returns `false` on timeout ([`REPLAY_OP_TIMEOUT_SECS`])
+/// or when the session/tab disappeared.
+async fn wait_for_output_quiescence(state: Signal<AppState>, session_id: &str) -> bool {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(REPLAY_OP_TIMEOUT_SECS);
+    let read_version = |state: &Signal<AppState>| {
+        state
+            .read()
+            .sessions
+            .iter()
+            .find(|t| t.id == session_id)
+            .map(|t| t.version)
+    };
+    let Some(mut last_version) = read_version(&state) else {
+        return false;
+    };
+    let mut stable = 0u32;
+    while stable < REPLAY_QUIESCENT_POLLS {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(REPLAY_POLL_MS)).await;
+        let Some(version) = read_version(&state) else {
+            return false;
+        };
+        if version == last_version {
+            stable += 1;
+        } else {
+            last_version = version;
+            stable = 0;
+        }
+    }
+    true
+}
+
+/// Replays the recorded establishment ops into a session once its reconnect
+/// (or startup restore) reaches `Connected`. Pacing is output-driven: each op
+/// is sent only after the remote has been quiet for a while (banner/menu
+/// finished printing), mirroring how a human waits for the bastion menu
+/// before typing. Aborts cleanly if the session disconnects again, the
+/// sender disappears, or the remote never goes quiet.
+fn schedule_replay_after_reconnect(
+    mut state: Signal<AppState>,
+    input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    tab_id: String,
+    ops: Vec<String>,
+) {
+    if ops.is_empty() {
+        return;
+    }
+    spawn(async move {
+        // 1. Wait for the reconnect to actually land. `None` means the
+        // connection task has not registered a state yet (startup restore
+        // path) — keep waiting; a failed attempt shows up as `Disconnected`.
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(REPLAY_CONNECT_WAIT_SECS);
+        loop {
+            match state.read().session_connection_states.get(&tab_id).copied() {
+                Some(SessionConnectionState::Connected) => break,
+                Some(SessionConnectionState::Reconnecting) | None => {
+                    if std::time::Instant::now() >= deadline {
+                        tracing::warn!(
+                            "[REPLAY] session {} never reached Connected — giving up",
+                            &tab_id[..tab_id.len().min(8)]
+                        );
+                        return;
+                    }
+                }
+                // Disconnected again (the reconnect attempt failed).
+                Some(SessionConnectionState::Disconnected) => return,
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(REPLAY_POLL_MS)).await;
+        }
+
+        // 2. Safety-filter the ops with the live checker.
+        let (safe_ops, skipped) = {
+            let s = state.read();
+            filter_replayable_ops(&ops, &s.safety_checker)
+        };
+        for op in &skipped {
+            tracing::warn!(
+                "[REPLAY] session {} skipping unsafe op: {}",
+                &tab_id[..tab_id.len().min(8)],
+                op
+            );
+        }
+        if safe_ops.is_empty() {
+            return;
+        }
+
+        // 3. Tell the user what is about to happen (same terminal-notice
+        // pattern as the reconnect prompt).
+        {
+            let mut msg = format!(
+                "\r\n{}\r\n",
+                crate::i18n::tf(
+                    "session.replaying_ops",
+                    &[("count", &safe_ops.len().to_string())]
+                )
+            );
+            if !skipped.is_empty() {
+                msg.push_str(&format!(
+                    "{}\r\n",
+                    crate::i18n::tf(
+                        "session.replay_skipped_unsafe",
+                        &[("count", &skipped.len().to_string())]
+                    )
+                ));
+            }
+            let terminals = state.read().terminals.clone();
+            if let Some(handle) = terminals.get(&tab_id) {
+                let render_result = handle.lock().process_and_render(msg.as_bytes());
+                let mut s = state.write();
+                if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == tab_id) {
+                    tab.render_output = render_result;
+                    tab.version += 1;
+                }
+            }
+        }
+
+        // 4. Send each op once the remote has gone quiet. The ops go through
+        // the raw input sender (not the command-submission dispatcher) so
+        // they are neither re-recorded nor enqueued for exit-code tracking —
+        // they are a replay of past input, not new commands.
+        let total = safe_ops.len();
+        for (idx, op) in safe_ops.into_iter().enumerate() {
+            if !wait_for_output_quiescence(state, &tab_id).await {
+                tracing::warn!(
+                    "[REPLAY] session {} output never went quiet before op {}/{} — aborting replay",
+                    &tab_id[..tab_id.len().min(8)],
+                    idx + 1,
+                    total
+                );
+                return;
+            }
+            if state.read().session_connection_states.get(&tab_id)
+                != Some(&SessionConnectionState::Connected)
+            {
+                tracing::warn!(
+                    "[REPLAY] session {} disconnected mid-replay at op {}/{} — aborting",
+                    &tab_id[..tab_id.len().min(8)],
+                    idx + 1,
+                    total
+                );
+                return;
+            }
+            let sender = input_senders.read().get(&tab_id).cloned();
+            let Some(sender) = sender else {
+                tracing::warn!(
+                    "[REPLAY] session {} lost its input sender — aborting replay",
+                    &tab_id[..tab_id.len().min(8)]
+                );
+                return;
+            };
+            if sender.send(format!("{op}\r").into_bytes()).is_err() {
+                tracing::warn!(
+                    "[REPLAY] session {} input channel closed — aborting replay",
+                    &tab_id[..tab_id.len().min(8)]
+                );
+                return;
+            }
+            tracing::info!(
+                "[REPLAY] session {} sent op {}/{}",
+                &tab_id[..tab_id.len().min(8)],
+                idx + 1,
+                total
+            );
+        }
+        tracing::info!(
+            "[REPLAY] session {} replay complete ({} op(s))",
+            &tab_id[..tab_id.len().min(8)],
+            total
+        );
+    });
+}
+
 fn reconnect_session(
     mut state: Signal<AppState>,
     mut input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
@@ -13294,6 +13959,19 @@ fn reconnect_session(
         previous_size.cols,
         previous_size.rows
     );
+    // Session-recovery replay: if this session recorded interactive
+    // establishment ops (jumpserver menu navigation), schedule their replay
+    // for after the transport reconnects. A configured login script owns the
+    // establishment flow instead, so replay is skipped in that case.
+    let replay_ops = replayable_ops(&state.read(), &tab_id);
+    if should_schedule_replay(conn.login_script.as_deref(), &replay_ops) {
+        tracing::info!(
+            "[REPLAY] session {} scheduling {} recorded op(s) for post-reconnect replay",
+            &tab_id[..tab_id.len().min(8)],
+            replay_ops.len()
+        );
+        schedule_replay_after_reconnect(state, input_senders, tab_id.clone(), replay_ops);
+    }
     // Clone before the `match` moves `tab_id` into the connect function.
     let wd_tab_id = tab_id.clone();
     match conn.kind {
