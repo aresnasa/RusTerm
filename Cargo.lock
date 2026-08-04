@@ -8351,6 +8351,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "rusterm-zmodem"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "thiserror 2.0.18",
+ "tracing",
+]
+
+[[package]]
 name = "rusticata-macros"
 version = "4.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -1,0 +1,15 @@
+[package]
+name = "rusterm-zmodem"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "ZMODEM protocol parser and state machine for RusTerm (lrzsz rz/sz interop)"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true

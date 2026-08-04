@@ -16,6 +16,7 @@ members = [
     "crates/rusterm-relay",
     "crates/rusterm-tunnel",
     "crates/rusterm-ohmyzsh",
+    "crates/rusterm-zmodem",
 ]
 
 [workspace.package]
@@ -137,6 +138,7 @@ rusterm-sync = { path = "crates/rusterm-sync" }
 rusterm-relay = { path = "crates/rusterm-relay" }
 rusterm-tunnel = { path = "crates/rusterm-tunnel" }
 rusterm-ohmyzsh = { path = "crates/rusterm-ohmyzsh" }
+rusterm-zmodem = { path = "crates/rusterm-zmodem" }
 
 # Patched transitive deps
 # `block v0.1.6` (pulled in by `cocoa` via `dioxus-desktop`) declares an
