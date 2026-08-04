@@ -1294,22 +1294,24 @@ fn drive_login_script(
 ) {
     use crate::state::LoginScriptRuntime;
 
-    // Lazy init.
+    // Lazy init — at most once per connection lifetime. A finished (or
+    // aborted) runtime must NOT re-arm on later output: a completed bastion
+    // navigation would otherwise re-trigger the moment its first `expect`
+    // pattern reappears (e.g. the user pressing `q` back to the menu) and
+    // yank the session away from the user. Reconnects re-run the script by
+    // removing the stale runtime in `reconnect_session`; restored sessions
+    // get fresh tab ids and therefore a fresh runtime.
     {
         let needs_init = {
             let s = state.read();
-            let done_or_absent = s
-                .login_scripts
-                .get(session_id)
-                .map(|rt| rt.done)
-                .unwrap_or(true);
+            let absent = !s.login_scripts.contains_key(session_id);
             let has_script = s
                 .session_configs
                 .get(session_id)
                 .and_then(|c| c.login_script.as_deref())
                 .map(|t| !t.trim().is_empty())
                 .unwrap_or(false);
-            done_or_absent && has_script
+            absent && has_script
         };
         if needs_init {
             let script = state
@@ -10951,6 +10953,12 @@ fn start_ssh_connection(
                                 }
                             }
                             check_onekey_match(state, input_senders, &id, &data);
+                            // Drive the connection's login script (bastion
+                            // menu navigation) on every output chunk — SSH is
+                            // the primary transport for jump hosts, so this
+                            // loop must feed the script just like the shell
+                            // and telnet loops do.
+                            drive_login_script(state, input_senders, &id, &data);
                         }
                         SessionEvent::Disconnected(id, reason) => {
                             // Force-flush any deferred render so the user sees the
@@ -12907,12 +12915,20 @@ fn restore_sessions(
                             );
                         }
                     }
-                    // Interactive sessions (jumpserver menus) are restored by
-                    // replaying the recorded establishment ops; integrated
-                    // shells by `cd`-ing back to the last cwd. The two are
-                    // mutually exclusive by construction (shell-integration
-                    // evidence clears the replay ops), but replay wins
-                    // defensively if a snapshot ever carries both.
+                    // Establishment on restore, in priority order:
+                    // 1. A configured login script owns the whole flow — it
+                    //    re-runs on the fresh connection (driven from the
+                    //    session output loop), so neither replay nor a blind
+                    //    `cd` may type into the bastion menu on top of it.
+                    // 2. Recorded interactive ops (jumpserver menu
+                    //    navigation) are replayed; if the snapshot also has
+                    //    a cwd (integrated target shell), a follow-up `cd`
+                    //    lands the user back in their directory.
+                    // 3. Plain integrated shells restore via `cd` alone.
+                    let has_login_script = conn_for_replay
+                        .login_script
+                        .as_deref()
+                        .is_some_and(|s| !s.trim().is_empty());
                     if should_schedule_replay(
                         conn_for_replay.login_script.as_deref(),
                         &ps.replay_ops,
@@ -12927,6 +12943,12 @@ fn restore_sessions(
                             input_senders.clone(),
                             tab_id.clone(),
                             ps.replay_ops.clone(),
+                            ps.cwd.clone(),
+                        );
+                    } else if has_login_script {
+                        tracing::info!(
+                            "[RESTORE] session {} has a login script — it owns establishment, skipping cd/replay",
+                            &tab_id[..tab_id.len().min(8)]
                         );
                     } else if let Some(cwd) = &ps.cwd {
                         schedule_cd_after_restore(
@@ -13082,14 +13104,25 @@ fn save_session_state_snapshot(state: &Signal<AppState>) {
     }
 }
 
-/// Schedule a `cd '<cwd>'\n` send to the session's input sender after a
-/// delay that's long enough for the shell to be ready (we piggyback on the
-/// existing 400ms shell-integration injection delay, then add a bit more
-/// so the `cd` arrives after the integration snippet).
+/// Builds the `cd` line used to restore a session's working directory.
 ///
-/// The path is single-quoted to handle spaces and most special characters.
-/// Single quotes inside the path are escaped with the standard `'\'` trick
+/// The path is single-quoted to handle spaces and most special characters;
+/// single quotes inside the path are escaped with the standard `'\''` trick
 /// (close quote, escaped quote, reopen quote).
+fn build_restore_cd_command(cwd: &str) -> String {
+    let escaped = cwd.replace('\'', "'\\''");
+    format!("cd '{escaped}'\r")
+}
+
+/// Schedule a `cd '<cwd>'\r` send to the session's input sender once the
+/// session is actually ready to receive it.
+///
+/// Readiness is connection-driven, not a blind delay: restored SSH sessions
+/// take seconds to register their input sender (a fixed 800ms sleep used to
+/// lose the `cd` entirely — "no input sender" in the logs), so we first wait
+/// for the sender to appear and any connection state to reach `Connected`,
+/// then wait for the output to go quiet (login banner finished printing)
+/// before typing into the remote.
 fn schedule_cd_after_restore(
     state: Signal<AppState>,
     input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
@@ -13097,20 +13130,43 @@ fn schedule_cd_after_restore(
     cwd: String,
 ) {
     spawn(async move {
-        // Wait for the shell to be ready. 800ms = the 400ms shell-integration
-        // injection delay + 400ms for the shell to process it and print the
-        // first prompt. This is a heuristic — if the shell is slow to start,
-        // the `cd` might arrive before the prompt and get echoed. Acceptable
-        // trade-off: the alternative (waiting for OSC 133;A prompt-start
-        // marker) would require plumbing the marker through the session task,
-        // which is a much larger change.
-        tokio::time::sleep(std::time::Duration::from_millis(800)).await;
+        // 1. Wait for the transport: the input sender must exist and, for
+        // remote sessions that track a connection state, the state must be
+        // `Connected` (local shells never register one — sender presence is
+        // their readiness signal). `Disconnected` means the restore attempt
+        // failed; give up quietly.
+        let deadline =
+            std::time::Instant::now() + std::time::Duration::from_secs(REPLAY_CONNECT_WAIT_SECS);
+        loop {
+            let has_sender = input_senders.read().contains_key(&tab_id);
+            let conn_state = state.read().session_connection_states.get(&tab_id).copied();
+            match conn_state {
+                Some(SessionConnectionState::Disconnected) => {
+                    tracing::warn!(
+                        "[RESTORE] session {} disconnected before `cd` could be sent",
+                        &tab_id[..tab_id.len().min(8)]
+                    );
+                    return;
+                }
+                Some(SessionConnectionState::Connected) | None if has_sender => break,
+                _ => {}
+            }
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    "[RESTORE] session {} never became ready for `cd` — giving up",
+                    &tab_id[..tab_id.len().min(8)]
+                );
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(REPLAY_POLL_MS)).await;
+        }
 
-        // Build the `cd` command with proper quoting.
-        // Single-quote the path; escape any embedded single quotes with `'\''`.
-        let escaped = cwd.replace('\'', "'\\''");
-        let cmd = format!("cd '{}'\r", escaped);
+        // 2. Let the login banner / first prompt finish printing so the `cd`
+        // lands on a quiet prompt instead of interleaving with the banner.
+        // A timeout here is non-fatal: send anyway, as before.
+        let _ = wait_for_output_quiescence(state, &tab_id).await;
 
+        let cmd = build_restore_cd_command(&cwd);
         let sender = input_senders.read().get(&tab_id).cloned();
         if let Some(sender) = sender {
             match sender.send(cmd.into_bytes()) {
@@ -13807,6 +13863,20 @@ mod session_replay_engine_tests {
         ));
         assert!(!should_schedule_replay(None, &[]));
     }
+
+    /// The restore `cd` line single-quotes the path and escapes embedded
+    /// single quotes so arbitrary directory names survive the round trip.
+    #[test]
+    fn restore_cd_command_quotes_paths() {
+        assert_eq!(
+            build_restore_cd_command("/var/log/my app"),
+            "cd '/var/log/my app'\r"
+        );
+        assert_eq!(
+            build_restore_cd_command("/tmp/it's here"),
+            "cd '/tmp/it'\\''s here'\r"
+        );
+    }
 }
 
 /// Waits until the session's terminal stops producing output: the tab's
@@ -13852,11 +13922,17 @@ async fn wait_for_output_quiescence(state: Signal<AppState>, session_id: &str) -
 /// finished printing), mirroring how a human waits for the bastion menu
 /// before typing. Aborts cleanly if the session disconnects again, the
 /// sender disappears, or the remote never goes quiet.
+///
+/// `follow_up_cwd`: when the snapshot also recorded a working directory
+/// (OSC 7 from the integrated shell the replay lands on), a `cd` is sent
+/// after the last op so the user gets both the target host *and* their
+/// directory back.
 fn schedule_replay_after_reconnect(
     mut state: Signal<AppState>,
     input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
     tab_id: String,
     ops: Vec<String>,
+    follow_up_cwd: Option<String>,
 ) {
     if ops.is_empty() {
         return;
@@ -13984,6 +14060,36 @@ fn schedule_replay_after_reconnect(
             &tab_id[..tab_id.len().min(8)],
             total
         );
+
+        // 5. Optional follow-up: restore the working directory on the shell
+        // the replay landed on. Only meaningful when the snapshot carried a
+        // cwd (integrated target shell); quiescence keeps the `cd` from
+        // interleaving with the target host's login banner.
+        if let Some(cwd) = follow_up_cwd {
+            if !wait_for_output_quiescence(state, &tab_id).await {
+                tracing::warn!(
+                    "[REPLAY] session {} output never went quiet — skipping follow-up cd",
+                    &tab_id[..tab_id.len().min(8)]
+                );
+                return;
+            }
+            if state.read().session_connection_states.get(&tab_id)
+                != Some(&SessionConnectionState::Connected)
+            {
+                return;
+            }
+            let sender = input_senders.read().get(&tab_id).cloned();
+            if let Some(sender) = sender {
+                let cmd = build_restore_cd_command(&cwd);
+                if sender.send(cmd.into_bytes()).is_ok() {
+                    tracing::info!(
+                        "[REPLAY] session {} sent follow-up `cd {}`",
+                        &tab_id[..tab_id.len().min(8)],
+                        cwd
+                    );
+                }
+            }
+        }
     });
 }
 
@@ -14031,6 +14137,10 @@ fn reconnect_session(
         s.onekey_output_since_submission.remove(&tab_id);
         s.onekey_preference_attempts.remove(&tab_id);
         s.pending_exit_check.remove(&tab_id);
+        // Drop the stale login-script runtime so the fresh connection
+        // re-runs the script from step 0 (`drive_login_script` initializes
+        // at most once per connection lifetime).
+        s.login_scripts.remove(&tab_id);
     }
     input_senders.write().remove(&tab_id);
 
@@ -14065,7 +14175,22 @@ fn reconnect_session(
             &tab_id[..tab_id.len().min(8)],
             replay_ops.len()
         );
-        schedule_replay_after_reconnect(state, input_senders, tab_id.clone(), replay_ops);
+        // The tab's last known cwd (OSC 7 from the integrated shell the
+        // replay lands on) survives the disconnect — restore it after the
+        // establishment ops.
+        let follow_up_cwd = state
+            .read()
+            .sessions
+            .iter()
+            .find(|t| t.id == tab_id)
+            .and_then(|t| t.cwd.clone());
+        schedule_replay_after_reconnect(
+            state,
+            input_senders,
+            tab_id.clone(),
+            replay_ops,
+            follow_up_cwd,
+        );
     }
     // Clone before the `match` moves `tab_id` into the connect function.
     let wd_tab_id = tab_id.clone();

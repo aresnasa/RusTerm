@@ -7483,9 +7483,11 @@ pub const REPLAY_MAX_OPS: usize = 10;
 ///   at [`REPLAY_MAX_OPS`] (establishment prefix only).
 /// - The first OSC 133;D exit code observed on the session is evidence of a
 ///   real integrated shell (interactive bastion menus never emit it). At that
-///   point the recorded ops are dropped and recording is disabled: cwd-based
-///   restore already covers integrated shells, and replaying regular shell
-///   commands on reconnect would be wrong.
+///   point the recorder is FROZEN: the ops recorded so far — the establishment
+///   prefix typed *before* the evidence arrived (e.g. bastion menu navigation
+///   that led to the integrated target shell) — are kept for replay, but
+///   recording stops permanently so regular shell commands never enter the
+///   replay log.
 /// - Preserved across disconnects (that's the whole point); removed when the
 ///   session closes.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -7493,7 +7495,8 @@ pub struct SessionReplayRecorder {
     /// Submitted input lines, in submission order (establishment prefix).
     pub ops: Vec<String>,
     /// True once shell-integration evidence (OSC 133;D) was observed. From
-    /// then on `ops` stays empty and recording is disabled for this session.
+    /// then on `ops` is frozen (kept as the establishment prefix) and
+    /// recording is disabled for this session.
     pub shell_integrated: bool,
 }
 
@@ -7535,30 +7538,34 @@ pub fn record_replay_op(state: &mut AppState, session_id: &str, op: &str) -> boo
 }
 
 /// Marks the session as having a real, shell-integrated remote (OSC 133;D
-/// exit code observed). Drops any ops recorded so far and permanently
-/// disables recording for this session — an interactive bastion menu never
-/// emits OSC 133, so this evidence means the recorded lines were regular
-/// shell commands, which must not be replayed on reconnect (cwd restore
-/// covers integrated shells already).
+/// exit code observed) and FREEZES the replay recorder: the ops recorded so
+/// far are kept, but recording is permanently disabled for this session.
+///
+/// Freezing (rather than clearing) matters for bastion flows: the user
+/// navigates an interactive jump-host menu (recorded), lands on a target
+/// host whose shell emits OSC 133;D, and that recorded navigation is exactly
+/// what a restore must replay to land back on the target. Direct-connect
+/// integrated shells report their first exit code right after the
+/// integration is injected — before the user types anything — so their
+/// frozen prefix is empty and cwd-based restore covers them as before.
+/// Commands typed *after* the evidence never enter the replay log.
 pub fn note_shell_integration_evidence(state: &mut AppState, session_id: &str) {
     let rec = state
         .session_replays
         .entry(session_id.to_string())
         .or_default();
-    if !rec.shell_integrated {
-        rec.shell_integrated = true;
-        rec.ops.clear();
-    }
+    rec.shell_integrated = true;
 }
 
-/// The operations a reconnect should replay for this session, in order.
-/// Empty when nothing was recorded or the session proved to be an
-/// integrated shell.
+/// The operations a reconnect should replay for this session, in order —
+/// the recorded establishment prefix. Shell-integration evidence freezes
+/// the recorder but keeps this prefix (see
+/// [`note_shell_integration_evidence`]); an empty result means nothing was
+/// recorded before the session proved to be an integrated shell.
 pub fn replayable_ops(state: &AppState, session_id: &str) -> Vec<String> {
     state
         .session_replays
         .get(session_id)
-        .filter(|rec| !rec.shell_integrated)
         .map(|rec| rec.ops.clone())
         .unwrap_or_default()
 }
@@ -7635,17 +7642,27 @@ mod session_replay_tests {
         assert!(!ops.contains(&"rm -rf /tmp/scratch".to_string()));
     }
 
-    /// OSC 133;D evidence means the remote is a real integrated shell (a
-    /// bastion menu never emits it): recorded ops are dropped and recording
-    /// is permanently disabled — cwd restore covers this session instead.
+    /// OSC 133;D evidence means the remote reached a real integrated shell.
+    /// The recorder FREEZES: the establishment prefix recorded before the
+    /// evidence (bastion menu navigation) is kept for replay, but nothing
+    /// typed afterwards is ever recorded. Clearing instead of freezing was
+    /// the original design — and it destroyed jumpserver menu navigation the
+    /// moment the target host's shell reported its first exit code, leaving
+    /// snapshots with nothing to replay.
     #[test]
-    fn shell_integration_evidence_clears_ops_and_disables_recording() {
+    fn shell_integration_evidence_freezes_ops_and_disables_recording() {
         let mut state = state_with_session("sess", ssh_kind());
-        assert!(record_replay_op(&mut state, "sess", "ls"));
+        assert!(record_replay_op(&mut state, "sess", "/q"));
+        assert!(record_replay_op(&mut state, "sess", "3"));
         note_shell_integration_evidence(&mut state, "sess");
-        assert!(replayable_ops(&state, "sess").is_empty());
+        // The pre-evidence establishment prefix survives...
+        assert_eq!(
+            replayable_ops(&state, "sess"),
+            vec!["/q".to_string(), "3".to_string()]
+        );
+        // ...but post-evidence shell commands never enter the log.
         assert!(!record_replay_op(&mut state, "sess", "cd /var/log"));
-        assert!(replayable_ops(&state, "sess").is_empty());
+        assert_eq!(replayable_ops(&state, "sess").len(), 2);
     }
 
     /// Only interactive remote kinds (SSH / Telnet) record. Local shells are
@@ -7710,10 +7727,11 @@ mod session_replay_tests {
         assert!(replayable_ops(&state, "sess").is_empty());
     }
 
-    /// The persisted snapshot carries replay ops for non-integrated sessions
-    /// and an empty list once integration evidence was seen.
+    /// The persisted snapshot carries the recorded establishment prefix, and
+    /// integration evidence freezes (not clears) it — the frozen prefix is
+    /// what a startup restore replays to cross the bastion again.
     #[test]
-    fn build_session_state_includes_replay_ops_only_without_integration_evidence() {
+    fn build_session_state_keeps_frozen_replay_ops_after_integration_evidence() {
         let mut state = state_with_session("sess", ssh_kind());
         state.sessions.push(SessionTab {
             id: "sess".to_string(),
@@ -7744,7 +7762,10 @@ mod session_replay_tests {
 
         note_shell_integration_evidence(&mut state, "sess");
         let snapshot = state.build_session_state("Dark");
-        assert!(snapshot.sessions[0].replay_ops.is_empty());
+        assert_eq!(
+            snapshot.sessions[0].replay_ops,
+            vec!["web-server-01".to_string()]
+        );
     }
 }
 
