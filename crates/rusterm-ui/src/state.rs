@@ -200,6 +200,12 @@ pub struct AppState {
     /// suggest nothing than suggest failed commands.
     #[serde(skip)]
     pub pending_exit_check: HashMap<String, VecDeque<(String, String)>>,
+    /// Sessions that have ever produced a real OSC 133;D exit code. Used to
+    /// permanently disable the prompt-return badge fallback
+    /// (`prompt_return_completion_target`) on integrated shells, so a late or
+    /// split-chunk exit-code marker can never race the fallback.
+    #[serde(skip)]
+    pub exit_code_sessions: HashSet<String>,
     /// Input tracked synchronously from terminal key events. This avoids using
     /// the asynchronously echoed terminal grid as the source of truth when
     /// Enter arrives immediately after a fast paste or Compare broadcast.
@@ -947,6 +953,7 @@ impl Default for AppState {
             master_password_error: None,
             suggestion_epoch: 0,
             pending_exit_check: HashMap::new(),
+            exit_code_sessions: HashSet::new(),
             terminal_command_lines: HashMap::new(),
             history_completion_sessions: HashSet::new(),
             suggestion_muted_sessions: HashSet::new(),
@@ -1625,6 +1632,38 @@ pub fn rollback_pending_exit(state: &mut AppState, session_id: &str, history_id:
     }
 }
 
+/// Records that the session produced a real OSC 133;D exit code. Used to
+/// permanently disable the prompt-return badge fallback on integrated shells
+/// so a late (or split-chunk) exit-code marker can never race the fallback.
+pub fn note_exit_code_evidence(state: &mut AppState, session_id: &str) {
+    state.exit_code_sessions.insert(session_id.to_string());
+}
+
+/// True when a session is eligible for the non-integrated prompt-return
+/// completion fallback: an approved command is still waiting for its exit
+/// code, the session never produced a real OSC 133;D marker, and the
+/// terminal's current line looks like a shell prompt again (the command
+/// finished and the prompt returned). Integrated shells are permanently
+/// excluded via `exit_code_sessions`. See app.rs
+/// `resolve_pending_command_via_prompt` for the badge/history semantics.
+pub fn prompt_return_completion_target(
+    state: &AppState,
+    session_id: &str,
+    current_line: &str,
+) -> bool {
+    if state.exit_code_sessions.contains(session_id) {
+        return false;
+    }
+    if !state
+        .pending_exit_check
+        .get(session_id)
+        .is_some_and(|q| !q.is_empty())
+    {
+        return false;
+    }
+    prompt_looks_like_shell(current_line)
+}
+
 #[cfg(test)]
 mod pending_exit_helpers_tests {
     use super::*;
@@ -1667,6 +1706,62 @@ mod pending_exit_helpers_tests {
         assert_eq!(state.pending_exit_check["session"].len(), 1);
         assert!(rollback_pending_exit(&mut state, "session", "first-id"));
         assert!(!state.pending_exit_check.contains_key("session"));
+    }
+
+    #[test]
+    fn prompt_return_fallback_requires_pending_command_and_shell_prompt() {
+        let mut state = AppState::default();
+
+        // No pending command: even a perfect prompt line is not a target.
+        assert!(!prompt_return_completion_target(
+            &state,
+            "session",
+            "root@host:~# "
+        ));
+
+        enqueue_pending_exit(&mut state, "session", "ls".to_string(), "id".to_string());
+        // Pending command + shell-looking prompt -> eligible.
+        assert!(prompt_return_completion_target(
+            &state,
+            "session",
+            "root@host:~# "
+        ));
+        // Pending command but output is mid-flight (no prompt) -> not eligible.
+        assert!(!prompt_return_completion_target(
+            &state,
+            "session",
+            "reading chunk 12/40"
+        ));
+        assert!(!prompt_return_completion_target(&state, "session", ""));
+    }
+
+    #[test]
+    fn prompt_return_fallback_is_disabled_after_real_exit_code_evidence() {
+        let mut state = AppState::default();
+        enqueue_pending_exit(&mut state, "session", "ls".to_string(), "id".to_string());
+        assert!(prompt_return_completion_target(
+            &state,
+            "session",
+            "root@host:~# "
+        ));
+
+        // Once any real OSC 133;D was observed for the session, the fallback
+        // never fires again — an integrated shell resolves via the exit-code
+        // pipeline, and a late marker can never race the fallback.
+        note_exit_code_evidence(&mut state, "session");
+        assert!(!prompt_return_completion_target(
+            &state,
+            "session",
+            "root@host:~# "
+        ));
+
+        // Other sessions without evidence stay eligible.
+        enqueue_pending_exit(&mut state, "other", "ls".to_string(), "id".to_string());
+        assert!(prompt_return_completion_target(
+            &state,
+            "other",
+            "root@host:~# "
+        ));
     }
 
     #[test]
@@ -2894,6 +2989,7 @@ pub fn close_session(
     }
     state.session_configs.remove(id);
     state.pending_exit_check.remove(id);
+    state.exit_code_sessions.remove(id);
     state.terminal_command_lines.remove(id);
     state.suggestion_muted_sessions.remove(id);
     state.session_replays.remove(id);
@@ -3070,6 +3166,7 @@ pub fn close_workspace(
         state.session_connection_states.remove(sid);
         state.session_configs.remove(sid);
         state.pending_exit_check.remove(sid);
+        state.exit_code_sessions.remove(sid);
         state.terminal_command_lines.remove(sid);
         state.session_replays.remove(sid);
         state.ssh_sessions.remove(sid);

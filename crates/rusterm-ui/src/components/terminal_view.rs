@@ -1487,7 +1487,14 @@ pub fn TerminalView(
     on_suggestion_navigate: EventHandler<Option<usize>>,
     on_suggestion_accept: EventHandler<String>,
     on_history_completion: EventHandler<()>,
-    on_suggestion_dismiss: EventHandler<()>,
+    /// Dismiss the suggestion panel. Payload `keep_inline_ghost`:
+    ///   - `true`  — user simply closed the popup (Escape / popup close):
+    ///     hide the panel but keep the dimmed inline ghost hint — the ghost
+    ///     is not a popup and needs no close affordance of its own.
+    ///   - `false` — the input line itself is about to change (arrow-key
+    ///     history navigation, Enter): clear panel AND ghost together so no
+    ///     stale ghost text lingers on the rewritten line.
+    on_suggestion_dismiss: EventHandler<bool>,
     /// Mute the automatic suggestion popup for the rest of this session
     /// ("mute this session" in the hint row). Not persisted.
     #[props(default)]
@@ -1924,7 +1931,7 @@ pub fn TerminalView(
                 // Arrow keys dismiss the panel and fall through to the PTY
                 // so the shell handles cursor movement / history navigation.
                 Key::ArrowDown | Key::ArrowUp | Key::ArrowLeft | Key::ArrowRight => {
-                    on_suggestion_dismiss.call(());
+                    on_suggestion_dismiss.call(false);
                     // Don't return — let the key continue to the PTY.
                 }
                 Key::Tab | Key::End if !ctrl && !alt && !meta && !shift => {
@@ -1935,7 +1942,10 @@ pub fn TerminalView(
                     return;
                 }
                 Key::Escape => {
-                    on_suggestion_dismiss.call(());
+                    // Escape only closes the popup — the dimmed inline ghost
+                    // hint stays (it is not a popup and has no close
+                    // affordance; it refreshes on the next keystroke).
+                    on_suggestion_dismiss.call(true);
                     return;
                 }
                 // Shift+Delete: delete the currently-selected suggestion from
@@ -1960,7 +1970,7 @@ pub fn TerminalView(
                 }
                 // Enter falls through to PTY normally (also dismisses panel)
                 Key::Enter => {
-                    on_suggestion_dismiss.call(());
+                    on_suggestion_dismiss.call(false);
                     // Don't return — let Enter continue to PTY
                 }
                 _ => {}
@@ -3177,7 +3187,9 @@ pub fn TerminalView(
                         on_suggestion_accept.call(cmd);
                     },
                     on_dismiss: move |_: ()| {
-                        on_suggestion_dismiss.call(());
+                        // Closing the popup hides the panel only; the dimmed
+                        // inline ghost hint is kept.
+                        on_suggestion_dismiss.call(true);
                     },
                     on_delete: move |cmd: String| {
                         on_suggestion_delete.call(cmd);

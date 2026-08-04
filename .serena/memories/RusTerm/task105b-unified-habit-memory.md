@@ -59,6 +59,17 @@
 - `cargo test --workspace --lib` — 全部通过 (688 UI + 65 analytics + 185 core + 6 proto + 其余)
 - 新测试 `pending_exit_check_works_for_all_session_backends` ✅
 
+## 增量：提示符返回回退（非集成 shell 的绿色成功徽章，2026-08-04）
+- 需求：普通 SSH 终端（远端 shell 未集成 OSC 133，如注入失败 / PROMPT_COMMAND 被覆盖 / 经堡垒机落地）也要显示顶部 TabBar 的"✓ 成功"绿色图标。
+- 实现：
+  - `state.rs` 新增 `AppState.exit_code_sessions: HashSet<String>`（发出过真实 OSC 133;D 的会话）+ `note_exit_code_evidence` + `prompt_return_completion_target` 谓词；close_session/close_workspace 清理。
+  - `app.rs` 新增 `resolve_pending_command_via_prompt(state, sid, log_tag, current_line)`：队列有待决命令 + 会话从未见 OSC 133;D + 当前行 `prompt_looks_like_shell` → pop 队列、badge=Success、入 command_history、DB/Analytics 以 `exit_code=None` 提交（语义"unknown, assume success"，不伪造 0）。
+  - SSH/LOCAL 内联路径：exit_code.is_some() 处加 `note_exit_code_evidence`；`if let Some(rc) = exit_code {...} else {...}` 的 else 分支调用回退（用 `handle.lock().terminal.extract_current_line()`）。
+  - SERIAL/TELNET：`process_session_exit_code` 内部已加 note_exit_code_evidence；其后 `if exit_code.is_none()` 调回退。
+- 关键设计：一旦会话发出过任何 OSC 133;D（含连接后注入成功的首次 spurious precmd），回退永久禁用，避免与分块到达的退出码标记竞争。
+- 已知取舍：非集成 shell 上失败命令也会显示绿色（rc 不可知，用户明确要图标）。
+- 测试：`prompt_return_fallback_requires_pending_command_and_shell_prompt`、`prompt_return_fallback_is_disabled_after_real_exit_code_evidence`；748 全绿。
+
 ## 未做（后续工作）
 - 将 SSH/Shell 的内联提交逻辑也重构为调用 `process_session_exit_code`（目前只 telnet/serial 用辅助函数；SSH/Shell 保持内联以降低回归风险）。
 - 实时建议管道接入 `suggest_by_context`（Task #105 未完成项）。

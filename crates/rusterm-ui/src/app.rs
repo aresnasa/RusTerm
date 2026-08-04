@@ -59,15 +59,15 @@ use crate::state::{
     close_workspace, command_send_targets, distribute_sessions_across_panes, enqueue_pending_exit,
     execute_tab_drop_on_pane, execute_tab_drop_on_pane_at, focus_pane_for_layout,
     focused_pane_session, invert_send_targets, move_floating_pane_for_active,
-    move_session_to_leftmost, note_shell_integration_evidence, note_shell_prompt_evidence,
-    pop_context_command, prepare_split_for_sidebar_drop, prepare_split_for_sidebar_drop_at,
-    prompt_looks_like_shell, push_workspace_tab, record_context_command, record_onekey_behavior,
-    record_replay_op, replayable_ops, resize_layout_split, rollback_pending_exit,
-    scroll_sync_targets, seed_onekey_habit_event, select_all_send_targets,
-    selected_send_target_ids, set_active_tab, set_pane_session_for_layout,
-    set_send_target_selected, source_pane_for_copy, suppress_comparison_diff_warning,
-    toggle_comparison_mode, toggle_pane_zoom, toggle_split_mode, track_terminal_input,
-    tracked_terminal_command,
+    move_session_to_leftmost, note_exit_code_evidence, note_shell_integration_evidence,
+    note_shell_prompt_evidence, pop_context_command, prepare_split_for_sidebar_drop,
+    prepare_split_for_sidebar_drop_at, prompt_looks_like_shell, prompt_return_completion_target,
+    push_workspace_tab, record_context_command, record_onekey_behavior, record_replay_op,
+    replayable_ops, resize_layout_split, rollback_pending_exit, scroll_sync_targets,
+    seed_onekey_habit_event, select_all_send_targets, selected_send_target_ids, set_active_tab,
+    set_pane_session_for_layout, set_send_target_selected, source_pane_for_copy,
+    suppress_comparison_diff_warning, toggle_comparison_mode, toggle_pane_zoom, toggle_split_mode,
+    track_terminal_input, tracked_terminal_command,
 };
 use crate::transfers::{FileEndpoint, TransferJob, TransferRequest};
 
@@ -3437,7 +3437,7 @@ fn render_terminal_pane(
                                 tab.suggestion_selected = 0;
                             });
                     },
-                    on_suggestion_dismiss: move |_: ()| {
+                    on_suggestion_dismiss: move |keep_inline_ghost: bool| {
                         state_for_cmd
                             .write()
                             .history_completion_sessions
@@ -3446,7 +3446,16 @@ fn render_terminal_pane(
                             .find(|t| t.id == sid_for_sug_dismiss)
                             .map(|tab| {
                                 tab.suggestion_visible = false;
-                                tab.suggestion = None;
+                                // Closing the popup only hides the panel. The
+                                // dimmed inline ghost hint (`tab.suggestion`)
+                                // is not a popup and has no close affordance,
+                                // so it stays — unless the input line is about
+                                // to change (arrow/Enter callers pass
+                                // `false`), in which case the ghost would go
+                                // stale and is cleared too.
+                                if !keep_inline_ghost {
+                                    tab.suggestion = None;
+                                }
                             });
                     },
                     on_suggestion_snooze: move |_: ()| {
@@ -11563,6 +11572,9 @@ fn start_ssh_connection(
                                     // replay ops and stop recording (cwd-based
                                     // restore covers integrated shells).
                                     note_shell_integration_evidence(&mut state.write(), &id);
+                                    // Integrated shells resolve strictly via the
+                                    // exit-code pipeline; disable the fallback.
+                                    note_exit_code_evidence(&mut state.write(), &id);
                                     tracing::info!(
                                         "[OUTPUT-SSH] session={} exit_code={:?} queue_len={}",
                                         &id[..id.len().min(8)],
@@ -11883,6 +11895,19 @@ fn start_ssh_connection(
                                             tab.last_command_status = status;
                                         }
                                     }
+                                } else {
+                                    // No OSC 133;D in this chunk: when the remote
+                                    // shell is not integrated, a prompt return
+                                    // completes the pending command (badge shows
+                                    // "✓ 成功"). No-op on integrated shells.
+                                    let current_line =
+                                        handle.lock().terminal.extract_current_line();
+                                    resolve_pending_command_via_prompt(
+                                        state,
+                                        &id,
+                                        "SSH",
+                                        &current_line,
+                                    );
                                 }
                             }
                             check_onekey_match(state, input_senders, &id, &data);
@@ -12058,6 +12083,9 @@ fn process_session_exit_code(
     // interactive bastion menu — drop any recorded session-recovery replay
     // ops and stop recording (cwd-based restore covers integrated shells).
     note_shell_integration_evidence(&mut state.write(), session_id);
+    // Permanently disable the prompt-return badge fallback for this session:
+    // integrated shells resolve strictly via the exit-code pipeline.
+    note_exit_code_evidence(&mut state.write(), session_id);
 
     // Log the queue depth for diagnostics (mirrors the SSH/Shell inline paths).
     if tracing::enabled!(tracing::Level::INFO) {
@@ -12277,6 +12305,105 @@ fn process_session_exit_code(
         if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == session_id) {
             tab.last_command_status = status;
         }
+    }
+}
+
+/// Non-integrated fallback: resolve one pending command when output returns
+/// to a shell-looking prompt without any OSC 133;D exit code. Sessions whose
+/// remote shell never adopted shell integration (dash/busybox, a shell
+/// reached through a bastion menu, a host that overwrote PROMPT_COMMAND)
+/// otherwise never flip the `last_command_status` badge — a plain SSH
+/// terminal then shows no green "✓ 成功" icon at all.
+///
+/// The truthful exit code is unknowable here, so the history/analytics row
+/// keeps `exit_code = None` ("unknown, assume success" — the same semantics
+/// as a plain `~/.bash_history` import) while the tab badge shows Success.
+/// Sessions that ever produced a real OSC 133;D are permanently excluded via
+/// `exit_code_sessions` (see `note_exit_code_evidence`), so the fallback can
+/// never race a late exit-code marker on integrated shells.
+fn resolve_pending_command_via_prompt(
+    mut state: Signal<AppState>,
+    session_id: &str,
+    log_tag: &str,
+    current_line: &str,
+) {
+    if !prompt_return_completion_target(&state.read(), session_id, current_line) {
+        return;
+    }
+    let popped = {
+        let mut s = state.write();
+        s.pending_exit_check
+            .get_mut(session_id)
+            .and_then(|q| q.pop_front())
+    };
+    let Some((cmd, db_id)) = popped else {
+        return;
+    };
+    tracing::info!(
+        "[OUTPUT-{}] session={} prompt-return fallback resolves {:?} (no OSC 133;D)",
+        log_tag,
+        &session_id[..session_id.len().min(8)],
+        cmd
+    );
+    let hostname = {
+        let mut s = state.write();
+        let hostname = s
+            .sessions
+            .iter()
+            .find(|t| t.id == session_id)
+            .and_then(|t| t.hostname.clone());
+        if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == session_id) {
+            if tab.command_history.last() != Some(&cmd) {
+                tab.command_history.push(cmd.clone());
+            }
+            tab.last_command_status = CommandStatus::Success;
+        }
+        hostname
+    };
+    let sid = session_id.to_string();
+    // Clone for the analytics record (the original `cmd` is moved into the DB
+    // entry below). Unused when the `analytics` feature is off.
+    let _analytics_cmd = cmd.clone();
+    let _analytics_host = hostname.clone();
+    let created_at = chrono::Utc::now().to_rfc3339();
+    let created_at_for_db = created_at.clone();
+    spawn(async move {
+        let db_path = dirs::data_dir()
+            .unwrap_or_default()
+            .join("rusterm")
+            .join("rusterm.db");
+        if let Ok(db) = rusterm_db::Database::open(Some(db_path)).await {
+            let entry = rusterm_db::history::HistoryEntry {
+                id: db_id,
+                command: cmd,
+                session_id: sid,
+                cwd: None,
+                hostname,
+                // Truthful exit code is unknowable without shell integration
+                // — keep NULL ("unknown, assume success") instead of faking 0.
+                exit_code: None,
+                duration_ms: None,
+                created_at: created_at_for_db,
+            };
+            if let Err(e) = db.save_history(entry).await {
+                tracing::warn!("Failed to save history: {}", e);
+            }
+        }
+    });
+    #[cfg(feature = "analytics")]
+    {
+        let analytics_handle = state.read().analytics.clone();
+        spawn(async move {
+            let analytics_entry = rusterm_analytics::AnalyticsCommand {
+                command: _analytics_cmd,
+                hostname: _analytics_host,
+                exit_code: None,
+                created_at,
+            };
+            if let Err(e) = analytics_handle.record_command(&analytics_entry) {
+                tracing::warn!("[ANALYTICS] failed to record command: {}", e);
+            }
+        });
     }
 }
 
@@ -12503,6 +12630,9 @@ fn start_shell_connection(
                                 // failed commands can never appear in suggestions, because
                                 // they were never recorded in the first place.
                                 if exit_code.is_some() {
+                                    // Integrated local shell: disable the
+                                    // prompt-return badge fallback permanently.
+                                    note_exit_code_evidence(&mut state.write(), &id);
                                     tracing::info!(
                                         "[OUTPUT-LOCAL] session={} exit_code={:?} queue_len={}",
                                         &id[..id.len().min(8)],
@@ -12789,6 +12919,19 @@ fn start_shell_connection(
                                             tab.last_command_status = status;
                                         }
                                     }
+                                } else {
+                                    // No OSC 133;D in this chunk: prompt-return
+                                    // fallback for shells that lost integration
+                                    // (e.g. PROMPT_COMMAND overwritten). No-op
+                                    // on integrated shells.
+                                    let current_line =
+                                        handle.lock().terminal.extract_current_line();
+                                    resolve_pending_command_via_prompt(
+                                        state,
+                                        &id,
+                                        "LOCAL",
+                                        &current_line,
+                                    );
                                 }
                             }
                             check_onekey_match(state, input_senders, &id, &data);
@@ -13002,6 +13145,19 @@ fn start_serial_connection(
                                 // exit code is processed here. Shared helper —
                                 // same path as SSH / Shell / Telnet.
                                 process_session_exit_code(state, &id, exit_code, "SERIAL");
+                                if exit_code.is_none() {
+                                    // Prompt-return fallback for serial shells
+                                    // without OSC 133 markers (badged as
+                                    // completed; no-op once real markers seen).
+                                    let current_line =
+                                        handle.lock().terminal.extract_current_line();
+                                    resolve_pending_command_via_prompt(
+                                        state,
+                                        &id,
+                                        "SERIAL",
+                                        &current_line,
+                                    );
+                                }
                                 {
                                     let mut s = state.write();
                                     // Throttle the DOM-facing snapshot for serial
@@ -13233,6 +13389,20 @@ fn start_telnet_connection(
                                 // or mark as failed (rc!=0). Shared helper —
                                 // same path as SSH / Shell / Serial.
                                 process_session_exit_code(state, &id, exit_code, "TELNET");
+                                if exit_code.is_none() {
+                                    // Prompt-return fallback for telnet targets
+                                    // that ignored the integration script
+                                    // (badged as completed; no-op once real
+                                    // markers seen).
+                                    let current_line =
+                                        handle.lock().terminal.extract_current_line();
+                                    resolve_pending_command_via_prompt(
+                                        state,
+                                        &id,
+                                        "TELNET",
+                                        &current_line,
+                                    );
+                                }
                                 {
                                     let mut s = state.write();
                                     apply_throttled_render(&mut s, &id, render_result);
