@@ -1268,3 +1268,48 @@ mod sftp_subsystem_reply_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod otp_prompt_tests {
+    use super::looks_like_otp_prompt;
+
+    #[test]
+    fn detects_english_otp_prompts() {
+        assert!(looks_like_otp_prompt("OTP: "));
+        assert!(looks_like_otp_prompt("Enter your MFA code: "));
+        assert!(looks_like_otp_prompt("Verification code: "));
+        assert!(looks_like_otp_prompt("TOTP: "));
+        assert!(looks_like_otp_prompt("2FA code:"));
+        assert!(looks_like_otp_prompt("Two-factor authentication code:"));
+        assert!(looks_like_otp_prompt("Authenticator code:"));
+    }
+
+    #[test]
+    fn detects_chinese_otp_prompts() {
+        // JumpServer with MFA enabled typically surfaces one of these.
+        assert!(looks_like_otp_prompt("请输入MFA认证码: "));
+        assert!(looks_like_otp_prompt("请输入验证码: "));
+        assert!(looks_like_otp_prompt("动态密码: "));
+        assert!(looks_like_otp_prompt("二次验证码: "));
+    }
+
+    #[test]
+    fn does_not_flag_plain_password_prompts() {
+        // A regular password prompt must NOT be treated as an OTP prompt —
+        // otherwise we'd skip the password and try to fetch a code that
+        // doesn't exist, breaking normal PAM password auth.
+        assert!(!looks_like_otp_prompt("Password: "));
+        assert!(!looks_like_otp_prompt("password for user: "));
+        assert!(!looks_like_otp_prompt("Enter passphrase: "));
+        assert!(!looks_like_otp_prompt("[sudo] password for user: "));
+    }
+
+    #[test]
+    fn detection_is_case_insensitive() {
+        assert!(looks_like_otp_prompt("otp:"));
+        assert!(looks_like_otp_prompt("Otp:"));
+        assert!(looks_like_otp_prompt("OTP:"));
+        assert!(looks_like_otp_prompt("mfa code:"));
+        assert!(looks_like_otp_prompt("MFA Code:"));
+    }
+}

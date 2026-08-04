@@ -1911,6 +1911,89 @@ mod tests {
     }
 
     #[test]
+    fn otp_webhook_feishubot_roundtrip() {
+        let cfg = OtpWebhookConfig::Feishubot {
+            app_id: "cli_xxx".to_string(),
+            app_secret: "secret".to_string(),
+            chat_id: "oc_yyy".to_string(),
+            code_pattern: default_otp_code_pattern(),
+            sender_open_id: Some("ou_zzz".to_string()),
+            max_age_secs: 90,
+            base_url: default_feishu_base_url(),
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        // Tagged enum must serialize with `kind`.
+        assert!(json.contains(r#""kind":"feishubot"#"));
+        let back: OtpWebhookConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn otp_webhook_http_roundtrip() {
+        let cfg = OtpWebhookConfig::Http {
+            url: "https://totp.example.local/current".to_string(),
+            method: "post".to_string(),
+            body: Some("{}".to_string()),
+            headers: vec![("Authorization".to_string(), "Bearer x".to_string())],
+            code_pattern: r"(\\d{6})".to_string(),
+            timeout_secs: 5,
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(json.contains(r#""kind":"http"#"));
+        let back: OtpWebhookConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg, back);
+    }
+
+    #[test]
+    fn otp_webhook_manual_tagged_serialization() {
+        let json = serde_json::to_string(&OtpWebhookConfig::Manual).unwrap();
+        assert_eq!(json, r#"{"kind":"manual"}"#);
+        let back: OtpWebhookConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, OtpWebhookConfig::Manual);
+    }
+
+    #[test]
+    fn otp_webhook_feishubot_uses_defaults_when_fields_omitted() {
+        // Legacy/partial settings files may omit the optional fields — they
+        // must fall back to the documented defaults, not fail to parse.
+        let json = r#"{
+            "kind":"feishubot",
+            "app_id":"cli_x",
+            "app_secret":"s",
+            "chat_id":"oc_y"
+        }"#;
+        let cfg: OtpWebhookConfig = serde_json::from_str(json).unwrap();
+        match cfg {
+            OtpWebhookConfig::Feishubot {
+                code_pattern,
+                max_age_secs,
+                base_url,
+                sender_open_id,
+                ..
+            } => {
+                assert_eq!(code_pattern, default_otp_code_pattern());
+                assert_eq!(max_age_secs, default_otp_max_age_secs());
+                assert_eq!(base_url, default_feishu_base_url());
+                assert!(sender_open_id.is_none());
+            }
+            other => panic!("expected Feishubot, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn persisted_config_without_otp_webhook_field_loads_as_none() {
+        // A settings file written before this feature shipped must still load
+        // — the missing `otp_webhook` field defaults to `None` via
+        // `#[serde(default)]`.
+        let json = r#"{
+            "version":1,
+            "connections":[]
+        }"#;
+        let cfg: PersistedConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.otp_webhook.is_none());
+    }
+
+    #[test]
     fn legacy_ssh_config_without_proxy_defaults_to_direct_connection() {
         let json = r#"{
             "host":"example.com",
