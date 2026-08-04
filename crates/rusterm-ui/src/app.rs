@@ -11044,6 +11044,9 @@ fn start_ssh_connection(
                         .insert(tab_id.clone(), SessionConnectionState::Connected);
                     app.ssh_sessions.insert(tab_id.clone(), ssh_session.clone());
                     app.sftp_clients.remove(&tab_id);
+                    // Plain SSH terminals show the green ✓ badge for a
+                    // successful connect, like jump-host sessions do.
+                    app.note_connection_outcome(&tab_id, None);
                 }
                 input_senders
                     .write()
@@ -12004,10 +12007,18 @@ fn start_ssh_connection(
                     &tab_id[..tab_id.len().min(8)],
                     e
                 );
-                state
-                    .write()
-                    .session_connection_states
-                    .insert(tab_id.clone(), SessionConnectionState::Failed);
+                {
+                    let mut s = state.write();
+                    s.session_connection_states
+                        .insert(tab_id.clone(), SessionConnectionState::Failed);
+                    // A failed attempt (auth error, unreachable host, timeout,
+                    // …) surfaces as the red ⚠ badge with the failure reason.
+                    // Shorten the session id before formatting it into the
+                    // reason so the borrow of `tab_id` ends before the
+                    // `&tab_id` call below.
+                    let reason = format!("{}", e);
+                    s.note_connection_outcome(&tab_id, Some(reason));
+                }
                 let failed = crate::i18n::tf("session.connection_failed", &[("error", &e)]);
                 let reconnect = crate::i18n::t("session.press_enter_to_reconnect");
                 let msg = format!("{failed}\r\n{reconnect}\r\n");

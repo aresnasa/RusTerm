@@ -1443,6 +1443,34 @@ impl AppState {
         }
     }
 
+    /// Decide the tab badge for a fresh (re)connection attempt's outcome.
+    ///
+    /// Plain SSH terminals never emit OSC 133;D until the user runs a
+    /// command, so without this the tab badge would stay `Idle` after a
+    /// successful connect — unlike jump-host sessions, which get a green ✓
+    /// via `mark_login_script_success`.
+    ///
+    /// - Success: upgrades `Idle` (fresh connect) and `Disconnected`
+    ///   (reconnect — the badge still shows the previous attempt's disconnect)
+    ///   to `Success`. A real command status (`Success`/`Failed`) is kept:
+    ///   connect-time runs before any new command, but the exit-code pipeline
+    ///   owns it from then on.
+    /// - Failure: *always* resets the badge to `Disconnected(reason)` so a
+    ///   stale status from the previous attempt cannot linger above the new
+    ///   terminal's "connection failed" message.
+    pub fn note_connection_outcome(&mut self, session_id: &str, failure: Option<String>) {
+        let Some(tab) = self.sessions.iter_mut().find(|t| t.id == session_id) else {
+            return;
+        };
+        tab.last_command_status = match failure {
+            Some(reason) => CommandStatus::Disconnected(reason),
+            None => match tab.last_command_status {
+                CommandStatus::Idle | CommandStatus::Disconnected(_) => CommandStatus::Success,
+                ref kept => kept.clone(),
+            },
+        };
+    }
+
     /// Look up the active tab's anchor session id (the session occupying
     /// pane 0 of the active tab's layout). Returns `None` if there's no
     /// active tab or the tab has no anchor yet.
@@ -6308,6 +6336,50 @@ mod tests {
 
         // Unknown session id is a no-op.
         state.mark_login_script_success("ghost");
+    }
+
+    /// Plain SSH connect: a successful attempt upgrades Idle (fresh connect)
+    /// or Disconnected (reconnect) badges to Success but never clobbers a
+    /// real command status; a failed attempt always resets the badge to
+    /// Disconnected with the failure reason.
+    #[test]
+    fn note_connection_outcome_covers_success_and_failure() {
+        let mut state = state_with_tabs(&["fresh", "reconnected", "running", "broken"]);
+
+        // Fresh connect: Idle -> Success.
+        state.note_connection_outcome("fresh", None);
+        assert_eq!(
+            state.sessions[0].last_command_status,
+            CommandStatus::Success
+        );
+
+        // Reconnect success clears the previous disconnect badge.
+        state.sessions[1].last_command_status = CommandStatus::Disconnected("timeout".to_string());
+        state.note_connection_outcome("reconnected", None);
+        assert_eq!(
+            state.sessions[1].last_command_status,
+            CommandStatus::Success
+        );
+
+        // A real (failed) command status is preserved on success.
+        state.sessions[2].last_command_status = CommandStatus::Failed(2);
+        state.note_connection_outcome("running", None);
+        assert_eq!(
+            state.sessions[2].last_command_status,
+            CommandStatus::Failed(2)
+        );
+
+        // Connect failure always flips the badge to Disconnected, even when
+        // a stale status from the previous attempt was showing.
+        state.sessions[3].last_command_status = CommandStatus::Success;
+        state.note_connection_outcome("broken", Some("auth failed".to_string()));
+        assert_eq!(
+            state.sessions[3].last_command_status,
+            CommandStatus::Disconnected("auth failed".to_string())
+        );
+
+        // Unknown session id is a no-op.
+        state.note_connection_outcome("ghost", None);
     }
 
     /// Task 15 contract: closing a pane's session and re-applying the
