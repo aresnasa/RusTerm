@@ -30,9 +30,13 @@ enum ClipboardCopyOutcome {
     Failed,
 }
 
+/// Public re-export so `app.rs` can use the same clipboard helper for the
+/// SelectAll (copy full session) callback without duplicating the logic.
+pub use ClipboardCopyOutcome as ClipboardCopyOutcomePub;
+pub use {ClipboardCopyOutcome as _, copy_text_to_clipboard as copy_text_to_clipboard_pub};
+
 /// Copy non-empty text to the OS clipboard. Synchronous (NSPasteboard / Win32
 /// / X11 writes are sub-millisecond). Empty input is rejected so a missed
-/// terminal mouseup can never erase the user's existing clipboard contents.
 fn copy_text_to_clipboard(text: String) -> ClipboardCopyOutcome {
     if text.is_empty() {
         tracing::debug!("[COPY] refused to replace clipboard with empty text");
