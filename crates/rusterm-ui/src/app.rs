@@ -13723,6 +13723,35 @@ fn restore_sessions(
                                 );
                             }
                         }
+                    }
+                    // Establishment ops to replay: the DuckDB replay-event
+                    // log wins over the bincode snapshot when it has data —
+                    // each event row is written as the input happens, so the
+                    // fold can't lose the final ops to the snapshot's save
+                    // debounce (and it survives crashes for the same
+                    // reason). Without the `analytics` feature the fold is
+                    // always empty and the snapshot ops are used as before.
+                    let restore_replay_ops = {
+                        let analytics = state.read().analytics.clone();
+                        match analytics.latest_replay_ops(&conn_for_replay.id) {
+                            Ok(ops) if !ops.is_empty() => {
+                                tracing::info!(
+                                    "[REPLAY] restored session {} using {} op(s) from the DuckDB replay-event log",
+                                    &tab_id[..tab_id.len().min(8)],
+                                    ops.len()
+                                );
+                                ops
+                            }
+                            Ok(_) => ps.replay_ops.clone(),
+                            Err(e) => {
+                                tracing::warn!(
+                                    "[REPLAY] failed to read replay-event log — falling back to snapshot ops: {e}"
+                                );
+                                ps.replay_ops.clone()
+                            }
+                        }
+                    };
+                    if !tab_id.is_empty() {
                         // Pre-seed command history tail so suggestions work.
                         let mut s = state.write();
                         if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == tab_id) {
@@ -13731,11 +13760,11 @@ fn restore_sessions(
                         // Re-seed the interactive-replay recorder so future
                         // reconnects of the restored session replay the same
                         // establishment ops.
-                        if !ps.replay_ops.is_empty() {
+                        if !restore_replay_ops.is_empty() {
                             s.session_replays.insert(
                                 tab_id.clone(),
                                 crate::state::SessionReplayRecorder {
-                                    ops: ps.replay_ops.clone(),
+                                    ops: restore_replay_ops.clone(),
                                     shell_integrated: false,
                                 },
                             );
@@ -13762,7 +13791,7 @@ fn restore_sessions(
                         .is_some_and(|s| !s.trim().is_empty());
                     if should_schedule_replay(
                         conn_for_replay.login_script.as_deref(),
-                        &ps.replay_ops,
+                        &restore_replay_ops,
                     ) {
                         if has_login_script {
                             suppress_login_script(&mut state.write(), &tab_id);
@@ -13770,13 +13799,13 @@ fn restore_sessions(
                         tracing::info!(
                             "[REPLAY] restored session {} scheduling {} recorded op(s)",
                             &tab_id[..tab_id.len().min(8)],
-                            ps.replay_ops.len()
+                            restore_replay_ops.len()
                         );
                         schedule_replay_after_reconnect(
                             state.clone(),
                             input_senders.clone(),
                             tab_id.clone(),
-                            ps.replay_ops.clone(),
+                            restore_replay_ops,
                             ps.cwd.clone(),
                         );
                     } else if has_login_script {
@@ -14760,6 +14789,29 @@ mod session_replay_engine_tests {
         assert!(safe.contains(&"web-server-01".to_string()));
         assert!(safe.contains(&"ls".to_string()));
         assert_eq!(skipped, ops(&["rm -rf /"]));
+    }
+
+    /// Context-establishing commands (`sudo -i`, `su`, nested `ssh`, docker
+    /// exec shells) must pass the replay safety filter — they are exactly
+    /// what the recovery replays after the bastion navigation. Only genuine
+    /// danger patterns (reboot & co) stay skipped.
+    #[test]
+    fn filter_keeps_context_commands_replayable() {
+        let checker = rusterm_core::CommandSafetyChecker::new();
+        let recorded = ops(&[
+            "/q",
+            "2",
+            "sudo -i",
+            "su - deploy",
+            "ssh internal-db-01",
+            "docker exec -it app bash",
+        ]);
+        let (safe, skipped) = filter_replayable_ops(&recorded, &checker);
+        assert_eq!(safe, recorded);
+        assert!(skipped.is_empty());
+        // A recorded `sudo reboot` would still be skipped, context or not.
+        let (_, skipped) = filter_replayable_ops(&ops(&["sudo reboot"]), &checker);
+        assert_eq!(skipped, ops(&["sudo reboot"]));
     }
 
     /// Recorded ops hold the user's *last* menu navigation, so they override
