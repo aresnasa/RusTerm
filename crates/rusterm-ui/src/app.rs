@@ -17181,7 +17181,12 @@ pub fn App() -> Element {
                     tabs: state.read().tabs.clone(),
                     sessions: state.read().sessions.clone(),
                     active: state.read().active_tab.clone(),
-                    focused_session: focused_pane_session(&state.read()),
+                    // Fall back to the active tab's anchor session when no
+                    // explicit pane focus exists (single-pane tabs have no
+                    // layout entry), so the focused-tab outline always marks
+                    // the tab the user just switched to.
+                    focused_session: focused_pane_session(&state.read())
+                        .or_else(|| state.read().active_session.clone()),
                     focused_appearance: state.read().focused_tab_appearance.clone(),
                     connection_states: state.read().session_connection_states.clone(),
                     on_select: move |id: String| {
