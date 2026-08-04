@@ -1923,7 +1923,7 @@ mod tests {
         };
         let json = serde_json::to_string(&cfg).unwrap();
         // Tagged enum must serialize with `kind`.
-        assert!(json.contains(r#""kind":"feishubot"#"));
+        assert!(json.contains("\"kind\":\"feishubot\""));
         let back: OtpWebhookConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg, back);
     }
@@ -1935,11 +1935,11 @@ mod tests {
             method: "post".to_string(),
             body: Some("{}".to_string()),
             headers: vec![("Authorization".to_string(), "Bearer x".to_string())],
-            code_pattern: r"(\\d{6})".to_string(),
+            code_pattern: r"(\d{6})".to_string(),
             timeout_secs: 5,
         };
         let json = serde_json::to_string(&cfg).unwrap();
-        assert!(json.contains(r#""kind":"http"#"));
+        assert!(json.contains("\"kind\":\"http\""));
         let back: OtpWebhookConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg, back);
     }
@@ -1947,7 +1947,7 @@ mod tests {
     #[test]
     fn otp_webhook_manual_tagged_serialization() {
         let json = serde_json::to_string(&OtpWebhookConfig::Manual).unwrap();
-        assert_eq!(json, r#"{"kind":"manual"}"#);
+        assert_eq!(json, "{\"kind\":\"manual\"}");
         let back: OtpWebhookConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(back, OtpWebhookConfig::Manual);
     }
