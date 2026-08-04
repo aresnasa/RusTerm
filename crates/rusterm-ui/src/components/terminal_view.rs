@@ -2835,6 +2835,7 @@ pub fn TerminalView(
                     on_dismiss: move |_: ()| {
                         on_onekey_dismiss.call(());
                     },
+                    fallback_top: popup_fallback_top.clone(),
                 }
             }
         }
