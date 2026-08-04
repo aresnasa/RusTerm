@@ -29,6 +29,17 @@
 - 新增：`restore_prompt_items_summarize_kind_host_and_replay`
 - 全量 rusterm-ui 689 passed；rustfmt 触碰文件干净。
 
+## 阶段 3：修复「正常退出后不弹框」（2026-08-04，提交 `1bb56de`）
+
+**根因（实证，非猜测）**：macOS 上最常见的"正常退出"是 **Cmd+Q / 菜单 Quit → `NSApp terminate:`，根本不触发 `WindowEvent::CloseRequested`**——close 路径的两处 `save_session_state_snapshot` 全被绕过，确认关闭对话框也不弹（证据：settings.json 里 `confirm_close_on_exit` 仍为 true；日志 06:46 连上 jumpserver 后 <30s 退出，重启无 "Prompting to restore"；`session_state.enc` 仅 104 字节=空快照）。30s 周期保存没来得及跑 → 磁盘还是旧的空快照 → 不弹框。app.rs 里 wry handler 注释原先声称 Cmd+Q 会触发 CloseRequested，是错的（已修正注释）。
+
+**修复（不依赖退出钩子）**：
+- 30s 周期保存循环改为 **2s 变更驱动**：每 2s `build_session_state`，用新增的 `SessionState::content_eq`（rusterm-core，忽略 saved_at 比较全部可恢复内容）做脏检查，内容没变不加密不写盘；变了才写。任何退出方式（Cmd+Q/崩溃/kill -9）磁盘快照最多落后 ~2s。
+- 新增 `AppState::session_snapshot_writable(&snapshot)`（state.rs）：**空快照在有会话仍处于连接/重连中（tab 存在但连接状态非 Connected 也非 Disconnected，排除 bottom shell）时不许写盘**——否则点「恢复」后 2s 内的保存 tick 或退出会把正在恢复的记忆冲掉。该守卫同时应用于 2s 循环和 `save_session_state_snapshot` 退出路径。全部 Disconnected 时空快照照写（登出契约不变）。
+- 测试：`content_eq_ignores_saved_at_but_detects_restorable_changes`（core）、`empty_snapshot_is_deferred_while_a_reconnect_is_in_flight`（ui state）。rusterm-ui 690 passed，rusterm-core 186 passed。
+
+**遗留/后续**：`session_state.enc` 用 bincode + `#[serde(default)]`——bincode 非自描述，**加字段不兼容旧快照**（日志 06:23:41 实证 `deserializing session state` 失败，d1b4648 加 replay_ops 造成一次性迁移破坏）。将来改 schema 要么 bump VERSION 接受丢弃，要么换自描述格式（如加密信封内改 serde_json）。
+
 ## 注意
 - `startup_restore_candidate` 的 `_legacy_restore_disabled` 参数仍被刻意忽略（快照成员资格即"是否该问"的真源）。
 - 外部并发进程仍会改写工作树——本任务期间未遇冲突，提交时用 `git commit -- <files>` 只收本任务文件。
