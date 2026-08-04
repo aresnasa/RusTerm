@@ -464,7 +464,7 @@ mod tests {
         // The session should have produced ZFILE header bytes to send.
         let pty = s.take_pty_output("s1");
         assert!(!pty.is_empty());
-        // ZFILE hex header starts with ZPAD ZPAD ZDLE ZHEX.
-        assert!(pty.windows(4).any(|w| w == [b'*', b'*', 0x18, b'C']));
+        // ZFILE hex header starts with ZPAD ZPAD ZDLE ZHEX ('B').
+        assert!(pty.windows(4).any(|w| w == [b'*', b'*', 0x18, b'B']));
     }
 }

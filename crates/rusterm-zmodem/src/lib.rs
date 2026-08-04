@@ -48,7 +48,7 @@ pub const ZDLE: u8 = 0x18;
 pub const ZPAD: u8 = b'*';
 /// ZBIN — binary header (4 data bytes + 2-byte CRC16).
 pub const ZBIN: u8 = b'A';
-/// ZBIN32 — binary header with 32-bit CRC (4 data bytes + 4-byte CRC32).
-pub const ZBIN32: u8 = b'B';
 /// ZHEX — hexadecimal header (4 data bytes + 2-byte CRC16, all hex-encoded).
-pub const ZHEX: u8 = b'C';
+pub const ZHEX: u8 = b'B';
+/// ZBIN32 — binary header with 32-bit CRC (4 data bytes + 4-byte CRC32).
+pub const ZBIN32: u8 = b'C';

@@ -10,7 +10,7 @@
 
 use crate::crc::{crc16_init, crc32_init};
 use crate::frame::{
-    CrcMode, DataEnd, FrameType, HeaderFrame, ZmodemFrame, zdle_decode, zdle_decode_n,
+    zdle_decode, zdle_decode_n, CrcMode, DataEnd, FrameType, HeaderFrame, ZmodemFrame,
 };
 use crate::{ZBIN, ZBIN32, ZDLE, ZHEX, ZPAD};
 
@@ -379,8 +379,8 @@ impl Detector {
             return None; // need at least one more byte after CR
         }
         let mut consumed = cr_idx + 1; // hex + CR
-        // lrzsz terminates hex headers with CR LF, but some implementations
-        // send CR 0x8A (high-bit LF variant) or CR 0x80. Accept all.
+                                       // lrzsz terminates hex headers with CR LF, but some implementations
+                                       // send CR 0x8A (high-bit LF variant) or CR 0x80. Accept all.
         let next = buf[consumed];
         if next == b'\n' || next == 0x80 || next == 0x8A {
             consumed += 1;
@@ -543,7 +543,7 @@ const _: [u8; 3] = BIN32_LEADER;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::{DataEnd, encode_bin_header, encode_bin32_header, encode_hex_header};
+    use crate::frame::{encode_bin32_header, encode_bin_header, encode_hex_header, DataEnd};
 
     fn make_header(ft: FrameType, data: [u8; 4]) -> HeaderFrame {
         HeaderFrame {
@@ -579,6 +579,26 @@ mod tests {
         let (pass, det) = d.feed(&enc);
         // Hex frame fully consumed → no passthrough.
         assert_eq!(pass, b"");
+        assert_eq!(det.len(), 1);
+        match &det[0] {
+            Detection::Frame(ZmodemFrame::Header(h)) => {
+                assert_eq!(h.frame_type, FrameType::ZRQInit);
+                assert_eq!(h.data, [0, 0, 0, 0]);
+            }
+            other => panic!("expected ZRQInit header, got {:?}", other),
+        }
+        assert!(d.is_armed());
+    }
+
+    #[test]
+    fn detects_real_lrzsz_sz_wire_bytes() {
+        // Exact bytes captured from a real `sz` run (lrzsz on Ubuntu):
+        // "rz\r" auto-start string, then hex ZRQINIT: ** ZDLE 'B' 00000000000000 CR 0x8A XON.
+        // Regression: ZHEX is 'B' (0x42), NOT 'C' — these were once swapped with ZBIN32.
+        let wire: &[u8] = b"rz\r**\x18B00000000000000\r\x8a\x11";
+        let mut d = Detector::new();
+        let (pass, det) = d.feed(wire);
+        assert_eq!(pass, b"rz\r");
         assert_eq!(det.len(), 1);
         match &det[0] {
             Detection::Frame(ZmodemFrame::Header(h)) => {
