@@ -63,7 +63,8 @@ pub use config::{DEFAULT_PORT, RelayAccount, RelayConfig, hash_password, verify_
 pub use curl::{CurlParseError, ParsedCurl, parse_curl};
 pub use dcg::{DcgVerdict, probe as probe_dcg};
 pub use executor::{
-    ExecOutcome, ExecutorError, HostInfo, NullExecutor, RelayExecutor, split_host_selector,
+    ExecOutcome, ExecStreamEvent, ExecutorError, HostInfo, NullExecutor, RelayExecutor,
+    buffered_exec_stream, split_host_selector,
 };
 pub use history::{
     HistoryCursor, HistoryPage, HistoryQuery, NullHistoryStore, RecordingHistoryStore,

@@ -3,6 +3,8 @@
 //! - `GET  /api/v1/health`            — unauthenticated liveness probe
 //! - `GET  /api/v1/hosts`             — list saved hosts the account may see
 //! - `POST /api/v1/exec`              — validate + execute one command
+//! - `POST /api/v1/exec/stream`       — same, but the response is NDJSON
+//!   streamed as the remote produces output (see [`exec_stream`])
 //! - `POST /api/v1/parse-curl`        — turn a pasted curl command into JSON
 //!
 //! All routes except `/health` require HTTP Basic auth (Argon2-verified) and
@@ -26,7 +28,9 @@ use crate::command_guard::BlocklistConfig;
 use crate::config::RelayConfig;
 #[cfg(test)]
 use crate::executor::NullExecutor;
-use crate::executor::{ExecOutcome, ExecutorError, HostInfo, RelayExecutor, split_host_selector};
+use crate::executor::{
+    ExecOutcome, ExecStreamEvent, ExecutorError, HostInfo, RelayExecutor, split_host_selector,
+};
 use crate::history::{
     HistoryCursor, HistoryQuery, RelayHistoryRecord, RelayHistoryStore, new_record_id,
 };
@@ -155,6 +159,7 @@ fn router(state: AppState) -> Router {
         .route("/api/v1/health", get(health))
         .route("/api/v1/hosts", get(list_hosts))
         .route("/api/v1/exec", post(exec))
+        .route("/api/v1/exec/stream", post(exec_stream))
         .route("/api/v1/history", get(list_history))
         .route("/api/v1/history/{id}", delete(delete_history))
         .route("/api/v1/parse-curl", post(parse_curl_handler))
@@ -519,16 +524,203 @@ async fn exec_shortform(
     execute_request(state, addr, headers, request, ExecResponseFormat::PlainText).await
 }
 
-async fn execute_request(
+/// `POST /api/v1/exec/stream` — same request shape and validation pipeline
+/// as `/api/v1/exec`, but the response body is NDJSON
+/// (`application/x-ndjson`) streamed chunk-by-chunk as the remote produces
+/// output, instead of buffered until the command finishes. Long-running
+/// commands (complex queries, builds) surface their output immediately:
+///
+/// ```text
+/// {"event":"chunk","data":"...output slice..."}
+/// {"event":"chunk","data":"..."}
+/// {"event":"done","exit_code":0,"timed_out":false,"truncated":false,"duration_ms":5123}
+/// ```
+///
+/// The stream ends with exactly one `done` (command finished) or `error`
+/// (outcome unknowable after dispatch — e.g. the live PTY closed mid-run)
+/// event. Pipeline failures *before* dispatch still return ordinary JSON
+/// error responses with real HTTP status codes. Consume with
+/// `curl -sN ... | while read line; do ...; done` or any NDJSON reader.
+async fn exec_stream(
+    State(state): State<AppState>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    Json(body): Json<ExecRequest>,
+) -> Response {
+    let prepared = match prepare_exec(&state, addr, &headers, &body).await {
+        Ok(p) => p,
+        Err(r) => return *r,
+    };
+
+    let started = Instant::now();
+    match state
+        .executor
+        .exec_stream(
+            &prepared.exec_selector,
+            &prepared.payload,
+            body.elevated,
+            prepared.timeout,
+        )
+        .await
+    {
+        Ok(rx) => ndjson_exec_response(state, addr, prepared, body.elevated, started, rx),
+        Err(err) => exec_error_response(&state, addr, &prepared, body.elevated, started, err),
+    }
+}
+
+/// Serialize one NDJSON line (JSON value + trailing newline).
+fn ndjson_line(value: serde_json::Value) -> axum::body::Bytes {
+    let mut line = value.to_string();
+    line.push('\n');
+    axum::body::Bytes::from(line)
+}
+
+/// Carried through the unfold loop of the streaming response body: the
+/// receiver plus everything needed for completion bookkeeping (audit +
+/// history) once the terminal event arrives.
+struct ExecStreamBodyState {
+    rx: tokio::sync::mpsc::Receiver<ExecStreamEvent>,
     state: AppState,
     addr: SocketAddr,
-    headers: HeaderMap,
-    body: ExecRequest,
-    response_format: ExecResponseFormat,
+    prepared: PreparedExec,
+    elevated: bool,
+    started: Instant,
+}
+
+/// Build the chunked NDJSON response over an executor event stream. Each
+/// received event becomes one line; `Done`/`Failed` (or an unexpectedly
+/// closed channel) terminate the body after running the same audit/history
+/// bookkeeping as the buffered path.
+fn ndjson_exec_response(
+    state: AppState,
+    addr: SocketAddr,
+    prepared: PreparedExec,
+    elevated: bool,
+    started: Instant,
+    rx: tokio::sync::mpsc::Receiver<ExecStreamEvent>,
 ) -> Response {
-    let account = match require_account(&state, &headers, addr.ip()) {
+    let body_state = ExecStreamBodyState {
+        rx,
+        state,
+        addr,
+        prepared,
+        elevated,
+        started,
+    };
+    let stream = futures::stream::unfold(Some(body_state), |slot| async move {
+        let mut s = slot?;
+        let item: Result<axum::body::Bytes, std::convert::Infallible> = match s.rx.recv().await {
+            Some(ExecStreamEvent::Chunk(data)) => {
+                let line = ndjson_line(serde_json::json!({ "event": "chunk", "data": data }));
+                return Some((Ok(line), Some(s)));
+            }
+            Some(ExecStreamEvent::Done {
+                exit_code,
+                timed_out,
+                truncated,
+                duration_ms,
+            }) => {
+                log_exec_completion(
+                    &s.state,
+                    s.addr,
+                    &s.prepared,
+                    s.elevated,
+                    exit_code,
+                    duration_ms,
+                    timed_out,
+                );
+                Ok(ndjson_line(serde_json::json!({
+                    "event": "done",
+                    "exit_code": exit_code,
+                    "timed_out": timed_out,
+                    "truncated": truncated,
+                    "duration_ms": duration_ms,
+                })))
+            }
+            terminal_failure => {
+                // `Failed` event, or the executor dropped the channel
+                // without a terminal event — either way the command's
+                // outcome is unknown after dispatch.
+                let message = match terminal_failure {
+                    Some(ExecStreamEvent::Failed { message }) => message,
+                    _ => "output stream closed before the command reported completion".to_string(),
+                };
+                s.state.audit.log(AuditEntry {
+                    ts: now_iso(),
+                    account: s.prepared.account_username.clone(),
+                    client_ip: s.addr.ip().to_string(),
+                    action: AuditAction::ExecFailed,
+                    host_id: Some(s.prepared.host.id.clone()),
+                    command: Some(s.prepared.payload.clone()),
+                    outcome: AuditOutcome {
+                        success: false,
+                        exit_code: None,
+                        reason: Some(message.clone()),
+                        duration_ms: Some(s.started.elapsed().as_millis() as u64),
+                    },
+                });
+                record_history(
+                    &s.state,
+                    &s.prepared.account_username,
+                    &s.prepared.host.id,
+                    &s.prepared.payload,
+                    s.elevated,
+                    None,
+                    Some(s.started.elapsed().as_millis() as u64),
+                    false,
+                );
+                Ok(ndjson_line(
+                    serde_json::json!({ "event": "error", "message": message }),
+                ))
+            }
+        };
+        // Terminal line: emit it, then end the stream on the next poll.
+        Some((item, None))
+    });
+
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            header::HeaderValue::from_static("application/x-ndjson"),
+        )
+        // Chunk-level latency matters more than compression for a stream.
+        .header(
+            header::CACHE_CONTROL,
+            header::HeaderValue::from_static("no-cache"),
+        )
+        .body(axum::body::Body::from_stream(stream))
+        .expect("valid ndjson streaming response")
+}
+
+/// Everything the exec pipeline resolved *before* dispatching to the
+/// executor: the authenticated account, the validated payload, the
+/// authorized host and the normalized selector. Shared by the buffered
+/// handlers (`/api/v1/exec`, `/r/{host}`) and the streaming handler
+/// (`/api/v1/exec/stream`) so the two paths can never drift on
+/// auth/validation/audit behaviour.
+struct PreparedExec {
+    account_username: String,
+    payload: String,
+    is_script: bool,
+    host: HostInfo,
+    exec_selector: String,
+    timeout: Duration,
+}
+
+/// Run the full pre-dispatch pipeline: authentication → payload resolution
+/// → rate limit → validation (+ script sandbox) → host authorization →
+/// timeout clamp → "accepted" audit entry. `Err` carries the ready-to-send
+/// error response.
+async fn prepare_exec(
+    state: &AppState,
+    addr: SocketAddr,
+    headers: &HeaderMap,
+    body: &ExecRequest,
+) -> Result<PreparedExec, Box<Response>> {
+    let account = match require_account(state, headers, addr.ip()) {
         Ok(a) => a,
-        Err(r) => return r,
+        Err(r) => return Err(Box::new(r)),
     };
 
     // Resolve command XOR script XOR script_base64 into a single payload.
@@ -540,7 +732,7 @@ async fn execute_request(
                 ts: now_iso(),
                 account: account.username.clone(),
                 client_ip: addr.ip().to_string(),
-                action: if is_script_field_set(&body) {
+                action: if is_script_field_set(body) {
                     AuditAction::ScriptRejected
                 } else {
                     AuditAction::ExecRejected
@@ -549,11 +741,11 @@ async fn execute_request(
                 command: None,
                 outcome: AuditOutcome::rejected(e.to_string()),
             });
-            return error_response_with_code(
+            return Err(Box::new(error_response_with_code(
                 StatusCode::BAD_REQUEST,
                 &e.to_string(),
                 Some(e.code()),
-            );
+            )));
         }
     };
 
@@ -575,7 +767,7 @@ async fn execute_request(
             command: Some(payload.clone()),
             outcome: AuditOutcome::rejected("account rate limit exceeded"),
         });
-        return too_many_requests();
+        return Err(Box::new(too_many_requests()));
     }
 
     // Validate: safety checker + API deny-list + readonly + allowlist.
@@ -590,10 +782,10 @@ async fn execute_request(
                 account.username,
                 errors
             );
-            return error_response(
+            return Err(Box::new(error_response(
                 StatusCode::INTERNAL_SERVER_ERROR,
                 "account allowlist has invalid regex — fix relay.json",
-            );
+            )));
         }
     };
     let validation = if is_script {
@@ -632,7 +824,10 @@ async fn execute_request(
             command: Some(payload.clone()),
             outcome: AuditOutcome::rejected(validation.to_string()),
         });
-        return error_response(StatusCode::FORBIDDEN, &validation.to_string());
+        return Err(Box::new(error_response(
+            StatusCode::FORBIDDEN,
+            &validation.to_string(),
+        )));
     }
 
     // Script-only: sandbox pre-flight (syntax check + dcg). The hard floor
@@ -654,11 +849,11 @@ async fn execute_request(
                     command: Some(payload.clone()),
                     outcome: AuditOutcome::rejected(reason.clone()),
                 });
-                return error_response_with_code(
+                return Err(Box::new(error_response_with_code(
                     StatusCode::FORBIDDEN,
                     &reason,
                     Some("sandbox_failed"),
-                );
+                )));
             }
         }
     }
@@ -699,10 +894,16 @@ async fn execute_request(
                 command: Some(payload.clone()),
                 outcome: AuditOutcome::rejected("host not allowed for account"),
             });
-            return error_response(StatusCode::FORBIDDEN, "host not allowed for this account");
+            return Err(Box::new(error_response(
+                StatusCode::FORBIDDEN,
+                "host not allowed for this account",
+            )));
         }
         None => {
-            return error_response(StatusCode::NOT_FOUND, "unknown host_id");
+            return Err(Box::new(error_response(
+                StatusCode::NOT_FOUND,
+                "unknown host_id",
+            )));
         }
     };
 
@@ -739,10 +940,73 @@ async fn execute_request(
         },
     });
 
+    Ok(PreparedExec {
+        account_username: account.username,
+        payload,
+        is_script,
+        host,
+        exec_selector,
+        timeout,
+    })
+}
+
+/// Audit + history bookkeeping for a completed execution (buffered or
+/// streaming). Mirrors what the pre-refactor `execute_request` did inline.
+fn log_exec_completion(
+    state: &AppState,
+    addr: SocketAddr,
+    prepared: &PreparedExec,
+    elevated: bool,
+    exit_code: Option<u32>,
+    duration_ms: u64,
+    timed_out: bool,
+) {
+    state.audit.log(AuditEntry {
+        ts: now_iso(),
+        account: prepared.account_username.clone(),
+        client_ip: addr.ip().to_string(),
+        action: if prepared.is_script {
+            AuditAction::ScriptAccepted
+        } else {
+            AuditAction::ExecAccepted
+        },
+        host_id: Some(prepared.host.id.clone()),
+        command: Some(prepared.payload.clone()),
+        outcome: AuditOutcome::ok(exit_code, duration_ms),
+    });
+    record_history(
+        state,
+        &prepared.account_username,
+        &prepared.host.id,
+        &prepared.payload,
+        elevated,
+        exit_code.map(|c| c as i32),
+        Some(duration_ms),
+        timed_out,
+    );
+}
+
+async fn execute_request(
+    state: AppState,
+    addr: SocketAddr,
+    headers: HeaderMap,
+    body: ExecRequest,
+    response_format: ExecResponseFormat,
+) -> Response {
+    let prepared = match prepare_exec(&state, addr, &headers, &body).await {
+        Ok(p) => p,
+        Err(r) => return *r,
+    };
+
     let started = Instant::now();
     match state
         .executor
-        .exec(&exec_selector, &payload, body.elevated, timeout)
+        .exec(
+            &prepared.exec_selector,
+            &prepared.payload,
+            body.elevated,
+            prepared.timeout,
+        )
         .await
     {
         Ok(ExecOutcome {
@@ -753,27 +1017,13 @@ async fn execute_request(
             truncated,
             duration_ms,
         }) => {
-            state.audit.log(AuditEntry {
-                ts: now_iso(),
-                account: account.username.clone(),
-                client_ip: addr.ip().to_string(),
-                action: if is_script {
-                    AuditAction::ScriptAccepted
-                } else {
-                    AuditAction::ExecAccepted
-                },
-                host_id: Some(host.id.clone()),
-                command: Some(payload.clone()),
-                outcome: AuditOutcome::ok(exit_code, duration_ms),
-            });
-            record_history(
+            log_exec_completion(
                 &state,
-                &account.username,
-                &host.id,
-                &payload,
+                addr,
+                &prepared,
                 body.elevated,
-                exit_code.map(|c| c as i32),
-                Some(duration_ms),
+                exit_code,
+                duration_ms,
                 timed_out,
             );
             match response_format {
@@ -818,77 +1068,90 @@ async fn execute_request(
                 }
             }
         }
-        Err(err) => {
-            if let ExecutorError::ElevationRequired(message) = &err {
-                state.audit.log(AuditEntry {
-                    ts: now_iso(),
-                    account: account.username.clone(),
-                    client_ip: addr.ip().to_string(),
-                    action: AuditAction::ExecFailed,
-                    host_id: Some(host.id.clone()),
-                    command: Some(payload.clone()),
-                    outcome: AuditOutcome {
-                        success: false,
-                        exit_code: None,
-                        reason: Some("elevation required".to_string()),
-                        duration_ms: Some(started.elapsed().as_millis() as u64),
-                    },
-                });
-                // The command was dispatched but couldn't run (needed sudo,
-                // none cached). Record it as a non-success so the user can
-                // see and retry — but with no exit_code, since nothing ran.
-                record_history(
-                    &state,
-                    &account.username,
-                    &host.id,
-                    &payload,
-                    body.elevated,
-                    None,
-                    Some(started.elapsed().as_millis() as u64),
-                    false,
-                );
-                return error_response_with_code(
-                    StatusCode::FORBIDDEN,
-                    message,
-                    Some("elevation_required"),
-                );
-            }
-            let (status, msg) = match &err {
-                ExecutorError::UnknownHost(_) => (StatusCode::NOT_FOUND, "unknown host_id"),
-                ExecutorError::Connect(_) => (StatusCode::BAD_GATEWAY, "SSH connect failed"),
-                ExecutorError::Exec(_) => (StatusCode::BAD_GATEWAY, "remote exec failed"),
-                ExecutorError::ElevationRequired(_) => unreachable!(),
-            };
-            let detail = safe_executor_detail(&err);
-            state.audit.log(AuditEntry {
-                ts: now_iso(),
-                account: account.username.clone(),
-                client_ip: addr.ip().to_string(),
-                action: AuditAction::ExecFailed,
-                host_id: Some(host.id.clone()),
-                command: Some(payload.clone()),
-                outcome: AuditOutcome {
-                    success: false,
-                    exit_code: None,
-                    reason: Some(err.to_string()),
-                    duration_ms: Some(started.elapsed().as_millis() as u64),
-                },
-            });
-            // Reached the executor but failed (connect/exec error). Record
-            // with no exit_code so the failure is visible and retryable.
-            record_history(
-                &state,
-                &account.username,
-                &host.id,
-                &payload,
-                body.elevated,
-                None,
-                Some(started.elapsed().as_millis() as u64),
-                false,
-            );
-            error_response_with_detail(status, msg, None, detail.as_deref())
-        }
+        Err(err) => exec_error_response(&state, addr, &prepared, body.elevated, started, err),
     }
+}
+
+/// Map an [`ExecutorError`] to its HTTP response, with the same audit +
+/// history bookkeeping the buffered path always did. Shared by the buffered
+/// and streaming handlers (a streaming request that fails *before* the
+/// stream starts still gets a proper status code).
+fn exec_error_response(
+    state: &AppState,
+    addr: SocketAddr,
+    prepared: &PreparedExec,
+    elevated: bool,
+    started: Instant,
+    err: ExecutorError,
+) -> Response {
+    if let ExecutorError::ElevationRequired(message) = &err {
+        state.audit.log(AuditEntry {
+            ts: now_iso(),
+            account: prepared.account_username.clone(),
+            client_ip: addr.ip().to_string(),
+            action: AuditAction::ExecFailed,
+            host_id: Some(prepared.host.id.clone()),
+            command: Some(prepared.payload.clone()),
+            outcome: AuditOutcome {
+                success: false,
+                exit_code: None,
+                reason: Some("elevation required".to_string()),
+                duration_ms: Some(started.elapsed().as_millis() as u64),
+            },
+        });
+        // The command was dispatched but couldn't run (needed sudo,
+        // none cached). Record it as a non-success so the user can
+        // see and retry — but with no exit_code, since nothing ran.
+        record_history(
+            state,
+            &prepared.account_username,
+            &prepared.host.id,
+            &prepared.payload,
+            elevated,
+            None,
+            Some(started.elapsed().as_millis() as u64),
+            false,
+        );
+        return error_response_with_code(
+            StatusCode::FORBIDDEN,
+            message,
+            Some("elevation_required"),
+        );
+    }
+    let (status, msg) = match &err {
+        ExecutorError::UnknownHost(_) => (StatusCode::NOT_FOUND, "unknown host_id"),
+        ExecutorError::Connect(_) => (StatusCode::BAD_GATEWAY, "SSH connect failed"),
+        ExecutorError::Exec(_) => (StatusCode::BAD_GATEWAY, "remote exec failed"),
+        ExecutorError::ElevationRequired(_) => unreachable!(),
+    };
+    let detail = safe_executor_detail(&err);
+    state.audit.log(AuditEntry {
+        ts: now_iso(),
+        account: prepared.account_username.clone(),
+        client_ip: addr.ip().to_string(),
+        action: AuditAction::ExecFailed,
+        host_id: Some(prepared.host.id.clone()),
+        command: Some(prepared.payload.clone()),
+        outcome: AuditOutcome {
+            success: false,
+            exit_code: None,
+            reason: Some(err.to_string()),
+            duration_ms: Some(started.elapsed().as_millis() as u64),
+        },
+    });
+    // Reached the executor but failed (connect/exec error). Record
+    // with no exit_code so the failure is visible and retryable.
+    record_history(
+        state,
+        &prepared.account_username,
+        &prepared.host.id,
+        &prepared.payload,
+        elevated,
+        None,
+        Some(started.elapsed().as_millis() as u64),
+        false,
+    );
+    error_response_with_detail(status, msg, None, detail.as_deref())
 }
 
 /// Whether the request carried a `script` or `script_base64` field (even if
@@ -1214,6 +1477,233 @@ mod tests {
         .await;
         assert_eq!(status, 200);
         assert!(executor.elevated.load(std::sync::atomic::Ordering::SeqCst));
+        handle.shutdown().await;
+    }
+
+    // ── streaming endpoint tests ────────────────────────────────────────
+
+    /// An executor double whose `exec_stream` emits scripted events with a
+    /// real producer task — the endpoint must relay them as NDJSON lines in
+    /// order, ending with the terminal event.
+    #[derive(Debug)]
+    struct ScriptedStreamExecutor {
+        events: Vec<crate::executor::ExecStreamEvent>,
+    }
+
+    #[async_trait::async_trait]
+    impl RelayExecutor for ScriptedStreamExecutor {
+        async fn list_hosts(&self) -> Vec<HostInfo> {
+            vec![HostInfo {
+                id: "host-1".to_string(),
+                name: "prod".to_string(),
+                host: "127.0.0.1".to_string(),
+                port: 22,
+                username: "ops".to_string(),
+            }]
+        }
+
+        async fn exec(
+            &self,
+            _host_id: &str,
+            _command: &str,
+            _elevated: bool,
+            _timeout: Duration,
+        ) -> Result<ExecOutcome, ExecutorError> {
+            unreachable!("streaming tests must not hit the buffered path")
+        }
+
+        async fn exec_stream(
+            &self,
+            _host_id: &str,
+            _command: &str,
+            _elevated: bool,
+            _timeout: Duration,
+        ) -> Result<tokio::sync::mpsc::Receiver<ExecStreamEvent>, ExecutorError> {
+            let (tx, rx) = tokio::sync::mpsc::channel(2);
+            let events = self.events.clone();
+            tokio::spawn(async move {
+                for event in events {
+                    // A paced producer proves chunks flow through while the
+                    // command is still "running" (bounded channel, cap 2).
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                    if tx.send(event).await.is_err() {
+                        return;
+                    }
+                }
+            });
+            Ok(rx)
+        }
+    }
+
+    /// The streaming endpoint relays executor chunks as NDJSON lines in
+    /// arrival order and finishes with a `done` event carrying the exit
+    /// metadata; completion is also recorded to the account history.
+    #[tokio::test]
+    async fn exec_stream_endpoint_relays_chunks_then_done() {
+        let executor = Arc::new(ScriptedStreamExecutor {
+            events: vec![
+                ExecStreamEvent::Chunk("row-1\n".to_string()),
+                ExecStreamEvent::Chunk("row-2\n".to_string()),
+                ExecStreamEvent::Done {
+                    exit_code: Some(0),
+                    timed_out: false,
+                    truncated: false,
+                    duration_ms: 42,
+                },
+            ],
+        });
+        let history = Arc::new(RecordingHistoryStore::new());
+        let handle = run(
+            test_config(),
+            executor,
+            history.clone() as Arc<dyn RelayHistoryStore>,
+        )
+        .await
+        .unwrap();
+
+        let (status, headers, body) = raw_stream_request(
+            &format!("{}/api/v1/exec/stream", handle.url()),
+            Some(("ops", "pw")),
+            &serde_json::json!({ "host_id": "host-1", "command": "docker ps" }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        assert_eq!(
+            headers.get("content-type").map(String::as_str),
+            Some("application/x-ndjson")
+        );
+        let lines: Vec<serde_json::Value> = body
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0]["event"], "chunk");
+        assert_eq!(lines[0]["data"], "row-1\n");
+        assert_eq!(lines[1]["data"], "row-2\n");
+        assert_eq!(lines[2]["event"], "done");
+        assert_eq!(lines[2]["exit_code"], 0);
+        assert_eq!(lines[2]["timed_out"], false);
+        assert_eq!(lines[2]["duration_ms"], 42);
+
+        // Completion bookkeeping matches the buffered path: one history
+        // record with the executed command.
+        let recs: serde_json::Value = reqwest_get(
+            &format!("{}/api/v1/history", handle.url()),
+            Some(("ops", "pw")),
+        )
+        .await;
+        assert_eq!(recs["entries"].as_array().map(|a| a.len()), Some(1));
+        assert_eq!(recs["entries"][0]["command"], "docker ps");
+        handle.shutdown().await;
+    }
+
+    /// Executors without a streaming implementation fall back to the
+    /// default buffered `exec_stream`: the whole outcome arrives as chunk
+    /// line(s) plus `done`, so the endpoint works uniformly.
+    #[tokio::test]
+    async fn exec_stream_endpoint_buffered_fallback_via_default_impl() {
+        let executor = Arc::new(RecordingExecutor {
+            outcome: Some(ExecOutcome {
+                exit_code: Some(3),
+                stdout: "all-output-at-once\n".to_string(),
+                stderr: "warned\n".to_string(),
+                timed_out: false,
+                truncated: false,
+                duration_ms: 7,
+            }),
+            ..Default::default()
+        });
+        let handle = run(test_config(), executor, Arc::new(NullHistoryStore))
+            .await
+            .unwrap();
+        let (status, _, body) = raw_stream_request(
+            &format!("{}/api/v1/exec/stream", handle.url()),
+            Some(("ops", "pw")),
+            &serde_json::json!({ "host_id": "host-1", "command": "uname -a" }),
+        )
+        .await;
+        assert_eq!(status, 200);
+        let lines: Vec<serde_json::Value> = body
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[0]["data"], "all-output-at-once\n");
+        assert_eq!(lines[1]["data"], "warned\n");
+        assert_eq!(lines[2]["event"], "done");
+        assert_eq!(lines[2]["exit_code"], 3);
+        handle.shutdown().await;
+    }
+
+    /// Pipeline failures before dispatch keep real HTTP status codes — the
+    /// streaming endpoint shares the exact validation/authorization path of
+    /// the buffered one.
+    #[tokio::test]
+    async fn exec_stream_endpoint_keeps_pre_dispatch_error_statuses() {
+        let executor: Arc<dyn RelayExecutor> = Arc::new(NullExecutor);
+        let handle = run(test_config(), executor, Arc::new(NullHistoryStore))
+            .await
+            .unwrap();
+        let url = format!("{}/api/v1/exec/stream", handle.url());
+        // Dangerous command → 403 before host lookup.
+        let (status, _, _) = raw_stream_request(
+            &url,
+            Some(("ops", "pw")),
+            &serde_json::json!({ "host_id": "h1", "command": "rm -rf /" }),
+        )
+        .await;
+        assert_eq!(status, 403);
+        // Unknown host → 404.
+        let (status, _, _) = raw_stream_request(
+            &url,
+            Some(("ops", "pw")),
+            &serde_json::json!({ "host_id": "ghost", "command": "uptime" }),
+        )
+        .await;
+        assert_eq!(status, 404);
+        // No auth → 401.
+        let (status, _, _) = raw_stream_request(
+            &url,
+            None,
+            &serde_json::json!({ "host_id": "h1", "command": "uptime" }),
+        )
+        .await;
+        assert_eq!(status, 401);
+        handle.shutdown().await;
+    }
+
+    /// A post-dispatch failure (live PTY died mid-run) arrives in-band as an
+    /// `error` event after any chunks that already streamed out.
+    #[tokio::test]
+    async fn exec_stream_endpoint_reports_in_band_failure_as_error_event() {
+        let executor = Arc::new(ScriptedStreamExecutor {
+            events: vec![
+                ExecStreamEvent::Chunk("partial output\n".to_string()),
+                ExecStreamEvent::Failed {
+                    message: "live session output closed".to_string(),
+                },
+            ],
+        });
+        let handle = run(test_config(), executor, Arc::new(NullHistoryStore))
+            .await
+            .unwrap();
+        let (status, _, body) = raw_stream_request(
+            &format!("{}/api/v1/exec/stream", handle.url()),
+            Some(("ops", "pw")),
+            &serde_json::json!({ "host_id": "host-1", "command": "sleep 999" }),
+        )
+        .await;
+        // Headers were already sent when the failure happened — the status
+        // stays 200 and the failure is the terminal NDJSON event.
+        assert_eq!(status, 200);
+        let lines: Vec<serde_json::Value> = body
+            .lines()
+            .map(|l| serde_json::from_str(l).unwrap())
+            .collect();
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0]["event"], "chunk");
+        assert_eq!(lines[1]["event"], "error");
+        assert_eq!(lines[1]["message"], "live session output closed");
         handle.shutdown().await;
     }
 
@@ -1657,6 +2147,84 @@ mod tests {
             .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_string()))
             .collect();
         (status, headers, body.to_string())
+    }
+
+    /// POST helper for the streaming endpoint: sends JSON, returns the
+    /// status, response headers, and the de-chunked body text (axum streams
+    /// NDJSON with `Transfer-Encoding: chunked`).
+    async fn raw_stream_request(
+        url: &str,
+        auth: Option<(&str, &str)>,
+        body: &serde_json::Value,
+    ) -> (u16, std::collections::HashMap<String, String>, String) {
+        use base64::Engine;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let parsed = url::Url::parse(url).unwrap();
+        let host = parsed.host_str().unwrap().to_string();
+        let port = parsed.port().unwrap();
+        let path = parsed.path().to_string();
+        let body = body.to_string();
+        let mut stream = tokio::net::TcpStream::connect((host.as_str(), port))
+            .await
+            .unwrap();
+        let mut request = format!(
+            "POST {path} HTTP/1.1\r\nHost: {host}:{port}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n",
+            body.len()
+        );
+        if let Some((username, password)) = auth {
+            let credentials =
+                base64::engine::general_purpose::STANDARD.encode(format!("{username}:{password}"));
+            request.push_str(&format!("Authorization: Basic {credentials}\r\n"));
+        }
+        request.push_str("Connection: close\r\n\r\n");
+        request.push_str(&body);
+        stream.write_all(request.as_bytes()).await.unwrap();
+
+        let mut response = Vec::new();
+        stream.read_to_end(&mut response).await.unwrap();
+        let text = String::from_utf8(response).unwrap();
+        let (head, raw_body) = text.split_once("\r\n\r\n").unwrap();
+        let status = head
+            .split_whitespace()
+            .nth(1)
+            .and_then(|value| value.parse().ok())
+            .unwrap();
+        let headers: std::collections::HashMap<String, String> = head
+            .lines()
+            .skip(1)
+            .filter_map(|line| line.split_once(':'))
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.trim().to_string()))
+            .collect();
+        let body_text = if headers
+            .get("transfer-encoding")
+            .is_some_and(|v| v.contains("chunked"))
+        {
+            dechunk(raw_body)
+        } else {
+            raw_body.to_string()
+        };
+        (status, headers, body_text)
+    }
+
+    /// Decode an HTTP/1.1 chunked body (`<hex-len>\r\n<data>\r\n...0\r\n`).
+    fn dechunk(raw: &str) -> String {
+        let mut out = String::new();
+        let mut rest = raw;
+        loop {
+            let Some((len_line, after)) = rest.split_once("\r\n") else {
+                break;
+            };
+            let Ok(len) = usize::from_str_radix(len_line.trim(), 16) else {
+                break;
+            };
+            if len == 0 {
+                break;
+            }
+            out.push_str(&after[..len.min(after.len())]);
+            rest = after.get(len + 2..).unwrap_or("");
+        }
+        out
     }
 
     async fn reqwest_get(url: &str, auth: Option<(&str, &str)>) -> serde_json::Value {

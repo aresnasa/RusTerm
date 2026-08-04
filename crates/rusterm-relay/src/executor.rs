@@ -55,6 +55,29 @@ pub enum ExecutorError {
     ElevationRequired(String),
 }
 
+/// One event on a streaming execution (`exec_stream`). Chunks arrive in
+/// output order as the remote produces them; the stream always ends with
+/// exactly one terminal event — `Done` (the command finished, possibly by
+/// timeout) or `Failed` (the command's status became unknowable after it was
+/// sent, e.g. the live PTY closed mid-run).
+#[derive(Debug, Clone)]
+pub enum ExecStreamEvent {
+    /// A slice of remote output, in arrival order. PTY-backed executions
+    /// merge stderr into stdout; the buffered fallback emits stdout and
+    /// stderr as separate chunks (stdout first).
+    Chunk(String),
+    /// Terminal event: the command finished.
+    Done {
+        exit_code: Option<u32>,
+        timed_out: bool,
+        truncated: bool,
+        duration_ms: u64,
+    },
+    /// Terminal event: the command was dispatched but its outcome is
+    /// unknown (transport died mid-run). Chunks already emitted are valid.
+    Failed { message: String },
+}
+
 /// Implemented by the app layer (`SshExecutor`) and by test doubles.
 #[async_trait]
 pub trait RelayExecutor: Send + Sync + std::fmt::Debug {
@@ -71,6 +94,50 @@ pub trait RelayExecutor: Send + Sync + std::fmt::Debug {
         elevated: bool,
         timeout: Duration,
     ) -> Result<ExecOutcome, ExecutorError>;
+
+    /// Run `command` on `host_id`, streaming output as it arrives instead
+    /// of buffering until completion. Errors *before* anything ran are
+    /// returned as `Err` (so the HTTP layer can still answer with a proper
+    /// status code); once the stream starts, completion or failure is
+    /// reported in-band via [`ExecStreamEvent::Done`] /
+    /// [`ExecStreamEvent::Failed`].
+    ///
+    /// The default implementation is a buffered fallback: it awaits the
+    /// plain [`RelayExecutor::exec`] and replays the outcome as one or two
+    /// chunks plus `Done`. Executors with access to incremental output
+    /// (live PTY taps) override it for true streaming.
+    async fn exec_stream(
+        &self,
+        host_id: &str,
+        command: &str,
+        elevated: bool,
+        timeout: Duration,
+    ) -> Result<tokio::sync::mpsc::Receiver<ExecStreamEvent>, ExecutorError> {
+        let outcome = self.exec(host_id, command, elevated, timeout).await?;
+        Ok(buffered_exec_stream(outcome))
+    }
+}
+
+/// Replay a buffered [`ExecOutcome`] as a short event stream: stdout chunk,
+/// stderr chunk (each only when non-empty), then `Done`. Used by the default
+/// `exec_stream` and by executors falling back to a buffered path.
+pub fn buffered_exec_stream(outcome: ExecOutcome) -> tokio::sync::mpsc::Receiver<ExecStreamEvent> {
+    // Capacity covers every event we send below, so the un-consumed sends
+    // can't block (the receiver may not be polled yet).
+    let (tx, rx) = tokio::sync::mpsc::channel(4);
+    if !outcome.stdout.is_empty() {
+        let _ = tx.try_send(ExecStreamEvent::Chunk(outcome.stdout));
+    }
+    if !outcome.stderr.is_empty() {
+        let _ = tx.try_send(ExecStreamEvent::Chunk(outcome.stderr));
+    }
+    let _ = tx.try_send(ExecStreamEvent::Done {
+        exit_code: outcome.exit_code,
+        timed_out: outcome.timed_out,
+        truncated: outcome.truncated,
+        duration_ms: outcome.duration_ms,
+    });
+    rx
 }
 
 /// A `RelayExecutor` that rejects everything. Used when SSH host management

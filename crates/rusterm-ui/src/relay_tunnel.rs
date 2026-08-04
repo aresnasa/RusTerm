@@ -16,8 +16,9 @@ use async_trait::async_trait;
 use rusterm_core::config::{ConnectionConfig, ConnectionKind, SshConfig};
 use rusterm_db::{Database, RelayHistoryEntry};
 use rusterm_relay::{
-    ExecOutcome, ExecutorError, HistoryCursor, HistoryPage, HistoryQuery, HostInfo, RelayExecutor,
-    RelayHandle, RelayHistoryRecord, RelayHistoryStore, run as run_relay, split_host_selector,
+    ExecOutcome, ExecStreamEvent, ExecutorError, HistoryCursor, HistoryPage, HistoryQuery,
+    HostInfo, RelayExecutor, RelayHandle, RelayHistoryRecord, RelayHistoryStore,
+    buffered_exec_stream, run as run_relay, split_host_selector,
 };
 use rusterm_ssh::{DirectConnectOptions, ExecResult, connect_direct};
 use rusterm_tunnel::{TunnelConnector, TunnelManager};
@@ -762,6 +763,257 @@ async fn exec_via_live_session(
     })
 }
 
+/// Streaming executions relay output as it arrives instead of holding it in
+/// memory, so the cap is far above the buffered path's 1 MiB — but still
+/// bounded so a runaway command can't melt a slow HTTP client.
+const MAX_STREAM_EXEC_OUTPUT: usize = 32 * 1024 * 1024;
+
+/// A newline-free `pending` buffer larger than this is flushed through
+/// (single-line progress output). Safe because the completion marker always
+/// starts on a fresh line — its printf emits a leading `\n`, which would put
+/// us on the has-newline path — but a short tail is still held back
+/// defensively (see [`LiveExecStreamParser::feed`]).
+const STREAM_PENDING_FLUSH_THRESHOLD: usize = 64 * 1024;
+
+/// Incremental splitter for streaming live-PTY exec output.
+///
+/// The buffered path ([`exec_via_live_session`]) collects ALL output, then
+/// strips the echoed wrapper and the completion marker in one pass — which
+/// is exactly why the API used to sit silent until a long command finished.
+/// This parser does the same filtering *incrementally* so each PTY read can
+/// be forwarded immediately:
+///
+/// - complete lines are released as soon as their `\n` arrives;
+/// - lines echoing the sentinel wrapper (`__rc=$?`) or carrying the rc tag
+///   are dropped, mirroring `strip_echoed_wrapper`;
+/// - the trailing partial line is held back until it completes, so a
+///   half-arrived completion marker can never leak into the stream;
+/// - once `find_complete_rc_marker` sees the full marker, everything before
+///   it is released and the exit code is reported.
+struct LiveExecStreamParser {
+    rc_tag: String,
+    pending: Vec<u8>,
+    emitted: usize,
+    truncated: bool,
+}
+
+impl LiveExecStreamParser {
+    fn new(rc_tag: &str) -> Self {
+        Self {
+            rc_tag: rc_tag.to_string(),
+            pending: Vec::new(),
+            emitted: 0,
+            truncated: false,
+        }
+    }
+
+    /// Feed one PTY read. Returns the text that is safe to emit now (if
+    /// any) and the exit code once the completion marker is fully present.
+    fn feed(&mut self, data: &[u8]) -> (Option<String>, Option<u32>) {
+        use rusterm_ssh::direct::find_complete_rc_marker;
+
+        self.pending.extend_from_slice(data);
+
+        // Complete marker present → release everything before it, done.
+        if let Some((tag_idx, code)) = find_complete_rc_marker(&self.pending, &self.rc_tag) {
+            let body: Vec<u8> = self.pending.drain(..tag_idx).collect();
+            self.pending.clear();
+            let text = self.filter_wrapper_lines(&body);
+            return (
+                self.release(text.trim_end_matches(['\r', '\n', ' '])),
+                Some(code),
+            );
+        }
+
+        // Release complete lines; the trailing partial line stays pending
+        // (it may be the start of the marker or of the echoed wrapper).
+        if let Some(last_nl) = self.pending.iter().rposition(|&b| b == b'\n') {
+            let complete: Vec<u8> = self.pending.drain(..=last_nl).collect();
+            let text = self.filter_wrapper_lines(&complete);
+            return (self.release(&text), None);
+        }
+
+        // Pathological single-line output (progress dots, no newline):
+        // flush most of it through, keeping a short tail in case a marker
+        // fragment ever lands here.
+        if self.pending.len() > STREAM_PENDING_FLUSH_THRESHOLD {
+            let keep = self.rc_tag.len() + 32;
+            let cut = self.pending.len() - keep;
+            let head: Vec<u8> = self.pending.drain(..cut).collect();
+            let text = String::from_utf8_lossy(&head).into_owned();
+            return (self.release(&text), None);
+        }
+
+        (None, None)
+    }
+
+    /// Timeout path: release whatever is pending (minus wrapper/marker
+    /// lines) so the client sees the tail that arrived before the deadline.
+    fn flush(&mut self) -> Option<String> {
+        let body = std::mem::take(&mut self.pending);
+        let text = self.filter_wrapper_lines(&body);
+        self.release(text.trim_end_matches(['\r', '\n', ' ']))
+    }
+
+    fn truncated(&self) -> bool {
+        self.truncated
+    }
+
+    /// Drop lines that belong to the sentinel machinery rather than the
+    /// command's own output: the echoed wrapper (`… ; __rc=$? ; printf …`,
+    /// which also contains the rc tag) and any incomplete marker line.
+    fn filter_wrapper_lines(&self, raw: &[u8]) -> String {
+        let text = String::from_utf8_lossy(raw);
+        let mut out = String::new();
+        for segment in text.split_inclusive('\n') {
+            if segment.contains("__rc=$?") || segment.contains(&self.rc_tag) {
+                continue;
+            }
+            out.push_str(segment);
+        }
+        out
+    }
+
+    /// Cap-aware emission: counts released bytes and suppresses output past
+    /// [`MAX_STREAM_EXEC_OUTPUT`] (the marker is still scanned for, so the
+    /// command completes normally — mirrors the buffered path's behaviour).
+    fn release(&mut self, text: &str) -> Option<String> {
+        if text.is_empty() {
+            return None;
+        }
+        let remaining = MAX_STREAM_EXEC_OUTPUT.saturating_sub(self.emitted);
+        if remaining == 0 {
+            self.truncated = true;
+            return None;
+        }
+        if text.len() > remaining {
+            self.truncated = true;
+            let mut cut = remaining;
+            while cut > 0 && !text.is_char_boundary(cut) {
+                cut -= 1;
+            }
+            self.emitted += cut;
+            if cut == 0 {
+                return None;
+            }
+            return Some(text[..cut].to_string());
+        }
+        self.emitted += text.len();
+        Some(text.to_string())
+    }
+}
+
+/// Streaming twin of [`exec_via_live_session`]: sends the same
+/// sentinel-wrapped command into the live PTY, but relays output through a
+/// bounded channel as it arrives instead of buffering until the completion
+/// marker. Errors *before* the command is queued are returned as `Err`
+/// (letting the HTTP layer answer with a status code); once queued,
+/// completion/failure is reported in-band via [`ExecStreamEvent`].
+async fn exec_stream_via_live_session(
+    entry: LiveSessionEntry,
+    command: &str,
+    timeout: Duration,
+) -> Result<tokio::sync::mpsc::Receiver<ExecStreamEvent>, LiveExecError> {
+    use rusterm_ssh::direct::random_sentinel_hex;
+
+    let started = Instant::now();
+    let mut tap = tokio::time::timeout(timeout, entry.session.begin_output_tap())
+        .await
+        .map_err(|_| {
+            LiveExecError::BeforeSend(
+                "timed out waiting for another live-session command to finish".to_string(),
+            )
+        })?
+        .map_err(|error| LiveExecError::BeforeSend(error.to_string()))?;
+    let remaining = timeout.saturating_sub(started.elapsed());
+    if remaining.is_zero() {
+        return Err(LiveExecError::BeforeSend(
+            "request deadline elapsed before the command was sent".to_string(),
+        ));
+    }
+
+    let sentinel = format!("RUSTERM_PTY_{}", random_sentinel_hex());
+    let rc_tag = format!("{sentinel}_RC_");
+    let wrapped = format!(
+        "{{ {command} ; }} ; __rc=$? ; printf '\\n{tag}%d\\n' \"$__rc\"\r",
+        command = command,
+        tag = rc_tag,
+    );
+
+    tracing::info!(
+        "[relay] reusing live session {} for streaming exec",
+        entry.session.session_id()
+    );
+    entry.input_tx.send(wrapped.into_bytes()).map_err(|error| {
+        LiveExecError::BeforeSend(format!("failed to queue command for live session: {error}"))
+    })?;
+
+    // The bounded channel is the buffer between the PTY reader and the
+    // (possibly slower) HTTP client: chunks flow through as they arrive,
+    // and backpressure pauses the tap loop instead of growing memory.
+    let (tx, rx) = tokio::sync::mpsc::channel::<ExecStreamEvent>(64);
+    let session = entry.session.clone();
+    tokio::spawn(async move {
+        let mut parser = LiveExecStreamParser::new(&rc_tag);
+        let deadline = tokio::time::sleep(remaining);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                biased;
+                data = tap.recv() => {
+                    let Some(data) = data else {
+                        session.mark_relay_exec_unusable();
+                        let _ = tx
+                            .send(ExecStreamEvent::Failed {
+                                message: "live session output closed after the command was queued; command status is unknown"
+                                    .to_string(),
+                            })
+                            .await;
+                        return;
+                    };
+                    let (chunk, code) = parser.feed(&data);
+                    if let Some(chunk) = chunk
+                        && tx.send(ExecStreamEvent::Chunk(chunk)).await.is_err()
+                    {
+                        // Client hung up. The command keeps running in the
+                        // PTY exactly as it would for a human operator; we
+                        // just stop relaying.
+                        return;
+                    }
+                    if let Some(code) = code {
+                        let _ = tx
+                            .send(ExecStreamEvent::Done {
+                                exit_code: Some(code),
+                                timed_out: false,
+                                truncated: parser.truncated(),
+                                duration_ms: started.elapsed().as_millis() as u64,
+                            })
+                            .await;
+                        return;
+                    }
+                }
+                _ = &mut deadline => {
+                    session.mark_relay_exec_unusable();
+                    if let Some(chunk) = parser.flush() {
+                        let _ = tx.send(ExecStreamEvent::Chunk(chunk)).await;
+                    }
+                    let _ = tx
+                        .send(ExecStreamEvent::Done {
+                            exit_code: None,
+                            timed_out: true,
+                            truncated: parser.truncated(),
+                            duration_ms: started.elapsed().as_millis() as u64,
+                        })
+                        .await;
+                    return;
+                }
+            }
+        }
+    });
+
+    Ok(rx)
+}
+
 #[async_trait]
 impl RelayExecutor for AppRelayExecutor {
     async fn list_hosts(&self) -> Vec<HostInfo> {
@@ -769,6 +1021,51 @@ impl RelayExecutor for AppRelayExecutor {
             .iter()
             .filter_map(|conn| ssh_config_of(conn).map(|ssh| to_host_info(conn, ssh)))
             .collect()
+    }
+
+    /// True streaming exists for the non-elevated live-PTY path, where the
+    /// output tap delivers chunks as the remote produces them. Every other
+    /// path (elevated sudo, fresh connections, bastion guards) delegates to
+    /// the buffered [`Self::exec`] — with all of its safety logic — and
+    /// replays the outcome as a short stream, so `/api/v1/exec/stream`
+    /// behaves uniformly across selector kinds.
+    async fn exec_stream(
+        &self,
+        host_id: &str,
+        command: &str,
+        elevated: bool,
+        timeout: Duration,
+    ) -> Result<tokio::sync::mpsc::Receiver<ExecStreamEvent>, ExecutorError> {
+        let bastion_live_only = live_session_required(host_id, &read_connections());
+        if !elevated && let Some(entry) = find_live_session(host_id) {
+            match exec_stream_via_live_session(entry, command, timeout).await {
+                Ok(rx) => return Ok(rx),
+                Err(LiveExecError::BeforeSend(error)) => {
+                    if bastion_live_only {
+                        tracing::error!(
+                            "[relay] live session required for bastion selector {host_id} but unavailable before send: {error}; refusing bastion fallback"
+                        );
+                        return Err(ExecutorError::Exec(format!(
+                            "[live-session-required] {}: {error}",
+                            crate::i18n::t("relay.live_session_required"),
+                        )));
+                    }
+                    tracing::warn!(
+                        "[relay] live session unavailable before send for {host_id}: {error}; using a buffered fresh connection"
+                    );
+                }
+                Err(LiveExecError::AfterSend(error)) => {
+                    tracing::error!(
+                        "[relay] live-session command status unknown for {host_id}: {error}; refusing automatic retry"
+                    );
+                    return Err(ExecutorError::Exec(format!(
+                        "{error}; the command was not retried"
+                    )));
+                }
+            }
+        }
+        let outcome = self.exec(host_id, command, elevated, timeout).await?;
+        Ok(buffered_exec_stream(outcome))
     }
 
     async fn exec(
@@ -1317,6 +1614,102 @@ mod tests {
         assert_eq!(code, Some(17));
         assert!(truncated_again);
         assert_eq!(raw.len(), MAX_LIVE_EXEC_OUTPUT);
+    }
+
+    // ── streaming exec parser tests ─────────────────────────────────────
+
+    /// Complete lines flow through immediately; the trailing partial line
+    /// is held until its newline arrives — this is the chunking contract
+    /// that lets a long-running command's output stream out line by line
+    /// instead of being buffered until completion.
+    #[test]
+    fn stream_parser_emits_complete_lines_and_holds_partial_tail() {
+        let mut parser = LiveExecStreamParser::new("RUSTERM_TEST_RC_");
+        let (chunk, code) = parser.feed(b"row-1\r\nrow-2\r\npartial");
+        assert_eq!(chunk.as_deref(), Some("row-1\r\nrow-2\r\n"));
+        assert_eq!(code, None);
+        let (chunk, code) = parser.feed(b"-rest\r\n");
+        assert_eq!(chunk.as_deref(), Some("partial-rest\r\n"));
+        assert_eq!(code, None);
+    }
+
+    /// The echoed sentinel wrapper (which contains both `__rc=$?` and the
+    /// rc tag) is dropped from the stream, mirroring the buffered path's
+    /// `strip_echoed_wrapper`.
+    #[test]
+    fn stream_parser_drops_the_echoed_wrapper_line() {
+        let rc_tag = "RUSTERM_TEST_RC_";
+        let mut parser = LiveExecStreamParser::new(rc_tag);
+        let echo =
+            format!("{{ ls ; }} ; __rc=$? ; printf '\\n{rc_tag}%d\\n' \"$__rc\"\r\nfile-a\r\n");
+        let (chunk, code) = parser.feed(echo.as_bytes());
+        assert_eq!(chunk.as_deref(), Some("file-a\r\n"));
+        assert_eq!(code, None);
+    }
+
+    /// A completion marker split across PTY reads never leaks into the
+    /// stream: the partial marker line is held back, and once complete the
+    /// exit code is reported with only the preceding output released.
+    #[test]
+    fn stream_parser_detects_split_marker_without_leaking_it() {
+        let rc_tag = "RUSTERM_TEST_RC_";
+        let mut parser = LiveExecStreamParser::new(rc_tag);
+        let (chunk, code) = parser.feed(b"result-line\r\n\nRUSTERM_TEST_");
+        assert_eq!(chunk.as_deref(), Some("result-line\r\n\n"));
+        assert_eq!(code, None);
+        // The partial marker stays pending — nothing is emitted.
+        let (chunk, code) = parser.feed(b"RC_");
+        assert_eq!(chunk, None);
+        assert_eq!(code, None);
+        let (chunk, code) = parser.feed(b"7\r\n");
+        assert_eq!(chunk, None);
+        assert_eq!(code, Some(7));
+    }
+
+    /// On timeout the pending tail (minus sentinel machinery) is flushed so
+    /// the client sees everything that arrived before the deadline.
+    #[test]
+    fn stream_parser_flush_releases_pending_tail() {
+        let mut parser = LiveExecStreamParser::new("RUSTERM_TEST_RC_");
+        let (chunk, _) = parser.feed(b"done-line\r\nstill-running");
+        assert_eq!(chunk.as_deref(), Some("done-line\r\n"));
+        assert_eq!(parser.flush().as_deref(), Some("still-running"));
+        // Flush drains — a second flush has nothing left.
+        assert_eq!(parser.flush(), None);
+    }
+
+    /// Output past the stream cap is suppressed (truncated flag set) but the
+    /// completion marker is still detected, so the command finishes cleanly
+    /// instead of timing out — mirrors the buffered path's contract.
+    #[test]
+    fn stream_parser_caps_output_but_still_finds_the_marker() {
+        let rc_tag = "RUSTERM_TEST_RC_";
+        let mut parser = LiveExecStreamParser::new(rc_tag);
+        let mut big = vec![b'x'; MAX_STREAM_EXEC_OUTPUT];
+        big.extend_from_slice(b"\r\noverflow-line\r\n");
+        let (chunk, code) = parser.feed(&big);
+        assert_eq!(code, None);
+        // Released text is capped to exactly the stream budget.
+        assert_eq!(chunk.map(|c| c.len()), Some(MAX_STREAM_EXEC_OUTPUT));
+        assert!(parser.truncated());
+        let (chunk, code) = parser.feed(format!("suppressed\r\n\n{rc_tag}3\r\n").as_bytes());
+        assert_eq!(chunk, None, "output past the cap must be suppressed");
+        assert_eq!(code, Some(3));
+    }
+
+    /// A giant newline-free line (progress output) is flushed through in
+    /// chunks instead of growing the pending buffer without bound; a short
+    /// tail is held back so a marker fragment can never slip out.
+    #[test]
+    fn stream_parser_flushes_giant_newline_free_output() {
+        let rc_tag = "RUSTERM_TEST_RC_";
+        let mut parser = LiveExecStreamParser::new(rc_tag);
+        let dots = vec![b'.'; STREAM_PENDING_FLUSH_THRESHOLD + 100];
+        let (chunk, code) = parser.feed(&dots);
+        let released = chunk.expect("oversized single-line output must flush");
+        assert_eq!(code, None);
+        assert_eq!(released.len(), dots.len() - (rc_tag.len() + 32));
+        assert!(released.bytes().all(|b| b == b'.'));
     }
 
     #[test]

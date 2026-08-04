@@ -8230,6 +8230,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "chrono",
+ "futures",
  "parking_lot",
  "regex",
  "rusterm-core",
