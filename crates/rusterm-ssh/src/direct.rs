@@ -867,10 +867,17 @@ impl DirectHandle {
             // Strip the echoed wrapper command line(s). The marker `__rc=$?`
             // is unique to our wrapper, so any line containing it is the
             // echoed command — never real command output.
-            strip_echoed_wrapper(before)
+            let stripped = strip_echoed_wrapper(before);
+            // PTY output also carries terminal-mode chatter (bracketed paste
+            // `ESC[?2004l`, colour codes, ...) and CRLF endings from
+            // `ONLCR`. Strip them so machine-readable output (YAML, JSON,
+            // ...) survives a redirect like `rusterm ... > out.yaml`.
+            sanitize_pty_output(&stripped)
         } else {
             // No valid sentinel — never strip at an echoed `%d` placeholder.
-            String::from_utf8_lossy(raw).into_owned()
+            // Still clean ANSI/CR from the raw best-effort output so a
+            // truncated capture doesn't carry escape sequences either.
+            sanitize_pty_output(&String::from_utf8_lossy(raw))
         };
 
         result.stdout = stdout.into_bytes();
@@ -1057,7 +1064,15 @@ impl DirectHandle {
 /// Mirrors the UI's `strip_ansi` so bastion menu prompts (which are wrapped
 /// in OSC title sequences and CSI colour codes) can be reliably matched by
 /// `expect` regexes in login scripts.
-fn strip_ansi_pty(data: &[u8]) -> String {
+///
+/// The regex covers the escape sequences we encounter on real PTY output:
+///   - OSC  (`ESC ] ... BEL` / `ESC ] ... ESC \`) — terminal title sets
+///   - CSI  (`ESC [ <params> <intermediates> <final>`) — colour, cursor,
+///           and DEC private modes such as `ESC[?2004h` / `ESC[?2004l`
+///           (bracketed paste enable/disable, emitted by bash on PTY init)
+///   - Charset designators (`ESC ( B`, `ESC ) 0`, ...)
+///   - Single-character ESC sequences (`ESC 7`, `ESC 8`, `ESC =`, ...)
+pub fn strip_ansi_pty(data: &[u8]) -> String {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| {
         regex::Regex::new(
@@ -1067,6 +1082,62 @@ fn strip_ansi_pty(data: &[u8]) -> String {
     });
     let raw = String::from_utf8_lossy(data);
     re.replace_all(&raw, "").to_string()
+}
+
+/// Normalize a PTY-captured command body into clean, machine-readable text.
+///
+/// PTY-backed executions inherit the shell's terminal init chatter and cooked
+/// output processing — even after the echoed wrapper line is removed, the
+/// captured stdout still contains:
+///
+///   - `ESC[?2004l` / `ESC[?2004h` — bracketed paste mode transitions that
+///     bash emits during interactive-session init on a PTY.
+///   - Other CSI/OSC sequences — title sets, colour codes, cursor moves.
+///   - `\r\n` line endings — sshd's PTY runs with `OPOST | ONLCR`, so every
+///     `\n` the command writes becomes `\r\n` on the wire. A file redirected
+///     from the API's stdout (e.g. `kubectl -o yaml > out.yaml`) would
+///     otherwise carry CRLF endings and a leading escape sequence.
+///
+/// This function strips ANSI escape sequences (reusing [`strip_ansi_pty`])
+/// and normalizes line endings to `\n`:
+///   - `\r\n` → `\n`
+///   - stray `\r` not followed by `\n` → `\n` (rare; e.g. some shells emit
+///     a bare CR to redraw a prompt line)
+///
+/// Tabs (`\t`) and other control characters that may legitimately appear in
+/// captured output (YAML uses spaces, but the same code path runs commands
+/// like `cat` over a binary file) are preserved — only CSI/OSC escapes and
+/// CR are touched.
+pub fn sanitize_pty_output(s: &str) -> String {
+    let stripped = strip_ansi_pty(s.as_bytes());
+    // Walk once: convert `\r\n` → `\n`, lone `\r` → `\n`. Cheaper than a
+    // regex replace and avoids re-scanning the whole string for each pattern.
+    let mut out = String::with_capacity(stripped.len());
+    let bytes = stripped.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        let b = bytes[i];
+        if b == b'\r' {
+            // Always emit `\n`; if the next byte is `\n` we skip it so we
+            // don't double the newline (handles CRLF).
+            out.push('\n');
+            if i + 1 < bytes.len() && bytes[i + 1] == b'\n' {
+                i += 2;
+            } else {
+                i += 1;
+            }
+            continue;
+        }
+        // Fast path: copy a run of non-CR bytes verbatim.
+        let run_end = bytes[i..]
+            .iter()
+            .position(|&c| c == b'\r')
+            .map(|p| i + p)
+            .unwrap_or(bytes.len());
+        out.push_str(&stripped[i..run_end]);
+        i = run_end;
+    }
+    out
 }
 
 /// Encode an interactive login answer exactly like pressing Enter in a PTY.
@@ -1462,6 +1533,11 @@ mod tests {
         assert!(stdout.contains("file1"));
         assert!(stdout.contains("file2"));
         assert!(!stdout.contains("RUSTERM_PTY_"));
+        // PTY ONLCR must not survive — every `\r\n` should be `\n`.
+        assert!(
+            !stdout.contains('\r'),
+            "expected CRLF to be normalized to LF, got: {stdout:?}"
+        );
     }
 
     #[test]
@@ -1475,7 +1551,7 @@ mod tests {
 
     #[test]
     fn extract_strips_echoed_wrapper_line() {
-        let raw = b"$ { ls ; } ; __rc=$? ; printf '\\nRUSTERM_PTY_0123456789abcdef_RC_%d\\n' \"$__rc\"\r\nfile1\r\n\r\nRUSTERM_PTY_0123456789abcdef_RC_0\r\n$ ";
+        let raw = b"$ { ls ; } ; __rc=$? ; printf '\nRUSTERM_PTY_0123456789abcdef_RC_%d\n' \"$__rc\"\r\nfile1\r\n\r\nRUSTERM_PTY_0123456789abcdef_RC_0\r\n$ ";
         let tag = "RUSTERM_PTY_0123456789abcdef_RC_";
         let mut result = ExecResult::default();
         DirectHandle::extract_pty_output(raw, tag, &mut result);
@@ -1484,6 +1560,42 @@ mod tests {
         assert!(stdout.contains("file1"));
         // The echoed wrapper line must be stripped.
         assert!(!stdout.contains("__rc=$?"));
+        // CRLF must be normalized to LF.
+        assert!(!stdout.contains('\r'));
+    }
+
+    #[test]
+    fn extract_strips_bracketed_paste_and_ansi_from_pty_init() {
+        // Real-world shape: bash emits `ESC[?2004l` (disable bracketed paste)
+        // during interactive-session init on a PTY, plus a title-set OSC
+        // sequence. The ONLCR pty mode also turns every `\n` into `\r\n`.
+        let raw = b"\x1b[?2004l\r\napiVersion: v1\r\nkind: Node\r\n\r\nRUSTERM_PTY_deadbeefdeadbeef_RC_0\r\n$ ";
+        let tag = "RUSTERM_PTY_deadbeefdeadbeef_RC_";
+        let mut result = ExecResult::default();
+        DirectHandle::extract_pty_output(raw, tag, &mut result);
+        assert_eq!(result.exit_code, Some(0));
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        // The `ESC[?2004l` escape is stripped; the `\r\n` that followed it
+        // becomes a `\n` (the literal newline bash emitted after the
+        // sequence). The command's actual output begins on the next line.
+        assert_eq!(stdout, "\napiVersion: v1\nkind: Node");
+        // No control characters should survive.
+        assert!(!stdout.contains('\x1b'));
+        assert!(!stdout.contains('\r'));
+    }
+
+    #[test]
+    fn extract_strips_osc_title_set_from_output() {
+        // OSC sequence `ESC]0;<title>\x07` is emitted by many shells after
+        // every command. It must not appear in captured stdout.
+        let raw = b"\x1b]0;user@host\x07hello\r\n\r\nRUSTERM_PTY_aaaaaaaa12345678_RC_0\r\n";
+        let tag = "RUSTERM_PTY_aaaaaaaa12345678_RC_";
+        let mut result = ExecResult::default();
+        DirectHandle::extract_pty_output(raw, tag, &mut result);
+        let stdout = String::from_utf8_lossy(&result.stdout);
+        assert_eq!(stdout, "hello");
+        assert!(!stdout.contains("user@host"));
+        assert!(!stdout.contains('\x1b'));
     }
 
     #[test]
@@ -1510,6 +1622,82 @@ mod tests {
         let s = "line1\nline2\nline3";
         let out = strip_echoed_wrapper(s);
         assert_eq!(out, "line1\nline2\nline3");
+    }
+
+    #[test]
+    fn sanitize_strips_bracketed_paste_disable_sequence() {
+        // `ESC[?2004l` is exactly what bash emits when it disables bracketed
+        // paste on PTY init — the original bug report.
+        let s = "\x1b[?2004lapiVersion: v1\r\nkind: Node\r\n";
+        assert_eq!(sanitize_pty_output(s), "apiVersion: v1\nkind: Node\n");
+    }
+
+    #[test]
+    fn sanitize_strips_bracketed_paste_enable_and_disable() {
+        // Some shells emit `ESC[?2004h` on init, then `ESC[?2004l` on exit.
+        let s = "\x1b[?2004h\x1b[?2004ldata\r\n";
+        assert_eq!(sanitize_pty_output(s), "data\n");
+    }
+
+    #[test]
+    fn sanitize_normalizes_crlf_to_lf() {
+        assert_eq!(sanitize_pty_output("a\r\nb\r\nc"), "a\nb\nc");
+    }
+
+    #[test]
+    fn sanitize_converts_lone_cr_to_lf() {
+        // Some terminals use a bare `\r` to redraw the current line
+        // (progress bars). Convert to `\n` so the captured output is at
+        // least line-based rather than collapsing onto one line.
+        assert_eq!(sanitize_pty_output("a\rb\rc"), "a\nb\nc");
+    }
+
+    #[test]
+    fn sanitize_preserves_tabs() {
+        // YAML uses spaces, not tabs, but other commands (`cat -T`, TSV
+        // output, ...) legitimately emit `\t`. Don't mangle them.
+        assert_eq!(sanitize_pty_output("col1\tcol2\r\n"), "col1\tcol2\n");
+    }
+
+    #[test]
+    fn sanitize_strips_osc_title_set() {
+        // `ESC]0;<title>\x07` (BEL-terminated OSC) — terminal title set.
+        assert_eq!(
+            sanitize_pty_output("\x1b]0;user@host\x07hello\n"),
+            "hello\n"
+        );
+    }
+
+    #[test]
+    fn sanitize_strips_osc_with_st_terminator() {
+        // `ESC]0;<title>\x1b\\` (ST-terminated OSC) — xterm title set.
+        assert_eq!(sanitize_pty_output("\x1b]0;title\x1b\\hello\n"), "hello\n");
+    }
+
+    #[test]
+    fn sanitize_strips_csi_colour_codes() {
+        // `ESC[32m...ESC[0m` — green text + reset.
+        assert_eq!(sanitize_pty_output("\x1b[32mgreen\x1b[0m\r\n"), "green\n");
+    }
+
+    #[test]
+    fn sanitize_preserves_normal_output_verbatim() {
+        assert_eq!(
+            sanitize_pty_output("plain text\nmore\n"),
+            "plain text\nmore\n"
+        );
+    }
+
+    #[test]
+    fn sanitize_handles_empty_input() {
+        assert_eq!(sanitize_pty_output(""), "");
+    }
+
+    #[test]
+    fn sanitize_does_not_corrupt_multibyte_utf8() {
+        // Chinese characters in bastion prompts must survive.
+        let s = "请选择目标资产\r\n";
+        assert_eq!(sanitize_pty_output(s), "请选择目标资产\n");
     }
 
     #[test]

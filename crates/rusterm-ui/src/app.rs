@@ -6275,6 +6275,7 @@ fn multi_pane_container(
         &'static str,
         String,
         CommandStatus,
+        bool,
         String,
         u32,
         &'static str,
@@ -6418,6 +6419,13 @@ fn multi_pane_container(
                     .map(|t| (t.name.clone(), t.last_command_status.clone()))
                     .unwrap_or_else(|| (sid.clone(), CommandStatus::Idle))
             };
+            // Connection state feeds the badge's "已连接" fallback: a live
+            // session whose command status is Idle (e.g. a jump-host target
+            // whose shell can't report exit codes) still shows green
+            // connection feedback instead of no badge at all.
+            let pane_connected = !sid.is_empty()
+                && state.read().session_connection_states.get(&sid).copied()
+                    == Some(SessionConnectionState::Connected);
             // `drag_sid` is a second clone for the ondragstart closure
             // (the first clone `drop_session_id` is consumed by the
             // ondrop closure; the original `sid` is consumed by the
@@ -6485,6 +6493,7 @@ fn multi_pane_container(
                 title_chrome,
                 title,
                 command_status,
+                pane_connected,
                 drag_sid,
                 z_index,
                 window_chrome,
@@ -6646,7 +6655,7 @@ fn multi_pane_container(
             // when the dragged pane actually changes. This aligns with the
             // user's frequency-vs-feedback preference: fewer re-renders over
             // per-tick feedback.
-            for (idx, session_id, (x, y, w, h), drop_session_id, border_style, drag_over_region, title_chrome, pane_title, command_status, drag_sid, z_index, window_chrome, pane_actions, pane_owner_for_click, pane_owner_for_title, accent_color, content_dim_style) in pane_items.into_iter() {
+            for (idx, session_id, (x, y, w, h), drop_session_id, border_style, drag_over_region, title_chrome, pane_title, command_status, pane_connected, drag_sid, z_index, window_chrome, pane_actions, pane_owner_for_click, pane_owner_for_title, accent_color, content_dim_style) in pane_items.into_iter() {
                 div {
                     key: "pane-{idx}-{session_id}",
                     style: format!(
@@ -7012,8 +7021,10 @@ fn multi_pane_container(
                         }
                         // Task #65: every split pane reports its own command
                         // result in the pane title bar. This never overlays or
-                        // mutates terminal output.
-                        CommandStatusBadge { status: command_status }
+                        // mutates terminal output. A live Connected session
+                        // with no command result yet shows a green "已连接"
+                        // badge instead of nothing.
+                        CommandStatusBadge { status: command_status, connected: pane_connected }
                         {pane_actions}
                     },
                     // Terminal content area: fills the remaining height

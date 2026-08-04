@@ -748,9 +748,14 @@ async fn exec_via_live_session(
     let stdout = if let Some((tag_idx, _)) = marker {
         let before = String::from_utf8_lossy(&raw[..tag_idx]);
         let before = before.trim_end_matches(['\r', '\n', ' ']);
-        strip_echoed_wrapper(before)
+        // PTY output carries terminal init chatter (bracketed-paste `ESC[?2004l`,
+        // colour codes, ...) and CRLF from `ONLCR`; strip both so the captured
+        // stdout survives a redirect like `rusterm kubectl -o yaml > out.yaml`.
+        let stripped = strip_echoed_wrapper(before);
+        rusterm_ssh::direct::sanitize_pty_output(&stripped)
     } else {
-        strip_echoed_wrapper(&String::from_utf8_lossy(&raw))
+        let stripped = strip_echoed_wrapper(&String::from_utf8_lossy(&raw));
+        rusterm_ssh::direct::sanitize_pty_output(&stripped)
     };
 
     Ok(ExecOutcome {
@@ -840,7 +845,7 @@ impl LiveExecStreamParser {
             let keep = self.rc_tag.len() + 32;
             let cut = self.pending.len() - keep;
             let head: Vec<u8> = self.pending.drain(..cut).collect();
-            let text = String::from_utf8_lossy(&head).into_owned();
+            let text = rusterm_ssh::direct::sanitize_pty_output(&String::from_utf8_lossy(&head));
             return (self.release(&text), None);
         }
 
@@ -862,14 +867,28 @@ impl LiveExecStreamParser {
     /// Drop lines that belong to the sentinel machinery rather than the
     /// command's own output: the echoed wrapper (`… ; __rc=$? ; printf …`,
     /// which also contains the rc tag) and any incomplete marker line.
+    ///
+    /// Each surviving line is also passed through
+    /// [`rusterm_ssh::direct::sanitize_pty_output`] so ANSI escape sequences
+    /// (bracketed-paste `ESC[?2004l`, colour codes, ...) and `\r\n` endings
+    /// emitted by the PTY don't leak into the streamed chunks. The marker
+    /// scan still runs against the raw `pending` bytes, so stripping ANSI
+    /// here can't mask the rc tag.
     fn filter_wrapper_lines(&self, raw: &[u8]) -> String {
+        use rusterm_ssh::direct::sanitize_pty_output;
+
         let text = String::from_utf8_lossy(raw);
         let mut out = String::new();
         for segment in text.split_inclusive('\n') {
             if segment.contains("__rc=$?") || segment.contains(&self.rc_tag) {
                 continue;
             }
-            out.push_str(segment);
+            // Sanitize in place: strip ANSI sequences and convert `\r\n` →
+            // `\n` (lone `\r` → `\n`). Because `split_inclusive` keeps the
+            // trailing `\n`, each `segment` is at most one line, so
+            // per-segment sanitization is equivalent to sanitizing the
+            // whole body and re-splitting.
+            out.push_str(&sanitize_pty_output(segment));
         }
         out
     }
@@ -1621,21 +1640,23 @@ mod tests {
     /// Complete lines flow through immediately; the trailing partial line
     /// is held until its newline arrives — this is the chunking contract
     /// that lets a long-running command's output stream out line by line
-    /// instead of being buffered until completion.
+    /// instead of being buffered until completion. PTY CRLF endings are
+    /// normalized to LF on the way out.
     #[test]
     fn stream_parser_emits_complete_lines_and_holds_partial_tail() {
         let mut parser = LiveExecStreamParser::new("RUSTERM_TEST_RC_");
         let (chunk, code) = parser.feed(b"row-1\r\nrow-2\r\npartial");
-        assert_eq!(chunk.as_deref(), Some("row-1\r\nrow-2\r\n"));
+        assert_eq!(chunk.as_deref(), Some("row-1\nrow-2\n"));
         assert_eq!(code, None);
         let (chunk, code) = parser.feed(b"-rest\r\n");
-        assert_eq!(chunk.as_deref(), Some("partial-rest\r\n"));
+        assert_eq!(chunk.as_deref(), Some("partial-rest\n"));
         assert_eq!(code, None);
     }
 
     /// The echoed sentinel wrapper (which contains both `__rc=$?` and the
     /// rc tag) is dropped from the stream, mirroring the buffered path's
-    /// `strip_echoed_wrapper`.
+    /// `strip_echoed_wrapper`. ANSI sequences and CRLF endings are also
+    /// stripped from each emitted chunk.
     #[test]
     fn stream_parser_drops_the_echoed_wrapper_line() {
         let rc_tag = "RUSTERM_TEST_RC_";
@@ -1643,7 +1664,7 @@ mod tests {
         let echo =
             format!("{{ ls ; }} ; __rc=$? ; printf '\\n{rc_tag}%d\\n' \"$__rc\"\r\nfile-a\r\n");
         let (chunk, code) = parser.feed(echo.as_bytes());
-        assert_eq!(chunk.as_deref(), Some("file-a\r\n"));
+        assert_eq!(chunk.as_deref(), Some("file-a\n"));
         assert_eq!(code, None);
     }
 
@@ -1655,7 +1676,7 @@ mod tests {
         let rc_tag = "RUSTERM_TEST_RC_";
         let mut parser = LiveExecStreamParser::new(rc_tag);
         let (chunk, code) = parser.feed(b"result-line\r\n\nRUSTERM_TEST_");
-        assert_eq!(chunk.as_deref(), Some("result-line\r\n\n"));
+        assert_eq!(chunk.as_deref(), Some("result-line\n\n"));
         assert_eq!(code, None);
         // The partial marker stays pending — nothing is emitted.
         let (chunk, code) = parser.feed(b"RC_");
@@ -1672,7 +1693,7 @@ mod tests {
     fn stream_parser_flush_releases_pending_tail() {
         let mut parser = LiveExecStreamParser::new("RUSTERM_TEST_RC_");
         let (chunk, _) = parser.feed(b"done-line\r\nstill-running");
-        assert_eq!(chunk.as_deref(), Some("done-line\r\n"));
+        assert_eq!(chunk.as_deref(), Some("done-line\n"));
         assert_eq!(parser.flush().as_deref(), Some("still-running"));
         // Flush drains — a second flush has nothing left.
         assert_eq!(parser.flush(), None);

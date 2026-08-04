@@ -207,6 +207,11 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         "restore.replay_badge" => ("replay", "回放"),
 
         // ── cmd_status.* — command status badge ─────────────────────────
+        "cmd_status.connected" => ("✓ Connected", "✓ 已连接"),
+        "cmd_status.connected_tip" => (
+            "Session is connected (no command result to report yet)",
+            "会话已连接（尚无命令执行结果）",
+        ),
         "cmd_status.success" => ("✓ Success", "✓ 成功"),
         "cmd_status.success_tip" => (
             "Last command succeeded (exit 0)",

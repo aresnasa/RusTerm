@@ -332,8 +332,13 @@ pub fn TabBar(
                             }
 
                             // Task #65: status belongs to the session's real top
-                            // bar, not to the terminal output surface.
-                            CommandStatusBadge { status: command_status }
+                            // bar, not to the terminal output surface. A live
+                            // Connected session with no command result yet still
+                            // shows a green "已连接" badge (see CommandStatusBadge).
+                            CommandStatusBadge {
+                                status: command_status,
+                                connected: conn_state == Some(SessionConnectionState::Connected),
+                            }
 
                             // Close button (show on hover or active)
                             if is_hover || is_active {
