@@ -26,7 +26,6 @@ tokio-rustls.workspace = true
 webpki-roots.workspace = true
 reqwest.workspace = true
 async-trait.workspace = true
-chrono.workspace = true
 serde_json.workspace = true
 
 rusterm-core.workspace = true

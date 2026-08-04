@@ -109,7 +109,7 @@ pub async fn connect_direct(
     ));
     let handle = tokio::time::timeout(
         options.connect_timeout,
-        connect_authenticated(config, client_cfg),
+        connect_authenticated(config, client_cfg, crate::otp::OtpProvider::Manual),
     )
     .await
     .map_err(|_| {
