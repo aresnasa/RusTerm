@@ -220,5 +220,5 @@ Linux gpu-muxi-001.x86.test.brainpp.dev 5.15.0-119-generic #1，将API 脚本放
 98. 模型可以从https://hf-mirror.com/下载，同时还要预留更换不同小模型的接口，支持用户自定义小模型。
 99. [@Image](zed:///agent/pasted-image?name=Image) 需要在[@Image](zed:///agent/pasted-image?name=Image) 这个界面里显示建议，然后自动保存，同时需要强化 settings 的搜索功能，支持模糊搜索已有的所有功能
 100. 添加 lrzsz，xterm支持，需要能够使用 lrzsz
-101. 0001:~/frank# sz k8s-node.ini
-**B00000000000000   不会弹窗，无法指定下载路径，同时还要继续修复会话无法全部复制的问题，鼠标选中也需要优化
+101. 0001:~/frank# sz k8s-node.ini**B00000000000000   不会弹窗，无法指定下载路径，同时还要继续修复会话无法全部复制的问题，鼠标选中也需要优化
+102. 全局功能-会话要支持断开和重连，顶部的会话还要支持复制会话（所有会话的登录逻辑都要支持复制）
