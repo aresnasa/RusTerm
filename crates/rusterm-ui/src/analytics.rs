@@ -37,8 +37,8 @@ pub mod enabled {
     use anyhow::{Context, Result};
     use parking_lot::Mutex;
     use rusterm_analytics::{
-        AnalyticsCommand, AnalyticsDB, BehaviorSummary, CategoryCount, HourlyUsage,
-        PrefixSuccessRate,
+        AnalyticsCommand, AnalyticsDB, BehaviorSummary, CategoryCount, Embedder, HashEmbedder,
+        HourlyUsage, PrefixSuccessRate, SuggestOptions,
     };
 
     use super::LearnedCorrection;
@@ -54,6 +54,11 @@ pub mod enabled {
     #[derive(Clone)]
     pub struct AnalyticsHandle {
         inner: Arc<Mutex<Option<AnalyticsDB>>>,
+        // Zero-cost default embedder for the habit-memory vector cache.
+        // `HashEmbedder` is stateless (just a dimension), so cloning the
+        // handle shares nothing mutable here — it's a Copy-like value behind
+        // the `Clone`-cheap `Arc`.
+        embedder: Arc<HashEmbedder>,
     }
 
     impl std::fmt::Debug for AnalyticsHandle {
@@ -69,6 +74,7 @@ pub mod enabled {
         pub fn new() -> Self {
             Self {
                 inner: Arc::new(Mutex::new(None)),
+                embedder: Arc::new(HashEmbedder::new()),
             }
         }
 
@@ -104,13 +110,16 @@ pub mod enabled {
             result
         }
 
-        /// Record a single command execution (incremental mirror). Called
-        /// from the runtime path each time a command succeeds (rc==0).
+        /// Record a single command execution (incremental mirror) AND cache
+        /// its embedding for habit-memory search. Called from the runtime
+        /// path each time a command succeeds (rc==0). Keeping the embedding
+        /// cache warm here means `suggest_by_context` can rank by semantic
+        /// similarity without re-running the embedder at query time.
         pub fn record_command(&self, cmd: &AnalyticsCommand) -> Result<()> {
             self.ensure_open()?;
             let guard = self.inner.lock();
             if let Some(db) = guard.as_ref() {
-                db.record_command(cmd)?;
+                db.record_command_embedded(cmd, self.embedder.as_ref())?;
             }
             Ok(())
         }
@@ -157,6 +166,49 @@ pub mod enabled {
                 .context("analytics db not open")?
                 .command_rankings_by_prefix(prefix, limit)?;
             Ok(rankings.into_iter().map(|r| r.command).collect())
+        }
+
+        /// Habit-memory suggestions: rank the user's commands by a blend of
+        /// semantic similarity to `partial` and recency-weighted usage
+        /// frequency. This is the "what does the user usually do that looks
+        /// like *this*?" query — it complements `suggest_by_prefix` (pure
+        /// prefix-frequency) by catching commands that don't share a textual
+        /// prefix but are semantically related (e.g. typing `kgp` could
+        /// surface `kubectl get pods` via char-n-gram + frequency).
+        ///
+        /// Returns just the command strings (sorted best-first) so the
+        /// disabled-feature stub matches this signature without depending on
+        /// `rusterm-analytics`. Uses `SuggestOptions::default()` for the
+        /// similarity/frequency blend and filters; pass `limit` to cap the
+        /// result count.
+        pub fn suggest_by_context(&self, partial: &str, limit: u32) -> Result<Vec<String>> {
+            self.ensure_open()?;
+            let query = self.embedder.embed(partial);
+            let opts = SuggestOptions {
+                limit,
+                ..SuggestOptions::default()
+            };
+            let guard = self.inner.lock();
+            let suggestions = guard
+                .as_ref()
+                .context("analytics db not open")?
+                .suggest_by_context(&query, &opts)?;
+            Ok(suggestions.into_iter().map(|s| s.command).collect())
+        }
+
+        /// Backfill the `command_embeddings` cache for commands that were
+        /// mirrored in bulk (via `mirror_from_sqlite`) and so don't yet have a
+        /// cached vector. Should be called once after a mirror so the
+        /// habit-memory layer has full coverage of historical commands, not
+        /// just the ones recorded live since the cache was introduced.
+        /// Returns the number of embeddings inserted.
+        pub fn backfill_embeddings(&self) -> Result<u64> {
+            self.ensure_open()?;
+            let guard = self.inner.lock();
+            guard
+                .as_ref()
+                .context("analytics db not open")?
+                .backfill_embeddings(self.embedder.as_ref())
         }
 
         pub fn classify(&self) -> Result<Vec<CategoryCount>> {
@@ -300,6 +352,24 @@ pub mod disabled {
         /// `rusterm_analytics` type so this module stays DuckDB-free.
         pub fn suggest_by_prefix(&self, _prefix: &str, _limit: u32) -> anyhow::Result<Vec<String>> {
             Ok(Vec::new())
+        }
+
+        /// Feature-off stub: no DuckDB, so no habit-memory vector search.
+        /// Returns an empty vec so call sites compile and behave as no-ops
+        /// without the `analytics` feature. Signature matches the enabled
+        /// version (`partial`, `limit`) — both are plain primitives so this
+        /// stub stays `rusterm-analytics`-free.
+        pub fn suggest_by_context(
+            &self,
+            _partial: &str,
+            _limit: u32,
+        ) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
+        }
+
+        /// Feature-off stub: no embeddings to backfill.
+        pub fn backfill_embeddings(&self) -> anyhow::Result<u64> {
+            Ok(0)
         }
     }
 

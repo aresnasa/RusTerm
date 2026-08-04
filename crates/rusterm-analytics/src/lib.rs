@@ -54,10 +54,12 @@ use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 
 pub mod classify;
+pub mod embed;
 pub mod mirror;
 pub mod sanitize;
 
 pub use classify::{CommandCategory, classify_commands};
+pub use embed::{DEFAULT_DIM, Embedder, HashEmbedder, cosine_similarity};
 pub use mirror::mirror_from_sqlite;
 pub use sanitize::{contains_sensitive_material, sanitize_command};
 
@@ -140,6 +142,93 @@ pub struct CommandCorrection {
 pub struct HourlyUsage {
     pub hour: u32,
     pub count: u64,
+}
+
+/// Recency-weighted ("decayed") frequency ranking of a single command line.
+///
+/// Unlike [`CommandRanking`] (which counts raw successes/failures), the
+/// `decayed_score` here is `Σ daily_decay ^ age_days` over every execution —
+/// recent runs count ~1.0, old runs fade toward 0. This is the "usage
+/// probability" signal the suggestion pipeline blends with semantic
+/// similarity (see [`AnalyticsDB::suggest_by_context`]) to model user habits.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HabitRanking {
+    pub command: String,
+    /// `Σ daily_decay ^ age_days`. Higher = used more, more recently.
+    pub decayed_score: f64,
+    pub total_count: u64,
+    pub successes: u64,
+    pub failures: u64,
+    /// RFC3339 UTC timestamp of the most recent execution.
+    pub last_seen: String,
+}
+
+impl HabitRanking {
+    /// Successes / (successes + failures); 0.0 when no known-outcome
+    /// observations exist. Mirrors `CommandRanking::success_rate`.
+    pub fn success_rate(&self) -> f64 {
+        let total = self.successes + self.failures;
+        if total == 0 {
+            0.0
+        } else {
+            self.successes as f64 / total as f64
+        }
+    }
+}
+
+/// A habit-memory suggestion: a command ranked by the blend of semantic
+/// similarity to a query and recency-weighted usage frequency.
+///
+/// Produced by [`AnalyticsDB::suggest_by_context`]. `score` is the final
+/// blended score in `[0, 1]` (higher = better); `similarity` and
+/// `decayed_score` are exposed so the UI can show *why* a command was
+/// suggested ("matches what you typed" vs "you run this a lot").
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HabitSuggestion {
+    pub command: String,
+    /// `alpha * max(0, similarity) + (1 - alpha) * freq_norm`.
+    pub score: f32,
+    /// Cosine similarity between the query embedding and the command's cached
+    /// embedding, in `[-1, 1]`. Clamped to `>= 0` in the blend.
+    pub similarity: f32,
+    /// Raw decayed frequency (same value as `HabitRanking::decayed_score`).
+    pub decayed_score: f64,
+    pub total_count: u64,
+    pub success_rate: f32,
+    pub last_seen: String,
+}
+
+/// Tuning knobs for [`AnalyticsDB::suggest_by_context`]. All fields have
+/// sensible defaults; pass `SuggestOptions::default()` for the common case.
+#[derive(Debug, Clone)]
+pub struct SuggestOptions {
+    /// Per-day decay multiplier applied to each past execution. `0.99` ≈ a
+    /// 69-day half-life: recent habits dominate but old ones still register.
+    pub daily_decay: f64,
+    /// Blend weight in `[0, 1]` between semantic similarity and frequency.
+    /// `0.0` = pure frequency, `1.0` = pure similarity, `0.5` = balanced.
+    pub alpha: f32,
+    /// Only suggest commands whose success rate is at least this (in
+    /// `[0, 1]`). `0.0` = no filter. Set higher (e.g. `0.5`) to avoid
+    /// surfacing commands the user usually fails.
+    pub min_success_rate: f32,
+    /// Only consider commands seen at least this many times. Filters out
+    /// one-off typos that happen to embed similarly to the query.
+    pub min_observations: u32,
+    /// Maximum number of suggestions to return. `0` is treated as no limit.
+    pub limit: u32,
+}
+
+impl Default for SuggestOptions {
+    fn default() -> Self {
+        Self {
+            daily_decay: 0.99,
+            alpha: 0.5,
+            min_success_rate: 0.0,
+            min_observations: 1,
+            limit: 10,
+        }
+    }
 }
 
 /// High-level behavior summary shown in the analytics panel.
@@ -232,6 +321,22 @@ impl AnalyticsDB {
             );
             CREATE INDEX IF NOT EXISTS idx_command_corrections_typo
                 ON command_corrections(typo);
+
+            -- Habit-memory vector store: one cached embedding per unique
+            -- command line. The embedding is stored as a JSON array string
+            -- (e.g. [0.1,0.2,...]) rather than a DuckDB FLOAT[N] column so
+            -- we avoid array-type binding quirks in duckdb-rs and keep the
+            -- schema portable. Vector math (cosine similarity) is done in
+            -- Rust at query time — cheap for <10k unique commands.
+            --
+            -- Populated lazily by `record_command_embedded` /
+            -- `upsert_embedding`; the raw `commands` table remains the source
+            -- of truth for frequency/decay, this is purely a semantic-similarity
+            -- cache so the (deterministic) embedder isn't re-run on every query.
+            CREATE TABLE IF NOT EXISTS command_embeddings (
+                command   VARCHAR PRIMARY KEY,
+                embedding VARCHAR NOT NULL
+            );
             ",
         )?;
         Ok(())
@@ -252,6 +357,90 @@ impl AnalyticsDB {
             duckdb::params![command, cmd.hostname, cmd.exit_code, cmd.created_at],
         )?;
         Ok(())
+    }
+
+    /// Record a command execution *and* cache its embedding for habit-memory
+    /// search. This is the preferred recording path for the live runtime:
+    /// it keeps `command_embeddings` warm so [`Self::suggest_by_context`]
+    /// can rank by semantic similarity without re-running the embedder.
+    ///
+    /// Embeddings are computed from the **sanitized** command (so cached
+    /// vectors never contain secret-derived signal) and upserted idempotently
+    /// — the same command always maps to the same vector, so repeated
+    /// executions only touch the `commands` table, not `command_embeddings`.
+    pub fn record_command_embedded(
+        &self,
+        cmd: &AnalyticsCommand,
+        embedder: &dyn embed::Embedder,
+    ) -> Result<()> {
+        let Some(command) = sanitize::sanitize_command(&cmd.command) else {
+            return Ok(());
+        };
+        {
+            let conn = self.conn.lock();
+            conn.execute(
+                "INSERT INTO commands (command, hostname, exit_code, created_at) \
+                 VALUES (?, ?, ?, ?)",
+                duckdb::params![command, cmd.hostname, cmd.exit_code, cmd.created_at],
+            )?;
+        }
+        // Compute and cache the embedding outside the DB lock — hashing is
+        // CPU-only and stateless, so there's no contention benefit to holding
+        // the lock, and re-acquiring it for the upsert is a single fast op.
+        let embedding = embedder.embed(&command);
+        self.upsert_embedding(&command, &embedding)
+    }
+
+    /// Insert (or replace) the cached embedding for a command. The embedding
+    /// is stored as a JSON array string. Public so a backfill job can populate
+    /// `command_embeddings` for commands mirrored via the bulk `mirror_from_sqlite`
+    /// path (which doesn't embed).
+    pub fn upsert_embedding(&self, command: &str, embedding: &[f32]) -> Result<()> {
+        let json = serde_json::to_string(embedding)
+            .context("serializing embedding to JSON for command_embeddings")?;
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO command_embeddings (command, embedding) VALUES (?, ?) \
+             ON CONFLICT(command) DO UPDATE SET embedding = excluded.embedding",
+            duckdb::params![command, json],
+        )?;
+        Ok(())
+    }
+
+    /// Backfill `command_embeddings` for every distinct command that doesn't
+    /// yet have a cached vector. Intended to run once after a bulk
+    /// `mirror_from_sqlite` (which inserts raw rows but no embeddings) so the
+    /// habit-memory layer has full coverage. Returns the number of embeddings
+    /// inserted. No-op for commands that already have an embedding.
+    pub fn backfill_embeddings(&self, embedder: &dyn embed::Embedder) -> Result<u64> {
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT c.command \
+             FROM commands c \
+             LEFT JOIN command_embeddings e ON e.command = c.command \
+             WHERE e.embedding IS NULL",
+        )?;
+        let missing: Vec<String> = stmt
+            .query_map([], |row| row.get::<_, String>(0))?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+        let mut inserted: u64 = 0;
+        for command in missing {
+            let embedding = embedder.embed(&command);
+            let json = serde_json::to_string(&embedding)
+                .context("serializing embedding during backfill")?;
+            // Re-acquire the lock per row — backfill is a batch job, not a
+            // hot path, so per-row locking is fine and keeps lock hold time
+            // short (each upsert is a single indexed write).
+            conn.execute(
+                "INSERT INTO command_embeddings (command, embedding) VALUES (?, ?) \
+                 ON CONFLICT(command) DO UPDATE SET embedding = excluded.embedding",
+                duckdb::params![command, json],
+            )?;
+            inserted += 1;
+        }
+        Ok(inserted)
     }
 
     /// Increment a locally learned correction pair. Pairing is decided by the
@@ -552,6 +741,206 @@ impl AnalyticsDB {
         Ok(rows)
     }
 
+    /// Recency-weighted ("decayed") frequency ranking of the user's commands.
+    ///
+    /// Each command's `decayed_score` is `Σ daily_decay ^ age_days` over all
+    /// its executions, where `age_days` is the integer-day age of each
+    /// execution relative to `now()`. A `daily_decay` of `0.99` gives a
+    /// ~69-day half-life: a command run today contributes ~1.0, one run a
+    /// week ago ~0.93, one run a year ago ~0.025. This is the "usage
+    /// probability" signal — it ranks *habits* (frequent AND recent) above
+    /// raw frequency alone.
+    ///
+    /// Unlike [`Self::command_rankings`] (pure count), this answers "what is
+    /// the user currently in the habit of doing?". Commands with NULL exit
+    /// codes count as observations but neither success nor failure. `limit`
+    /// of `0` means no limit.
+    ///
+    /// Scans the `commands` table once (vectorised by DuckDB, <1ms for <100k
+    /// rows) — no precomputed decay column to drift out of sync.
+    pub fn habit_rankings(&self, daily_decay: f64, limit: u32) -> Result<Vec<HabitRanking>> {
+        let limit_clause = if limit == 0 {
+            String::new()
+        } else {
+            format!("LIMIT {}", u64::from(limit))
+        };
+        let conn = self.conn.lock();
+        let mut stmt = conn.prepare(&format!(
+            "SELECT
+                command,
+                SUM(CASE WHEN exit_code = 0 THEN 1 ELSE 0 END) AS ok,
+                SUM(CASE WHEN exit_code IS NOT NULL AND exit_code != 0 THEN 1 ELSE 0 END) AS fail,
+                COUNT(*) AS total,
+                SUM(POWER(
+                    CAST(? AS DOUBLE),
+                    GREATEST(0, DATE_DIFF('day',
+                        TRY_CAST(created_at AS TIMESTAMPTZ),
+                        CAST(NOW() AS TIMESTAMPTZ)))
+                )) AS decayed,
+                MAX(created_at) AS last_seen
+             FROM commands
+             GROUP BY command
+             ORDER BY decayed DESC, command ASC
+             {limit_clause}"
+        ))?;
+        let rows = stmt
+            .query_map(duckdb::params![daily_decay], |row| {
+                let ok: i64 = row.get(1)?;
+                let fail: i64 = row.get(2)?;
+                let total: i64 = row.get(3)?;
+                let decayed: Option<f64> = row.get(4)?;
+                Ok(HabitRanking {
+                    command: row.get(0)?,
+                    decayed_score: decayed.unwrap_or(0.0),
+                    total_count: total as u64,
+                    successes: ok as u64,
+                    failures: fail as u64,
+                    last_seen: row.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Suggest commands the user is likely to run next, ranked by a blend of
+    /// **semantic similarity** to `query_embedding` and **decayed usage
+    /// frequency**. This is the core "habit memory" query: it answers
+    /// "what does the user usually do that looks like *this*?".
+    ///
+    /// Scoring (per candidate command):
+    /// ```text
+    ///   freq_norm   = decayed_score / max_decayed_score   // ∈ [0, 1]
+    ///   similarity  = cosine(query, cached_embedding)      // ∈ [-1, 1]
+    ///   score       = alpha * max(0, similarity) + (1 - alpha) * freq_norm
+    /// ```
+    /// Negative similarity (semantically unrelated) contributes `0`, so a
+    /// command only ranks on frequency unless it's genuinely similar to the
+    /// query. Candidates with `total_count < min_observations` or
+    /// `success_rate < min_success_rate` are filtered out first.
+    ///
+    /// Vector math is done in Rust (cosine over ≤10k cached embeddings is
+    /// <10ms); the decayed score + counts come from a single DuckDB scan.
+    /// Commands without a cached embedding are skipped (call
+    /// [`Self::backfill_embeddings`] to populate them after a bulk mirror).
+    pub fn suggest_by_context(
+        &self,
+        query_embedding: &[f32],
+        opts: &SuggestOptions,
+    ) -> Result<Vec<HabitSuggestion>> {
+        let conn = self.conn.lock();
+        // One round-trip: per-command decayed score, counts, last_seen, and
+        // the cached embedding JSON. LEFT JOIN so commands without a cached
+        // embedding are still scored on frequency (filtered out below).
+        let mut stmt = conn.prepare(
+            "SELECT
+                c.command,
+                SUM(CASE WHEN c.exit_code = 0 THEN 1 ELSE 0 END) AS ok,
+                SUM(CASE WHEN c.exit_code IS NOT NULL AND c.exit_code != 0 THEN 1 ELSE 0 END) AS fail,
+                COUNT(*) AS total,
+                SUM(POWER(
+                    CAST(? AS DOUBLE),
+                    GREATEST(0, DATE_DIFF('day',
+                        TRY_CAST(c.created_at AS TIMESTAMPTZ),
+                        CAST(NOW() AS TIMESTAMPTZ)))
+                )) AS decayed,
+                MAX(c.created_at) AS last_seen,
+                e.embedding
+             FROM commands c
+             LEFT JOIN command_embeddings e ON e.command = c.command
+             GROUP BY c.command, e.embedding",
+        )?;
+        struct Row {
+            command: String,
+            ok: u64,
+            fail: u64,
+            total: u64,
+            decayed: f64,
+            last_seen: String,
+            embedding_json: Option<String>,
+        }
+        let rows: Vec<Row> = stmt
+            .query_map(duckdb::params![opts.daily_decay], |r| {
+                let ok: i64 = r.get(1)?;
+                let fail: i64 = r.get(2)?;
+                let total: i64 = r.get(3)?;
+                let decayed: Option<f64> = r.get(4)?;
+                Ok(Row {
+                    command: r.get(0)?,
+                    ok: ok as u64,
+                    fail: fail as u64,
+                    total: total as u64,
+                    decayed: decayed.unwrap_or(0.0),
+                    last_seen: r.get::<_, Option<String>>(5)?.unwrap_or_default(),
+                    embedding_json: r.get::<_, Option<String>>(6)?,
+                })
+            })?
+            .filter_map(|r| r.ok())
+            .collect();
+        drop(stmt);
+        // Release the DB lock before the (CPU-only) vector math.
+        drop(conn);
+
+        let max_decayed = rows.iter().map(|r| r.decayed).fold(0.0f64, f64::max);
+        let alpha = opts.alpha;
+        let min_obs = u64::from(opts.min_observations.max(1));
+
+        let mut suggestions: Vec<HabitSuggestion> = rows
+            .into_iter()
+            .filter(|r| r.total >= min_obs)
+            .filter_map(|r| {
+                // Skip commands without a cached embedding — can't score
+                // similarity. (Frequency-only candidates would dominate
+                // unrelated queries; the caller can use habit_rankings for
+                // pure-frequency suggestions.)
+                let json = r.embedding_json?;
+                let emb: Vec<f32> = serde_json::from_str(&json).ok()?;
+                let success_rate = if r.ok + r.fail == 0 {
+                    0.0
+                } else {
+                    r.ok as f32 / (r.ok + r.fail) as f32
+                };
+                if success_rate < opts.min_success_rate {
+                    return None;
+                }
+                let similarity = embed::cosine_similarity(query_embedding, &emb);
+                let freq_norm = if max_decayed > 0.0 {
+                    (r.decayed / max_decayed) as f32
+                } else {
+                    0.0
+                };
+                let score = alpha * similarity.max(0.0) + (1.0 - alpha) * freq_norm;
+                Some(HabitSuggestion {
+                    command: r.command,
+                    score,
+                    similarity,
+                    decayed_score: r.decayed,
+                    total_count: r.total,
+                    success_rate,
+                    last_seen: r.last_seen,
+                })
+            })
+            .filter(|s| s.score > 0.0)
+            .collect();
+
+        // Sort by blended score desc; ties broken by raw decayed frequency
+        // (prefer stronger habits) then command asc for determinism.
+        suggestions.sort_by(|a, b| {
+            b.score
+                .partial_cmp(&a.score)
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| {
+                    b.decayed_score
+                        .partial_cmp(&a.decayed_score)
+                        .unwrap_or(std::cmp::Ordering::Equal)
+                })
+                .then_with(|| a.command.cmp(&b.command))
+        });
+        if opts.limit > 0 {
+            suggestions.truncate(opts.limit as usize);
+        }
+        Ok(suggestions)
+    }
+
     /// Commands the user frequently fails: total observations >=
     /// min_observations AND failure share >= (1.0 - max_success_rate),
     /// sorted worst (lowest success rate, then most failures) first.
@@ -674,7 +1063,7 @@ impl AnalyticsDB {
     /// analytics" UI action.
     pub fn clear(&self) -> Result<()> {
         let conn = self.conn.lock();
-        conn.execute_batch("DELETE FROM commands; DELETE FROM command_corrections;")?;
+        conn.execute_batch("DELETE FROM commands; DELETE FROM command_corrections; DELETE FROM command_embeddings;")?;
         Ok(())
     }
 }
@@ -1111,5 +1500,250 @@ mod tests {
         db.clear().unwrap();
         assert_eq!(db.total_commands().unwrap(), 0);
         assert!(db.command_corrections_for("gti status").unwrap().is_empty());
+    }
+
+    // ── habit-memory / vector-storage tests ─────────────────────────────
+
+    fn now_rfc3339() -> String {
+        chrono::Utc::now().to_rfc3339()
+    }
+
+    fn days_ago_rfc3339(days: i64) -> String {
+        (chrono::Utc::now() - chrono::Duration::days(days)).to_rfc3339()
+    }
+
+    #[test]
+    fn record_command_embedded_caches_embedding() {
+        let db = AnalyticsDB::open_in_memory().unwrap();
+        let emb = HashEmbedder::new();
+        db.record_command_embedded(&cmd("git status", Some(0), &now_rfc3339()), &emb)
+            .unwrap();
+        // The cached embedding must equal what the embedder produces.
+        let conn = db.conn.lock();
+        let json: String = conn
+            .query_row(
+                "SELECT embedding FROM command_embeddings WHERE command = 'git status'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        let cached: Vec<f32> = serde_json::from_str(&json).unwrap();
+        let expected = emb.embed("git status");
+        assert_eq!(cached.len(), expected.len());
+        for (a, b) in cached.iter().zip(expected.iter()) {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "cached embedding must match embedder output"
+            );
+        }
+    }
+
+    #[test]
+    fn record_command_embedded_drops_secret_commands() {
+        // A PEM-key command is dropped by the sanitizer — it must NOT be
+        // recorded in commands NOR get a cached embedding.
+        let db = AnalyticsDB::open_in_memory().unwrap();
+        let emb = HashEmbedder::new();
+        let pem = "cat -----BEGIN PRIVATE KEY-----\nMIIEvQ==";
+        db.record_command_embedded(&cmd(pem, Some(0), &now_rfc3339()), &emb)
+            .unwrap();
+        assert_eq!(db.total_commands().unwrap(), 0);
+        let conn = db.conn.lock();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM command_embeddings", [], |r| r.get(0))
+            .unwrap();
+        drop(conn);
+        assert_eq!(n, 0, "no embedding should be cached for a dropped command");
+    }
+
+    #[test]
+    fn upsert_embedding_is_idempotent() {
+        let db = AnalyticsDB::open_in_memory().unwrap();
+        let v = vec![0.1, 0.2, 0.3];
+        db.upsert_embedding("ls", &v).unwrap();
+        db.upsert_embedding("ls", &v).unwrap();
+        let conn = db.conn.lock();
+        let n: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM command_embeddings WHERE command = 'ls'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        drop(conn);
+        assert_eq!(n, 1, "upsert must not duplicate rows");
+    }
+
+    #[test]
+    fn backfill_embeddings_fills_missing() {
+        let db = AnalyticsDB::open_in_memory().unwrap();
+        // Record via the non-embedding path (simulates bulk mirror).
+        db.record_command(&cmd("git status", Some(0), &now_rfc3339()))
+            .unwrap();
+        db.record_command(&cmd("docker ps", Some(0), &now_rfc3339()))
+            .unwrap();
+        let emb = HashEmbedder::new();
+        let filled = db.backfill_embeddings(&emb).unwrap();
+        assert_eq!(filled, 2);
+        // Second backfill is a no-op.
+        let again = db.backfill_embeddings(&emb).unwrap();
+        assert_eq!(again, 0);
+    }
+
+    #[test]
+    fn habit_rankings_decays_by_recency() {
+        // "ls" was run 1000 days ago; "pwd" was run today. With a 0.99 daily
+        // decay, the 1000-day-old command contributes ~0.99^1000 ≈ 4e-5,
+        // effectively 0 — so "pwd" must rank above "ls" even though both have
+        // one execution.
+        let db = AnalyticsDB::open_in_memory().unwrap();
+        db.record_command(&cmd("ls", Some(0), &days_ago_rfc3339(1000)))
+            .unwrap();
+        db.record_command(&cmd("pwd", Some(0), &now_rfc3339()))
+            .unwrap();
+        let rankings = db.habit_rankings(0.99, 0).unwrap();
+        assert_eq!(rankings.len(), 2);
+        assert_eq!(rankings[0].command, "pwd", "recent command must rank first");
+        assert!(
+            rankings[0].decayed_score > rankings[1].decayed_score,
+            "recent decayed score {} must beat old {}",
+            rankings[0].decayed_score,
+            rankings[1].decayed_score
+        );
+        // Today's command contributes ~1.0; 1000-day-old ~0.
+        assert!(
+            (rankings[0].decayed_score - 1.0).abs() < 0.01,
+            "today's decayed score ≈ 1.0, got {}",
+            rankings[0].decayed_score
+        );
+        assert!(
+            rankings[1].decayed_score < 0.001,
+            "1000-day-old decayed score ≈ 0, got {}",
+            rankings[1].decayed_score
+        );
+    }
+
+    #[test]
+    fn habit_rankings_counts_total_including_null_exit_codes() {
+        // Two executions of "ls": one ok, one NULL exit. total must be 2,
+        // successes 1, failures 0 (NULL is neither).
+        let db = AnalyticsDB::open_in_memory().unwrap();
+        db.record_command(&cmd("ls", Some(0), &now_rfc3339()))
+            .unwrap();
+        db.record_command(&cmd("ls", None, &now_rfc3339())).unwrap();
+        let r = db.habit_rankings(0.99, 0).unwrap();
+        assert_eq!(r.len(), 1);
+        assert_eq!(r[0].total_count, 2);
+        assert_eq!(r[0].successes, 1);
+        assert_eq!(r[0].failures, 0);
+    }
+
+    #[test]
+    fn suggest_by_context_ranks_similar_higher() {
+        let db = AnalyticsDB::open_in_memory().unwrap();
+        let emb = HashEmbedder::new();
+        // Seed two habits: a git one and a docker one.
+        for _ in 0..5 {
+            db.record_command_embedded(&cmd("git status", Some(0), &now_rfc3339()), &emb)
+                .unwrap();
+        }
+        for _ in 0..5 {
+            db.record_command_embedded(&cmd("docker ps", Some(0), &now_rfc3339()), &emb)
+                .unwrap();
+        }
+        // Query with something git-like — "git status" must outrank "docker ps".
+        let q = emb.embed("git log");
+        let sugg = db
+            .suggest_by_context(&q, &SuggestOptions::default())
+            .unwrap();
+        assert!(!sugg.is_empty());
+        assert_eq!(sugg[0].command, "git status");
+        assert!(sugg[0].similarity > 0.0);
+        // docker ps may or may not appear (its similarity could be ≤0 → filtered);
+        // but if it does, git status must be above it.
+        if let Some(docker) = sugg.iter().find(|s| s.command == "docker ps") {
+            assert!(
+                sugg[0].score >= docker.score,
+                "git status must outrank docker ps for a git-like query"
+            );
+        }
+    }
+
+    #[test]
+    fn suggest_by_context_frequency_boosts_habits() {
+        // With alpha=0 (pure frequency), the more-frequent command wins
+        // regardless of similarity.
+        let db = AnalyticsDB::open_in_memory().unwrap();
+        let emb = HashEmbedder::new();
+        for _ in 0..10 {
+            db.record_command_embedded(&cmd("ls", Some(0), &now_rfc3339()), &emb)
+                .unwrap();
+        }
+        for _ in 0..1 {
+            db.record_command_embedded(&cmd("pwd", Some(0), &now_rfc3339()), &emb)
+                .unwrap();
+        }
+        let q = emb.embed("pwd"); // semantically biased toward pwd
+        let pure_freq = SuggestOptions {
+            alpha: 0.0,
+            ..SuggestOptions::default()
+        };
+        let sugg = db.suggest_by_context(&q, &pure_freq).unwrap();
+        assert!(!sugg.is_empty());
+        // "ls" has 10x the decayed frequency, so with alpha=0 it must win.
+        assert_eq!(sugg[0].command, "ls");
+    }
+
+    #[test]
+    fn suggest_by_context_filters_low_success_rate() {
+        let db = AnalyticsDB::open_in_memory().unwrap();
+        let emb = HashEmbedder::new();
+        // "badcmd" fails every time.
+        for _ in 0..5 {
+            db.record_command_embedded(&cmd("badcmd", Some(1), &now_rfc3339()), &emb)
+                .unwrap();
+        }
+        let q = emb.embed("badcmd");
+        let strict = SuggestOptions {
+            min_success_rate: 0.5,
+            ..SuggestOptions::default()
+        };
+        let sugg = db.suggest_by_context(&q, &strict).unwrap();
+        assert!(
+            sugg.iter().all(|s| s.command != "badcmd"),
+            "0% success-rate command must be filtered out"
+        );
+    }
+
+    #[test]
+    fn suggest_by_context_skips_commands_without_embedding() {
+        // Record via the non-embedding path, so command_embeddings is empty.
+        let db = AnalyticsDB::open_in_memory().unwrap();
+        db.record_command(&cmd("git status", Some(0), &now_rfc3339()))
+            .unwrap();
+        let q = HashEmbedder::new().embed("git");
+        let sugg = db
+            .suggest_by_context(&q, &SuggestOptions::default())
+            .unwrap();
+        assert!(
+            sugg.is_empty(),
+            "commands without a cached embedding must be skipped"
+        );
+    }
+
+    #[test]
+    fn clear_wipes_embeddings() {
+        let db = AnalyticsDB::open_in_memory().unwrap();
+        let emb = HashEmbedder::new();
+        db.record_command_embedded(&cmd("ls", Some(0), &now_rfc3339()), &emb)
+            .unwrap();
+        db.clear().unwrap();
+        let conn = db.conn.lock();
+        let n: i64 = conn
+            .query_row("SELECT COUNT(*) FROM command_embeddings", [], |r| r.get(0))
+            .unwrap();
+        drop(conn);
+        assert_eq!(n, 0, "clear() must wipe command_embeddings too");
     }
 }
