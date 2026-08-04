@@ -1733,6 +1733,27 @@ pub fn set_active_tab(state: &mut AppState, tab_id: &str) {
         .iter()
         .find(|t| t.id == tab_id)
         .and_then(|t| t.anchor_session_id.clone());
+    // Keep the focused-tab outline attached to the newly active tab: point
+    // pane focus at the pane holding the tab's anchor session (or pane 0).
+    // Tabs whose implicit Single layout has no entry drop explicit pane
+    // focus; `focused_pane_session` then yields None and the UI falls back
+    // to the tab's anchor session.
+    state.focused_pane = state.layouts.get(tab_id).map(|layout| {
+        let pane_idx = state
+            .active_session
+            .as_deref()
+            .and_then(|anchor| {
+                layout
+                    .panes
+                    .iter()
+                    .position(|pane| pane.session_id == anchor)
+            })
+            .unwrap_or(0);
+        FocusedPane {
+            layout_owner_tab_id: tab_id.to_string(),
+            pane_idx,
+        }
+    });
 }
 
 /// Activate the workspace tab and pane that contain `session_id`.
