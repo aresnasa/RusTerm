@@ -11,8 +11,8 @@ max-height: var(--suggestion-popup-max-height, calc(100% - var(--suggestion-top,
    - **拖动中**(`popup_drag_active` Signal 为 true):resize future 本 tick 跳过写入,位置由拖动 JS 直接维护。
    - **手动偏移**(`SUGGESTION_POPUP_OFFSET_Y` GlobalSignal ≠ 0):`build_manual_popup_layout_script` 在 JS 里算 `top = clamp(anchor + offset, 0, H-24)`(anchor = `--suggestion-top`),max-height = 剩余空间;忽略自动上/下翻转。
    - **自动**(offset == 0):`popup_layout()` 方向选择(优先下方,`POPUP_MIN_BELOW_PX=48`)。
-2. **`--suggestion-top/bottom`**:测量 eval 通过 `[data-cursor-row="1"]` 找光标行,写在 `terminal-input-{sid}` 容器上。
-3. **`fallback_top` prop**:`popup_fallback_top_px(cursor_row)` = `8 + (row+1)×19` px 兜底(首帧)。
+2. **`--suggestion-top/bottom`**:测量脚本 `build_terminal_measure_script(measure_cid, scroll_cid)`(纯函数,可测试)写在 `terminal-input-{sid}` 容器上。**锚点行分离(2026-08 Task 6)**:`--suggestion-top` 和 popupBelow 用 **popup 锚点行** `[data-popup-anchor="1"] || [data-cursor-row="1"]` 的 rect(锚点 = 光标行之后最后一个有非空白内容的行,`popup_anchor_row(&rows, cursor_row)` 纯函数计算;提示符在屏幕中部、下方还有旧输出时弹窗开在旧输出下面,不遮挡);`--suggestion-bottom` 和 popupAbove 仍用**光标行** rect(上翻仍贴提示符上方)。两个 data 属性都仅在 cursor_visible 时通过 `html.push_str` 注入行 HTML。
+3. **`fallback_top` prop**:`popup_fallback_top_px(popup_anchor)` = `8 + (row+1)×19` px 兜底(首帧;Task 6 起传锚点行而非光标行)。
 
 ## 拖动弹窗 + 记录用户习惯(2026-08, Task 5)
 - 两个弹窗顶部有 **拖动把手条**("•••", 12px 高, cursor:grab;OneKeyPopup 的把手 `margin-right:26px` 避开右上 × 按钮)。props:`on_drag_start: EventHandler<f64>`(clientY)+ `on_position_reset: EventHandler<()>`(双击复位),均 `#[props(default)]`。
@@ -34,7 +34,12 @@ max-height: var(--suggestion-popup-max-height, calc(100% - var(--suggestion-top,
 - 测量/轮询 eval 需顶层 `return`。
 - 拖动把手的 onmousedown 必须 prevent_default+stop_propagation(与弹窗根的焦点保护 handler 共存);把手 dblclick 依赖"未移动即 cancel"保护,否则单纯点击会把当前位置误存为偏移。
 
+## Task 6 备注(锚点行)
+- 拖动偏移相对 `--suggestion-top`,自动继承新锚点,无需改拖动代码;OneKey feedback label 同理。
+- 全屏应用(vim 等)光标下方全是内容 → 锚点=最后一行 → 弹窗上翻,可接受。
+- 已知取舍:`popup_anchor_row` 只在渲染时算一次,与 100ms 测量异步,极端刷屏下最多滞后一个测量周期。
+
 ## 测试
-`terminal_view.rs::tests`:6 个 popup 定位纯函数测试 + `popup_drag_script_uses_document_capture_listeners_and_unique_globals`、`popup_drag_poll_parsing_covers_pending_cancel_and_done`、`popup_drag_offsets_snap_to_automatic_and_clamp_extremes`、`manual_popup_layout_script_applies_offset_on_top_of_the_anchor`。
+`terminal_view.rs::tests`:6 个 popup 定位纯函数测试 + `popup_anchor_row_*`(4 个:提示符在末尾退化为光标行/下方有内容取最后内容行/纯空白行视为空/忽略光标上方内容)+ `measure_script_anchors_suggestion_top_to_popup_anchor_row` + `popup_drag_script_uses_document_capture_listeners_and_unique_globals`、`popup_drag_poll_parsing_covers_pending_cancel_and_done`、`popup_drag_offsets_snap_to_automatic_and_clamp_extremes`、`manual_popup_layout_script_applies_offset_on_top_of_the_anchor`。
 `config_manager.rs::tests`:`suggestion_popup_offset_defaults_roundtrips_and_survives_other_saves`、`suggestion_popup_offset_normalization_rejects_garbage`。
-基线:rusterm-ui lib **727**,rusterm-core lib **193**(2026-08 Task 5 后)。
+基线:rusterm-ui lib **732**,rusterm-core lib **193**(2026-08 Task 6 后)。
