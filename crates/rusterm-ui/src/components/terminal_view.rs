@@ -1180,6 +1180,27 @@ fn popup_layout(space_above: f64, space_below: f64, desired_height: f64) -> Popu
     }
 }
 
+/// Rendered height of one terminal row in px (13px font × 1.5 line-height,
+/// as WebKit lays it out). Keep in sync with the container/row styles below.
+const TERMINAL_ROW_HEIGHT_PX: f64 = 19.0;
+
+/// Top padding of the terminal container (`padding: 8px 12px 4px 4px`).
+const TERMINAL_PADDING_TOP_PX: f64 = 8.0;
+
+/// Pane-relative `top` (px) placing a popup directly BELOW the cursor row,
+/// computed purely from the render state (no DOM measurement).
+///
+/// This is the CSS fallback for `--suggestion-top`: the measurement loop
+/// (the 100ms resize future) refines the value from live DOM rects, but it
+/// runs asynchronously — on the popup's first frame, or if the measurement
+/// ever fails to find the cursor row, the variable is unset. The previous
+/// fallback was a fixed `2em`, which pinned the popup to the TOP of the
+/// terminal while the prompt sat far below it. Deriving the fallback from
+/// `cursor_row` keeps the popup under the prompt from the very first frame.
+fn popup_fallback_top_px(cursor_row: usize) -> f64 {
+    TERMINAL_PADDING_TOP_PX + (cursor_row as f64 + 1.0) * TERMINAL_ROW_HEIGHT_PX
+}
+
 #[component]
 pub fn TerminalView(
     session_id: String,
@@ -1917,6 +1938,11 @@ pub fn TerminalView(
     let cursor_visible = render_output.cursor_visible;
     let line_number_start = render_output.line_number_start;
     let total_rows = render_output.rows.len();
+
+    // Deterministic below-the-prompt fallback for popup positioning, used
+    // until (or whenever) the DOM measurement loop hasn't provided
+    // `--suggestion-top`. See `popup_fallback_top_px`.
+    let popup_fallback_top = format!("{:.0}px", popup_fallback_top_px(cursor_row));
 
     // Scroll-position indicator: a small "thumb" on the right edge showing
     // where the visible window sits within (scrollback + grid). Only shown when
@@ -2776,6 +2802,7 @@ pub fn TerminalView(
                     correction_suggestions: current_suggestion_corrections.clone(),
                     history_completion: current_history_completion_visible,
                     max_rows: suggestion_max_rows,
+                    fallback_top: popup_fallback_top.clone(),
                 }
             }
 
@@ -2784,7 +2811,7 @@ pub fn TerminalView(
                 Some(OneKeySubmissionFeedback::Submitted { .. })
             ) {
                 div {
-                    style: "position:absolute;right:10px;top:var(--suggestion-top, 2em);z-index:19;padding:5px 9px;background:var(--skin-bg);border:1px solid var(--skin-success);border-radius:4px;color:var(--skin-success);font-size:11px;pointer-events:none;",
+                    style: "position:absolute;right:10px;top:var(--suggestion-top, {popup_fallback_top});z-index:19;padding:5px 9px;background:var(--skin-bg);border:1px solid var(--skin-success);border-radius:4px;color:var(--skin-success);font-size:11px;pointer-events:none;",
                     { crate::i18n::t("onekey.submission_feedback") }
                 }
             }

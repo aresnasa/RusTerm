@@ -19,6 +19,12 @@ pub fn OneKeyPopup(
     on_select: EventHandler<usize>,
     on_save: EventHandler<()>,
     on_dismiss: EventHandler<()>,
+    /// CSS length used for `top` when the measured `--suggestion-top` /
+    /// `--suggestion-popup-top` variables are not (yet) set. TerminalView
+    /// passes a pixel offset computed from the cursor row so the popup opens
+    /// below the prompt from its very first frame; defaults to `2em`.
+    #[props(default = "2em".to_string())]
+    fallback_top: String,
 ) -> Element {
     let _lang = crate::i18n::LANGUAGE();
     let rejected = matches!(
@@ -37,9 +43,9 @@ pub fn OneKeyPopup(
             style: "
                 position: absolute;
                 left: 0; right: 0;
-                top: var(--suggestion-popup-top, var(--suggestion-top, 2em));
+                top: var(--suggestion-popup-top, var(--suggestion-top, {fallback_top}));
                 bottom: var(--suggestion-popup-bottom, auto);
-                max-height: var(--suggestion-popup-max-height, calc(100% - var(--suggestion-top, 2em)));
+                max-height: var(--suggestion-popup-max-height, calc(100% - var(--suggestion-top, {fallback_top})));
                 overflow-y: auto;
                 background: #16161e;
                 border: 1px solid #2a2b3d;

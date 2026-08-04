@@ -11512,6 +11512,7 @@ fn start_ssh_connection(
                                             .unwrap_or(0)
                                     );
                                 }
+                                let mut had_pending_command = false;
                                 let committed: Option<(
                                     String,
                                     String,
@@ -11523,6 +11524,7 @@ fn start_ssh_connection(
                                         .pending_exit_check
                                         .get_mut(&id)
                                         .and_then(|q| q.pop_front());
+                                    had_pending_command = popped.is_some();
                                     tracing::info!(
                                         "[OUTPUT-SSH] rc={} popped={:?}",
                                         rc,
@@ -11708,6 +11710,9 @@ fn start_ssh_connection(
                                         }
                                     }
                                 }
+                                // Capture before the move below — the badge update reads this after
+                                // `committed` is destructured by `if let Some(...) = committed`.
+                                let committed_was_some = committed.is_some();
                                 if let Some((cmd, db_id, hostname, learned_typo)) = committed {
                                     let sid = id.clone();
                                     // Clone for the analytics record (the original `cmd` is
@@ -11797,23 +11802,23 @@ fn start_ssh_connection(
                                         });
                                     }
                                 }
-                                // Task #65: surface the command's exit code as a
-                                // colored badge in the terminal pane top bar
-                                // (NOT as an injected ANSI line — the user
-                                // explicitly rejected terminal-output injection).
-                                // OSC 133;D (zsh/bash) gave us the exit code;
-                                // we store it on the SessionTab so the top-bar
-                                // renderer can show green ✓ / red ✗. fish/nu/pwsh
-                                // don't report exit codes, so this is a no-op
-                                // there.
+                                // Task #65: surface the command's exit code as a colored
+                                // badge in the terminal pane top bar. Only when a
+                                // real user command was tracked (popped from the
+                                // queue); spurious shell-startup markers must
+                                // NOT flip the badge. See `decide_command_status`.
                                 if let Some(rc) = exit_code {
-                                    let mut s = state.write();
-                                    if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
-                                        tab.last_command_status = if rc == 0 {
-                                            CommandStatus::Success
-                                        } else {
-                                            CommandStatus::Failed(rc)
-                                        };
+                                    if let Some(status) = decide_command_status(
+                                        had_pending_command,
+                                        committed_was_some,
+                                        rc,
+                                    ) {
+                                        let mut s = state.write();
+                                        if let Some(tab) =
+                                            s.sessions.iter_mut().find(|t| t.id == id)
+                                        {
+                                            tab.last_command_status = status;
+                                        }
                                     }
                                 }
                             }
@@ -11946,6 +11951,36 @@ fn start_ssh_connection(
 /// target whose shell wasn't configured with shell integration). In that case
 /// the command stays in the `pending_exit_check` queue until the shell reports
 /// an exit code or the session is closed.
+/// Decide the badge [`CommandStatus`] from a shell-reported exit code.
+///
+/// Returns `None` when the marker is spurious — i.e. no user command was
+/// being tracked (`!had_pending_command`). This is the connect-time fix:
+/// the shell's first precmd after shell-integration injection emits
+/// `OSC 133;D;$?` where `$?` reflects `.bashrc`/`.zshrc` noise (e.g. a
+/// missing `powerline-daemon` → 127). That marker pops nothing from the
+/// `pending_exit_check` queue, so it must NOT flip the badge — otherwise
+/// the user sees "✗ Failed (exit 127)" right after connecting despite the
+/// connection succeeding.
+///
+/// - `had_pending_command`: a command was popped from the queue.
+/// - `committed`: the command line was committed to history (covers rc==0
+///   AND compound commands whose last segment is non-zero).
+/// - `rc`: the shell-reported exit code.
+fn decide_command_status(
+    had_pending_command: bool,
+    committed: bool,
+    rc: i32,
+) -> Option<CommandStatus> {
+    if !had_pending_command {
+        return None;
+    }
+    Some(if committed {
+        CommandStatus::Success
+    } else {
+        CommandStatus::Failed(rc)
+    })
+}
+
 fn process_session_exit_code(
     mut state: Signal<AppState>,
     session_id: &str,
@@ -11979,12 +12014,23 @@ fn process_session_exit_code(
     }
 
     // ── Commit decision: pop the pending command and decide commit vs fail ──
+    // `had_pending_command` records whether the queue actually had a command
+    // to pop. Spurious OSC 133;D markers — emitted by the shell's first
+    // precmd right after shell-integration injection, where `$?` reflects
+    // `.bashrc`/`.zshrc` noise (e.g. a missing `powerline-daemon` → 127) —
+    // pop nothing and must NOT flip the status badge, otherwise the user
+    // sees "✗ Failed (exit 127)" right after connecting.
+    // Initialized to `false` so the outer scope is initialized for the
+    // borrow checker; the block below always overwrites it before it's read.
+    #[allow(unused_assignments)]
+    let mut had_pending_command = false;
     let committed: Option<(String, String, Option<String>, Option<String>)> = {
         let mut s = state.write();
         let popped = s
             .pending_exit_check
             .get_mut(session_id)
             .and_then(|q| q.pop_front());
+        had_pending_command = popped.is_some();
         tracing::info!(
             "[OUTPUT-{}] rc={} popped={:?}",
             log_tag,
@@ -12091,6 +12137,9 @@ fn process_session_exit_code(
     };
 
     // ── Recording: if a command was committed, persist to history DB + analytics ──
+    // Capture before the move below — the badge update reads this after `committed`
+    // has been destructured by `if let Some(...) = committed`.
+    let committed_was_some = committed.is_some();
     if let Some((cmd, db_id, hostname, learned_typo)) = committed {
         let sid = session_id.to_string();
         // Clone for the analytics record (the original `cmd` is moved into the
@@ -12158,14 +12207,12 @@ fn process_session_exit_code(
     }
 
     // ── Update the tab's exit-code badge ──
-    {
+    // Only when a real user command was tracked (popped from the queue).
+    // See `decide_command_status` for the spurious-marker rationale.
+    if let Some(status) = decide_command_status(had_pending_command, committed_was_some, rc) {
         let mut s = state.write();
         if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == session_id) {
-            tab.last_command_status = if rc == 0 {
-                CommandStatus::Success
-            } else {
-                CommandStatus::Failed(rc)
-            };
+            tab.last_command_status = status;
         }
     }
 }
@@ -12405,6 +12452,7 @@ fn start_shell_connection(
                                             .unwrap_or(0)
                                     );
                                 }
+                                let mut had_pending_command = false;
                                 let committed: Option<(
                                     String,
                                     String,
@@ -12416,6 +12464,7 @@ fn start_shell_connection(
                                         .pending_exit_check
                                         .get_mut(&id)
                                         .and_then(|q| q.pop_front());
+                                    had_pending_command = popped.is_some();
                                     tracing::info!(
                                         "[OUTPUT-LOCAL] rc={} popped={:?}",
                                         rc,
@@ -12567,6 +12616,9 @@ fn start_shell_connection(
                                         }
                                     }
                                 }
+                                // Capture before the move below — the badge update reads this after
+                                // `committed` is destructured by `if let Some(...) = committed`.
+                                let committed_was_some = committed.is_some();
                                 if let Some((cmd, db_id, hostname, learned_typo)) = committed {
                                     let sid = id.clone();
                                     // Clone for the analytics record (the original `cmd` is
@@ -12656,18 +12708,23 @@ fn start_shell_connection(
                                         });
                                     }
                                 }
-                                // Task #65: surface the command's exit code as a
-                                // colored badge in the terminal pane top bar
-                                // (local shell path). Mirrors the SSH branch —
-                                // see there for rationale.
+                                // Task #65: surface the command's exit code as a colored
+                                // badge (local shell path). Only when a real user
+                                // command was tracked; spurious shell-startup
+                                // markers must NOT flip the badge. See
+                                // `decide_command_status`.
                                 if let Some(rc) = exit_code {
-                                    let mut s = state.write();
-                                    if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
-                                        tab.last_command_status = if rc == 0 {
-                                            CommandStatus::Success
-                                        } else {
-                                            CommandStatus::Failed(rc)
-                                        };
+                                    if let Some(status) = decide_command_status(
+                                        had_pending_command,
+                                        committed_was_some,
+                                        rc,
+                                    ) {
+                                        let mut s = state.write();
+                                        if let Some(tab) =
+                                            s.sessions.iter_mut().find(|t| t.id == id)
+                                        {
+                                            tab.last_command_status = status;
+                                        }
                                     }
                                 }
                             }
@@ -20708,5 +20765,48 @@ mod command_status_tests {
             CommandStatus::Disconnected(reason) => assert_eq!(reason, "timeout"),
             other => panic!("expected Disconnected, got {other:?}"),
         }
+    }
+
+    // ── Spurious-marker guard (connect-time "error 127" fix) ──
+    // The shell's first precmd after shell-integration injection emits
+    // OSC 133;D;$? where $? reflects .bashrc/.zshrc noise (e.g. a missing
+    // helper → 127). With no command in the pending queue, that marker must
+    // NOT flip the badge — otherwise the user sees "✗ Failed (exit 127)"
+    // right after connecting.
+
+    #[test]
+    fn spurious_exit_code_with_no_pending_command_leaves_badge_untouched() {
+        // Empty queue + rc=127 (shell-startup noise) → None (don't touch).
+        assert_eq!(decide_command_status(false, false, 127), None);
+        // Empty queue + rc=0 (shell-startup success) → None too.
+        assert_eq!(decide_command_status(false, true, 0), None);
+    }
+
+    #[test]
+    fn real_success_command_sets_success_badge() {
+        // User ran `ls` (queued), exited 0, committed → Success.
+        assert_eq!(
+            decide_command_status(true, true, 0),
+            Some(CommandStatus::Success)
+        );
+    }
+
+    #[test]
+    fn real_failed_command_sets_failed_badge_with_rc() {
+        // User ran `pwdwd` (queued), exited 127, not committed → Failed(127).
+        assert_eq!(
+            decide_command_status(true, false, 127),
+            Some(CommandStatus::Failed(127))
+        );
+    }
+
+    #[test]
+    fn compound_command_with_nonzero_last_segment_is_success() {
+        // `ls; false` (queued) → rc=1 from `false`, but the line was
+        // committed (compound command) → Success, NOT Failed(1).
+        assert_eq!(
+            decide_command_status(true, true, 1),
+            Some(CommandStatus::Success)
+        );
     }
 }
