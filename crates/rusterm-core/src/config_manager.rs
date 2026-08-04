@@ -582,6 +582,7 @@ impl ConfigManager {
             api_custom_templates: existing.api_custom_templates.clone(),
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: offset_y,
+            otp_webhook: existing.otp_webhook.clone(),
         };
 
         let json =
