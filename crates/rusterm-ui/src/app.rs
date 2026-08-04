@@ -11018,7 +11018,20 @@ fn start_ssh_connection(
 
         let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel::<SessionEvent>();
         let host_for_import = ssh_config.host.clone();
-        let client = rusterm_ssh::SshClient::new(ssh_config, event_tx.clone());
+        // Build the OTP / MFA provider from the user's `otp_webhook` setting.
+        // When no provider is configured (or it's `Manual`), this falls back
+        // to `OtpProvider::Manual` and OTP prompts are surfaced to the user
+        // through the existing OneKey credential popup for manual entry.
+        let otp_provider = {
+            let cfg = state
+                .read()
+                .config_manager
+                .as_ref()
+                .and_then(|cm| cm.load_otp_webhook());
+            rusterm_ssh::OtpProvider::from_config(cfg.as_ref())
+        };
+        let client = rusterm_ssh::SshClient::new(ssh_config, event_tx.clone())
+            .with_otp_provider(otp_provider);
 
         // Cap the entire connect attempt (TCP + SSH handshake + auth + PTY
         // request) so a server that accepts TCP but never completes the

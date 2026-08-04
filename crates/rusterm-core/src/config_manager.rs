@@ -10,9 +10,10 @@ use rand::RngCore;
 use crate::config::{
     ConnectionConfig, ConnectionKind, CustomApiTemplate, DEFAULT_ONEKEY_PASSWORD_EXPECT,
     EncryptedValue, FocusedTabAppearance, Keybindings, Language, OneKey, OneKeyPreference,
-    OneKeyStep, PersistedConfig, PersistedConnection, PersistedConnectionKind, PersistedOneKey,
-    PersistedOneKeyStep, PersistedProxyConfig, PersistedSshAuth, PersistedSshConfig, ProxyConfig,
-    QwenLocalSettings, SidebarPreferences, SkinSettings, SshAuth, SshConfig, WorkspacePreferences,
+    OneKeyStep, OtpWebhookConfig, PersistedConfig, PersistedConnection, PersistedConnectionKind,
+    PersistedOneKey, PersistedOneKeyStep, PersistedProxyConfig, PersistedSshAuth,
+    PersistedSshConfig, ProxyConfig, QwenLocalSettings, SidebarPreferences, SkinSettings, SshAuth,
+    SshConfig, WorkspacePreferences,
 };
 use rusterm_crypto::{KeyringStore, decrypt_data, encrypt_data};
 
@@ -1013,6 +1014,28 @@ impl ConfigManager {
         persisted.version = CONFIG_VERSION;
         persisted.master_password_hash = self.master_password_hash.clone();
         persisted.qwen_local = settings.clone();
+        let json =
+            serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
+        let temp_path = self.config_path.with_extension("json.tmp");
+        fs::write(&temp_path, &json).context("Failed to write config file")?;
+        fs::rename(&temp_path, &self.config_path).context("Failed to rename temp config file")?;
+        Ok(())
+    }
+
+    /// Load the configured OTP / MFA webhook provider, or `None` when no
+    /// automatic provider is configured (the safe default).
+    pub fn load_otp_webhook(&self) -> Option<OtpWebhookConfig> {
+        self.read_persisted().otp_webhook
+    }
+
+    /// Persist the OTP / MFA webhook provider. Read-modify-write preserves
+    /// encrypted credentials and every unrelated setting. Pass `None` (or
+    /// `Some(OtpWebhookConfig::Manual)`) to disable automatic OTP auto-fill.
+    pub fn save_otp_webhook(&self, cfg: Option<&OtpWebhookConfig>) -> Result<()> {
+        let mut persisted = self.read_persisted_for_update()?;
+        persisted.version = CONFIG_VERSION;
+        persisted.master_password_hash = self.master_password_hash.clone();
+        persisted.otp_webhook = cfg.cloned();
         let json =
             serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
         let temp_path = self.config_path.with_extension("json.tmp");
