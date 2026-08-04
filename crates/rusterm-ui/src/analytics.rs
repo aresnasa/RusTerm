@@ -302,13 +302,14 @@ pub mod enabled {
                 .behavior_summary()
         }
 
-        /// Append one session-recovery replay event to the DuckDB time-series
-        /// log. `ts_micros`/`seq` are captured synchronously at input time by
-        /// the caller — they define the fold order, so this call is safe to
-        /// run on a spawned task that lands out of order.
+        /// Append one session-recovery replay event to the session's dedicated
+        /// DuckDB time-series stream. `ts_micros`/`seq` are captured
+        /// synchronously at input time by the caller — they define the fold
+        /// order, so this call is safe to run on a spawned task that lands out
+        /// of order.
         pub fn record_replay_event(
             &self,
-            connection_id: &str,
+            session_id: &str,
             ts_micros: i64,
             seq: u64,
             event: &str,
@@ -319,21 +320,33 @@ pub mod enabled {
             guard
                 .as_ref()
                 .context("analytics db not open")?
-                .record_replay_event(connection_id, ts_micros, seq, event, op)
+                .record_replay_event(session_id, ts_micros, seq, event, op)
         }
 
-        /// The connection's current replayable establishment ops (its replay
+        /// The session's current replayable establishment ops (its own replay
         /// events folded in submission order). Preferred over the bincode
         /// snapshot's `replay_ops` at restore time: each event row is written
         /// as the input happens, so the fold can't lose ops to the snapshot's
-        /// save debounce.
-        pub fn latest_replay_ops(&self, connection_id: &str) -> Result<Vec<String>> {
+        /// save debounce. Strictly per-session — concurrent tabs of the same
+        /// saved connection restore independently.
+        pub fn latest_replay_ops(&self, session_id: &str) -> Result<Vec<String>> {
             self.ensure_open()?;
             let guard = self.inner.lock();
             guard
                 .as_ref()
                 .context("analytics db not open")?
-                .latest_replay_ops(connection_id)
+                .latest_replay_ops(session_id)
+        }
+
+        /// Delete one session's replay-event stream (stream migrated on
+        /// restore, or tab closed for good).
+        pub fn clear_replay_stream(&self, session_id: &str) -> Result<()> {
+            self.ensure_open()?;
+            let guard = self.inner.lock();
+            guard
+                .as_ref()
+                .context("analytics db not open")?
+                .clear_replay_stream(session_id)
         }
     }
 
@@ -489,7 +502,7 @@ pub mod disabled {
         /// just lose the final ops to the snapshot save debounce).
         pub fn record_replay_event(
             &self,
-            _connection_id: &str,
+            _session_id: &str,
             _ts_micros: i64,
             _seq: u64,
             _event: &str,
@@ -500,8 +513,13 @@ pub mod disabled {
 
         /// Feature-off stub: no persisted replay-event log. Empty means the
         /// restore path uses the snapshot's `replay_ops` instead.
-        pub fn latest_replay_ops(&self, _connection_id: &str) -> anyhow::Result<Vec<String>> {
+        pub fn latest_replay_ops(&self, _session_id: &str) -> anyhow::Result<Vec<String>> {
             Ok(Vec::new())
+        }
+
+        /// Feature-off stub: nothing persisted, nothing to clear.
+        pub fn clear_replay_stream(&self, _session_id: &str) -> anyhow::Result<()> {
+            Ok(())
         }
     }
 

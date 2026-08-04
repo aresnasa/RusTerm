@@ -2867,6 +2867,12 @@ pub fn close_session(
     state.pending_exit_check.remove(id);
     state.terminal_command_lines.remove(id);
     state.session_replays.remove(id);
+    // The tab is gone for good — no snapshot will reference this id again,
+    // so its per-session replay-event stream is garbage. Best-effort delete
+    // (a no-op stub without the `analytics` feature).
+    if let Err(e) = state.analytics.clear_replay_stream(id) {
+        tracing::debug!("[REPLAY] failed to clear replay stream on close: {e}");
+    }
     state.ssh_sessions.remove(id);
     state.sftp_clients.remove(id);
     state.transfers.cancel_for_session(id);

@@ -13836,21 +13836,27 @@ fn restore_sessions(
                             }
                         }
                     }
-                    // Establishment ops to replay: the DuckDB replay-event
-                    // log wins over the bincode snapshot when it has data —
-                    // each event row is written as the input happens, so the
-                    // fold can't lose the final ops to the snapshot's save
+                    // Establishment ops to replay: the session's OWN DuckDB
+                    // replay-event stream (keyed by the persisted tab id)
+                    // wins over the bincode snapshot when it has data — each
+                    // event row is written as the input happens, so the fold
+                    // can't lose the final ops to the snapshot's save
                     // debounce (and it survives crashes for the same
-                    // reason). Without the `analytics` feature the fold is
-                    // always empty and the snapshot ops are used as before.
+                    // reason). Streams are strictly per-session: several
+                    // jumpserver windows restored from the same saved
+                    // connection each fold only their own navigation, so
+                    // concurrent restores can't cross-contaminate. Without
+                    // the `analytics` feature the fold is always empty and
+                    // the snapshot ops are used as before.
                     let restore_replay_ops = {
                         let analytics = state.read().analytics.clone();
-                        match analytics.latest_replay_ops(&conn_for_replay.id) {
+                        match analytics.latest_replay_ops(&ps.id) {
                             Ok(ops) if !ops.is_empty() => {
                                 tracing::info!(
-                                    "[REPLAY] restored session {} using {} op(s) from the DuckDB replay-event log",
+                                    "[REPLAY] restored session {} using {} op(s) from its per-session replay stream (was {})",
                                     &tab_id[..tab_id.len().min(8)],
-                                    ops.len()
+                                    ops.len(),
+                                    &ps.id[..ps.id.len().min(8)],
                                 );
                                 ops
                             }
@@ -13863,6 +13869,17 @@ fn restore_sessions(
                             }
                         }
                     };
+                    // Re-home the stream onto the freshly minted tab id so
+                    // the next snapshot/restart finds it, and drop the old
+                    // stream (its id is now unreferenced).
+                    if !restore_replay_ops.is_empty() && !tab_id.is_empty() {
+                        migrate_replay_stream(
+                            state.read().analytics.clone(),
+                            ps.id.clone(),
+                            tab_id.clone(),
+                            restore_replay_ops.clone(),
+                        );
+                    }
                     if !tab_id.is_empty() {
                         // Pre-seed command history tail so suggestions work.
                         let mut s = state.write();
@@ -14862,8 +14879,14 @@ fn suppress_login_script(state: &mut AppState, session_id: &str) {
 static REPLAY_EVENT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
 
 /// Persists one replay-recorder mutation (`op`/`context`/`pop`/`reset`) to
-/// the DuckDB time-series log, keyed by the session's *connection* id so the
-/// record survives reconnects (fresh session UUIDs) and app restarts.
+/// the session's dedicated DuckDB time-series stream, keyed by the SESSION
+/// id — each tab records only its own operations, so several jumpserver
+/// windows opened from the same saved connection can never interleave or
+/// overwrite each other's establishment history (the pre-2026-08 log was
+/// keyed by connection id, which made concurrent restores fold the last
+/// writer's ops into every window). Reconnects keep the tab id, so a stream
+/// survives them; app restarts mint fresh tab ids, and the restore path
+/// migrates the stream (see [`migrate_replay_stream`]).
 ///
 /// Ordering metadata (`ts_micros` + [`REPLAY_EVENT_SEQ`]) is captured
 /// synchronously HERE, in user-input order; only the DB insert runs on a
@@ -14871,9 +14894,12 @@ static REPLAY_EVENT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::Atomi
 /// fold. Without the `analytics` feature the handle is a no-op stub and
 /// recovery falls back to the bincode snapshot's `replay_ops`.
 fn persist_replay_event(app: &AppState, session_id: &str, event: &'static str, op: Option<String>) {
-    let Some(connection_id) = app.session_configs.get(session_id).map(|c| c.id.clone()) else {
+    // Only real sessions (with a stored connection config) record — mirrors
+    // the recorder's own gating and keeps phantom ids out of the table.
+    if !app.session_configs.contains_key(session_id) {
         return;
-    };
+    }
+    let session_id = session_id.to_string();
     let ts_micros = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_micros() as i64)
@@ -14882,9 +14908,50 @@ fn persist_replay_event(app: &AppState, session_id: &str, event: &'static str, o
     let analytics = app.analytics.clone();
     spawn(async move {
         if let Err(e) =
-            analytics.record_replay_event(&connection_id, ts_micros, seq, event, op.as_deref())
+            analytics.record_replay_event(&session_id, ts_micros, seq, event, op.as_deref())
         {
             tracing::warn!("[REPLAY] failed to persist replay event: {e}");
+        }
+    });
+}
+
+/// Re-homes a restored session's replay stream onto its freshly minted tab
+/// id: writes the folded `ops` as a new event stream under `new_session_id`
+/// (with synchronously captured ordering, like [`persist_replay_event`]),
+/// then deletes the old stream. This keeps the crash-safety property of the
+/// DB log across restarts — if the app dies again before the next snapshot
+/// save, the next restore still finds the ops under the id the new snapshot
+/// will reference — and stops orphaned streams from accumulating.
+fn migrate_replay_stream(
+    analytics: crate::analytics::AnalyticsHandle,
+    old_session_id: String,
+    new_session_id: String,
+    ops: Vec<String>,
+) {
+    let ordered: Vec<(i64, u64, String)> = ops
+        .into_iter()
+        .map(|op| {
+            let ts_micros = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_micros() as i64)
+                .unwrap_or(0);
+            let seq = REPLAY_EVENT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            (ts_micros, seq, op)
+        })
+        .collect();
+    spawn(async move {
+        for (ts_micros, seq, op) in &ordered {
+            if let Err(e) =
+                analytics.record_replay_event(&new_session_id, *ts_micros, *seq, "op", Some(op))
+            {
+                tracing::warn!("[REPLAY] failed to migrate replay stream: {e}");
+                return;
+            }
+        }
+        if old_session_id != new_session_id
+            && let Err(e) = analytics.clear_replay_stream(&old_session_id)
+        {
+            tracing::warn!("[REPLAY] failed to clear migrated replay stream: {e}");
         }
     });
 }

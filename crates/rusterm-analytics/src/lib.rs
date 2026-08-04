@@ -394,17 +394,33 @@ impl AnalyticsDB {
             -- input time and seq is an in-process monotonic tiebreaker, so
             -- a fold replays rows in exact submission order even though
             -- the DB writes happen on spawned tasks that may land out of
-            -- order. Keyed by connection id (session ids are fresh UUIDs
-            -- on every reconnect, so they can't join across restarts).
-            CREATE TABLE IF NOT EXISTS replay_events (
-                connection_id VARCHAR NOT NULL,
-                ts_micros     BIGINT NOT NULL,
-                seq           BIGINT NOT NULL,
-                event         VARCHAR NOT NULL,
-                op            VARCHAR
+            -- order.
+            --
+            -- Keyed by SESSION id — each terminal tab owns a dedicated
+            -- event stream that records only its own operations. Several
+            -- tabs of the same saved connection (multiple jumpserver
+            -- windows navigated to different targets) therefore never
+            -- interleave or overwrite each other's establishment history.
+            -- Session ids are fresh UUIDs after an app restart, so the
+            -- restore path migrates the old stream to the new session id
+            -- (see the UI's `migrate_replay_stream`); a plain reconnect
+            -- keeps the tab id and simply continues its stream.
+            CREATE TABLE IF NOT EXISTS session_replay_events (
+                session_id VARCHAR NOT NULL,
+                ts_micros  BIGINT NOT NULL,
+                seq        BIGINT NOT NULL,
+                event      VARCHAR NOT NULL,
+                op         VARCHAR
             );
-            CREATE INDEX IF NOT EXISTS idx_replay_events_conn
-                ON replay_events(connection_id, ts_micros, seq);
+            CREATE INDEX IF NOT EXISTS idx_session_replay_events_sid
+                ON session_replay_events(session_id, ts_micros, seq);
+
+            -- The pre-2026-08 connection-keyed log. Dropped because its
+            -- last-writer-wins folding is exactly the multi-window mixup
+            -- the per-session table fixes; its data cannot be attributed
+            -- back to individual sessions, so it is not migrated (restore
+            -- falls back to the per-session snapshot ops once).
+            DROP TABLE IF EXISTS replay_events;
             ",
         )?;
         Ok(())
@@ -652,16 +668,17 @@ impl AnalyticsDB {
         Ok(rows)
     }
 
-    /// Append one session-recovery replay event (see the `replay_events`
-    /// schema comment for the event grammar). `ts_micros` and `seq` are
-    /// captured synchronously by the caller at input time — they define the
-    /// fold order, so this insert may safely run on a spawned task that
-    /// lands out of order. Free-form op text goes through the credential
-    /// sanitizer; secret-looking lines drop the whole event (defense in
-    /// depth — the UI already refuses to record credential-prompt input).
+    /// Append one session-recovery replay event to the session's dedicated
+    /// stream (see the `session_replay_events` schema comment for the event
+    /// grammar). `ts_micros` and `seq` are captured synchronously by the
+    /// caller at input time — they define the fold order, so this insert may
+    /// safely run on a spawned task that lands out of order. Free-form op
+    /// text goes through the credential sanitizer; secret-looking lines drop
+    /// the whole event (defense in depth — the UI already refuses to record
+    /// credential-prompt input).
     pub fn record_replay_event(
         &self,
-        connection_id: &str,
+        session_id: &str,
         ts_micros: i64,
         seq: u64,
         event: &str,
@@ -678,27 +695,42 @@ impl AnalyticsDB {
         };
         let conn = self.conn.lock();
         conn.execute(
-            "INSERT INTO replay_events (connection_id, ts_micros, seq, event, op)\n             VALUES (?, ?, ?, ?, ?)",
-            duckdb::params![connection_id, ts_micros, seq as i64, event, op],
+            "INSERT INTO session_replay_events (session_id, ts_micros, seq, event, op)\n             VALUES (?, ?, ?, ?, ?)",
+            duckdb::params![session_id, ts_micros, seq as i64, event, op],
         )?;
         Ok(())
     }
 
-    /// The current replayable establishment ops for a connection: all its
+    /// The current replayable establishment ops for one session: its own
     /// replay events folded in (ts_micros, seq) order. This reproduces the
     /// in-memory recorder's final state, surviving app restarts and the
     /// snapshot debounce (each event row is written as the input happens).
-    pub fn latest_replay_ops(&self, connection_id: &str) -> Result<Vec<String>> {
+    /// Streams are strictly per-session, so concurrent tabs of the same
+    /// saved connection restore independently.
+    pub fn latest_replay_ops(&self, session_id: &str) -> Result<Vec<String>> {
         let conn = self.conn.lock();
         let mut statement = conn.prepare(
-            "SELECT event, op FROM replay_events\n             WHERE connection_id = ?\n             ORDER BY ts_micros ASC, seq ASC",
+            "SELECT event, op FROM session_replay_events\n             WHERE session_id = ?\n             ORDER BY ts_micros ASC, seq ASC",
         )?;
         let rows = statement
-            .query_map(duckdb::params![connection_id], |row| {
+            .query_map(duckdb::params![session_id], |row| {
                 Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(fold_replay_events(rows))
+    }
+
+    /// Delete one session's entire replay-event stream. Called after the
+    /// restore path migrates a stream to the freshly created session id, and
+    /// when a tab is closed for good — keeps the table from accumulating
+    /// streams that no snapshot references anymore.
+    pub fn clear_replay_stream(&self, session_id: &str) -> Result<()> {
+        let conn = self.conn.lock();
+        conn.execute(
+            "DELETE FROM session_replay_events WHERE session_id = ?",
+            duckdb::params![session_id],
+        )?;
+        Ok(())
     }
 
     /// Total row count in the `commands` table. Used by tests and the
@@ -1242,7 +1274,7 @@ impl AnalyticsDB {
     /// analytics" UI action.
     pub fn clear(&self) -> Result<()> {
         let conn = self.conn.lock();
-        conn.execute_batch("DELETE FROM commands; DELETE FROM command_corrections; DELETE FROM command_embeddings; DELETE FROM onekey_events; DELETE FROM replay_events;")?;
+        conn.execute_batch("DELETE FROM commands; DELETE FROM command_corrections; DELETE FROM command_embeddings; DELETE FROM onekey_events; DELETE FROM session_replay_events;")?;
         Ok(())
     }
 }
@@ -1823,8 +1855,49 @@ mod tests {
         db.record_replay_event("conn-1", 4_000, 4, "pop", None)
             .unwrap();
         assert_eq!(db.latest_replay_ops("conn-1").unwrap(), vec!["/q", "2"]);
-        // Other connections are unaffected.
+        // Other sessions are unaffected.
         assert!(db.latest_replay_ops("conn-2").unwrap().is_empty());
+    }
+
+    /// Two jumpserver windows opened from the SAME saved connection record
+    /// into disjoint streams: concurrent interleaved writes never mix, each
+    /// session folds only its own navigation, and clearing one stream (tab
+    /// closed / stream migrated on restore) leaves the other intact. This is
+    /// the multi-window restore-mixup regression: the old table keyed by
+    /// connection id folded both windows into one last-writer-wins list.
+    #[test]
+    fn replay_streams_are_isolated_per_session_and_clearable_per_stream() {
+        let db = AnalyticsDB::open_in_memory().unwrap();
+        // Interleaved submission order across two tabs of one connection.
+        db.record_replay_event("tab-a", 1_000, 1, "op", Some("/q"))
+            .unwrap();
+        db.record_replay_event("tab-b", 1_500, 2, "op", Some("/q"))
+            .unwrap();
+        db.record_replay_event("tab-a", 2_000, 3, "op", Some("web-01"))
+            .unwrap();
+        db.record_replay_event("tab-b", 2_500, 4, "op", Some("db-02"))
+            .unwrap();
+        db.record_replay_event("tab-a", 3_000, 5, "context", Some("sudo -i"))
+            .unwrap();
+        assert_eq!(
+            db.latest_replay_ops("tab-a").unwrap(),
+            vec!["/q", "web-01", "sudo -i"]
+        );
+        assert_eq!(db.latest_replay_ops("tab-b").unwrap(), vec!["/q", "db-02"]);
+        // A reset in one window must not thaw/clear the other.
+        db.record_replay_event("tab-b", 4_000, 6, "reset", None)
+            .unwrap();
+        assert_eq!(
+            db.latest_replay_ops("tab-a").unwrap(),
+            vec!["/q", "web-01", "sudo -i"]
+        );
+        assert!(db.latest_replay_ops("tab-b").unwrap().is_empty());
+        // Per-stream clear is surgical.
+        db.clear_replay_stream("tab-a").unwrap();
+        assert!(db.latest_replay_ops("tab-a").unwrap().is_empty());
+        db.record_replay_event("tab-b", 5_000, 7, "op", Some("/w"))
+            .unwrap();
+        assert_eq!(db.latest_replay_ops("tab-b").unwrap(), vec!["/w"]);
     }
 
     /// Rows may be INSERTed out of order (spawned tasks) — the fold orders
