@@ -35,7 +35,7 @@ portable-pty = "0.9"
 regex = "1"
 
 # SSH
-russh = { version = "0.61", features = ["aws-lc-rs"] }
+russh = { version = "0.62", features = ["aws-lc-rs"] }
 russh-config = "0.58"
 russh-sftp = "2.3"
 rustls = "0.23"
