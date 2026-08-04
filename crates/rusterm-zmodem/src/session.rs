@@ -103,6 +103,9 @@ pub struct ZmodemSession {
     file_mode: Option<u32>,
     /// Bytes received/sent so far.
     bytes_transferred: u64,
+    /// Offset from the last ZDATA header (receive path). Data subframes
+    /// after ZDATA carry file data; the offset is relative to this.
+    data_offset: u32,
     /// Local path for receive (set by the UI after FileOffer).
     save_path: Option<PathBuf>,
     /// Local file bytes to send (set by the UI before driving the send loop).
@@ -151,6 +154,7 @@ impl ZmodemSession {
             file_mtime: None,
             file_mode: None,
             bytes_transferred: 0,
+            data_offset: 0,
             save_path: None,
             send_payload: None,
             send_offset: 0,
@@ -284,6 +288,11 @@ impl ZmodemSession {
                 self.phase = Phase::Sending;
                 self.pump_send_blocks();
             }
+            // ---- Receive: ZDATA carries the file offset, followed by data
+            // subframes with actual file content. ----
+            (Phase::Receiving, FrameType::ZData) => {
+                self.data_offset = u32::from_le_bytes(h.data);
+            }
             // ---- Send: ZACK acknowledges a data block ----
             (Phase::Sending, FrameType::ZAck) => {
                 self.pump_send_blocks();
@@ -346,16 +355,18 @@ impl ZmodemSession {
             });
             return;
         }
-        // Actual file data.
-        self.bytes_transferred = offset as u64 + payload.len() as u64;
+        // Actual file data. The offset from the ZDATA header is the base;
+        // data subframes are relative to it.
+        let abs_offset = self.data_offset as u64 + offset as u64;
+        self.bytes_transferred = abs_offset + payload.len() as u64;
         self.events.push(SessionEvent::DataReceived {
-            offset,
+            offset: abs_offset as u32,
             len: payload.len(),
             total: self.file_size,
             data: payload,
         });
         if end.expects_ack() {
-            self.send_zack(offset);
+            self.send_zack(abs_offset as u32);
         }
     }
 
@@ -385,9 +396,11 @@ impl ZmodemSession {
     }
 
     fn pump_send_blocks(&mut self) {
-        let payload = match &self.send_payload {
-            Some(p) => p,
-            None => return,
+        // Clone the payload reference to avoid a borrow conflict with
+        // send_zdata (which needs &mut self to push to to_pty).
+        let payload = self.send_payload.clone();
+        let Some(payload) = payload else {
+            return;
         };
         // Send one block per ACK (simple stop-and-wait). A production impl
         // would window multiple blocks, but lrzsz tolerates stop-and-wait.
@@ -397,6 +410,10 @@ impl ZmodemSession {
             self.send_zeof(payload.len() as u32);
             return;
         }
+        // Send a ZDATA header with the current offset, followed by a data
+        // subframe. This is what real lrzsz does: ZDATA header carries the
+        // file offset, data subframes carry the actual bytes.
+        self.send_zdata(start as u32);
         let end = (start + self.block_size as usize).min(payload.len());
         let chunk = &payload[start..end];
         let block_end = if end == payload.len() {
@@ -404,7 +421,7 @@ impl ZmodemSession {
         } else {
             DataEnd::AckContinue
         };
-        let frame = crate::frame::encode_data_block(start as u32, chunk, block_end, self.crc_mode);
+        let frame = crate::frame::encode_data_subframe(chunk, block_end, self.crc_mode);
         self.to_pty.extend_from_slice(&frame);
         self.send_offset = end as u32;
         self.bytes_transferred = end as u64;
@@ -418,9 +435,11 @@ impl ZmodemSession {
         let frame = HeaderFrame {
             frame_type: FrameType::ZRInit,
             // data[0..2] = max block (0 = use default), data[2] = flags
-            // (CANFDX=0x01 | CANOVIO=0x02 | CANBRK=0x20). We advertise full
-            // duplex + overlap I/O.
-            data: [0x00, 0x00, 0x21, 0x00],
+            // (CANFDX=0x01 | CANOVIO=0x02). We advertise full duplex +
+            // overlap I/O. We deliberately do NOT set CANFC32 (0x20) so that
+            // lrzsz uses ZBIN/CRC16 for binary headers and data subframes,
+            // which is simpler and better tested.
+            data: [0x00, 0x00, 0x03, 0x00],
             crc_mode: CrcMode::Crc16,
         };
         self.to_pty
@@ -470,7 +489,9 @@ impl ZmodemSession {
         let mut payload = name.as_bytes().to_vec();
         payload.push(0);
         payload.extend_from_slice(meta.as_bytes());
-        let block = crate::frame::encode_data_block(0, &payload, DataEnd::AckEnd, self.crc_mode);
+        // Use encode_data_subframe (no ZDATA leader, no offset) — this is
+        // what real lrzsz sends for the ZFILE metadata subframe.
+        let block = crate::frame::encode_data_subframe(&payload, DataEnd::AckEnd, self.crc_mode);
         self.to_pty.extend_from_slice(&block);
     }
 
@@ -478,6 +499,16 @@ impl ZmodemSession {
         let frame = HeaderFrame {
             frame_type: FrameType::ZEof,
             data: pos.to_le_bytes(),
+            crc_mode: CrcMode::Crc16,
+        };
+        self.to_pty
+            .extend_from_slice(&crate::frame::encode_hex_header(&frame));
+    }
+
+    fn send_zdata(&mut self, offset: u32) {
+        let frame = HeaderFrame {
+            frame_type: FrameType::ZData,
+            data: offset.to_le_bytes(),
             crc_mode: CrcMode::Crc16,
         };
         self.to_pty
@@ -625,5 +656,141 @@ mod tests {
         s.feed(&enc);
         let events = s.take_events();
         assert!(events.iter().any(|e| matches!(e, SessionEvent::Skipped)));
+    }
+
+    // ---- Full receive-path integration test ----
+
+    #[test]
+    fn receive_path_zfile_with_metadata_triggers_file_offer() {
+        // Simulate the full `sz` flow: ZRQINIT → ZRINIT response →
+        // ZFILE header + data subframe (filename + metadata).
+        let mut s = ZmodemSession::new();
+
+        // 1. Feed ZRQINIT (what `sz` sends first).
+        let zrqinit = HeaderFrame {
+            frame_type: FrameType::ZRQInit,
+            data: [0, 0, 0, 0],
+            crc_mode: CrcMode::Crc16,
+        };
+        s.feed(&crate::frame::encode_hex_header(&zrqinit));
+        let events = s.take_events();
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::ReceiveOffered))
+        );
+        // Session should have emitted ZRINIT.
+        assert!(!s.take_pty_output().is_empty());
+
+        // 2. Feed ZFILE header + data subframe (what `sz` sends after
+        //    receiving ZRINIT). The data subframe carries the filename
+        //    and metadata: "k8s-node.ini\0size mtime mode\0".
+        let zfile = HeaderFrame {
+            frame_type: FrameType::ZFile,
+            data: [0, 0, 0, 0],
+            crc_mode: CrcMode::Crc16,
+        };
+        let mut zfile_bytes = crate::frame::encode_hex_header(&zfile);
+        let mut metadata = b"k8s-node.ini".to_vec();
+        metadata.push(0x00); // NUL separator
+        metadata.extend_from_slice(b"1024 1700000000 0644");
+        metadata.push(0x00); // trailing NUL
+        let subframe =
+            crate::frame::encode_data_subframe(&metadata, DataEnd::AckEnd, CrcMode::Crc16);
+        zfile_bytes.extend_from_slice(&subframe);
+        s.feed(&zfile_bytes);
+
+        // 3. The session should have emitted a FileOffer event with the
+        //    filename extracted from the data subframe.
+        let events = s.take_events();
+        let offer = events
+            .iter()
+            .find_map(|e| match e {
+                SessionEvent::FileOffer { name, size, .. } => Some((name.clone(), *size)),
+                _ => None,
+            })
+            .expect("expected FileOffer event");
+        assert_eq!(offer.0, "k8s-node.ini");
+        assert_eq!(offer.1, Some(1024));
+    }
+
+    #[test]
+    fn receive_path_full_transfer_with_zdata_and_zeof() {
+        // Full transfer: ZRQINIT → ZRINIT → ZFILE + metadata →
+        // (save path set) → ZRPOS sent → ZDATA + data → ZEOF → ZFIN.
+        let mut s = ZmodemSession::new();
+
+        // ZRQINIT
+        let zrqinit = HeaderFrame {
+            frame_type: FrameType::ZRQInit,
+            data: [0, 0, 0, 0],
+            crc_mode: CrcMode::Crc16,
+        };
+        s.feed(&crate::frame::encode_hex_header(&zrqinit));
+        let _ = s.take_events();
+        let _ = s.take_pty_output();
+
+        // ZFILE + metadata
+        let zfile = HeaderFrame {
+            frame_type: FrameType::ZFile,
+            data: [0, 0, 0, 0],
+            crc_mode: CrcMode::Crc16,
+        };
+        let mut zfile_bytes = crate::frame::encode_hex_header(&zfile);
+        let mut metadata = b"data.bin".to_vec();
+        metadata.push(0x00);
+        metadata.extend_from_slice(b"5 0 0");
+        metadata.push(0x00);
+        zfile_bytes.extend_from_slice(&crate::frame::encode_data_subframe(
+            &metadata,
+            DataEnd::AckEnd,
+            CrcMode::Crc16,
+        ));
+        s.feed(&zfile_bytes);
+        let _ = s.take_events(); // FileOffer
+        let _ = s.take_pty_output();
+
+        // Simulate the UI setting the save path (sends ZRPOS).
+        s.set_save_path(std::path::PathBuf::from("/dev/null"));
+        let pty = s.take_pty_output();
+        // ZRPOS should have been sent.
+        assert!(!pty.is_empty());
+
+        // ZDATA header + data subframe ("Hello" = 5 bytes).
+        let zdata = HeaderFrame {
+            frame_type: FrameType::ZData,
+            data: 0u32.to_le_bytes(), // offset = 0
+            crc_mode: CrcMode::Crc16,
+        };
+        let mut zdata_bytes = crate::frame::encode_hex_header(&zdata);
+        zdata_bytes.extend_from_slice(&crate::frame::encode_data_subframe(
+            b"Hello",
+            DataEnd::AckEnd,
+            CrcMode::Crc16,
+        ));
+        s.feed(&zdata_bytes);
+        let events = s.take_events();
+        // Should have DataReceived event with the file data.
+        assert!(events.iter().any(|e| matches!(
+            e,
+            SessionEvent::DataReceived { data, .. } if data == b"Hello"
+        )));
+
+        // ZEOF
+        let zeof = HeaderFrame {
+            frame_type: FrameType::ZEof,
+            data: 5u32.to_le_bytes(), // position = 5 (file size)
+            crc_mode: CrcMode::Crc16,
+        };
+        s.feed(&crate::frame::encode_hex_header(&zeof));
+        let events = s.take_events();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            SessionEvent::Done {
+                direction: Direction::Receive,
+                bytes: 5
+            }
+        )));
+        assert!(s.is_finished());
     }
 }

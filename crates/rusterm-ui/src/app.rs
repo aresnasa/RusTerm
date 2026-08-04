@@ -10175,16 +10175,20 @@ fn start_ssh_connection(
                             // Reset the SSH login-output debounce on every remote
                             // output chunk so shell integration waits for a quiet PTY.
                             let _ = initial_output_activity_tx.send(());
-                            let data = shell_integration_echo_filter.lock().filter(&data);
+                            // Intercept ZMODEM (lrzsz rz/sz) frames BEFORE the
+                            // echo filter so ZMODEM binary bytes bypass the echo
+                            // filter entirely. The echo filter only cares about
+                            // the shell-integration setup command echo, which
+                            // happens once at startup; by the time `sz`/`rz` run,
+                            // the echo filter is idle. Returns the non-protocol
+                            // passthrough bytes; protocol bytes are consumed by
+                            // the per-session ZmodemSession and acked via the
+                            // input sender.
+                            let data = intercept_zmodem(state, input_senders, &id, &data);
                             if data.is_empty() {
                                 continue;
                             }
-                            // Intercept ZMODEM (lrzsz rz/sz) frames before
-                            // rendering. Returns the non-protocol passthrough
-                            // bytes; protocol bytes are consumed by the
-                            // per-session ZmodemSession and acked via the
-                            // input sender.
-                            let data = intercept_zmodem(state, input_senders, &id, &data);
+                            let data = shell_integration_echo_filter.lock().filter(&data);
                             if data.is_empty() {
                                 continue;
                             }
@@ -10831,16 +10835,13 @@ fn start_shell_connection(
                     match event {
                         SessionEvent::Output(id, mut data) => {
                             pending_event = drain_output_batch(&mut event_rx, &id, &mut data);
-                            let data = shell_integration_echo_filter.lock().filter(&data);
+                            // Intercept ZMODEM BEFORE the echo filter (see
+                            // SSH handler for rationale).
+                            let data = intercept_zmodem(state, input_senders, &id, &data);
                             if data.is_empty() {
                                 continue;
                             }
-                            // Intercept ZMODEM (lrzsz rz/sz) frames before
-                            // rendering. Returns the non-protocol passthrough
-                            // bytes; protocol bytes are consumed by the
-                            // per-session ZmodemSession and acked via the
-                            // input sender.
-                            let data = intercept_zmodem(state, input_senders, &id, &data);
+                            let data = shell_integration_echo_filter.lock().filter(&data);
                             if data.is_empty() {
                                 continue;
                             }

@@ -119,25 +119,28 @@ pub struct HeaderFrame {
 }
 
 /// Data subframe terminator (the byte after the data block's ZDLE).
+///
+/// These are the actual on-wire ZMODEM byte values used by lrzsz
+/// (`zmodem.h`): `ZCRCE='h'`, `ZCRCG='i'`, `ZCRCQ='j'`, `ZCRCW='k'`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DataEnd {
-    /// `ZCRCE` — end of frame, no ACK.
-    End = 0x01,
-    /// `ZCRCG` — frame continues, no ACK.
-    Continue = 0x02,
-    /// `ZCRCQ` — ACK requested, frame continues.
-    AckContinue = 0x03,
-    /// `ZCRCW` — ACK requested, end of frame.
-    AckEnd = 0x04,
+    /// `ZCRCE` (0x68) — end of frame, no ACK.
+    End = 0x68,
+    /// `ZCRCG` (0x69) — frame continues, no ACK.
+    Continue = 0x69,
+    /// `ZCRCQ` (0x6A) — ACK requested, frame continues.
+    AckContinue = 0x6A,
+    /// `ZCRCW` (0x6B) — ACK requested, end of frame.
+    AckEnd = 0x6B,
 }
 
 impl DataEnd {
     pub fn from_byte(byte: u8) -> Option<Self> {
         Some(match byte {
-            0x01 => Self::End,
-            0x02 => Self::Continue,
-            0x03 => Self::AckContinue,
-            0x04 => Self::AckEnd,
+            0x68 => Self::End,
+            0x69 => Self::Continue,
+            0x6A => Self::AckContinue,
+            0x6B => Self::AckEnd,
             _ => return None,
         })
     }
@@ -145,6 +148,12 @@ impl DataEnd {
     /// True if the sender expects an ACK after this block.
     pub fn expects_ack(self) -> bool {
         matches!(self, Self::AckContinue | Self::AckEnd)
+    }
+
+    /// True if this terminator ends the data frame (no more subframes
+    /// expected until the next ZDATA/ZFILE header).
+    pub fn is_end(self) -> bool {
+        matches!(self, Self::End | Self::AckEnd)
     }
 }
 
@@ -238,6 +247,36 @@ pub fn zdle_decode(data: &[u8], terminators: &[u8]) -> (Vec<u8>, usize) {
     (out, i)
 }
 
+/// Decode exactly `n` ZDLE-escaped bytes from `data`. Returns the decoded
+/// bytes and the number of input bytes consumed, or `None` if `data` doesn't
+/// contain enough bytes to produce `n` decoded bytes.
+///
+/// Unlike [`zdle_decode`], this function does NOT stop at data terminators —
+/// it treats every `ZDLE <byte>` as an escape sequence. This is correct for
+/// parsing fixed-length fields (header bodies, CRCs) where terminators don't
+/// appear.
+pub fn zdle_decode_n(data: &[u8], n: usize) -> Option<(Vec<u8>, usize)> {
+    let mut out = Vec::with_capacity(n);
+    let mut i = 0;
+    while out.len() < n {
+        if i >= data.len() {
+            return None;
+        }
+        let b = data[i];
+        if b == ZDLE {
+            if i + 1 >= data.len() {
+                return None;
+            }
+            out.push(data[i + 1] ^ 0x40);
+            i += 2;
+        } else {
+            out.push(b);
+            i += 1;
+        }
+    }
+    Some((out, i))
+}
+
 // ---------------------------------------------------------------------------
 // Hex header encoding
 // ---------------------------------------------------------------------------
@@ -311,6 +350,12 @@ pub fn encode_bin32_header(frame: &HeaderFrame) -> Vec<u8> {
 /// Each block is `<escaped-data> ZDLE <end-byte>` followed by the block's CRC
 /// (2 or 4 bytes, ZDLE-escaped). For simplicity this encodes a single block
 /// per call with the requested terminator; callers chunk the file as needed.
+///
+/// **Note**: This format includes a ZDATA leader + offset, which is NOT what
+/// real lrzsz sends for data subframes. Real `sz` sends ZDATA as a separate
+/// header frame, then data subframes via [`encode_data_subframe`] (no leader,
+/// no offset). This function is retained for backward compatibility with the
+/// existing send-path code.
 pub fn encode_data_block(offset: u32, data: &[u8], end: DataEnd, crc_mode: CrcMode) -> Vec<u8> {
     let mut out = Vec::with_capacity(data.len() + 16);
     // Frame leader: ZDLE ZDATA (ZDATA = 10 = 0x0A → must be ZDLE-escaped).
@@ -326,6 +371,34 @@ pub fn encode_data_block(offset: u32, data: &[u8], end: DataEnd, crc_mode: CrcMo
     out.push(ZDLE);
     out.push(end as u8);
     // CRC.
+    match crc_mode {
+        CrcMode::Crc16 => {
+            let crc = crc16_init(data);
+            out.extend(zdle_encode(&crc.to_be_bytes()));
+        }
+        CrcMode::Crc32 => {
+            let crc = crc32_init(data);
+            out.extend(zdle_encode(&crc.to_le_bytes()));
+        }
+    }
+    out
+}
+
+/// Encode a data subframe WITHOUT a ZDATA leader or offset, as real lrzsz
+/// `sz`/`rz` does after a ZFILE or ZDATA header:
+/// `<escaped-data> ZDLE <end-byte> <escaped-crc>`.
+///
+/// This is the correct format for both the ZFILE metadata subframe (filename
+/// + size/mtime/mode) and the file-data subframes that follow a ZDATA header.
+/// The offset is carried by the preceding ZDATA header, not repeated here.
+pub fn encode_data_subframe(data: &[u8], end: DataEnd, crc_mode: CrcMode) -> Vec<u8> {
+    let mut out = Vec::with_capacity(data.len() + 16);
+    // Data payload, ZDLE-escaped.
+    out.extend(zdle_encode(data));
+    // Terminator: ZDLE + end-byte (ZCRCE/ZCRCG/ZCRCQ/ZCRCW).
+    out.push(ZDLE);
+    out.push(end as u8);
+    // CRC over the unescaped data.
     match crc_mode {
         CrcMode::Crc16 => {
             let crc = crc16_init(data);
