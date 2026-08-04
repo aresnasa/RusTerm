@@ -1488,6 +1488,14 @@ pub fn TerminalView(
     on_suggestion_accept: EventHandler<String>,
     on_history_completion: EventHandler<()>,
     on_suggestion_dismiss: EventHandler<()>,
+    /// Mute the automatic suggestion popup for the rest of this session
+    /// ("mute this session" in the hint row). Not persisted.
+    #[props(default)]
+    on_suggestion_snooze: EventHandler<()>,
+    /// Disable the suggestion feature entirely and persist the choice
+    /// ("disable entirely" in the hint row).
+    #[props(default)]
+    on_suggestion_disable: EventHandler<()>,
     /// Delete the currently-selected suggestion from history (dirty-data
     /// cleanup). Triggered by Shift+Delete while the suggestion panel is open.
     /// The handler in `app.rs` removes the command from `command_history`,
@@ -3173,6 +3181,12 @@ pub fn TerminalView(
                     },
                     on_delete: move |cmd: String| {
                         on_suggestion_delete.call(cmd);
+                    },
+                    on_snooze: move |_: ()| {
+                        on_suggestion_snooze.call(());
+                    },
+                    on_disable: move |_: ()| {
+                        on_suggestion_disable.call(());
                     },
                     correction_suggestions: current_suggestion_corrections.clone(),
                     history_completion: current_history_completion_visible,

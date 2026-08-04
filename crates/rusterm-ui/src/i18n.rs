@@ -238,6 +238,16 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
             "纠正项：Tab 仅替换，不执行 · 历史项：× 删除",
         ),
         "suggestion.history_hint" => ("Shift+Del or click × to remove", "Shift+Del 或点击 × 删除"),
+        "suggestion.snooze" => ("Mute this session", "本次不再提示"),
+        "suggestion.snooze_tooltip" => (
+            "Hide suggestions for this session only (new sessions show them again)",
+            "本次会话不再提示（新会话会重新显示）",
+        ),
+        "suggestion.disable" => ("Disable entirely", "彻底关闭"),
+        "suggestion.disable_tooltip" => (
+            "Turn off command suggestions (re-enable in Settings)",
+            "彻底关闭命令建议（可在设置中重新开启）",
+        ),
         "suggestion.history_completion_title" => ("Complete from history", "补全历史"),
         "suggestion.history_completion_hint" => (
             "Ctrl+N/P selects · Enter inserts · Esc closes",

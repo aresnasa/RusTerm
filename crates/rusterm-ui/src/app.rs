@@ -2568,6 +2568,7 @@ fn render_terminal_pane(
             let sid_for_history_completion = tab.id.clone();
             let sid_for_sug_accept = tab.id.clone();
             let sid_for_sug_dismiss = tab.id.clone();
+            let sid_for_sug_snooze = tab.id.clone();
             let sid_for_sug_delete = tab.id.clone();
             let sid_for_ok = tab.id.clone();
             let sid_for_ok_sel = tab.id.clone();
@@ -2888,8 +2889,15 @@ fn render_terminal_pane(
                         if !is_enter && !is_arrow {
                             // Skip the entire suggestion pipeline when the user
                             // has disabled suggestions — no debounce spawn, no
-                            // DB query, no popup.
-                            if !state_for_cmd.read().suggestion_enabled {
+                            // DB query, no popup. Same when this session was
+                            // muted via the popup hint row ("mute this
+                            // session") — the mute is not persisted.
+                            let suggestions_silenced = {
+                                let s = state_for_cmd.read();
+                                !s.suggestion_enabled
+                                    || s.suggestion_muted_sessions.contains(&sid_clone)
+                            };
+                            if suggestions_silenced {
                                 // Also clear any stale suggestion that might be
                                 // showing from before the user toggled it off.
                                 state_for_cmd.write().sessions.iter_mut()
@@ -3440,6 +3448,49 @@ fn render_terminal_pane(
                                 tab.suggestion_visible = false;
                                 tab.suggestion = None;
                             });
+                    },
+                    on_suggestion_snooze: move |_: ()| {
+                        // "Mute this session": remember the mute and clear
+                        // the current popup. The input pipeline checks the
+                        // muted set before spawning any query, so no more
+                        // suggestions appear until this session closes.
+                        state_for_cmd
+                            .write()
+                            .history_completion_sessions
+                            .remove(&sid_for_sug_snooze);
+                        let mut s = state_for_cmd.write();
+                        s.suggestion_muted_sessions
+                            .insert(sid_for_sug_snooze.clone());
+                        if let Some(tab) = s.sessions.iter_mut()
+                            .find(|t| t.id == sid_for_sug_snooze)
+                        {
+                            tab.suggestion = None;
+                            tab.suggestions = Vec::new();
+                            tab.suggestion_corrections.clear();
+                            tab.suggestion_visible = false;
+                            tab.suggestion_selected = 0;
+                        }
+                    },
+                    on_suggestion_disable: move |_: ()| {
+                        // "Disable entirely": persist suggestion_enabled=false
+                        // (re-enable from the Settings dialog) and clear every
+                        // visible popup. Mirrors `on_save_suggestions`.
+                        if let Some(cm) = state_for_cmd.read().config_manager.clone() {
+                            let count = state_for_cmd.read().suggestion_count;
+                            if let Err(e) = cm.save_suggestion_settings(false, count) {
+                                tracing::error!("Failed to save suggestion settings: {}", e);
+                            }
+                        }
+                        let mut s = state_for_cmd.write();
+                        s.suggestion_enabled = false;
+                        s.history_completion_sessions.clear();
+                        s.suggestion_muted_sessions.clear();
+                        for tab in &mut s.sessions {
+                            tab.suggestion = None;
+                            tab.suggestions = Vec::new();
+                            tab.suggestion_visible = false;
+                            tab.suggestion_selected = 0;
+                        }
                     },
                     on_suggestion_delete: move |cmd: String| {
                         // Shift+Delete on a suggestion item: the user wants

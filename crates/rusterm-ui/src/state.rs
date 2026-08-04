@@ -209,6 +209,13 @@ pub struct AppState {
     /// This mode changes Enter from "execute" to "replace the current line".
     #[serde(skip)]
     pub history_completion_sessions: HashSet<String>,
+    /// Sessions whose user clicked "don't show again this session" in the
+    /// suggestion popup's hint row. Muted sessions skip the entire
+    /// suggestion pipeline (same as `suggestion_enabled = false`, but scoped
+    /// to the session and NOT persisted — a new session sees suggestions
+    /// again). Entries are removed by `close_session`.
+    #[serde(skip)]
+    pub suggestion_muted_sessions: HashSet<String>,
     /// Commands that have just failed (rc != 0) and are awaiting the async
     /// `mark_command_failed` DB write to complete.
     ///
@@ -942,6 +949,7 @@ impl Default for AppState {
             pending_exit_check: HashMap::new(),
             terminal_command_lines: HashMap::new(),
             history_completion_sessions: HashSet::new(),
+            suggestion_muted_sessions: HashSet::new(),
             recent_failed_commands: HashSet::new(),
             last_failed_command_by_session: HashMap::new(),
             onekeys: Vec::new(),
@@ -2866,6 +2874,7 @@ pub fn close_session(
     state.session_configs.remove(id);
     state.pending_exit_check.remove(id);
     state.terminal_command_lines.remove(id);
+    state.suggestion_muted_sessions.remove(id);
     state.session_replays.remove(id);
     // The tab is gone for good — no snapshot will reference this id again,
     // so its per-session replay-event stream is garbage. Best-effort delete
@@ -4676,6 +4685,7 @@ mod tests {
         state
             .pending_exit_check
             .insert("alpha".to_string(), VecDeque::new());
+        state.suggestion_muted_sessions.insert("alpha".to_string());
 
         close_session(&mut state, &mut senders, "alpha");
 
@@ -4694,6 +4704,7 @@ mod tests {
         );
         assert!(!state.session_configs.contains_key("alpha"));
         assert!(!state.pending_exit_check.contains_key("alpha"));
+        assert!(!state.suggestion_muted_sessions.contains("alpha"));
     }
 
     #[test]

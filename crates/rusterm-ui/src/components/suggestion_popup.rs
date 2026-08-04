@@ -78,6 +78,16 @@ pub fn SuggestionPopup(
     /// position and return to automatic placement.
     #[props(default)]
     on_position_reset: EventHandler<()>,
+    /// Fired when the user picks "mute this session" in the hint row —
+    /// hides the popup for the rest of this session only. New sessions see
+    /// suggestions again (the mute is not persisted).
+    #[props(default)]
+    on_snooze: EventHandler<()>,
+    /// Fired when the user picks "disable entirely" — turns the whole
+    /// suggestion feature off and persists the choice to settings.json.
+    /// Re-enable from the Settings dialog.
+    #[props(default)]
+    on_disable: EventHandler<()>,
 ) -> Element {
     let _lang = crate::i18n::LANGUAGE();
     if suggestions.is_empty() {
@@ -266,25 +276,75 @@ pub fn SuggestionPopup(
                     }
                 }
             }
-            // Hint row — tells the user both affordances exist. Muted color
-            // so it doesn't compete with the suggestions themselves.
+            // Hint row — tells the user both affordances exist, like the
+            // oh-my-zsh update prompt ("disable with DISABLE_AUTO_UPDATE").
+            // Muted color so it doesn't compete with the suggestions.
             div {
                 style: "
                     display:flex;
                     align-items:center;
-                    justify-content:flex-end;
+                    justify-content:space-between;
+                    gap:12px;
                     padding:2px 12px;
                     border-top:1px solid #2a2b3d;
                     color:#9aa5ce;
                     font-size:11px;
                     background:#1a1b26;
                 ",
-                if history_completion {
-                    { crate::i18n::t("suggestion.history_completion_hint") }
-                } else if has_corrections {
-                    { crate::i18n::t("suggestion.correction_hint") }
-                } else {
-                    { crate::i18n::t("suggestion.history_hint") }
+                span {
+                    style: "min-width:0;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;",
+                    if history_completion {
+                        { crate::i18n::t("suggestion.history_completion_hint") }
+                    } else if has_corrections {
+                        { crate::i18n::t("suggestion.correction_hint") }
+                    } else {
+                        { crate::i18n::t("suggestion.history_hint") }
+                    }
+                }
+                // Temp/permanent dismissal only applies to the automatic
+                // popup — the explicit Alt+R picker is user-invoked, so
+                // offering to mute it would be misleading.
+                if !history_completion {
+                div {
+                    style: "display:flex;align-items:center;gap:8px;flex-shrink:0;",
+                    span {
+                        class: "sug-act",
+                        style: "color:#565f89;cursor:pointer;text-decoration:underline dotted;",
+                        title: crate::i18n::t("suggestion.snooze_tooltip"),
+                        onpointerdown: move |e| {
+                            e.prevent_default();
+                            e.stop_propagation();
+                        },
+                        onmousedown: move |e| {
+                            e.prevent_default();
+                            e.stop_propagation();
+                        },
+                        onclick: move |e| {
+                            e.stop_propagation();
+                            on_snooze.call(());
+                        },
+                        { crate::i18n::t("suggestion.snooze") }
+                    }
+                    span { style: "color:#2a2b3d;user-select:none;", "·" }
+                    span {
+                        class: "sug-act",
+                        style: "color:#565f89;cursor:pointer;text-decoration:underline dotted;",
+                        title: crate::i18n::t("suggestion.disable_tooltip"),
+                        onpointerdown: move |e| {
+                            e.prevent_default();
+                            e.stop_propagation();
+                        },
+                        onmousedown: move |e| {
+                            e.prevent_default();
+                            e.stop_propagation();
+                        },
+                        onclick: move |e| {
+                            e.stop_propagation();
+                            on_disable.call(());
+                        },
+                        { crate::i18n::t("suggestion.disable") }
+                    }
+                }
                 }
             }
             // Hover rule for the × button on non-selected rows. Selected rows
