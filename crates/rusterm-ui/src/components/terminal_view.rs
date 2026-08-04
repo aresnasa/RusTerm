@@ -650,7 +650,10 @@ fn cell_style(fg: &CellColor, bg: &CellColor, flags: CellFlags) -> String {
 /// Background applied to cells inside the active mouse-drag selection.
 /// Matches the search-match highlight hue so all accent overlays read as
 /// one system. Applied over the cell's own background (selection bg wins).
-const SELECTION_BG: &str = "background:rgba(122,162,247,0.30)";
+/// Opacity 0.35 is high enough to be clearly visible over both dark and
+/// light cell backgrounds, but low enough that the underlying text color
+/// remains readable (WindTerm uses a similar opacity).
+const SELECTION_BG: &str = "background:rgba(122,162,247,0.35)";
 
 /// Convert client-viewport px coords to a `(row, col)` terminal cell using
 /// the live `getBoundingClientRect` origin of the content div and the

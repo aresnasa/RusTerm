@@ -162,6 +162,12 @@ pub fn TabBar(
     } else {
         "opacity:0.4;cursor:default;".to_string()
     };
+    // Pre-clone the menu session id for each onclick closure. dioxus `move`
+    // closures take ownership of captured variables, so a single `menu_sid`
+    // can't be shared across three closures — each gets its own clone.
+    let menu_sid_disconnect = menu_snapshot.as_ref().map(|(sid, _, _)| sid.clone());
+    let menu_sid_reconnect = menu_snapshot.as_ref().map(|(sid, _, _)| sid.clone());
+    let menu_sid_copy = menu_snapshot.as_ref().map(|(sid, _, _)| sid.clone());
 
     rsx! {
         div {
@@ -332,7 +338,7 @@ pub fn TabBar(
             // click-away backdrop + a fixed-position menu. The menu reads the
             // anchor session id from the `context_menu` signal, so it doesn't
             // need per-tab clones.
-            if let Some((menu_sid, menu_x, menu_y)) = menu_snapshot {
+            if let Some((_menu_sid, menu_x, menu_y)) = &menu_snapshot {
                 // Click-away backdrop.
                 div {
                     style: "position:fixed;inset:0;z-index:2999;",
@@ -344,8 +350,10 @@ pub fn TabBar(
                     div {
                         style: "padding:6px 12px;font-size:12px;display:flex;align-items:center;gap:8px;white-space:nowrap;color:var(--skin-text);{disconnect_style}",
                         onclick: move |_| {
-                            if can_disconnect {
-                                on_disconnect.call(menu_sid.clone());
+                            if let Some(sid) = &menu_sid_disconnect {
+                                if can_disconnect {
+                                    on_disconnect.call(sid.clone());
+                                }
                             }
                             context_menu.set(None);
                         },
@@ -355,8 +363,10 @@ pub fn TabBar(
                     div {
                         style: "padding:6px 12px;font-size:12px;display:flex;align-items:center;gap:8px;white-space:nowrap;color:var(--skin-text);{reconnect_style}",
                         onclick: move |_| {
-                            if can_reconnect {
-                                on_reconnect.call(menu_sid.clone());
+                            if let Some(sid) = &menu_sid_reconnect {
+                                if can_reconnect {
+                                    on_reconnect.call(sid.clone());
+                                }
                             }
                             context_menu.set(None);
                         },
@@ -369,7 +379,9 @@ pub fn TabBar(
                     div {
                         style: "padding:6px 12px;font-size:12px;cursor:pointer;color:var(--skin-text);display:flex;align-items:center;gap:8px;white-space:nowrap;",
                         onclick: move |_| {
-                            on_copy_session.call(menu_sid.clone());
+                            if let Some(sid) = &menu_sid_copy {
+                                on_copy_session.call(sid.clone());
+                            }
                             context_menu.set(None);
                         },
                         "⧉  {crate::i18n::t(\"session.copy_session\")}"
