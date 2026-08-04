@@ -3,7 +3,11 @@
 ## Goal
 Add ZMODEM file-transfer support (interoperate with system-installed `lrzsz` `rz`/`sz`) and ensure xterm-compatible terminal type. User: "添加 lrzsz，xterm支持，需要能够使用 lrzsz".
 
-**STATUS: Diagnostic tracing added — runtime `sz`/`rz` still not triggering save dialog.** All 44 unit tests pass but runtime fails. Comprehensive `tracing::info!`/`tracing::warn!` logs have been added throughout the ZMODEM pipeline (`intercept_zmodem`, `Detector::begin_frame`, `complete_hex`, `spawn_save_dialog`) to pinpoint the failure. User should run the app, reproduce with `sz test`, then check `~/Library/Application Support/rusterm/logs/rusterm.log.*` for `[ZMODEM]` entries.
+**STATUS: Two runtime root causes found via log forensics and FIXED (commits 886cee4 + 1890707). Awaiting user re-test.**
+
+1. **ZHEX/ZBIN32 constants were SWAPPED vs the ZMODEM spec** (`lib.rs`): we had `ZBIN32=b'B'`, `ZHEX=b'C'`; correct is **ZHEX='B' (0x42)**, **ZBIN32='C' (0x43)**. Real lrzsz sends hex headers as `** ZDLE B ...`, which our detector misparsed as a never-completing Bin32 frame. All 44 unit tests were green because encoder+decoder shared the same wrong constants (self-consistent). Root-caused from runtime log line: `rz\r 2a 2a 18 42 30×14 0d 8a 11` + `entering InFrame: kind=Bin32 fmt=0x42`. Regression test `detects_real_lrzsz_sz_wire_bytes` uses the exact captured wire bytes. **Lesson: self-consistent round-trip tests cannot catch wrong wire constants — always test against captured real-world bytes.**
+
+2. **rfd dialogs were spawned with `tokio::spawn`** (worker thread). On macOS, NSSavePanel/NSOpenPanel must be created on the main thread, so the dialog would silently never appear. Changed `spawn_save_dialog` + `spawn_send_file_picker` to `dioxus::prelude::spawn` (main-thread event loop), matching the working rfd usage in `remote_files_panel.rs`. Safe because `dispatch_event` is only called from `intercept_zmodem`, which runs inside the dioxus-spawned SSH/shell event loop tasks; zmodem.rs unit tests never touch these two functions (dioxus spawn panics outside a runtime context).
 
 ## Approach
 **Pure-Rust ZMODEM protocol implementation** (NOT shelling out to a local `lrzsz` binary). The remote `rz`/`sz` emits protocol frames; RusTerm parses + responds to them in-process. This matches how iTerm2 / WindTerm integrate ZMODEM.
@@ -71,6 +75,8 @@ Non-zmodem passthrough, ZRQINIT activates + produces ZRINIT, bytes-before-frame 
 - `fix(zmodem): add diagnostic tracing + overflow guards + 0x8A LF support` — runtime debugging infrastructure
 - `fix(ui): SelectAll now copies full scrollback (not just visible viewport)` — session copy fix
 - `fix(ui): selection highlight opacity 0.30 → 0.35 for better visibility` — mouse selection optimization
+- `886cee4 fix(zmodem): ZHEX='B' / ZBIN32='C' — constants were swapped vs spec` — THE runtime parse fix (+1 regression test = 45)
+- `1890707 fix(zmodem): run rfd dialogs on main thread via dioxus spawn` — macOS dialog thread fix
 
 ## Session copy (full scrollback) fix
 
