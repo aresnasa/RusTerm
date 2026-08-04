@@ -5259,6 +5259,30 @@ mod tests {
     }
 
     #[test]
+    fn switching_top_tab_retargets_pane_focus_to_new_tab() {
+        // Focus follows the active tab so its border outline stays correct:
+        // switching away must not leave `focused_pane` pointing at the old
+        // tab's layout.
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        apply_layout_preset(&mut state, LayoutPreset::Split2H);
+        assert!(focus_pane_for_layout(&mut state, "alpha", 1));
+        assert_eq!(focused_pane_session(&state).as_deref(), Some("beta"));
+
+        set_active_tab(&mut state, "beta");
+        // beta's tab has no layout entry (implicit Single): explicit pane
+        // focus is dropped, and the UI falls back to the tab's anchor.
+        assert_eq!(state.focused_pane, None);
+        assert_eq!(focused_pane_session(&state), None);
+
+        // Switching back to the multi-pane tab focuses the pane holding the
+        // tab's anchor session (leave pane 0), never a stale pane index.
+        set_active_tab(&mut state, "alpha");
+        let focused = state.focused_pane.as_ref().expect("layout focus");
+        assert_eq!(focused.layout_owner_tab_id, "alpha");
+        assert_eq!(focused_pane_session(&state).as_deref(), Some("alpha"));
+    }
+
+    #[test]
     fn activate_session_switches_to_its_workspace_tab() {
         let mut state = state_with_active_session(&["alpha", "beta"]);
 
