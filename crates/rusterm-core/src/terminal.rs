@@ -320,15 +320,70 @@ struct ScreenSwitchState {
     mode_show_cursor: bool,
     mode_cursor_keys: bool,
     mode_bracketed_paste: bool,
-    mode_mouse_reporting: bool,
-    mode_mouse_sgr: bool,
-    mode_mouse_button_motion: bool,
-    mode_mouse_any_motion: bool,
+    // NOTE: mouse-tracking modes (1000/1002/1003/1006) are deliberately NOT
+    // saved/restored across alt-screen switches. In xterm/alacritty they are
+    // global modes untouched by ESC[?1049h/l; restoring them here would
+    // re-enable mouse reporting after an app disabled tracking inside the
+    // alt screen, leaving the shell prompt eating SGR mouse reports as
+    // garbage input (`0;31;33M...`) and blocking local drag-selection.
     mode_line_wrap: bool,
     mode_origin: bool,
     scroll_top: usize,
     scroll_bottom: usize,
     saved_cursor: Option<CursorState>,
+}
+
+// ── Shell-integration marker scanning ───────────────────────────────
+
+/// A FinalTerm `ESC ] 1 3 3 ; D ; <exit_code> (BEL|ST)` marker found in an
+/// output buffer. `end` is the byte offset just past the exit-code digits
+/// (the OSC terminator, if present, is left for the VTE parser to consume).
+struct ExitCodeMarker {
+    end: usize,
+    /// Parsed exit code. `Some(0)` when the marker carries no code;
+    /// `None` when the digits were present but unparseable.
+    exit_code: Option<i32>,
+}
+
+/// Find the first OSC 133;D shell-integration marker in `data`.
+///
+/// Single pass over the buffer keyed off the rare ESC (0x1b) byte. Because
+/// ESC almost never appears in ordinary terminal output, the inner literal
+/// comparison only fires on actual escape sequences, making this effectively
+/// O(n) with a tiny constant. Markers that straddle a process() boundary are
+/// not matched (same limitation as the previous whole-buffer scanner).
+fn find_exit_code_marker(data: &[u8]) -> Option<ExitCodeMarker> {
+    // `ESC ] 1 3 3 ; D`
+    const SUFFIX: &[u8] = b"]133;D";
+    let data_len = data.len();
+    let mut i = 0;
+    while i < data_len {
+        if data[i] == 0x1b
+            && i + 1 + SUFFIX.len() <= data_len
+            && data[i + 1..i + 1 + SUFFIX.len()] == *SUFFIX
+        {
+            let mut j = i + 1 + SUFFIX.len();
+            // Optional ';' separator before the numeric exit code.
+            if j < data_len && data[j] == b';' {
+                j += 1;
+            }
+            let digit_start = j;
+            while j < data_len && data[j].is_ascii_digit() {
+                j += 1;
+            }
+            let exit_code = if j > digit_start {
+                std::str::from_utf8(&data[digit_start..j])
+                    .ok()
+                    .and_then(|s| s.parse::<i32>().ok())
+            } else {
+                // 133;D with no code → treat as success (0).
+                Some(0)
+            };
+            return Some(ExitCodeMarker { end: j, exit_code });
+        }
+        i += 1;
+    }
+    None
 }
 
 // ── Terminal ────────────────────────────────────────────────────────
@@ -494,63 +549,53 @@ impl Terminal {
     }
 
     pub fn process(&mut self, data: &[u8], parser: &mut ansi::Processor) {
-        // Extract OSC 133;D;<exit_code> (shell integration) before feeding to
-        // VTE — vte's ansi::Handler doesn't expose OSC dispatch, so unknown OSCs
-        // (like 133) are silently dropped by the Processor's Perform impl.
-        self.scan_exit_codes(data);
-        // Extract OSC 7 cwd reports (shell integration) — same reason.
+        // Extract OSC 7 cwd reports (shell integration) before feeding to
+        // VTE — vte's ansi::Handler doesn't expose OSC dispatch, so unknown
+        // OSCs (like 7 and 133) are silently dropped by the Processor's
+        // Perform impl.
         self.scan_cwd(data);
-        parser.advance(self, data);
+        // Feed the buffer to VTE in segments split at OSC 133;D markers
+        // (shell integration "command finished"). Besides recording the exit
+        // code, each marker proves the foreground command has exited, so
+        // nothing can legitimately be consuming mouse reports any more —
+        // clear stale mouse-tracking modes left behind by applications that
+        // were killed (or bastion menus that handed off to a target shell)
+        // without sending ESC[?1000l. Without this, the UI keeps forwarding
+        // SGR mouse reports to the shell (which echoes them as garbage like
+        // `0;31;33M`) and local drag-selection/copy stays disabled.
+        // Processing in stream order means an application that enables mouse
+        // tracking AFTER the marker (the next foreground command) keeps it.
+        let mut pos = 0;
+        while let Some(marker) = find_exit_code_marker(&data[pos..]) {
+            let end = pos + marker.end;
+            parser.advance(self, &data[pos..end]);
+            if let Some(rc) = marker.exit_code {
+                self.last_exit_code = Some(rc);
+                self.exit_code_dirty = true;
+            }
+            self.clear_stale_mouse_modes();
+            pos = end;
+        }
+        parser.advance(self, &data[pos..]);
     }
 
-    /// Scan raw output for FinalTerm shell-integration markers
-    /// `ESC ] 1 3 3 ; D ; <exit_code> (BEL|ST)` and record the last exit code.
-    ///
-    /// Single pass over the buffer keyed off the rare ESC (0x1b) byte. This
-    /// replaces the previous `windows().position()` search, which performed a
-    /// naive O(n·m) substring comparison on every `process()` call. Because ESC
-    /// almost never appears in ordinary terminal output, the inner literal
-    /// comparison only fires on actual escape sequences, making this effectively
-    /// O(n) with a tiny constant. Behaviour (including not matching markers that
-    /// straddle a process() boundary) is unchanged.
-    fn scan_exit_codes(&mut self, data: &[u8]) {
-        // `ESC ] 1 3 3 ; D`
-        const SUFFIX: &[u8] = b"]133;D";
-        let data_len = data.len();
-        let mut i = 0;
-        while i < data_len {
-            if data[i] == 0x1b {
-                // Need at least ESC + suffix bytes after this position.
-                if i + 1 + SUFFIX.len() <= data_len && data[i + 1..i + 1 + SUFFIX.len()] == *SUFFIX
-                {
-                    let mut j = i + 1 + SUFFIX.len();
-                    // Optional ';' separator before the numeric exit code.
-                    if j < data_len && data[j] == b';' {
-                        j += 1;
-                    }
-                    let digit_start = j;
-                    while j < data_len && data[j].is_ascii_digit() {
-                        j += 1;
-                    }
-                    let rc = if j > digit_start {
-                        std::str::from_utf8(&data[digit_start..j])
-                            .ok()
-                            .and_then(|s| s.parse::<i32>().ok())
-                    } else {
-                        // 133;D with no code → treat as success (0).
-                        Some(0)
-                    };
-                    if let Some(rc) = rc {
-                        self.last_exit_code = Some(rc);
-                        self.exit_code_dirty = true;
-                    }
-                    // Skip past the consumed marker; continue scanning in case
-                    // multiple exit codes arrive in one batch (last one wins).
-                    i = j;
-                    continue;
-                }
-            }
-            i += 1;
+    /// The foreground command has exited (OSC 133;D observed). If any mouse
+    /// tracking mode is still set, it is stale — the app that requested it is
+    /// gone — so drop them all. This restores local drag-selection/copy and
+    /// stops mouse reports from being injected into the shell's stdin.
+    fn clear_stale_mouse_modes(&mut self) {
+        if self.mode_mouse_reporting
+            || self.mode_mouse_button_motion
+            || self.mode_mouse_any_motion
+            || self.mode_mouse_sgr
+        {
+            tracing::debug!(
+                "[TERM] OSC 133;D with mouse tracking still enabled — clearing stale mouse modes"
+            );
+            self.mode_mouse_reporting = false;
+            self.mode_mouse_sgr = false;
+            self.mode_mouse_button_motion = false;
+            self.mode_mouse_any_motion = false;
         }
     }
 
@@ -1601,10 +1646,6 @@ impl Handler for Terminal {
                         mode_show_cursor: self.mode_show_cursor,
                         mode_cursor_keys: self.mode_cursor_keys,
                         mode_bracketed_paste: self.mode_bracketed_paste,
-                        mode_mouse_reporting: self.mode_mouse_reporting,
-                        mode_mouse_sgr: self.mode_mouse_sgr,
-                        mode_mouse_button_motion: self.mode_mouse_button_motion,
-                        mode_mouse_any_motion: self.mode_mouse_any_motion,
                         mode_line_wrap: self.mode_line_wrap,
                         mode_origin: self.mode_origin,
                         scroll_top: self.scroll_top,
@@ -1680,10 +1721,6 @@ impl Handler for Terminal {
                         self.mode_show_cursor = saved.mode_show_cursor;
                         self.mode_cursor_keys = saved.mode_cursor_keys;
                         self.mode_bracketed_paste = saved.mode_bracketed_paste;
-                        self.mode_mouse_reporting = saved.mode_mouse_reporting;
-                        self.mode_mouse_sgr = saved.mode_mouse_sgr;
-                        self.mode_mouse_button_motion = saved.mode_mouse_button_motion;
-                        self.mode_mouse_any_motion = saved.mode_mouse_any_motion;
                         self.mode_line_wrap = saved.mode_line_wrap;
                         self.mode_origin = saved.mode_origin;
                         self.scroll_top = saved.scroll_top;
@@ -1989,9 +2026,19 @@ mod tests {
         assert!(out.mode_mouse_reporting);
         assert!(out.mode_mouse_sgr);
 
-        // App enters alt screen — mouse modes are restored on exit.
+        // Mouse modes are GLOBAL (xterm semantics): an app that disables
+        // tracking inside the alt screen leaves it disabled after exiting.
+        // Restoring the pre-alt-screen state here used to re-enable mouse
+        // reporting behind the shell's back, injecting SGR reports like
+        // `0;31;33M` into stdin and blocking local drag-selection/copy.
         term.process(b"\x1b[?1049h\x1b[?1000l", &mut parser);
         assert!(!term.render().mode_mouse_reporting);
+        term.process(b"\x1b[?1049l", &mut parser);
+        assert!(!term.render().mode_mouse_reporting);
+
+        // ...and conversely, tracking enabled inside the alt screen stays on
+        // after exit until the app explicitly disables it.
+        term.process(b"\x1b[?1049h\x1b[?1000h", &mut parser);
         term.process(b"\x1b[?1049l", &mut parser);
         assert!(term.render().mode_mouse_reporting);
 
@@ -2006,6 +2053,55 @@ mod tests {
         term.process(b"\x1b[?1003h\x1bc", &mut parser);
         assert!(!term.render().mode_mouse_reporting);
         assert!(!term.render().mode_mouse_sgr);
+    }
+
+    /// A shell-integration OSC 133;D marker means the foreground command has
+    /// exited — any mouse-tracking mode still set at that point is stale (the
+    /// app was killed, or a bastion menu handed off to a target shell without
+    /// sending ESC[?1000l). The terminal must drop the stale modes so mouse
+    /// reports stop being injected into the shell's stdin (`0;31;33M...`
+    /// garbage) and local drag-selection/copy works again.
+    #[test]
+    fn osc133_command_done_clears_stale_mouse_modes() {
+        let mut term = Terminal::new(TerminalSize::default());
+        let mut parser = vte::ansi::Processor::new();
+
+        term.process(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h", &mut parser);
+        let out = term.render();
+        assert!(out.mode_mouse_reporting);
+        assert!(out.mode_mouse_button_motion);
+        assert!(out.mode_mouse_sgr);
+
+        // App dies without cleanup; the shell prints its prompt marker.
+        term.process(b"\x1b]133;D;137\x07$ ", &mut parser);
+        let out = term.render();
+        assert!(!out.mode_mouse_reporting);
+        assert!(!out.mode_mouse_button_motion);
+        assert!(!out.mode_mouse_any_motion);
+        assert!(!out.mode_mouse_sgr);
+        // The exit code is still recorded.
+        assert_eq!(term.take_exit_code(), Some(137));
+    }
+
+    /// The stale-mode clear must happen in stream order: an app launched by
+    /// the NEXT command that enables mouse tracking after the 133;D marker
+    /// (even within the same output chunk) keeps its modes.
+    #[test]
+    fn osc133_clear_respects_stream_order() {
+        let mut term = Terminal::new(TerminalSize::default());
+        let mut parser = vte::ansi::Processor::new();
+
+        // Stale mode from a dead app, prompt marker, then a new app enables
+        // tracking — all in one buffer, as one PTY read may deliver it.
+        term.process(
+            b"\x1b[?1000h\x1b]133;D;0\x07$ vim\r\n\x1b[?1002h\x1b[?1006h",
+            &mut parser,
+        );
+        let out = term.render();
+        assert!(out.mode_mouse_reporting);
+        assert!(out.mode_mouse_button_motion);
+        assert!(out.mode_mouse_sgr);
+        assert_eq!(term.take_exit_code(), Some(0));
     }
 
     #[test]
