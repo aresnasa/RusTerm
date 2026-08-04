@@ -3124,7 +3124,7 @@ fn render_terminal_pane(
                                     (last_row - 1, last_col),
                                 );
                                 if !text.is_empty() {
-                                    match crate::components::terminal_view::copy_text_to_clipboard_pub(text) {
+                                    match crate::components::terminal_view::copy_text_to_clipboard(text) {
                                         crate::components::terminal_view::ClipboardCopyOutcome::Copied(n) => {
                                             tracing::info!(
                                                 "[COPY] SelectAll (full session) copied {n} chars for session {:?}",
