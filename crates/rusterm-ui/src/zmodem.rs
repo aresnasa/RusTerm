@@ -20,9 +20,10 @@
 //!
 //! `process_output` runs on the synchronous event loop and only updates the
 //! in-memory session state + drains `to_pty` bytes (which the caller injects
-//! via `input_senders`). File I/O and the rfd dialogs happen in `spawn`ed
-//! tasks that report back through the [`ZmodemSessions`] handle, so the
-//! event loop is never blocked on disk or a native dialog.
+//! via `input_senders`). File I/O and the rfd dialogs happen in dioxus
+//! `spawn`ed tasks (main-thread event loop — required on macOS, where
+//! NSSavePanel/NSOpenPanel must be created on the main thread) that report
+//! back through the [`ZmodemSessions`] handle.
 
 use std::collections::HashMap;
 use std::io::Write;
@@ -270,7 +271,9 @@ fn spawn_send_file_picker(
     state_handle: Arc<Mutex<ZmodemSessions>>,
     input_sender: mpsc::UnboundedSender<Vec<u8>>,
 ) {
-    tokio::spawn(async move {
+    // Must be a dioxus `spawn` (main-thread event loop), NOT `tokio::spawn`:
+    // on macOS rfd's NSOpenPanel must be created on the main thread.
+    dioxus::prelude::spawn(async move {
         let file = rfd::AsyncFileDialog::new()
             .set_title("选择要上传的文件 / Select file to send")
             .pick_file()
@@ -315,7 +318,9 @@ fn spawn_save_dialog(
         &session_id[..session_id.len().min(8)],
         default_name
     );
-    tokio::spawn(async move {
+    // Must be a dioxus `spawn` (main-thread event loop), NOT `tokio::spawn`:
+    // on macOS rfd's NSSavePanel must be created on the main thread.
+    dioxus::prelude::spawn(async move {
         let mut dialog =
             rfd::AsyncFileDialog::new().set_title("保存接收的文件 / Save received file");
         if !default_name.is_empty() {
