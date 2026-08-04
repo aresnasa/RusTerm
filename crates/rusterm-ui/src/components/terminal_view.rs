@@ -424,6 +424,9 @@ enum CopyShortcut {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TerminalOverlayKeyAction {
     Copy(CopyShortcut),
+    /// Cmd+A (macOS) or Ctrl+Shift+A (other platforms): select all visible
+    /// terminal content and copy it to the clipboard.
+    SelectAll,
     OneKey(OneKeyKeyAction),
     None,
 }
@@ -448,6 +451,11 @@ fn terminal_overlay_key_action(
     }
     if is_c && ctrl && shift && !alt && !meta {
         return TerminalOverlayKeyAction::Copy(CopyShortcut::CtrlShift);
+    }
+    // Cmd+A (macOS) or Ctrl+Shift+A: select all visible rows and copy.
+    let is_a = matches!(key, Key::Character(s) if s.eq_ignore_ascii_case("a"));
+    if is_a && ((meta && !ctrl && !alt) || (ctrl && shift && !alt && !meta)) {
+        return TerminalOverlayKeyAction::SelectAll;
     }
     if onekey_visible && onekey_len > 0 {
         return TerminalOverlayKeyAction::OneKey(onekey_popup_key_action(
@@ -1228,6 +1236,9 @@ pub fn TerminalView(
     let mut selecting = use_signal(|| false);
     let mut mouse_button_down: Signal<Option<u8>> = use_signal(|| None);
     let mut last_motion_cell: Signal<Option<(usize, usize)>> = use_signal(|| None);
+    // Timestamp of the last double-click, used to detect a triple-click
+    // → select entire row. Reset after the timeout window.
+    let mut last_dblclick: Signal<Option<std::time::Instant>> = use_signal(|| None);
     // (content-left, content-top, cell-width, cell-height), in client px.
     // Polled by the geometry effect: the rect changes on resize/pane drags,
     // the cell metrics only change with a font (re)load. NONE until the first
@@ -1382,6 +1393,33 @@ pub fn TerminalView(
                 return;
             }
             TerminalOverlayKeyAction::OneKey(_) | TerminalOverlayKeyAction::None => {}
+            TerminalOverlayKeyAction::SelectAll => {
+                e.prevent_default();
+                e.stop_propagation();
+                // Select all visible rows: anchor at (0, 0), head at the last
+                // row's last cell. Then extract and copy the text.
+                if !copy_rows.is_empty() {
+                    let last_row = copy_rows.len() - 1;
+                    let last_col = copy_rows[last_row].cells.len().saturating_sub(1);
+                    let ts = TextSelection {
+                        anchor: (0, 0),
+                        head: (last_row, last_col),
+                    };
+                    selection.set(Some(ts));
+                    selecting.set(false);
+                    let text = extract_selection(&copy_rows, ts.anchor, ts.head);
+                    if !text.is_empty() {
+                        selection_text.set(text.clone());
+                        if let ClipboardCopyOutcome::Copied(n) = copy_text_to_clipboard(text) {
+                            tracing::info!(
+                                "[COPY] SelectAll copied {n} chars for session {:?}",
+                                &sid_for_copy[..sid_for_copy.len().min(8)]
+                            );
+                        }
+                    }
+                }
+                return;
+            }
         }
 
         // Standard terminal find shortcuts. Cmd+F is used on macOS; Ctrl+F is
@@ -1986,6 +2024,7 @@ pub fn TerminalView(
     let sel_on_input = on_input;
     let down_reporting = render_output.mode_mouse_reporting && render_output.scrollback_offset == 0;
     let down_sgr = render_output.mode_mouse_sgr;
+    let down_rows = render_output.rows.clone();
     let on_mouse_down = move |e: MouseEvent| {
         if current_disconnected {
             return;
@@ -2031,6 +2070,34 @@ pub fn TerminalView(
         if button == 0 {
             // Local selection (Shift forces it even when the app reports).
             let Some(cell) = event_cell(&e) else { return };
+
+            // Triple-click detection: if the last double-click was very
+            // recent (< 500ms), treat this as a triple-click and select
+            // the entire row under the cursor (WindTerm behaviour).
+            let is_triple = last_dblclick()
+                .is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(500));
+            last_dblclick.set(None);
+            if is_triple {
+                let (row, _col) = cell;
+                let row_cells = down_rows.get(row);
+                let last_col = row_cells
+                    .map(|r| r.cells.len())
+                    .unwrap_or(0)
+                    .saturating_sub(1);
+                let ts = TextSelection {
+                    anchor: (row, 0),
+                    head: (row, last_col),
+                };
+                selection.set(Some(ts));
+                selecting.set(false);
+                let text = extract_selection(&down_rows, ts.anchor, ts.head);
+                if !text.is_empty() {
+                    selection_text.set(text.clone());
+                    copy_text_to_clipboard(text);
+                }
+                return;
+            }
+
             selection.set(Some(TextSelection {
                 anchor: cell,
                 head: cell,
@@ -2178,6 +2245,8 @@ pub fn TerminalView(
         let head = (row, end_col);
         selection.set(Some(TextSelection { anchor, head }));
         selecting.set(false); // no drag follows unless a fresh mousedown starts
+        // Record the timestamp so the next mousedown can detect a triple-click.
+        last_dblclick.set(Some(std::time::Instant::now()));
         let text = extract_selection(&dbl_rows, anchor, head);
         if !text.is_empty() {
             selection_text.set(text.clone());
@@ -3124,6 +3193,27 @@ mod tests {
                 false,
             ),
             TerminalOverlayKeyAction::OneKey(OneKeyKeyAction::DismissAndForward)
+        );
+    }
+
+    #[test]
+    fn select_all_shortcut_detected_on_cmd_a_and_ctrl_shift_a() {
+        let key = Key::Character("a".into());
+        // Cmd+A (macOS)
+        assert_eq!(
+            terminal_overlay_key_action(&key, false, false, true, false, false, 0, 0, false),
+            TerminalOverlayKeyAction::SelectAll
+        );
+        // Ctrl+Shift+A (other platforms)
+        assert_eq!(
+            terminal_overlay_key_action(&key, true, false, false, true, false, 0, 0, false),
+            TerminalOverlayKeyAction::SelectAll
+        );
+        // Ctrl+A without Shift should NOT trigger SelectAll (it's a terminal
+        // control sequence — move to line start).
+        assert_eq!(
+            terminal_overlay_key_action(&key, true, false, false, false, false, 0, 0, false),
+            TerminalOverlayKeyAction::None
         );
     }
 
