@@ -471,7 +471,6 @@ const _: [u8; 3] = BIN32_LEADER;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ZHEX;
     use crate::frame::{DataEnd, encode_bin_header, encode_bin32_header, encode_hex_header};
 
     fn make_header(ft: FrameType, data: [u8; 4]) -> HeaderFrame {

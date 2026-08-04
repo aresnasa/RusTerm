@@ -519,7 +519,6 @@ impl ZmodemSession {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::encode_hex_header;
     use crate::{ZDLE, ZHEX, ZPAD};
 
     #[test]
