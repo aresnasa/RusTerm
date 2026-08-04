@@ -2208,6 +2208,83 @@ mod tests {
     }
 
     #[test]
+    fn theme_mode_defaults_to_dark_for_legacy_settings() {
+        let config: PersistedConfig =
+            serde_json::from_str(r#"{"version":1,"connections":[]}"#).unwrap();
+        assert_eq!(config.skin.mode, ThemeMode::Dark);
+    }
+
+    #[test]
+    fn theme_mode_system_resolves_to_os_preference() {
+        assert_eq!(ThemeMode::System.resolve(true), ThemeMode::Dark);
+        assert_eq!(ThemeMode::System.resolve(false), ThemeMode::Light);
+        assert_eq!(ThemeMode::Dark.resolve(false), ThemeMode::Dark);
+        assert_eq!(ThemeMode::Light.resolve(true), ThemeMode::Light);
+    }
+
+    #[test]
+    fn palette_picks_light_variant_when_mode_resolves_to_light() {
+        let dark = SkinSettings {
+            kind: SkinKind::TokyoNight,
+            mode: ThemeMode::Dark,
+            ..SkinSettings::default()
+        };
+        let light = SkinSettings {
+            kind: SkinKind::TokyoNight,
+            mode: ThemeMode::Light,
+            ..SkinSettings::default()
+        };
+        // Dark mode never consults the OS flag.
+        assert_eq!(dark.palette(true), SkinPalette::tokyo_night());
+        assert_eq!(dark.palette(false), SkinPalette::tokyo_night());
+        // Light mode picks the light variant regardless of the OS flag.
+        assert_eq!(light.palette(true), SkinPalette::tokyo_night_light());
+        assert_eq!(light.palette(false), SkinPalette::tokyo_night_light());
+    }
+
+    #[test]
+    fn palette_system_mode_follows_os_preference() {
+        let system = SkinSettings {
+            kind: SkinKind::OneDark,
+            mode: ThemeMode::System,
+            ..SkinSettings::default()
+        };
+        assert_eq!(system.palette(true), SkinPalette::one_dark());
+        assert_eq!(system.palette(false), SkinPalette::one_light());
+    }
+
+    #[test]
+    fn palette_custom_uses_the_resolved_variant_slot() {
+        let mut skin = SkinSettings {
+            kind: SkinKind::Custom,
+            mode: ThemeMode::System,
+            ..SkinSettings::default()
+        };
+        skin.custom.accent = "#111111".to_string();
+        skin.custom_light.accent = "#222222".to_string();
+        assert_eq!(skin.palette(true).accent, "#111111");
+        assert_eq!(skin.palette(false).accent, "#222222");
+    }
+
+    #[test]
+    fn skin_settings_roundtrip_preserves_mode_and_custom_light() {
+        let skin = SkinSettings {
+            kind: SkinKind::Custom,
+            mode: ThemeMode::System,
+            custom: SkinPalette::default(),
+            custom_light: SkinPalette::one_light(),
+        };
+        let json = serde_json::to_string(&skin).unwrap();
+        let restored: SkinSettings = serde_json::from_str(&json).unwrap();
+        assert_eq!(restored, skin);
+        // Legacy configs (no mode / custom_light fields) keep working.
+        let legacy: SkinSettings =
+            serde_json::from_str(r#"{"kind":"tokyo_night","custom":{}}"#).unwrap();
+        assert_eq!(legacy.mode, ThemeMode::Dark);
+        assert_eq!(legacy.custom_light, default_custom_light_palette());
+    }
+
+    #[test]
     fn keybindings_normalize_unsafe_manual_values() {
         let keybindings = Keybindings {
             close_focused_pane: Some(KeyChord {

@@ -116,6 +116,7 @@ fn main() {
         r#"">
 <style>
 html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#1a1b26;}
+@media (prefers-color-scheme: light){html,body{background:#e1e2e7;}}
 #main{width:100%;height:100%;overflow:hidden;}
 .conn-item:hover{background:#24283b!important;}
 .conn-item{cursor:pointer;transition:background 0.1s;}

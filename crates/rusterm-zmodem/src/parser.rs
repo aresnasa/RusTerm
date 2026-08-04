@@ -591,6 +591,41 @@ mod tests {
     }
 
     #[test]
+    fn detects_hex_zrqinit_with_sz_capability_flags() {
+        // Real `sz` may send ZRQINIT with ZF0 = CANFC32|CANFDX|CANOVIO = 0x23.
+        // The detector must still detect the frame (CRC is non-zero).
+        let frame = make_header(FrameType::ZRQInit, [0x23, 0, 0, 0]);
+        let enc = encode_hex_header(&frame);
+        let mut d = Detector::new();
+        let (pass, det) = d.feed(&enc);
+        assert_eq!(pass, b"");
+        assert_eq!(det.len(), 1);
+        match &det[0] {
+            Detection::Frame(ZmodemFrame::Header(h)) => {
+                assert_eq!(h.frame_type, FrameType::ZRQInit);
+                assert_eq!(h.data, [0x23, 0, 0, 0]);
+            }
+            other => panic!("expected ZRQInit header, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn detects_hex_zrqinit_with_highbit_lf_terminator() {
+        // Some ZMODEM implementations send CR 0x8A (high-bit LF variant)
+        // instead of CR LF. The detector must accept both.
+        let frame = make_header(FrameType::ZRQInit, [0, 0, 0, 0]);
+        let mut enc = encode_hex_header(&frame);
+        // Replace the trailing LF (0x0A) with 0x8A.
+        let last = enc.len() - 1;
+        assert_eq!(enc[last], b'\n');
+        enc[last] = 0x8A;
+        let mut d = Detector::new();
+        let (pass, det) = d.feed(&enc);
+        assert_eq!(pass, b"");
+        assert_eq!(det.len(), 1);
+    }
+
+    #[test]
     fn detects_hex_zrinit_frame_with_capability_flags() {
         // ZRINIT with data = [0x00, 0x00, 0x20, 0x00] (CANFDX | CANOVIO).
         let frame = make_header(FrameType::ZRInit, [0x00, 0x00, 0x20, 0x00]);

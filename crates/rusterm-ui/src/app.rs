@@ -13387,7 +13387,10 @@ pub fn App() -> Element {
     // that `ThemeMode::System` follows the OS live. Seeded synchronously here
     // so the very first render already uses the correct variant.
     let mut system_is_dark: Signal<bool> = use_signal(|| {
-        *dioxus::desktop::window().theme() == dioxus::desktop::tao::window::Theme::Dark
+        matches!(
+            dioxus::desktop::window().theme(),
+            dioxus::desktop::tao::window::Theme::Dark
+        )
     });
 
     // Pane index currently being hovered by a drag operation, or `None` when
@@ -14078,7 +14081,7 @@ pub fn App() -> Element {
         else {
             return;
         };
-        system_is_dark.set(*theme == dioxus::desktop::tao::window::Theme::Dark);
+        system_is_dark.set(matches!(theme, dioxus::desktop::tao::window::Theme::Dark));
     });
 
     // Re-show the window when the close-confirmation dialog becomes visible.

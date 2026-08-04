@@ -847,8 +847,10 @@ pub fn SettingsDialog(
     // correctly inside the dialog. Read fresh on every render; this is cheap
     // (a tao window property read) and keeps the preview in sync if the user
     // switches OS theme while the dialog is open.
-    let system_is_dark =
-        *dioxus::desktop::window().theme() == dioxus::desktop::tao::window::Theme::Dark;
+    let system_is_dark = matches!(
+        dioxus::desktop::window().theme(),
+        dioxus::desktop::tao::window::Theme::Dark
+    );
     let skin_preview = skin_draft().palette(system_is_dark);
     // When editing the Custom skin, toggles whether the color fields below
     // edit the dark (`custom`) or light (`custom_light`) variant. Defaults to

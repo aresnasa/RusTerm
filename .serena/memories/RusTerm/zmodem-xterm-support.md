@@ -3,7 +3,7 @@
 ## Goal
 Add ZMODEM file-transfer support (interoperate with system-installed `lrzsz` `rz`/`sz`) and ensure xterm-compatible terminal type. User: "添加 lrzsz，xterm支持，需要能够使用 lrzsz".
 
-**STATUS: Working** — `sz file` on a remote host now triggers a save dialog and downloads the file correctly.
+**STATUS: Diagnostic tracing added — runtime `sz`/`rz` still not triggering save dialog.** All 44 unit tests pass but runtime fails. Comprehensive `tracing::info!`/`tracing::warn!` logs have been added throughout the ZMODEM pipeline (`intercept_zmodem`, `Detector::begin_frame`, `complete_hex`, `spawn_save_dialog`) to pinpoint the failure. User should run the app, reproduce with `sz test`, then check `~/Library/Application Support/rusterm/logs/rusterm.log.*` for `[ZMODEM]` entries.
 
 ## Approach
 **Pure-Rust ZMODEM protocol implementation** (NOT shelling out to a local `lrzsz` binary). The remote `rz`/`sz` emits protocol frames; RusTerm parses + responds to them in-process. This matches how iTerm2 / WindTerm integrate ZMODEM.
@@ -21,7 +21,7 @@ Pure-Rust, fully unit-testable, no UI dependencies.
 1. **ZRINIT flags = 0x03** (CANFDX|CANOVIO), NOT 0x21 (which advertised CANFC32, forcing sz to use ZBIN32).
 2. **DataEnd wire values = 0x68-0x6B** (ZCRCE='h', ZCRCG='i', ZCRCQ='j', ZCRCW='k'), NOT 0x01-0x04.
 3. **Data subframes have NO ZPAD ZDLE leader** — they start directly after a header and end with `ZDLE <frameend> <crc>`. The `InData` state handles this.
-4. **`complete_hex` waits for the byte after CR** before returning — otherwise the LF is left in the collector and misinterpreted as the first byte of a data subframe.
+4. **`complete_hex` waits for the byte after CR** before returning — otherwise the LF is left in the collector and misinterpreted as the first byte of a data subframe. Also accepts `0x8A` (high-bit LF variant) in addition to `0x0A` and `0x80`.
 5. **`complete_bin` uses `zdle_decode_n`** (decode exactly N bytes) instead of decoding the entire buffer — prevents trailing data subframe bytes from corrupting the header CRC check.
 6. **Remaining bytes are re-fed recursively** via `process_byte()` after a frame completes — prevents data subframe loss.
 7. **`encode_data_subframe`** (no ZDATA leader, no offset) is used for ZFILE metadata and ZDATA data subframes. `encode_data_block` (with ZDATA leader) is retained but deprecated.
@@ -34,7 +34,7 @@ Pure-Rust, fully unit-testable, no UI dependencies.
 - **Stop-and-wait send**: one ZDATA block per ZACK (not windowed). lrzsz tolerates this.
 - **ZDLE decode**: standard `byte ^ 0x40`. High-bit CR variant (0x8D→0x0D) is NOT supported (non-standard; lrzsz uses plain 0x4D for CR).
 
-### 42 unit tests
+### 44 unit tests (+2 ZRQINIT with flags + high-bit LF)
 CRC vectors, ZDLE round-trips, hex/binary header detection (incl. partial frames + CRC rejection), cancel on 8×CAN, receive/send negotiation, file metadata parsing (NUL-separated), session lifecycle, **data subframe detection** (ZFILE+subframe in one chunk, separate chunks, ZDATA+Continue+End, control bytes in payload), **full receive-path integration** (ZRQINIT→ZFILE+metadata→FileOffer, ZRQINIT→ZFILE→ZRPOS→ZDATA+data→ZEOF→Done).
 
 ## Integration: `rusterm-ui/src/zmodem.rs`
@@ -58,16 +58,57 @@ Non-zmodem passthrough, ZRQINIT activates + produces ZRINIT, bytes-before-frame 
 - 3 tests (default, user-supplied wins, non-TERM keys ignored).
 
 ## Test totals
-- rusterm-zmodem: 42 (was 36; +6 data subframe + integration tests)
-- rusterm-ui: 673 (was 672; +1 SelectAll test)
+- rusterm-zmodem: 44 (was 42; +2 ZRQINIT with flags + high-bit LF tests)
+- rusterm-ui: 678 (was 673; external process added 5 skin/theme tests)
 - rusterm-proto: 6
-- All green. (Pre-existing unrelated failure in `rusterm-relay::command_guard::tests::empty_json_object_is_valid` — not touched.)
+- All green.
 
 ## Commits
 - `feat(zmodem): add rusterm-zmodem crate with ZMODEM protocol parser` — core crate (36 tests)
 - `feat(zmodem): integrate ZMODEM into terminal sessions + xterm TERM` — UI wiring + proto TERM
 - `fix(zmodem): fix ZMODEM detection — data subframe parsing, CRC, ZRINIT flags` — the big fix (9 root causes, +6 tests)
 - `feat(ui): add Cmd+A select-all-copy and triple-click line select` — session copy + mouse selection improvements
+- `fix(zmodem): add diagnostic tracing + overflow guards + 0x8A LF support` — runtime debugging infrastructure
+- `fix(ui): SelectAll now copies full scrollback (not just visible viewport)` — session copy fix
+- `fix(ui): selection highlight opacity 0.30 → 0.35 for better visibility` — mouse selection optimization
+
+## Session copy (full scrollback) fix
+
+**Problem**: Cmd+A / Ctrl+Shift+A (SelectAll) only copied the *visible viewport* rows, not the full session scrollback. Users couldn't copy the entire session history.
+
+**Fix**: Added `on_copy_all: EventHandler<()>` prop to `TerminalView`. When SelectAll is triggered, instead of selecting visible rows, it calls `on_copy_all` which:
+1. Locks the terminal entry
+2. Gets `scrollback_len()` (total scrollback lines)
+3. Calls `render_with_scroll(max_scroll)` to render ALL rows (scrollback + visible grid)
+4. Extracts text from (0,0) to (last_row, last_col)
+5. Copies to clipboard via `copy_text_to_clipboard`
+
+The `copy_text_to_clipboard` and `ClipboardCopyOutcome` were made `pub` in `terminal_view.rs` so `app.rs` can reuse them.
+
+## Mouse selection optimization
+
+- Selection highlight opacity increased from 0.30 to 0.35 (`SELECTION_BG`) for better visibility over both dark and light cell backgrounds.
+- Existing mouse selection features (double-click word, triple-click line, drag-select, copy-on-select) are unchanged.
+
+## Diagnostic tracing (added for runtime debugging)
+
+When `sz`/`rz` doesn't trigger a dialog, check the log file (`~/Library/Application Support/rusterm/logs/rusterm.log.*`) for these `[ZMODEM]` / `[ZMODEM-DETECT]` entries:
+
+- `[ZMODEM] no input sender for session ...` — `intercept_zmodem` couldn't find the session's input sender in `input_senders`. This means ZMODEM bytes pass through as text (the #1 suspect).
+- `[ZMODEM] ZPAD in data for ...` — ZPAD (0x2A) was found in the output data, indicating a potential ZMODEM frame leader. The hex preview shows the first 40 bytes.
+- `[ZMODEM-DETECT] entering InFrame: kind=... fmt=...` — the detector recognized a ZMODEM leader and started collecting a frame.
+- `[ZMODEM-DETECT] complete_hex: CRC mismatch! type=... expected=... actual=...` — the frame was received but the CRC didn't match (corruption or wrong CRC algorithm).
+- `[ZMODEM-DETECT] complete_hex: detected ...` — a frame was successfully detected.
+- `[ZMODEM-DETECT] InFrame overflow (... bytes) — resetting to Idle` — the collector grew beyond 4 KiB without completing a frame (malformed input).
+- `[ZMODEM] sending N bytes to PTY for ...` — ZMODEM response (e.g., ZRINIT) was sent back to the remote.
+- `[ZMODEM] event for ...: ReceiveOffered` — the session detected a ZRQINIT and is ready to receive.
+- `[ZMODEM] event for ...: FileOffer { name: ..., size: ... }` — a file offer was received; the save dialog should spawn next.
+- `[ZMODEM] spawning save dialog for ...` — the rfd save dialog was spawned.
+- `[ZMODEM] save dialog result for ...: picked/cancelled/failed` — the dialog completed.
+
+### Overflow guards (added to prevent detector stuck states)
+- **InFrame**: if the collector exceeds 4 KiB without completing a frame, the detector resets to Idle and flushes collected bytes as passthrough (prevents the detector from silently swallowing all subsequent output).
+- **InData**: if the collector exceeds 64 KiB without finding a data subframe terminator, the detector resets to Idle.
 
 ## Known limitations / future work
 - **No transfer progress UI panel** yet. Progress is logged (`[ZMODEM] data received offset=… len=…`). The existing `transfers` module (TransferState/TransferJob) could be reused to show a progress bar, but isn't wired up.
