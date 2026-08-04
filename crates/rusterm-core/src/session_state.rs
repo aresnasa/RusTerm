@@ -280,6 +280,22 @@ impl SessionState {
     pub fn exists() -> bool {
         Self::resolve_path().map(|p| p.exists()).unwrap_or(false)
     }
+
+    /// Compare the *persistable content* of two snapshots, ignoring
+    /// `saved_at`.
+    ///
+    /// The change-driven save loop uses this as its dirty check: a snapshot
+    /// is rebuilt every couple of seconds, but re-encrypting and rewriting
+    /// `session_state.enc` is only worthwhile when something the next launch
+    /// would actually restore differs (session membership, cwd, history
+    /// tail, terminal size, replay ops, active session, theme). Comparing
+    /// `saved_at` would make every rebuild look dirty and defeat the check.
+    pub fn content_eq(&self, other: &SessionState) -> bool {
+        self.schema_version == other.schema_version
+            && self.active_session == other.active_session
+            && self.sessions == other.sessions
+            && self.theme == other.theme
+    }
 }
 
 /// Convenience wrapper that holds the master key in `Zeroizing` memory so it's
@@ -347,6 +363,38 @@ mod tests {
         let loaded = SessionState::load_from(&path, &key).unwrap().unwrap();
 
         assert_eq!(state, loaded);
+    }
+
+    /// `content_eq` is the change-driven save loop's dirty check: a rebuilt
+    /// snapshot only differs by `saved_at` unless something restorable
+    /// changed, so `saved_at` must be ignored while every persistable field
+    /// must be compared.
+    #[test]
+    fn content_eq_ignores_saved_at_but_detects_restorable_changes() {
+        let base = sample_state();
+
+        // Same content, newer timestamp — NOT dirty.
+        let mut rebuilt = base.clone();
+        rebuilt.saved_at = chrono::Utc::now();
+        assert!(base.content_eq(&rebuilt));
+
+        // cwd changed — dirty.
+        let mut cwd_changed = rebuilt.clone();
+        cwd_changed.sessions[0].cwd = Some("/tmp".to_string());
+        assert!(!base.content_eq(&cwd_changed));
+
+        // Session membership changed — dirty.
+        let mut logged_out = rebuilt.clone();
+        logged_out.sessions.clear();
+        logged_out.active_session = None;
+        assert!(!base.content_eq(&logged_out));
+
+        // Replay ops changed — dirty.
+        let mut replay_changed = rebuilt;
+        replay_changed.sessions[0]
+            .replay_ops
+            .push("ssh app".to_string());
+        assert!(!base.content_eq(&replay_changed));
     }
 
     #[test]

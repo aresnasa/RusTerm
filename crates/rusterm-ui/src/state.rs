@@ -937,6 +937,36 @@ impl AppState {
         }
     }
 
+    /// Whether a freshly-built snapshot may safely overwrite the on-disk
+    /// `session_state.enc` right now.
+    ///
+    /// Non-empty snapshots are always writable. An **empty** snapshot is the
+    /// durable "user logged out of every terminal" record — but it is only
+    /// trustworthy when every workspace terminal has *definitively*
+    /// disconnected. While a connect or reconnect is still in flight (the
+    /// tab exists but its connection state is not yet `Connected` and not
+    /// yet `Disconnected`), writing the empty snapshot would destroy the
+    /// previous run's memory: e.g. the user clicks 恢复, the jumpserver
+    /// reconnect takes ten seconds, and a save tick (or a quit) lands in
+    /// that window. Deferring the write preserves the old snapshot until
+    /// the in-flight sessions settle either way.
+    ///
+    /// The embedded bottom shell is ignored — it's never part of the
+    /// snapshot, so its (always `Connected`) state must not block empty
+    /// writes.
+    pub fn session_snapshot_writable(&self, snapshot: &rusterm_core::SessionState) -> bool {
+        if !snapshot.sessions.is_empty() {
+            return true;
+        }
+        !self.sessions.iter().any(|tab| {
+            self.bottom_shell_session_id.as_deref() != Some(tab.id.as_str())
+                && !matches!(
+                    self.session_connection_states.get(&tab.id),
+                    Some(SessionConnectionState::Disconnected)
+                )
+        })
+    }
+
     /// Encrypt + atomically persist the current session state. No-op if
     /// `restore_disabled` is true (the user picked "不再询问" earlier — we
     /// don't save so we don't re-prompt on next launch either). Returns the
@@ -3416,6 +3446,58 @@ mod tests {
             .unwrap();
         assert!(logged_out.sessions.is_empty());
         assert_eq!(logged_out.active_session, None);
+    }
+
+    /// Empty snapshots must not clobber `session_state.enc` while a
+    /// connect/reconnect is still in flight — otherwise clicking 恢复 and
+    /// quitting (or a save tick landing) before the jumpserver reconnect
+    /// completes would erase the very session memory being restored.
+    #[test]
+    fn empty_snapshot_is_deferred_while_a_reconnect_is_in_flight() {
+        // Non-empty snapshot: always writable.
+        let mut state = state_with_tabs(&["workspace"]);
+        state
+            .session_connection_states
+            .insert("workspace".to_string(), SessionConnectionState::Connected);
+        let snapshot = state.build_session_state("Default Dark");
+        assert!(!snapshot.sessions.is_empty());
+        assert!(state.session_snapshot_writable(&snapshot));
+
+        // Tab exists but has no connection-state entry yet (initial connect
+        // in flight, e.g. right after clicking 恢复): defer the empty write.
+        let state = state_with_tabs(&["restoring"]);
+        let snapshot = state.build_session_state("Default Dark");
+        assert!(snapshot.sessions.is_empty());
+        assert!(!state.session_snapshot_writable(&snapshot));
+
+        // Reconnecting: still in flight — defer.
+        let mut state = state_with_tabs(&["flaky"]);
+        state
+            .session_connection_states
+            .insert("flaky".to_string(), SessionConnectionState::Reconnecting);
+        let snapshot = state.build_session_state("Default Dark");
+        assert!(!state.session_snapshot_writable(&snapshot));
+
+        // Every terminal definitively disconnected: the empty snapshot is
+        // the durable logged-out record and MUST be written.
+        let mut state = state_with_tabs(&["done"]);
+        state
+            .session_connection_states
+            .insert("done".to_string(), SessionConnectionState::Disconnected);
+        let snapshot = state.build_session_state("Default Dark");
+        assert!(state.session_snapshot_writable(&snapshot));
+
+        // The embedded bottom shell (always Connected, never persisted)
+        // must not block empty writes.
+        let mut state = state_with_tabs(&["embedded-shell"]);
+        state.bottom_shell_session_id = Some("embedded-shell".to_string());
+        state.session_connection_states.insert(
+            "embedded-shell".to_string(),
+            SessionConnectionState::Connected,
+        );
+        let snapshot = state.build_session_state("Default Dark");
+        assert!(snapshot.sessions.is_empty());
+        assert!(state.session_snapshot_writable(&snapshot));
     }
 
     /// move_session_to_leftmost must relocate the matching tab to index 0.

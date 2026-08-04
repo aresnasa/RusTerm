@@ -13053,7 +13053,9 @@ fn save_layout_snapshot(state: &Signal<AppState>) {
 /// Best-effort: failures (no master key, encrypt/write error) are logged but
 /// never block the exit. Empty snapshots are still written so a previous
 /// logged-in state cannot be restored after the user has disconnected or
-/// closed every terminal.
+/// closed every terminal — unless a connect/reconnect is still in flight
+/// (`session_snapshot_writable`), in which case the previous snapshot is
+/// preserved so quitting mid-reconnect doesn't erase the session memory.
 fn save_session_state_snapshot(state: &Signal<AppState>) {
     let s = state.read();
     // While the startup restore prompt is undecided, the on-disk snapshot
@@ -13071,6 +13073,9 @@ fn save_session_state_snapshot(state: &Signal<AppState>) {
     // Build the snapshot while holding the read lock, then release before the
     // CPU-bound encrypt+write (same pattern as the periodic save loop).
     let snapshot = s.build_session_state(s.theme_name());
+    if !s.session_snapshot_writable(&snapshot) {
+        return;
+    }
     drop(s);
     if let Err(e) = snapshot.save(&master_key) {
         tracing::warn!("Failed to save session state on exit: {}", e);
@@ -14791,8 +14796,12 @@ pub fn App() -> Element {
     //     event-loop iteration) actually closes the window and exits the app.
     //
     // The handler only fires on the OS-level CloseRequested event (close
-    // button, Cmd+Q on macOS with a single window, Alt+F4 on Linux/Windows).
-    // It does NOT fire on `desktop.close()` — that sends `UserWindowEvent::CloseWindow`,
+    // button, Alt+F4 on Linux/Windows). It does NOT fire on macOS Cmd+Q /
+    // menu Quit — those go through `NSApp terminate:` and kill the process
+    // without any window event, bypassing this handler AND the confirmation
+    // dialog entirely. Session state survives that path only because the
+    // change-driven save loop keeps `session_state.enc` at most ~2 s stale.
+    // It also does NOT fire on `desktop.close()` — that sends `UserWindowEvent::CloseWindow`,
     // which re-enters `handle_close_requested` directly (as a `UserEvent`, not
     // a `WindowEvent::CloseRequested`), so there's no infinite dialog loop
     // when the 确认关闭 button calls `desktop.close()`.
@@ -14959,22 +14968,43 @@ pub fn App() -> Element {
         }
     });
 
-    // Periodically persist the session state (cwd of each tab, etc.) so the
-    // user can restore on next launch even if the app is killed without a
-    // graceful shutdown. 30s is a balance between not losing too much state
-    // and not hammering the disk with encrypted writes.
+    // Change-driven session-state persistence. The snapshot (logged-in
+    // sessions + cwds + history tails + replay ops) is rebuilt every couple
+    // of seconds and written whenever its persistable content changed.
     //
-    // We skip saving only while the app is locked (no master key available).
-    // Empty snapshots are intentionally persisted: they record that no terminal
-    // was logged in and prevent an older non-empty snapshot from being restored.
+    // Why not save only on exit: on macOS the most common "normal exit" is
+    // Cmd+Q / the menu Quit item, which goes through `NSApp terminate:` and
+    // NEVER fires `WindowEvent::CloseRequested` — every exit hook (the wry
+    // close handler AND the confirm-close button) is bypassed and the
+    // process just dies. The old 30-second timer left up to 30 s of state
+    // unsaved, so a connect-then-quit inside that window lost the session
+    // memory and the next launch showed no restore prompt. Keeping the
+    // on-disk snapshot no more than ~2 s stale makes the startup restore
+    // prompt reliable for EVERY exit type: Cmd+Q, close button, crash, or
+    // force-kill.
+    //
+    // Cost control: the dirty check (`content_eq`, ignores `saved_at`)
+    // means the CPU-bound encrypt + disk write only happens when session
+    // membership / cwd / history / size / replay content actually changed —
+    // idle sessions cost one cheap in-memory snapshot build per tick.
+    //
+    // We skip saving while the app is locked (no master key available) and
+    // while the startup restore prompt is undecided (the file still holds
+    // the previous run's sessions — see `save_session_state_snapshot`).
+    // Empty snapshots are persisted only once every workspace terminal has
+    // definitively disconnected (`session_snapshot_writable`): they record
+    // that no terminal was logged in and prevent an older non-empty snapshot
+    // from being restored, but must not clobber the file while a
+    // connect/reconnect is still in flight.
     //
     // The save itself is atomic (temp + rename) so concurrent saves from
     // multiple sources (this loop + the close handler) can't corrupt the
     // file — last writer wins, which is the correct behavior for a snapshot.
     let state_for_save = state.clone();
     let _session_state_save_future = use_future(move || async move {
+        let mut last_saved: Option<rusterm_core::SessionState> = None;
         loop {
-            tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+            tokio::time::sleep(std::time::Duration::from_secs(2)).await;
 
             let s = state_for_save.read();
             if s.unlock_state != UnlockState::Unlocked {
@@ -14996,10 +15026,25 @@ pub fn App() -> Element {
             // before encrypting+writing (encryption is CPU-bound, no need
             // to hold the lock through it).
             let snapshot = s.build_session_state(s.theme_name());
+            if !s.session_snapshot_writable(&snapshot) {
+                // A connect/reconnect is still in flight — deciding "nothing
+                // is logged in" now would be premature. Keep the previous
+                // on-disk snapshot until the sessions settle.
+                continue;
+            }
+            // Dirty check: skip the encrypt+write when nothing the next
+            // launch would restore has changed since the last write.
+            if last_saved
+                .as_ref()
+                .is_some_and(|prev| prev.content_eq(&snapshot))
+            {
+                continue;
+            }
             // Drop the read lock before the (CPU-bound) encrypt+write.
             drop(s);
-            if let Err(e) = snapshot.save(&master_key) {
-                tracing::warn!("Failed to save session state: {}", e);
+            match snapshot.save(&master_key) {
+                Ok(()) => last_saved = Some(snapshot),
+                Err(e) => tracing::warn!("Failed to save session state: {}", e),
             }
         }
     });
