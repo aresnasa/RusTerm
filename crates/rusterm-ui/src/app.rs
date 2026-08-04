@@ -2594,11 +2594,16 @@ fn render_terminal_pane(
                 .get(&tab.id)
                 .cloned();
             // Both disconnected and reconnecting sessions have no live input
-            // channel. Repeated Enter during `Reconnecting` is ignored by the
-            // atomic state transition in `reconnect_session`.
+            // channel. A `Failed` connect attempt is treated the same way so
+            // Enter offers a retry. Repeated Enter during `Reconnecting` is
+            // ignored by the atomic state transition in `reconnect_session`.
             let tab_disconnected = matches!(
                 state.read().session_connection_states.get(&tab.id),
-                Some(SessionConnectionState::Disconnected | SessionConnectionState::Reconnecting)
+                Some(
+                    SessionConnectionState::Disconnected
+                        | SessionConnectionState::Reconnecting
+                        | SessionConnectionState::Failed
+                )
             );
             let keybindings = state.read().keybindings.clone();
             let history_completion_visible =
@@ -8803,9 +8808,10 @@ fn onekey_enabled_for_session(state: &AppState, session_id: &str) -> bool {
 }
 
 fn begin_reconnect(state: &mut AppState, session_id: &str) -> bool {
-    if state.session_connection_states.get(session_id)
-        != Some(&SessionConnectionState::Disconnected)
-    {
+    if !matches!(
+        state.session_connection_states.get(session_id),
+        Some(SessionConnectionState::Disconnected | SessionConnectionState::Failed)
+    ) {
         return false;
     }
     state
@@ -10381,6 +10387,39 @@ mod session_startup_tests {
         assert!(begin_reconnect(&mut state, "pane-a"));
     }
 
+    /// A `Failed` connect attempt (distinct from a clean `Disconnected`) is a
+    /// valid retry starting point for `begin_reconnect`, so the indicator dot
+    /// can show red and the user can still press Enter to retry.
+    #[test]
+    fn begin_reconnect_accepts_failed_state() {
+        let mut state = AppState::default();
+        state
+            .session_connection_states
+            .insert("pane-a".to_string(), SessionConnectionState::Failed);
+
+        assert!(begin_reconnect(&mut state, "pane-a"));
+        assert_eq!(
+            state.session_connection_states.get("pane-a"),
+            Some(&SessionConnectionState::Reconnecting),
+        );
+    }
+
+    /// `Connecting` and `Connected` are NOT valid retry starting points —
+    /// `begin_reconnect` must reject them so a duplicate connect can't race.
+    #[test]
+    fn begin_reconnect_rejects_connecting_and_connected() {
+        let mut state = AppState::default();
+        state
+            .session_connection_states
+            .insert("c".to_string(), SessionConnectionState::Connecting);
+        assert!(!begin_reconnect(&mut state, "c"));
+
+        state
+            .session_connection_states
+            .insert("c".to_string(), SessionConnectionState::Connected);
+        assert!(!begin_reconnect(&mut state, "c"));
+    }
+
     /// A session stuck in `Reconnecting` (because the connect attempt hung and
     /// the watchdog hasn't fired yet) rejects `begin_reconnect` — this is the
     /// bug the user hit ("多次都没有触发会话恢复"). The fix is the watchdog
@@ -11875,7 +11914,7 @@ fn start_ssh_connection(
                 state
                     .write()
                     .session_connection_states
-                    .insert(tab_id.clone(), SessionConnectionState::Disconnected);
+                    .insert(tab_id.clone(), SessionConnectionState::Failed);
                 let failed = crate::i18n::tf("session.connection_failed", &[("error", &e)]);
                 let reconnect = crate::i18n::t("session.press_enter_to_reconnect");
                 let msg = format!("{failed}\r\n{reconnect}\r\n");
@@ -12696,7 +12735,7 @@ fn start_shell_connection(
             state
                 .write()
                 .session_connection_states
-                .insert(tab_id.clone(), SessionConnectionState::Disconnected);
+                .insert(tab_id.clone(), SessionConnectionState::Failed);
             let failed = crate::i18n::tf("session.shell_failed", &[("error", &e)]);
             let reconnect = crate::i18n::t("session.press_enter_to_reconnect");
             let msg = format!("{failed}\r\n{reconnect}\r\n");
@@ -12919,7 +12958,7 @@ fn start_serial_connection(
                     let render_result = handle.lock().process_and_render(msg.as_bytes());
                     let mut s = state.write();
                     s.session_connection_states
-                        .insert(tab_id.clone(), SessionConnectionState::Disconnected);
+                        .insert(tab_id.clone(), SessionConnectionState::Failed);
                     if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == tab_id) {
                         tab.render_output = render_result;
                         tab.version += 1;
@@ -12928,6 +12967,10 @@ fn start_serial_connection(
             }
             Err(e) => {
                 tracing::error!("[SERIAL] spawn_blocking panicked: {}", e);
+                state
+                    .write()
+                    .session_connection_states
+                    .insert(tab_id.clone(), SessionConnectionState::Failed);
             }
         }
     });
@@ -13144,7 +13187,7 @@ fn start_telnet_connection(
                     let render_result = handle.lock().process_and_render(msg.as_bytes());
                     let mut s = state.write();
                     s.session_connection_states
-                        .insert(tab_id.clone(), SessionConnectionState::Disconnected);
+                        .insert(tab_id.clone(), SessionConnectionState::Failed);
                     if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == tab_id) {
                         tab.render_output = render_result;
                         tab.version += 1;
@@ -14004,7 +14047,7 @@ fn schedule_cd_after_restore(
             let has_sender = input_senders.read().contains_key(&tab_id);
             let conn_state = state.read().session_connection_states.get(&tab_id).copied();
             match conn_state {
-                Some(SessionConnectionState::Disconnected) => {
+                Some(SessionConnectionState::Disconnected | SessionConnectionState::Failed) => {
                     tracing::warn!(
                         "[RESTORE] session {} disconnected before `cd` could be sent",
                         &tab_id[..tab_id.len().min(8)]
@@ -14389,6 +14432,12 @@ fn open_connection(
         .write()
         .session_configs
         .insert(tab_id.clone(), conn.clone());
+    // Mark the session as Connecting so the indicator dot renders the
+    // in-progress (blue) colour until the driver reports Connected/Failed.
+    state
+        .write()
+        .session_connection_states
+        .insert(tab_id.clone(), SessionConnectionState::Connecting);
 
     let assigned_to_target = match &conn.kind {
         ConnectionKind::Ssh(ssh_config) => {
@@ -14536,12 +14585,17 @@ fn disconnect_session_state(
     input_senders: &mut HashMap<String, mpsc::UnboundedSender<Vec<u8>>>,
     tab_id: &str,
 ) -> bool {
-    // Guard: only disconnect a session that is currently Connected (or
-    // mid-Reconnecting). Already-Disconnected / unknown sessions are a no-op
-    // so the button is safe to click repeatedly.
+    // Guard: only disconnect a session that is currently Connected,
+    // mid-Reconnecting, or still Connecting (cancel an in-flight attempt).
+    // Already-Disconnected/Failed/unknown sessions are a no-op so the button
+    // is safe to click repeatedly.
     let can_disconnect = matches!(
         state.session_connection_states.get(tab_id),
-        Some(SessionConnectionState::Connected) | Some(SessionConnectionState::Reconnecting)
+        Some(
+            SessionConnectionState::Connected
+                | SessionConnectionState::Reconnecting
+                | SessionConnectionState::Connecting
+        )
     );
     if !can_disconnect {
         return false;
@@ -14987,13 +15041,14 @@ fn schedule_replay_after_reconnect(
     spawn(async move {
         // 1. Wait for the reconnect to actually land. `None` means the
         // connection task has not registered a state yet (startup restore
-        // path) — keep waiting; a failed attempt shows up as `Disconnected`.
+        // path) — keep waiting; a failed attempt shows up as `Failed`.
         let deadline =
             std::time::Instant::now() + std::time::Duration::from_secs(REPLAY_CONNECT_WAIT_SECS);
         loop {
             match state.read().session_connection_states.get(&tab_id).copied() {
                 Some(SessionConnectionState::Connected) => break,
-                Some(SessionConnectionState::Reconnecting) | None => {
+                Some(SessionConnectionState::Reconnecting | SessionConnectionState::Connecting)
+                | None => {
                     if std::time::Instant::now() >= deadline {
                         tracing::warn!(
                             "[REPLAY] session {} never reached Connected — giving up",
@@ -15002,8 +15057,11 @@ fn schedule_replay_after_reconnect(
                         return;
                     }
                 }
-                // Disconnected again (the reconnect attempt failed).
-                Some(SessionConnectionState::Disconnected) => return,
+                // Disconnected or Failed again (the reconnect attempt
+                // failed). Both are terminal for this replay attempt.
+                Some(SessionConnectionState::Disconnected | SessionConnectionState::Failed) => {
+                    return;
+                }
             }
             tokio::time::sleep(std::time::Duration::from_millis(REPLAY_POLL_MS)).await;
         }
@@ -15342,7 +15400,7 @@ fn reconnect_session(
             state
                 .write()
                 .session_connection_states
-                .insert(tab_id.clone(), SessionConnectionState::Disconnected);
+                .insert(tab_id.clone(), SessionConnectionState::Failed);
             tracing::warn!(
                 "[Reconnect] unsupported connection kind for {}",
                 &tab_id[..tab_id.len().min(8)]
@@ -15368,14 +15426,14 @@ fn reconnect_session(
         );
         if stuck {
             tracing::warn!(
-                "[Reconnect] watchdog: session {} stuck in Reconnecting after {}s, flipping to Disconnected",
+                "[Reconnect] watchdog: session {} stuck in Reconnecting after {}s, flipping to Failed",
                 &wd_tab_id[..wd_tab_id.len().min(8)],
                 RECONNECT_WATCHDOG_SECS
             );
             {
                 let mut s = wd_state.write();
                 s.session_connection_states
-                    .insert(wd_tab_id.clone(), SessionConnectionState::Disconnected);
+                    .insert(wd_tab_id.clone(), SessionConnectionState::Failed);
             }
             // Surface a reconnect prompt so the user knows they can retry.
             let terminals = wd_state.read().terminals.clone();

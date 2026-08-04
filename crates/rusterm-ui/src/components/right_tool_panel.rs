@@ -113,6 +113,16 @@ fn connection_status(state: SessionConnectionState) -> (&'static str, String, &'
             crate::i18n::t("sessions.status_reconnecting"),
             "var(--skin-warning)",
         ),
+        SessionConnectionState::Connecting => (
+            "◌",
+            crate::i18n::t("sessions.status_connecting"),
+            "var(--skin-accent)",
+        ),
+        SessionConnectionState::Failed => (
+            "✕",
+            crate::i18n::t("sessions.status_failed"),
+            "var(--skin-danger)",
+        ),
     }
 }
 

@@ -31,6 +31,30 @@ fn session_type_label(kind: &SessionType) -> &'static str {
     }
 }
 
+/// Resolve the indicator-dot colour for a tab from its session's connection
+/// state. The colours come from the user-configurable skin palette CSS
+/// variables, so they follow the active theme (and can be customised via the
+/// Custom skin settings):
+///
+/// - `Connected`    → `--skin-success` (green)
+/// - `Connecting`   → `--skin-accent`  (blue)
+/// - `Reconnecting` → `--skin-warning` (amber)
+/// - `Failed`       → `--skin-danger`  (red)
+/// - `Disconnected` → `--skin-text-muted` (neutral grey)
+///
+/// `None` (no state entry yet) falls back to `--skin-accent` so a freshly
+/// created tab shows the in-progress blue until its driver reports back.
+fn connection_state_dot_color(state: Option<SessionConnectionState>) -> &'static str {
+    match state {
+        Some(SessionConnectionState::Connected) => "var(--skin-success)",
+        Some(SessionConnectionState::Connecting) => "var(--skin-accent)",
+        Some(SessionConnectionState::Reconnecting) => "var(--skin-warning)",
+        Some(SessionConnectionState::Failed) => "var(--skin-danger)",
+        Some(SessionConnectionState::Disconnected) => "var(--skin-text-muted)",
+        None => "var(--skin-accent)",
+    }
+}
+
 fn focused_tab_chrome(is_focused: bool, appearance: &FocusedTabAppearance) -> (String, String) {
     if is_focused {
         (
@@ -151,7 +175,10 @@ pub fn TabBar(
         menu_state,
         SessionConnectionState::Connected | SessionConnectionState::Reconnecting
     );
-    let can_reconnect = matches!(menu_state, SessionConnectionState::Disconnected);
+    let can_reconnect = matches!(
+        menu_state,
+        SessionConnectionState::Disconnected | SessionConnectionState::Failed
+    );
     let disconnect_style = if can_disconnect {
         "cursor:pointer;".to_string()
     } else {
@@ -188,6 +215,11 @@ pub fn TabBar(
                     let is_hover = hover_tab() == Some(tab.id.clone());
                     let color = session_type_color(&kind);
                     let _label = session_type_label(&kind);
+                    // The indicator dot reflects the session's *connection*
+                    // state (blue→green/red), not its type. Type colour is
+                    // still used for the active-tab underline below.
+                    let conn_state = connection_states.get(&session_id).copied();
+                    let dot_color = connection_state_dot_color(conn_state);
                     let command_status = sessions
                         .iter()
                         .find(|session| session.id == session_id)
@@ -286,9 +318,12 @@ pub fn TabBar(
                                 )));
                             },
 
-                            // Type indicator dot
+                            // Connection-state indicator dot. Colour follows
+                            // the connection lifecycle (blue while connecting,
+                            // green once connected, red on failure) and is
+                            // driven by the user-configurable skin palette.
                             span {
-                                style: "width: 6px; height: 6px; border-radius: 50%; background: {color}; flex-shrink: 0;",
+                                style: "width: 6px; height: 6px; border-radius: 50%; background: {dot_color}; flex-shrink: 0;",
                             }
 
                             span {
@@ -469,5 +504,36 @@ mod tests {
         // Falls back to the anchor id stub and default SSH kind.
         assert_eq!(id, "sess-gone");
         assert_eq!(kind, SessionType::Ssh);
+    }
+
+    /// The indicator dot must reflect the connection lifecycle:
+    /// blue while connecting, green once connected, red on failure. These
+    /// pin the mapping so a future refactor can't silently swap colours.
+    #[test]
+    fn connection_state_dot_color_maps_lifecycle_colours() {
+        use crate::state::SessionConnectionState;
+
+        assert_eq!(
+            connection_state_dot_color(Some(SessionConnectionState::Connected)),
+            "var(--skin-success)"
+        );
+        assert_eq!(
+            connection_state_dot_color(Some(SessionConnectionState::Connecting)),
+            "var(--skin-accent)"
+        );
+        assert_eq!(
+            connection_state_dot_color(Some(SessionConnectionState::Reconnecting)),
+            "var(--skin-warning)"
+        );
+        assert_eq!(
+            connection_state_dot_color(Some(SessionConnectionState::Failed)),
+            "var(--skin-danger)"
+        );
+        assert_eq!(
+            connection_state_dot_color(Some(SessionConnectionState::Disconnected)),
+            "var(--skin-text-muted)"
+        );
+        // No state entry yet (brand-new tab) shows the in-progress blue.
+        assert_eq!(connection_state_dot_color(None), "var(--skin-accent)");
     }
 }

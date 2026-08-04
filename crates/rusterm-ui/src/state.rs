@@ -582,6 +582,16 @@ pub enum SessionConnectionState {
     Connected,
     Disconnected,
     Reconnecting,
+    /// Initial connection attempt is in flight (not yet authenticated). The
+    /// indicator dot renders blue while this is active. Set by `open_connection`
+    /// before the connection driver runs, and replaced by `Connected` on
+    /// success or `Failed` on error.
+    Connecting,
+    /// A connect/reconnect attempt failed. Semantically "settled" (like
+    /// `Disconnected`) for snapshot-write gating, but visually distinct so the
+    /// indicator dot renders red. `begin_reconnect` accepts this as a valid
+    /// retry starting point, same as `Disconnected`.
+    Failed,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1135,7 +1145,7 @@ impl AppState {
             self.bottom_shell_session_id.as_deref() != Some(tab.id.as_str())
                 && !matches!(
                     self.session_connection_states.get(&tab.id),
-                    Some(SessionConnectionState::Disconnected)
+                    Some(SessionConnectionState::Disconnected | SessionConnectionState::Failed)
                 )
         })
     }
@@ -3657,6 +3667,16 @@ mod tests {
         state
             .session_connection_states
             .insert("done".to_string(), SessionConnectionState::Disconnected);
+        let snapshot = state.build_session_state("Default Dark");
+        assert!(state.session_snapshot_writable(&snapshot));
+
+        // `Failed` is also a settled state (connect attempt errored), so an
+        // empty snapshot must be writable — otherwise a stuck-failed session
+        // would block durable logout records forever.
+        let mut state = state_with_tabs(&["failed"]);
+        state
+            .session_connection_states
+            .insert("failed".to_string(), SessionConnectionState::Failed);
         let snapshot = state.build_session_state("Default Dark");
         assert!(state.session_snapshot_writable(&snapshot));
 
