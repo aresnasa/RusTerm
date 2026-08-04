@@ -11,5 +11,6 @@ pub mod relay_tunnel;
 pub mod skin;
 pub mod state;
 pub mod transfers;
+pub mod zmodem;
 
 pub use app::App;

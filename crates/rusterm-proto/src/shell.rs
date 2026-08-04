@@ -45,9 +45,18 @@ impl ShellConnection {
             cmd.cwd(dir);
         }
 
+        // Default the terminal type to xterm-256color for local shells. The
+        // SSH path negotiates TERM via `request_pty(terminal_type, ...)`;
+        // local PTYs inherit the host environment, which may be unset or a
+        // dumb value when launched from a GUI app. ZMODEM (lrzsz rz/sz) and
+        // most curses/ANSI programs require a real `TERM`. A user-supplied
+        // `TERM` in `config.env` always wins.
+        let effective_term = effective_term_value(&config.env);
         for (key, value) in &config.env {
             cmd.env(key, value);
         }
+        // Apply the resolved TERM (user value or the xterm-256color default).
+        cmd.env("TERM", &effective_term);
 
         let mut child = pair.slave.spawn_command(cmd)?;
 
@@ -179,5 +188,39 @@ impl ShellConnection {
         let _ = event_tx.send(SessionEvent::Connected(session_id));
 
         Ok(session)
+    }
+}
+
+/// The TERM value a local shell session will use: the user-supplied value
+/// from `config.env` if present, otherwise the xterm-256color default.
+///
+/// Extracted as a pure function so the precedence rule (user > default) can
+/// be unit-tested without spawning a PTY.
+fn effective_term_value(env: &[(String, String)]) -> String {
+    env.iter()
+        .find(|(k, _)| k == "TERM")
+        .map(|(_, v)| v.clone())
+        .unwrap_or_else(|| "xterm-256color".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effective_term_defaults_to_xterm_256color() {
+        assert_eq!(effective_term_value(&[]), "xterm-256color");
+    }
+
+    #[test]
+    fn effective_term_respects_user_supplied_value() {
+        let env = vec![("TERM".to_string(), "screen-256color".to_string())];
+        assert_eq!(effective_term_value(&env), "screen-256color");
+    }
+
+    #[test]
+    fn effective_term_ignores_non_term_env_keys() {
+        let env = vec![("PATH".to_string(), "/usr/bin".to_string())];
+        assert_eq!(effective_term_value(&env), "xterm-256color");
     }
 }

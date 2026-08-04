@@ -305,6 +305,12 @@ pub struct AppState {
     pub transfers: crate::transfers::TransferState,
     #[serde(skip)]
     pub transfer_cancellations: HashMap<String, (u32, CancellationToken)>,
+    /// Per-session ZMODEM (lrzsz rz/sz) state. Lazily installed when the
+    /// first ZMODEM frame is detected in a session's output stream.
+    /// Shared via `Arc<Mutex<...>>` so spawned rfd-dialog + file-IO tasks
+    /// can write back without taking the Dioxus state lock.
+    #[serde(skip)]
+    pub zmodem: std::sync::Arc<parking_lot::Mutex<crate::zmodem::ZmodemSessions>>,
     /// Local PTY session rendered only inside the bottom dock Shell panel.
     #[serde(skip)]
     pub bottom_shell_session_id: Option<String>,
@@ -757,6 +763,9 @@ impl Default for AppState {
             sftp_clients: HashMap::new(),
             transfers: crate::transfers::TransferState::default(),
             transfer_cancellations: HashMap::new(),
+            zmodem: std::sync::Arc::new(parking_lot::Mutex::new(
+                crate::zmodem::ZmodemSessions::new(),
+            )),
             bottom_shell_session_id: None,
             analytics: crate::analytics::AnalyticsHandle::default(),
             ohmyzsh: None,

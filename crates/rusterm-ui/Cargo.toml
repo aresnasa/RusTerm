@@ -36,6 +36,7 @@ rusterm-plugins.workspace = true
 rusterm-proto.workspace = true
 rusterm-history.workspace = true
 rusterm-ohmyzsh.workspace = true
+rusterm-zmodem.workspace = true
 # Analytics (DuckDB-backed OLAP layer). Optional because the bundled DuckDB
 # C++ library adds ~50MB to the binary — users who don't want the analytics
 # panel can build without this feature and pay no cost. When disabled, the

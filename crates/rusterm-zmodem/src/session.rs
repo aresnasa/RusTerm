@@ -42,11 +42,13 @@ pub enum SessionEvent {
         mtime: Option<u64>,
         mode: Option<u32>,
     },
-    /// A chunk of file data was received and CRC-verified.
+    /// A chunk of file data was received and CRC-verified. The `data`
+    /// payload is owned so the UI layer can write it to disk.
     DataReceived {
         offset: u32,
         len: usize,
         total: Option<u64>,
+        data: Vec<u8>,
     },
     /// The transfer completed (`ZEOF` received and acknowledged).
     Done { direction: Direction, bytes: u64 },
@@ -63,6 +65,10 @@ enum Phase {
     Init,
     /// Receive: waiting for ZFILE after sending ZRINIT.
     AwaitFile,
+    /// Receive: ZFILE received, FileOffer emitted, waiting for the UI to
+    /// resolve a save path before sending ZRPOS (so the sender doesn't
+    /// stream data before the writer is installed).
+    AwaitSavePath,
     /// Receive: streaming data blocks.
     Receiving,
     /// Send: waiting for ZRPOS (resume point) after sending ZFILE.
@@ -113,6 +119,24 @@ impl Default for ZmodemSession {
     }
 }
 
+impl std::fmt::Debug for ZmodemSession {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ZmodemSession")
+            .field("direction", &self.direction)
+            .field("phase", &self.phase)
+            .field("crc_mode", &self.crc_mode)
+            .field("file_name", &self.file_name)
+            .field("file_size", &self.file_size)
+            .field("bytes_transferred", &self.bytes_transferred)
+            .field("send_offset", &self.send_offset)
+            .field(
+                "send_payload_len",
+                &self.send_payload.as_ref().map(|p| p.len()),
+            )
+            .finish()
+    }
+}
+
 impl ZmodemSession {
     pub fn new() -> Self {
         Self {
@@ -155,12 +179,22 @@ impl ZmodemSession {
     }
 
     /// Set the local save path (receive path) after the UI resolves the
-    /// FileOffer. Triggers the ZRINIT acknowledgement to the sender.
+    /// FileOffer. When the session is in [`Phase::AwaitSavePath`] (ZFILE
+    /// received, waiting for the user to pick a save location), this sends
+    /// ZRPOS(0) to tell the sender to start streaming and transitions to
+    /// [`Phase::Receiving`]. This ordering guarantees the writer is open
+    /// before any data blocks arrive.
     pub fn set_save_path(&mut self, path: PathBuf) {
         self.save_path = Some(path);
-        // If we were awaiting the file offer, send ZRINIT to the sender.
-        if self.phase == Phase::Init || self.phase == Phase::AwaitFile {
-            self.send_zrinit();
+        match self.phase {
+            // Pre-ZFILE: stash the path; ZRINIT was already sent on ZRQINIT.
+            Phase::Init | Phase::AwaitFile => {}
+            // Post-ZFILE: the writer is ready, tell the sender to start.
+            Phase::AwaitSavePath => {
+                self.send_zrpos(0);
+                self.phase = Phase::Receiving;
+            }
+            _ => {}
         }
     }
 
@@ -236,18 +270,12 @@ impl ZmodemSession {
             }
             // ---- Receive: ZFILE carries the filename + metadata ----
             (Phase::AwaitFile, FrameType::ZFile) => {
-                // The actual filename arrives in the following data subframe;
-                // for now emit a placeholder offer and let the data handler
-                // fill in the details.
-                self.events.push(SessionEvent::FileOffer {
-                    name: self.file_name.clone().unwrap_or_default(),
-                    size: self.file_size,
-                    mtime: self.file_mtime,
-                    mode: self.file_mode,
-                });
-                self.phase = Phase::Receiving;
-                // Acknowledge with ZRPOS = 0 (start from beginning).
-                self.send_zrpos(0);
+                // The filename + size/mtime/mode arrive in the following data
+                // subframe (parsed by handle_data). Do NOT emit FileOffer yet
+                // — wait for the metadata so the save dialog has a real name.
+                // Do NOT send ZRPOS yet — wait for the UI to resolve a save
+                // path so the writer is installed before data streams in.
+                self.phase = Phase::AwaitSavePath;
             }
             // ---- Send: ZRPOS tells us where to resume ----
             (Phase::AwaitRpos, FrameType::ZRPos) => {
@@ -300,20 +328,22 @@ impl ZmodemSession {
     fn handle_data(&mut self, offset: u32, payload: Vec<u8>, end: DataEnd) {
         // Receive path: the first data after ZFILE carries the filename +
         // metadata as a NUL-separated string: "name\0size mtime mode\0".
-        if self.phase == Phase::Receiving && self.file_name.is_none() && self.bytes_transferred == 0
+        // This arrives while we're in AwaitSavePath (before ZRPOS is sent).
+        if (self.phase == Phase::Receiving || self.phase == Phase::AwaitSavePath)
+            && self.file_name.is_none()
+            && self.bytes_transferred == 0
         {
             // This is the ZFILE metadata subframe (not actual file data).
             self.parse_file_metadata(&payload);
-            // Re-emit the FileOffer with the now-known name.
+            // Emit the FileOffer with the now-known name. The UI opens a
+            // save dialog; when it resolves, set_save_path() sends ZRPOS
+            // and transitions to Receiving. We do NOT send ZRPOS here.
             self.events.push(SessionEvent::FileOffer {
                 name: self.file_name.clone().unwrap_or_default(),
                 size: self.file_size,
                 mtime: self.file_mtime,
                 mode: self.file_mode,
             });
-            if end.expects_ack() {
-                self.send_zrpos(0);
-            }
             return;
         }
         // Actual file data.
@@ -322,8 +352,8 @@ impl ZmodemSession {
             offset,
             len: payload.len(),
             total: self.file_size,
+            data: payload,
         });
-        // TODO: write payload to save_path via a callback/channel.
         if end.expects_ack() {
             self.send_zack(offset);
         }

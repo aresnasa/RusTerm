@@ -559,6 +559,53 @@ fn shed_backlog_overflow(
     }
 }
 
+/// Intercept ZMODEM (lrzsz rz/sz) protocol frames in session output before
+/// they reach the terminal renderer.
+///
+/// Returns the bytes that should still be rendered (non-ZMODEM passthrough).
+/// ZMODEM protocol bytes are consumed by the per-session [`ZmodemSession`];
+/// any `to_pty` response bytes (ZRINIT/ZACK/ZFIN) are injected back to the
+/// remote via `input_senders`. File-save/open dialogs and on-disk writes
+/// are spawned as async tasks so the event loop is never blocked.
+///
+/// When no ZMODEM frame is in flight, this is a no-op: it returns `data`
+/// unchanged and performs no allocation beyond a quick detector scan.
+fn intercept_zmodem(
+    state: Signal<AppState>,
+    input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    session_id: &str,
+    data: &[u8],
+) -> Vec<u8> {
+    // Clone the shared ZMODEM state handle (cheap Arc bump) and the input
+    // sender BEFORE taking any Dioxus write lock, to avoid re-entrancy.
+    let zmodem_handle = state.read().zmodem.clone();
+    let sender = input_senders.read().get(session_id).cloned();
+    let Some(sender) = sender else {
+        // No input sender → can't inject ZMODEM responses; fall through to
+        // normal rendering so the user at least sees the raw bytes.
+        return data.to_vec();
+    };
+
+    let processed = {
+        let mut z = zmodem_handle.lock();
+        crate::zmodem::process_output(&mut z, session_id, data)
+    };
+
+    // Inject ZMODEM protocol response bytes back to the PTY.
+    if !processed.to_pty.is_empty() {
+        let _ = sender.send(processed.to_pty);
+    }
+
+    // Dispatch UI events (file dialogs, progress, completion). Each event
+    // may spawn an async task; Done/Cancelled return true to signal the
+    // session is finished.
+    for event in processed.events {
+        crate::zmodem::dispatch_event(session_id, event, zmodem_handle.clone(), sender.clone());
+    }
+
+    processed.passthrough
+}
+
 #[cfg(test)]
 mod drain_output_batch_tests {
     use super::*;
@@ -10132,6 +10179,15 @@ fn start_ssh_connection(
                             if data.is_empty() {
                                 continue;
                             }
+                            // Intercept ZMODEM (lrzsz rz/sz) frames before
+                            // rendering. Returns the non-protocol passthrough
+                            // bytes; protocol bytes are consumed by the
+                            // per-session ZmodemSession and acked via the
+                            // input sender.
+                            let data = intercept_zmodem(state, input_senders, &id, &data);
+                            if data.is_empty() {
+                                continue;
+                            }
 
                             // Shadow-sandbox capture starts only after explicit
                             // execution approval and is scoped to this session.
@@ -10501,6 +10557,7 @@ fn start_ssh_connection(
                                 app.ssh_sessions.remove(&id);
                                 app.sftp_clients.remove(&id);
                                 app.transfers.cancel_for_session(&id);
+                                app.zmodem.lock().remove(&id);
                                 let job_ids = app
                                     .transfers
                                     .jobs
@@ -10775,6 +10832,15 @@ fn start_shell_connection(
                         SessionEvent::Output(id, mut data) => {
                             pending_event = drain_output_batch(&mut event_rx, &id, &mut data);
                             let data = shell_integration_echo_filter.lock().filter(&data);
+                            if data.is_empty() {
+                                continue;
+                            }
+                            // Intercept ZMODEM (lrzsz rz/sz) frames before
+                            // rendering. Returns the non-protocol passthrough
+                            // bytes; protocol bytes are consumed by the
+                            // per-session ZmodemSession and acked via the
+                            // input sender.
+                            let data = intercept_zmodem(state, input_senders, &id, &data);
                             if data.is_empty() {
                                 continue;
                             }
@@ -11098,6 +11164,7 @@ fn start_shell_connection(
                             );
                             input_senders.write().remove(&id);
                             state.write().login_scripts.remove(&id);
+                            state.write().zmodem.lock().remove(&id);
                             sync_live_sessions(&state, &input_senders);
                             let mut s = state.write();
                             s.session_connection_states

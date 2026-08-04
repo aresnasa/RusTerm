@@ -8338,6 +8338,7 @@ dependencies = [
  "rusterm-relay",
  "rusterm-ssh",
  "rusterm-tunnel",
+ "rusterm-zmodem",
  "serde",
  "serde_json",
  "sha2 0.10.9",
