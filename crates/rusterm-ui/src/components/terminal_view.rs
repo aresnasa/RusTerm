@@ -1143,12 +1143,29 @@ struct PopupLayout {
     max_height_px: u32,
 }
 
-/// Choose the cursor side that can fit the popup, falling back to the larger
-/// side and constraining the popup so its own scroll area handles overflow.
+/// Minimum usable height (px) for keeping the popup below the cursor row.
+/// Roughly two popup rows (13px font × 1.5 line-height plus padding) — enough
+/// to show one suggestion and the hint row, with internal scrolling for the
+/// rest. Anything shorter is an unreadable sliver, so we flip above instead.
+const POPUP_MIN_BELOW_PX: f64 = 48.0;
+
+/// Choose which side of the cursor row the popup opens on.
+///
+/// Below-first policy: opening above the prompt covers the stdout the user is
+/// reading (the shell prompt usually sits in the lower half of the screen, so
+/// "pick the larger side" would flip above almost every time). We therefore
+/// stay below whenever the popup fits there entirely, or at least a usable
+/// slice ([`POPUP_MIN_BELOW_PX`]) does — the popup's own scroll area handles
+/// the overflow. Only when the cursor is so close to the bottom edge that
+/// below cannot show even that minimum (and above genuinely has more room) do
+/// we fall back to opening above.
 fn popup_layout(space_above: f64, space_below: f64, desired_height: f64) -> PopupLayout {
     let space_above = space_above.max(0.0);
     let space_below = space_below.max(0.0);
-    let direction = if space_below >= desired_height || space_below >= space_above {
+    let direction = if space_below >= desired_height
+        || space_below >= POPUP_MIN_BELOW_PX
+        || space_below >= space_above
+    {
         PopupDirection::Below
     } else {
         PopupDirection::Above
@@ -2821,21 +2838,46 @@ mod tests {
     }
 
     #[test]
-    fn popup_flips_above_when_bottom_dock_reduces_space() {
-        let layout = popup_layout(180.0, 45.0, 120.0);
+    fn popup_stays_below_with_partial_space_and_scrolls_internally() {
+        // Prompt in the lower half: above has plenty of room, but below still
+        // has a usable slice (>= POPUP_MIN_BELOW_PX). Stay below so the popup
+        // never covers the stdout above the prompt; internal scrolling
+        // handles the overflow.
+        let layout = popup_layout(300.0, 60.0, 120.0);
+        assert_eq!(layout.direction, PopupDirection::Below);
+        assert_eq!(layout.max_height_px, 60);
+    }
+
+    #[test]
+    fn popup_flips_above_only_when_bottom_edge_leaves_no_usable_space() {
+        // Cursor hugging the bottom edge (bastion menus, long output): below
+        // cannot show even a readable sliver, so fall back to above.
+        let layout = popup_layout(180.0, 20.0, 120.0);
         assert_eq!(layout.direction, PopupDirection::Above);
         assert_eq!(layout.max_height_px, 180);
     }
 
     #[test]
-    fn popup_uses_larger_side_and_scrolls_when_neither_side_fits() {
+    fn popup_uses_below_when_neither_side_fits_but_below_is_usable() {
         let layout = popup_layout(70.0, 50.0, 140.0);
-        assert_eq!(layout.direction, PopupDirection::Above);
-        assert_eq!(layout.max_height_px, 70);
+        assert_eq!(layout.direction, PopupDirection::Below);
+        assert_eq!(layout.max_height_px, 50);
 
         let resized = popup_layout(35.0, 90.0, 140.0);
         assert_eq!(resized.direction, PopupDirection::Below);
         assert_eq!(resized.max_height_px, 90);
+    }
+
+    #[test]
+    fn popup_prefers_below_when_both_sides_are_tiny() {
+        // Degenerate viewport: both sides below the minimum. Below wins when
+        // it is at least as large as above (keeps stdout visible), above only
+        // when it is strictly larger.
+        let below = popup_layout(10.0, 10.0, 120.0);
+        assert_eq!(below.direction, PopupDirection::Below);
+
+        let above = popup_layout(30.0, 10.0, 120.0);
+        assert_eq!(above.direction, PopupDirection::Above);
     }
 
     #[test]
