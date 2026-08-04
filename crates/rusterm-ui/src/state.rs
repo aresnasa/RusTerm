@@ -7500,19 +7500,26 @@ pub struct SessionReplayRecorder {
     pub shell_integrated: bool,
 }
 
-/// Records one submitted input line into the session's replay recorder.
-/// Returns `true` if the op was recorded.
+/// Records one submitted menu-navigation input line into the session's
+/// replay recorder. Returns `true` if the op was recorded.
+///
+/// Caller contract: only pass MENU-class submissions here. Input typed at a
+/// shell prompt must be routed to [`note_shell_prompt_evidence`] instead, and
+/// input typed at a detected credential prompt (password/token/username) must
+/// not be passed at all — see the `on_input` Enter branch in `app.rs`, which
+/// classifies the prompt line via [`prompt_looks_like_shell`].
+///
+/// Menu reentry thaws a frozen recorder: if the session was previously
+/// frozen by shell evidence (OSC 133;D or a shell-looking prompt) and the
+/// user is back at a bastion menu, the stale establishment prefix is cleared
+/// and recording restarts, so the snapshot always holds the *last* navigation
+/// sequence — the one that leads to where the user actually is.
 ///
 /// Guards (in order):
 /// - empty/whitespace-only input is ignored;
 /// - only SSH and Telnet sessions record (local shells are restored via cwd,
 ///   serial ports have no login flow to replay);
-/// - a session with shell-integration evidence never records;
 /// - the establishment window is capped at [`REPLAY_MAX_OPS`].
-///
-/// Credential filtering is the caller's job: input typed at a detected
-/// credential prompt (password/token/username) must NOT be passed here — see
-/// the `on_input` Enter branch in `app.rs`.
 pub fn record_replay_op(state: &mut AppState, session_id: &str, op: &str) -> bool {
     let op = op.trim();
     if op.is_empty() {
@@ -7530,11 +7537,60 @@ pub fn record_replay_op(state: &mut AppState, session_id: &str, op: &str) -> boo
         .session_replays
         .entry(session_id.to_string())
         .or_default();
-    if rec.shell_integrated || rec.ops.len() >= REPLAY_MAX_OPS {
+    if rec.shell_integrated {
+        // Menu reentry after landing on a shell: the old establishment
+        // prefix leads to the *previous* target — discard it and re-record
+        // the navigation that leads to the new one.
+        rec.ops.clear();
+        rec.shell_integrated = false;
+    }
+    if rec.ops.len() >= REPLAY_MAX_OPS {
         return false;
     }
     rec.ops.push(op.to_string());
     true
+}
+
+/// Heuristic classifier for the terminal line the cursor sits on when the
+/// user presses Enter: does it look like a *shell* prompt (as opposed to an
+/// interactive bastion/jump-host menu prompt)?
+///
+/// Shell-looking evidence: classic POSIX suffixes (`$ `, `# `, `% `),
+/// PowerShell (`PS ...>`), and modern prompt glyphs (`➜`, `❯`). A bare `"> "`
+/// is deliberately NOT treated as shell: bastion menus like JumpServer's
+/// `Opt>` must win, at the accepted cost of misclassifying some exotic
+/// remote prompts (e.g. fish's `~>`), whose submissions are then recorded
+/// as menu ops and neutralized by the safety filters at replay time.
+pub fn prompt_looks_like_shell(current_line: &str) -> bool {
+    let line = current_line.trim_end();
+    if line.is_empty() {
+        return false;
+    }
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('➜') || trimmed.starts_with('❯') {
+        return true;
+    }
+    if trimmed.starts_with("PS ") && trimmed.contains('>') {
+        return true;
+    }
+    // Classic prompt terminator followed by the typed input:
+    // `[root@web ~]# id`, `user@host:~$ exit`, `host% ls`.
+    if ["$ ", "# ", "% "].iter().any(|m| line.contains(m)) {
+        return true;
+    }
+    // Bare prompt with no input yet (`$`/`#` at end of line).
+    matches!(line.chars().last(), Some('$') | Some('#'))
+}
+
+/// Marks shell evidence based on the *prompt line* the user submitted at
+/// (classified by [`prompt_looks_like_shell`]), freezing the replay recorder
+/// exactly like OSC 133;D evidence does.
+///
+/// This matters for bastion targets WITHOUT shell integration: they never
+/// emit OSC 133;D, so without prompt-based evidence every shell command they
+/// run would pollute the replay log as a fake menu op.
+pub fn note_shell_prompt_evidence(state: &mut AppState, session_id: &str) {
+    note_shell_integration_evidence(state, session_id);
 }
 
 /// Marks the session as having a real, shell-integrated remote (OSC 133;D
@@ -7548,7 +7604,10 @@ pub fn record_replay_op(state: &mut AppState, session_id: &str, op: &str) -> boo
 /// integrated shells report their first exit code right after the
 /// integration is injected — before the user types anything — so their
 /// frozen prefix is empty and cwd-based restore covers them as before.
-/// Commands typed *after* the evidence never enter the replay log.
+/// Commands typed *after* the evidence never enter the replay log — the
+/// `on_input` classifier routes shell-prompt submissions away from
+/// [`record_replay_op`], and menu reentry thaws the freeze via
+/// [`record_replay_op`] so the recorder always holds the latest navigation.
 pub fn note_shell_integration_evidence(state: &mut AppState, session_id: &str) {
     let rec = state
         .session_replays
@@ -7644,25 +7703,64 @@ mod session_replay_tests {
 
     /// OSC 133;D evidence means the remote reached a real integrated shell.
     /// The recorder FREEZES: the establishment prefix recorded before the
-    /// evidence (bastion menu navigation) is kept for replay, but nothing
-    /// typed afterwards is ever recorded. Clearing instead of freezing was
-    /// the original design — and it destroyed jumpserver menu navigation the
-    /// moment the target host's shell reported its first exit code, leaving
-    /// snapshots with nothing to replay.
+    /// evidence (bastion menu navigation) is kept for replay. Clearing
+    /// instead of freezing was the original design — and it destroyed
+    /// jumpserver menu navigation the moment the target host's shell
+    /// reported its first exit code, leaving snapshots with nothing to
+    /// replay. (Post-evidence shell commands are kept out of the log by the
+    /// `on_input` prompt classifier, which never routes them here.)
     #[test]
-    fn shell_integration_evidence_freezes_ops_and_disables_recording() {
+    fn shell_evidence_freezes_the_establishment_prefix() {
         let mut state = state_with_session("sess", ssh_kind());
         assert!(record_replay_op(&mut state, "sess", "/q"));
         assert!(record_replay_op(&mut state, "sess", "3"));
         note_shell_integration_evidence(&mut state, "sess");
-        // The pre-evidence establishment prefix survives...
+        // The pre-evidence establishment prefix survives the freeze.
         assert_eq!(
             replayable_ops(&state, "sess"),
             vec!["/q".to_string(), "3".to_string()]
         );
-        // ...but post-evidence shell commands never enter the log.
-        assert!(!record_replay_op(&mut state, "sess", "cd /var/log"));
-        assert_eq!(replayable_ops(&state, "sess").len(), 2);
+    }
+
+    /// Menu reentry after landing on a shell: the user backs out of the
+    /// target host to the bastion menu and navigates somewhere else. The
+    /// recorder THAWS and restarts, so the snapshot always holds the *last*
+    /// navigation — the one that leads to where the user actually is — not
+    /// the stale first one.
+    #[test]
+    fn menu_reentry_thaws_and_restarts_recording() {
+        let mut state = state_with_session("sess", ssh_kind());
+        assert!(record_replay_op(&mut state, "sess", "/q"));
+        assert!(record_replay_op(&mut state, "sess", "2"));
+        note_shell_integration_evidence(&mut state, "sess");
+        // Back at the bastion menu: a new menu-class op thaws and re-records.
+        assert!(record_replay_op(&mut state, "sess", "/w"));
+        assert!(record_replay_op(&mut state, "sess", "3"));
+        assert_eq!(
+            replayable_ops(&state, "sess"),
+            vec!["/w".to_string(), "3".to_string()]
+        );
+    }
+
+    /// The prompt classifier separates shell prompts (whose submissions
+    /// freeze the recorder) from interactive bastion menu prompts (whose
+    /// submissions record). A bare "> " is deliberately menu-class:
+    /// JumpServer's `Opt>` must win over exotic remote prompts.
+    #[test]
+    fn prompt_classification_separates_menus_from_shells() {
+        for shell in [
+            "[root@web ~]# id",
+            "ecs-user@host:~$ exit",
+            "host% ls",
+            "PS C:\\Users\\dev> dir",
+            "❯ make build",
+            "➜  ~ git status",
+        ] {
+            assert!(prompt_looks_like_shell(shell), "shell-class: {shell:?}");
+        }
+        for menu in ["请选择目标资产：3", "请选择资产分类：/q", "Opt> p", ""] {
+            assert!(!prompt_looks_like_shell(menu), "menu-class: {menu:?}");
+        }
     }
 
     /// Only interactive remote kinds (SSH / Telnet) record. Local shells are

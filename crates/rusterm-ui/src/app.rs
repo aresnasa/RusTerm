@@ -59,12 +59,13 @@ use crate::state::{
     distribute_sessions_across_panes, enqueue_pending_exit, execute_tab_drop_on_pane,
     execute_tab_drop_on_pane_at, focus_pane_for_layout, focused_pane_session, invert_send_targets,
     move_floating_pane_for_active, move_session_to_leftmost, note_shell_integration_evidence,
-    prepare_split_for_sidebar_drop, prepare_split_for_sidebar_drop_at, push_workspace_tab,
-    record_replay_op, replayable_ops, resize_layout_split, rollback_pending_exit,
-    scroll_sync_targets, select_all_send_targets, selected_send_target_ids, set_active_tab,
-    set_pane_session_for_layout, set_send_target_selected, source_pane_for_copy,
-    suppress_comparison_diff_warning, toggle_comparison_mode, toggle_pane_zoom, toggle_split_mode,
-    track_terminal_input, tracked_terminal_command,
+    note_shell_prompt_evidence, prepare_split_for_sidebar_drop, prepare_split_for_sidebar_drop_at,
+    prompt_looks_like_shell, push_workspace_tab, record_replay_op, replayable_ops,
+    resize_layout_split, rollback_pending_exit, scroll_sync_targets, select_all_send_targets,
+    selected_send_target_ids, set_active_tab, set_pane_session_for_layout,
+    set_send_target_selected, source_pane_for_copy, suppress_comparison_diff_warning,
+    toggle_comparison_mode, toggle_pane_zoom, toggle_split_mode, track_terminal_input,
+    tracked_terminal_command,
 };
 use crate::transfers::{FileEndpoint, TransferJob, TransferRequest};
 
@@ -2722,9 +2723,19 @@ fn render_terminal_pane(
                                 );
                                 if sent > 0 {
                                     if !prompt_is_credential {
+                                        // Classify the prompt line: shell prompts
+                                        // freeze the recorder (their commands must
+                                        // never replay), menu prompts record —
+                                        // thawing a frozen recorder on menu
+                                        // reentry so the last navigation wins.
+                                        let shell_like =
+                                            prompt_looks_like_shell(&current_line);
                                         let mut app = state_for_cmd.write();
                                         for target in &input_targets {
-                                            if record_replay_op(&mut app, target, &command) {
+                                            if shell_like {
+                                                note_shell_prompt_evidence(&mut app, target);
+                                            } else if record_replay_op(&mut app, target, &command)
+                                            {
                                                 tracing::debug!(
                                                     "[REPLAY] recorded op for session={} ops_len={}",
                                                     &target[..target.len().min(8)],
@@ -12916,14 +12927,19 @@ fn restore_sessions(
                         }
                     }
                     // Establishment on restore, in priority order:
-                    // 1. A configured login script owns the whole flow — it
-                    //    re-runs on the fresh connection (driven from the
-                    //    session output loop), so neither replay nor a blind
-                    //    `cd` may type into the bastion menu on top of it.
-                    // 2. Recorded interactive ops (jumpserver menu
-                    //    navigation) are replayed; if the snapshot also has
-                    //    a cwd (integrated target shell), a follow-up `cd`
+                    // 1. Recorded interactive ops (jumpserver menu
+                    //    navigation) are replayed — they hold the user's
+                    //    *last* selection, overriding a pure-navigation
+                    //    login script (which is suppressed so the two never
+                    //    double-drive the menu). If the snapshot also has a
+                    //    cwd (integrated target shell), a follow-up `cd`
                     //    lands the user back in their directory.
+                    // 2. Otherwise a configured login script owns the whole
+                    //    flow — always when it carries credentials
+                    //    (send_onekey), or when nothing was recorded. It
+                    //    re-runs on the fresh connection (driven from the
+                    //    session output loop), so no blind `cd` may type
+                    //    into the bastion menu on top of it.
                     // 3. Plain integrated shells restore via `cd` alone.
                     let has_login_script = conn_for_replay
                         .login_script
@@ -12933,6 +12949,9 @@ fn restore_sessions(
                         conn_for_replay.login_script.as_deref(),
                         &ps.replay_ops,
                     ) {
+                        if has_login_script {
+                            suppress_login_script(&mut state.write(), &tab_id);
+                        }
                         tracing::info!(
                             "[REPLAY] restored session {} scheduling {} recorded op(s)",
                             &tab_id[..tab_id.len().min(8)],
@@ -13810,12 +13829,56 @@ fn filter_replayable_ops(
     (safe, skipped)
 }
 
+/// Whether the login script needs the OneKey credential store — i.e. it
+/// contains at least one `send_onekey` step. Credential-bearing scripts must
+/// keep owning the establishment flow (replay can never re-enter secrets);
+/// pure-navigation scripts are static and lose to the freshly recorded ops.
+/// Unparseable scripts count as non-credential (they would abort anyway).
+fn script_handles_credentials(script: &str) -> bool {
+    rusterm_core::parse_login_script(script)
+        .map(|steps| {
+            steps
+                .iter()
+                .any(|s| matches!(s, rusterm_core::LoginStep::SendOneKey { .. }))
+        })
+        .unwrap_or(false)
+}
+
 /// Whether a reconnect/restore should schedule interactive-operation replay
-/// for this connection. A configured login script owns the establishment
-/// flow (expect/send navigation) — replaying recorded ops on top of it would
-/// double-drive the remote menu.
+/// for this connection.
+///
+/// Recorded ops reflect the user's *last* navigation (e.g. they switched to
+/// a different machine through the bastion menu after the login script ran),
+/// so they win over a pure-navigation login script — the script would land
+/// on the stale, statically configured target. A credential-bearing script
+/// (`send_onekey`) still wins: replay must never re-enter secrets, and
+/// running both would double-drive the remote menu. When the script wins —
+/// or nothing was recorded — no replay is scheduled.
 fn should_schedule_replay(login_script: Option<&str>, ops: &[String]) -> bool {
-    !ops.is_empty() && login_script.is_none_or(|s| s.trim().is_empty())
+    if ops.is_empty() {
+        return false;
+    }
+    match login_script {
+        Some(s) if !s.trim().is_empty() => !script_handles_credentials(s),
+        _ => true,
+    }
+}
+
+/// Pre-seeds a finished [`LoginScriptRuntime`] for this session so the
+/// absent-only lazy init in the event loops never starts the configured
+/// login script. Used when recorded-ops replay overrides a pure-navigation
+/// script: driving both would double-feed the bastion menu.
+fn suppress_login_script(state: &mut AppState, session_id: &str) {
+    state.login_scripts.insert(
+        session_id.to_string(),
+        crate::state::LoginScriptRuntime {
+            steps: Vec::new(),
+            idx: 0,
+            send_buffer: Default::default(),
+            done: true,
+            wait_started: None,
+        },
+    );
 }
 
 #[cfg(test)]
@@ -13850,18 +13913,43 @@ mod session_replay_engine_tests {
         assert_eq!(skipped, ops(&["rm -rf /"]));
     }
 
-    /// A configured login script owns session establishment — replay must
-    /// not double-drive the remote menu. Blank scripts don't count.
+    /// Recorded ops hold the user's *last* menu navigation, so they override
+    /// a pure-navigation login script (which would land on the stale, static
+    /// target). A credential-bearing (send_onekey) script still owns the
+    /// establishment flow — replay must never re-enter secrets. Blank
+    /// scripts don't count; nothing recorded means nothing to replay.
     #[test]
-    fn replay_is_skipped_when_a_login_script_is_configured() {
+    fn recorded_ops_override_pure_navigation_scripts_but_not_credential_ones() {
         let recorded = ops(&["web-server-01"]);
         assert!(should_schedule_replay(None, &recorded));
         assert!(should_schedule_replay(Some("   "), &recorded));
-        assert!(!should_schedule_replay(
+        // Pure navigation: the fresh recording wins.
+        assert!(should_schedule_replay(
             Some("expect Opt>\nsend web-server-01"),
             &recorded
         ));
+        // Credential-bearing: the script wins.
+        assert!(!should_schedule_replay(
+            Some("expect Password:\nsend_onekey prod-root"),
+            &recorded
+        ));
         assert!(!should_schedule_replay(None, &[]));
+        assert!(!should_schedule_replay(
+            Some("expect Opt>\nsend web-server-01"),
+            &[]
+        ));
+    }
+
+    /// `script_handles_credentials` keys the override decision: only
+    /// `send_onekey` steps count, and unparseable scripts (which would abort
+    /// at runtime anyway) count as non-credential.
+    #[test]
+    fn credential_detection_looks_for_send_onekey_steps() {
+        assert!(script_handles_credentials(
+            "expect Password:\nsend_onekey prod-root"
+        ));
+        assert!(!script_handles_credentials("expect Opt>\nsend 11\nsend 2"));
+        assert!(!script_handles_credentials("not a real dsl line"));
     }
 
     /// The restore `cd` line single-quotes the path and escapes embedded
@@ -14166,10 +14254,20 @@ fn reconnect_session(
     );
     // Session-recovery replay: if this session recorded interactive
     // establishment ops (jumpserver menu navigation), schedule their replay
-    // for after the transport reconnects. A configured login script owns the
-    // establishment flow instead, so replay is skipped in that case.
+    // for after the transport reconnects. They hold the user's *last*
+    // selection, so they override a pure-navigation login script (which is
+    // suppressed to avoid double-driving the menu); a credential-bearing
+    // (send_onekey) script owns the establishment flow instead, so replay is
+    // skipped in that case.
     let replay_ops = replayable_ops(&state.read(), &tab_id);
     if should_schedule_replay(conn.login_script.as_deref(), &replay_ops) {
+        if conn
+            .login_script
+            .as_deref()
+            .is_some_and(|s| !s.trim().is_empty())
+        {
+            suppress_login_script(&mut state.write(), &tab_id);
+        }
         tracing::info!(
             "[REPLAY] session {} scheduling {} recorded op(s) for post-reconnect replay",
             &tab_id[..tab_id.len().min(8)],
@@ -17058,6 +17156,17 @@ fn strip_prompt(line: &str) -> String {
         }
     }
 
+    // 1b. CJK bastion menus prompt with a fullwidth colon
+    //     ("请选择目标资产：3") — the input follows the last one. The plain
+    //     ASCII ": " is deliberately not treated as a marker (far too common
+    //     in ordinary output).
+    if let Some(idx) = line.rfind('：') {
+        let cmd = line[idx + '：'.len_utf8()..].trim();
+        if !cmd.is_empty() {
+            return cmd.to_string();
+        }
+    }
+
     // 2. Start markers (➜, ❯) — followed by directory + optional git info,
     //    then the command. Skip all prompt-like words after the marker.
     let start_markers = ["\u{279c}", "\u{276f}"]; // ➜ ❯
@@ -17827,6 +17936,15 @@ mod prompt_tests {
     fn custom_prompt_with_bare_greater_than() {
         // Python REPL, custom PS1="> ", mysql, etc.
         assert_eq!(strip_prompt("> SELECT 1"), "SELECT 1");
+    }
+
+    #[test]
+    fn cjk_bastion_menu_prompt_strips_fullwidth_colon() {
+        // Chinese jumpserver/bastion menus prompt with a fullwidth colon;
+        // the replay recorder's fallback path must not capture the whole
+        // prompt text as the op.
+        assert_eq!(strip_prompt("请选择目标资产：3"), "3");
+        assert_eq!(strip_prompt("请选择资产分类：/q"), "/q");
     }
 
     // ── Compound commands (|, ||, &&, ;) must be preserved ──────────────
