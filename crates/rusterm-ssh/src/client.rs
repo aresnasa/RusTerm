@@ -9,6 +9,8 @@ use rusterm_core::event::SessionEvent;
 use rusterm_core::session::{Session, SessionId, SessionType};
 use rusterm_core::terminal::TerminalSize;
 
+use crate::otp::OtpProvider;
+
 const INTERACTIVE_PTY_MODES: &[(Pty, u32)] = &[
     (Pty::ECHO, 1),
     (Pty::ICANON, 1),
@@ -365,9 +367,15 @@ fn interactive_client_config() -> client::Config {
 /// ready-to-use russh client handle. Shared by [`SshClient::connect`]
 /// (interactive PTY sessions) and background consumers (tunnels, REST
 /// relay) that only need exec/direct-tcpip channels.
+///
+/// `otp_provider` supplies MFA codes when the server issues an OTP prompt
+/// during keyboard-interactive auth. Pass [`OtpProvider::Manual`] to disable
+/// auto-fetch and let the server reject the auth (the interactive UI owns
+/// the manual-entry fallback path through the OneKey credential popup).
 pub async fn connect_authenticated(
     config: &SshConfig,
     client_config: Arc<client::Config>,
+    otp_provider: OtpProvider,
 ) -> anyhow::Result<client::Handle<Handler>> {
     // Derive the host-key verification policy from the user's config.
     // Unknown / empty values fall back to AcceptNew (TOFU) inside
@@ -378,7 +386,7 @@ pub async fn connect_authenticated(
     let stream = connect_transport(&config.host, config.port, config.proxy.as_ref()).await?;
     let mut handle = client::connect_stream(client_config, stream, handler).await?;
 
-    authenticate(&mut handle, config).await?;
+    authenticate(&mut handle, config, &otp_provider).await?;
     Ok(handle)
 }
 

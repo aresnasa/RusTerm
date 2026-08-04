@@ -3,6 +3,7 @@ pub mod client;
 pub mod direct;
 pub mod host_spec;
 pub mod known_hosts;
+pub mod otp;
 pub mod sftp;
 pub mod ssh_config;
 pub mod transport;
@@ -10,6 +11,7 @@ pub mod transport;
 pub use client::{SshClient, SshSession, connect_authenticated, parse_remote_history};
 pub use direct::{DirectConnectOptions, DirectHandle, ExecResult, connect_direct};
 pub use host_spec::{HostSpec, HostSpecError, Protocol, default_port, parse_host_input};
+pub use otp::OtpProvider;
 pub use sftp::{
     RemoteDirEntry, RemoteFileMetadata, RemoteFileType, SftpClient, SftpError, TransferResult,
 };
