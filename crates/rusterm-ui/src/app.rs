@@ -14078,12 +14078,36 @@ fn restore_sessions(
     // `restore_sessions` behaviour above).
     if let Some(saved_layout) = crate::layout_state::LayoutState::load() {
         if !saved_layout.tabs.is_empty() {
-            tracing::info!(
-                "Applying saved pane layouts: {} tab(s)",
-                saved_layout.tabs.len()
-            );
-            state.write().apply_layout_state(&saved_layout);
-            state.write().dedup_pane_session_tabs();
+            // Guard against an ambiguous name→id mapping. `apply_layout_state`
+            // re-attaches saved pane layouts by session *display name*, and
+            // `dedup_pane_session_tabs` then collapses the standalone tabs whose
+            // anchor became a pane in another tab. When two restored sessions
+            // share the same display name (e.g. the same jumpserver connection
+            // opened twice and navigated to different targets via its menu),
+            // that name-based matching is ambiguous and would merge two
+            // independent tabs into a single tab with two split panes — both
+            // showing the same session. Skipping layout restore here keeps each
+            // restored session in its own tab (the default `restore_sessions`
+            // behaviour) and lets the now-empty snapshot auto-delete the stale
+            // `layout_state.json` within the next 30s periodic-save window.
+            let mut names = std::collections::HashSet::new();
+            let ambiguous = state
+                .read()
+                .sessions
+                .iter()
+                .any(|s| !names.insert(s.name.clone()));
+            if ambiguous {
+                tracing::info!(
+                    "Skipping layout restore: restored sessions have duplicate display names — keeping each in its own tab to avoid merge"
+                );
+            } else {
+                tracing::info!(
+                    "Applying saved pane layouts: {} tab(s)",
+                    saved_layout.tabs.len()
+                );
+                state.write().apply_layout_state(&saved_layout);
+                state.write().dedup_pane_session_tabs();
+            }
         }
     }
 }
