@@ -14097,6 +14097,12 @@ fn restore_sessions(
 fn save_layout_snapshot(state: &Signal<AppState>) {
     let snapshot = state.read().build_layout_state();
     if snapshot.tabs.is_empty() {
+        // Nothing custom to persist: remove any previous snapshot so a stale
+        // split layout can't be fossilised and re-applied on the next launch
+        // (which would merge separate same-named tabs into one tab's panes).
+        if let Err(e) = crate::layout_state::LayoutState::delete() {
+            tracing::warn!("Failed to delete stale layout state on exit: {}", e);
+        }
         return;
     }
     if let Err(e) = snapshot.save() {
@@ -16686,22 +16692,34 @@ pub fn App() -> Element {
             ))
             .await;
 
-            // Skip if there are no layouts to save (single-session tabs have
-            // no layout entry). The snapshot builder itself also filters out
-            // trivial single-pane tabs, but checking `is_empty` here avoids
-            // even building the snapshot when there's clearly nothing to do.
+            // Skip the build when there are clearly no layouts at all
+            // (single-session tabs have no layout entry).
             let snapshot = {
                 let s = state_for_layout_save.read();
                 if s.layouts.is_empty() {
-                    continue;
+                    None
+                } else {
+                    Some(s.build_layout_state())
                 }
-                s.build_layout_state()
             };
-            if snapshot.tabs.is_empty() {
+            let empty = match &snapshot {
+                None => true,
+                Some(s) => s.tabs.is_empty(),
+            };
+            if empty {
+                // Nothing custom to persist: remove any previous snapshot so
+                // a stale split layout can't be fossilised and re-applied on
+                // the next launch (which would merge separate same-named
+                // tabs into one tab's panes).
+                if let Err(e) = crate::layout_state::LayoutState::delete() {
+                    tracing::warn!("Failed to delete stale layout state: {}", e);
+                }
                 continue;
             }
-            if let Err(e) = snapshot.save() {
-                tracing::warn!("Failed to save layout state: {}", e);
+            if let Some(snapshot) = snapshot {
+                if let Err(e) = snapshot.save() {
+                    tracing::warn!("Failed to save layout state: {}", e);
+                }
             }
         }
     });

@@ -146,6 +146,27 @@ impl LayoutState {
         std::fs::rename(&temp_path, path).context("Failed to rename layout state file")?;
         Ok(())
     }
+
+    /// Remove the persisted layout-state file, if present.
+    ///
+    /// Called when the current workspace has no non-trivial layouts to save:
+    /// without this, the last multi-pane arrangement would fossilise on disk
+    /// and be re-applied to every future launch even after the user went back
+    /// to plain single-pane tabs — restoring sessions then collapses separate
+    /// same-named tabs into one tab's split panes.
+    pub fn delete() -> Result<()> {
+        let path = Self::resolve_path()?;
+        Self::delete_from(&path)
+    }
+
+    /// Delete from a specific path — used by tests. A missing file is fine.
+    pub fn delete_from(path: &PathBuf) -> Result<()> {
+        match std::fs::remove_file(path) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e).context("Failed to delete layout state file"),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -175,6 +196,27 @@ mod tests {
         state.save_to(&path).unwrap();
         let loaded = LayoutState::load_from(&path).unwrap();
         assert_eq!(state, loaded);
+    }
+
+    #[test]
+    fn delete_removes_file_and_ignores_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("layout_state.json");
+
+        // Missing file: no-op, no error.
+        LayoutState::delete_from(&path).unwrap();
+
+        let state = LayoutState {
+            schema_version: 1,
+            saved_at: None,
+            tabs: vec![],
+        };
+        state.save_to(&path).unwrap();
+        assert!(path.exists());
+
+        LayoutState::delete_from(&path).unwrap();
+        assert!(!path.exists());
+        assert!(LayoutState::load_from(&path).is_none());
     }
 
     #[test]
