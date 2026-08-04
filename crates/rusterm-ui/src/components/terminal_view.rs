@@ -1201,6 +1201,166 @@ fn popup_fallback_top_px(cursor_row: usize) -> f64 {
     TERMINAL_PADDING_TOP_PX + (cursor_row as f64 + 1.0) * TERMINAL_ROW_HEIGHT_PX
 }
 
+// ── Draggable popup placement (user habit) ─────────────────────────
+
+/// User-adjusted vertical offset (px) applied to the suggestion / OneKey
+/// popups relative to their automatic cursor-row anchor. `0.0` means fully
+/// automatic placement. Global on purpose: the preference is a user habit
+/// shared by every session/pane. Loaded from settings.json at startup and
+/// persisted (via `on_popup_offset_commit`) whenever a drag ends.
+pub static SUGGESTION_POPUP_OFFSET_Y: GlobalSignal<f64> = GlobalSignal::new(|| 0.0);
+
+/// Minimum popup sliver (px) that must stay visible inside the pane when the
+/// user drags the popup or when a persisted offset is reapplied — roughly one
+/// suggestion row, so the grip always remains reachable.
+const POPUP_MANUAL_MIN_VISIBLE_PX: f64 = 24.0;
+
+/// Drags that end within this distance of the automatic anchor snap back to
+/// `0.0` (fully automatic placement, including the above/below flip).
+const POPUP_OFFSET_SNAP_PX: f64 = 4.0;
+
+/// Poll script for an in-flight popup drag. The state global is written by
+/// the document-level listeners installed by
+/// [`build_install_popup_drag_script`]: `'active'` while dragging,
+/// `'done:<offset>'` after a successful drop, `'cancel'` for aborted or
+/// no-movement presses.
+const POPUP_DRAG_POLL_JS: &str =
+    "return (function() { return window.__rusterm_popup_drag_state || ''; })()";
+
+/// Tear down any leftover popup-drag listeners and reset the state global.
+const POPUP_DRAG_CLEANUP_JS: &str = "(function() { if (window._rusterm_popup_drag_remove) { window._rusterm_popup_drag_remove(); window._rusterm_popup_drag_remove = null; } window.__rusterm_popup_drag_state = ''; document.body.style.webkitUserSelect = ''; document.body.style.userSelect = ''; })()";
+
+/// Result of one poll of the popup-drag state global.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum PopupDragPoll {
+    /// Drag still in progress (or listeners not installed yet).
+    Pending,
+    /// Drag ended. `Some(offset)` is the new persistent offset relative to
+    /// the automatic anchor; `None` means cancelled / no movement — keep the
+    /// current preference.
+    Finished(Option<f64>),
+}
+
+/// Parse the value returned by [`POPUP_DRAG_POLL_JS`]. Offsets are clamped
+/// to a sane range and snapped to `0.0` (automatic) when the user drops the
+/// popup back onto its automatic anchor.
+fn parse_popup_drag_poll_response(s: &str) -> PopupDragPoll {
+    match s {
+        "" | "active" => PopupDragPoll::Pending,
+        "cancel" => PopupDragPoll::Finished(None),
+        other => match other
+            .strip_prefix("done:")
+            .and_then(|v| v.parse::<f64>().ok())
+        {
+            Some(offset) if offset.is_finite() => {
+                let offset = offset.clamp(-5000.0, 5000.0);
+                let offset = if offset.abs() < POPUP_OFFSET_SNAP_PX {
+                    0.0
+                } else {
+                    offset
+                };
+                PopupDragPoll::Finished(Some(offset))
+            }
+            _ => PopupDragPoll::Finished(None),
+        },
+    }
+}
+
+/// Build the JS that installs document-level capture-phase listeners for a
+/// popup drag started at viewport `start_y`. Element-level mousemove is
+/// unreliable in the WKWebView, so — like splitter/tab/pane drags — the
+/// listeners live on `document`, write progress to unique window globals
+/// (`__rusterm_popup_drag_state`), and move the popup live by setting the
+/// same `--suggestion-popup-*` CSS variables the resize future maintains.
+/// The final result is the offset of the dropped popup relative to the
+/// automatic `--suggestion-top` anchor, so the habit follows the prompt row
+/// instead of pinning the popup to an absolute pane position.
+pub(crate) fn build_install_popup_drag_script(container_id: &str, start_y: f64) -> String {
+    format!(
+        "(function() {{\n\
+            if (window._rusterm_popup_drag_remove) {{ window._rusterm_popup_drag_remove(); }}\n\
+            var el = document.getElementById('{container_id}');\n\
+            var popup = el ? el.querySelector('[data-rusterm-terminal-popup=\"true\"]') : null;\n\
+            if (!el || !popup) {{ window.__rusterm_popup_drag_state = 'cancel'; return; }}\n\
+            var baseTop = popup.getBoundingClientRect().top - el.getBoundingClientRect().top;\n\
+            var startY = {start_y};\n\
+            var lastTop = baseTop;\n\
+            var moved = false;\n\
+            window.__rusterm_popup_drag_state = 'active';\n\
+            document.body.style.webkitUserSelect = 'none';\n\
+            document.body.style.userSelect = 'none';\n\
+            if (window.getSelection) {{ window.getSelection().removeAllRanges(); }}\n\
+            var applyTop = function(top) {{\n\
+                var h = el.clientHeight;\n\
+                var clamped = Math.min(Math.max(top, 0), Math.max(0, h - {POPUP_MANUAL_MIN_VISIBLE_PX}));\n\
+                el.style.setProperty('--suggestion-popup-top', clamped + 'px');\n\
+                el.style.setProperty('--suggestion-popup-bottom', 'auto');\n\
+                el.style.setProperty('--suggestion-popup-max-height', Math.max({POPUP_MANUAL_MIN_VISIBLE_PX}, h - clamped) + 'px');\n\
+                return clamped;\n\
+            }};\n\
+            var removeListeners = function() {{\n\
+                document.removeEventListener('mousemove', moveHandler, true);\n\
+                document.removeEventListener('mouseup', upHandler, true);\n\
+                document.removeEventListener('keydown', keyHandler, true);\n\
+                window.removeEventListener('blur', blurHandler, true);\n\
+                document.body.style.webkitUserSelect = '';\n\
+                document.body.style.userSelect = '';\n\
+                window._rusterm_popup_drag_remove = null;\n\
+            }};\n\
+            var finish = function(cancelled) {{\n\
+                removeListeners();\n\
+                var anchor = parseFloat(el.style.getPropertyValue('--suggestion-top'));\n\
+                if (cancelled || !moved || isNaN(anchor)) {{\n\
+                    window.__rusterm_popup_drag_state = 'cancel';\n\
+                    return;\n\
+                }}\n\
+                window.__rusterm_popup_drag_state = 'done:' + (lastTop - anchor).toFixed(2);\n\
+            }};\n\
+            var moveHandler = function(e) {{\n\
+                var dy = e.clientY - startY;\n\
+                if (dy > 3 || dy < -3) {{ moved = true; }}\n\
+                lastTop = applyTop(baseTop + dy);\n\
+                e.preventDefault();\n\
+                e.stopPropagation();\n\
+            }};\n\
+            var upHandler = function(e) {{\n\
+                e.preventDefault();\n\
+                e.stopPropagation();\n\
+                finish(false);\n\
+            }};\n\
+            var keyHandler = function(e) {{ if (e.key === 'Escape') {{ finish(true); }} }};\n\
+            var blurHandler = function() {{ finish(true); }};\n\
+            document.addEventListener('mousemove', moveHandler, true);\n\
+            document.addEventListener('mouseup', upHandler, true);\n\
+            document.addEventListener('keydown', keyHandler, true);\n\
+            window.addEventListener('blur', blurHandler, true);\n\
+            window._rusterm_popup_drag_remove = function() {{ removeListeners(); }};\n\
+        }})()"
+    )
+}
+
+/// Build the JS applying a persisted manual offset on top of the automatic
+/// cursor anchor: `top = clamp(anchor + offset)`, with the max-height sized
+/// to the remaining space below. Used by the 100ms resize future instead of
+/// the automatic above/below layout whenever the user has dragged the popup
+/// (offset ≠ 0), so the remembered position keeps tracking the prompt row.
+fn build_manual_popup_layout_script(container_id: &str, offset_y: f64) -> String {
+    format!(
+        "(function() {{\n\
+            var el = document.getElementById('{container_id}');\n\
+            if (!el) {{ return; }}\n\
+            var anchor = parseFloat(el.style.getPropertyValue('--suggestion-top'));\n\
+            if (isNaN(anchor)) {{ return; }}\n\
+            var h = el.clientHeight;\n\
+            if (!(h > 0)) {{ return; }}\n\
+            var top = Math.min(Math.max(anchor + {offset_y}, 0), Math.max(0, h - {POPUP_MANUAL_MIN_VISIBLE_PX}));\n\
+            el.style.setProperty('--suggestion-popup-top', top + 'px');\n\
+            el.style.setProperty('--suggestion-popup-bottom', 'auto');\n\
+            el.style.setProperty('--suggestion-popup-max-height', Math.max({POPUP_MANUAL_MIN_VISIBLE_PX}, h - top) + 'px');\n\
+        }})()"
+    )
+}
+
 #[component]
 pub fn TerminalView(
     session_id: String,
@@ -1268,6 +1428,13 @@ pub fn TerminalView(
     /// configured `suggestion_count`). Passed through to `SuggestionPopup`.
     #[props(default)]
     suggestion_max_rows: usize,
+    /// Fired when the user finishes dragging a popup by its grip (or
+    /// double-clicks the grip to reset). Payload: the new persistent
+    /// vertical offset in px relative to the automatic cursor anchor
+    /// (`0.0` = automatic placement). The app persists it to settings.json
+    /// so the position habit survives restarts.
+    #[props(default)]
+    on_popup_offset_commit: EventHandler<f64>,
 ) -> Element {
     let _lang = crate::i18n::LANGUAGE();
     let mut focused = use_signal(|| false);
@@ -1293,6 +1460,12 @@ pub fn TerminalView(
     // the cell metrics only change with a font (re)load. NONE until the first
     // successful poll — mouse/wheel hit-testing ignores events before that.
     let mut content_geo: Signal<Option<(f64, f64, f64, f64)>> = use_signal(|| None);
+
+    // True while the user is dragging a popup by its grip. While set, the
+    // 100ms resize future pauses its `--suggestion-popup-*` writes so it
+    // doesn't fight the document-level drag listeners, and the drag poll
+    // future below runs fast to catch the drop promptly.
+    let popup_drag_active = use_signal(|| false);
 
     let current_suggestion = suggestion.clone();
     let current_suggestions = suggestions.clone();
@@ -1909,21 +2082,39 @@ pub fn TerminalView(
                                     && space_below >= 0.0
                                     && desired >= 0.0
                                 {
-                                    let layout = popup_layout(space_above, space_below, desired);
-                                    let (top, bottom) = match layout.direction {
-                                        PopupDirection::Above => {
-                                            ("auto", "var(--suggestion-bottom, 2em)")
-                                        }
-                                        PopupDirection::Below => {
-                                            ("var(--suggestion-top, 2em)", "auto")
-                                        }
-                                    };
-                                    let popup_cid = cid.clone();
-                                    let _ = dioxus::document::eval(&format!(
-                                        "(function() {{ const el = document.getElementById('{popup_cid}'); if (!el) return; el.style.setProperty('--suggestion-popup-top', '{top}'); el.style.setProperty('--suggestion-popup-bottom', '{bottom}'); el.style.setProperty('--suggestion-popup-max-height', '{}px'); }})()",
-                                        layout.max_height_px
-                                    ))
-                                    .await;
+                                    // A grip drag owns the popup position while
+                                    // active — skip this tick so the 100ms loop
+                                    // doesn't fight the live drag listeners.
+                                    let dragging = *popup_drag_active.peek();
+                                    let manual_offset = *SUGGESTION_POPUP_OFFSET_Y.peek();
+                                    if dragging {
+                                        // no-op
+                                    } else if manual_offset != 0.0 && manual_offset.is_finite() {
+                                        // The user dragged the popup: reapply the
+                                        // remembered offset on top of the cursor
+                                        // anchor instead of the automatic layout.
+                                        let _ = dioxus::document::eval(
+                                            &build_manual_popup_layout_script(&cid, manual_offset),
+                                        )
+                                        .await;
+                                    } else {
+                                        let layout =
+                                            popup_layout(space_above, space_below, desired);
+                                        let (top, bottom) = match layout.direction {
+                                            PopupDirection::Above => {
+                                                ("auto", "var(--suggestion-bottom, 2em)")
+                                            }
+                                            PopupDirection::Below => {
+                                                ("var(--suggestion-top, 2em)", "auto")
+                                            }
+                                        };
+                                        let popup_cid = cid.clone();
+                                        let _ = dioxus::document::eval(&format!(
+                                            "(function() {{ const el = document.getElementById('{popup_cid}'); if (!el) return; el.style.setProperty('--suggestion-popup-top', '{top}'); el.style.setProperty('--suggestion-popup-bottom', '{bottom}'); el.style.setProperty('--suggestion-popup-max-height', '{}px'); }})()",
+                                            layout.max_height_px
+                                        ))
+                                        .await;
+                                    }
                                 }
                             }
                         }
@@ -1932,6 +2123,64 @@ pub fn TerminalView(
             }
         }
     });
+
+    // ── Popup drag-to-move (user habit) ──
+    // The grip's mousedown installs document-level capture listeners (see
+    // `build_install_popup_drag_script`); this never-ending future polls the
+    // drag state global and, when the drop lands, stores the new offset in
+    // the global preference signal and asks the app to persist it.
+    let drag_commit_handler = on_popup_offset_commit;
+    let _popup_drag_future = use_future(move || {
+        let mut drag_active = popup_drag_active;
+        async move {
+            loop {
+                if !*drag_active.peek() {
+                    tokio::time::sleep(std::time::Duration::from_millis(120)).await;
+                    continue;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                let Ok(value) = dioxus::document::eval(POPUP_DRAG_POLL_JS).await else {
+                    continue;
+                };
+                let Some(s) = value.as_str() else { continue };
+                match parse_popup_drag_poll_response(s) {
+                    PopupDragPoll::Pending => {}
+                    PopupDragPoll::Finished(result) => {
+                        drag_active.set(false);
+                        let _ = dioxus::document::eval(POPUP_DRAG_CLEANUP_JS).await;
+                        if let Some(offset) = result {
+                            *SUGGESTION_POPUP_OFFSET_Y.write() = offset;
+                            drag_commit_handler.call(offset);
+                        }
+                    }
+                }
+            }
+        }
+    });
+
+    // Grip mousedown → begin a drag. Shared by both popups.
+    let popup_drag_sid = session_id.clone();
+    let start_popup_drag = move |client_y: f64| {
+        let mut drag_active = popup_drag_active;
+        if *drag_active.peek() {
+            return;
+        }
+        drag_active.set(true);
+        let script =
+            build_install_popup_drag_script(&format!("terminal-input-{popup_drag_sid}"), client_y);
+        spawn(async move {
+            let _ = dioxus::document::eval(&script).await;
+        });
+    };
+    let start_popup_drag_for_onekey = start_popup_drag.clone();
+
+    // Grip double-click → forget the habit and go back to automatic
+    // placement (persisted immediately, like a drag).
+    let reset_popup_offset = move |_: ()| {
+        *SUGGESTION_POPUP_OFFSET_Y.write() = 0.0;
+        drag_commit_handler.call(0.0);
+    };
+    let reset_popup_offset_for_onekey = reset_popup_offset;
 
     let cursor_row = render_output.cursor_row;
     let cursor_col = render_output.cursor_col;
@@ -2803,6 +3052,8 @@ pub fn TerminalView(
                     history_completion: current_history_completion_visible,
                     max_rows: suggestion_max_rows,
                     fallback_top: popup_fallback_top.clone(),
+                    on_drag_start: move |client_y: f64| start_popup_drag(client_y),
+                    on_position_reset: move |_: ()| reset_popup_offset(()),
                 }
             }
 
@@ -2836,6 +3087,8 @@ pub fn TerminalView(
                         on_onekey_dismiss.call(());
                     },
                     fallback_top: popup_fallback_top.clone(),
+                    on_drag_start: move |client_y: f64| start_popup_drag_for_onekey(client_y),
+                    on_position_reset: move |_: ()| reset_popup_offset_for_onekey(()),
                 }
             }
         }
@@ -2845,15 +3098,16 @@ pub fn TerminalView(
 #[cfg(test)]
 mod tests {
     use super::{
-        ClipboardCopyOutcome, CopyShortcut, OneKeyKeyAction, PopupDirection, SEARCH_CURRENT_BG,
-        SEARCH_MATCH_BG, TerminalOverlayKeyAction, TextSelection, accepts_history_completion,
-        accepts_inline_suggestion, app_owns_mouse, cell_style, color_to_css,
-        copy_text_to_clipboard, cursor_key_seq, event_cell_from_coords,
+        ClipboardCopyOutcome, CopyShortcut, OneKeyKeyAction, PopupDirection, PopupDragPoll,
+        SEARCH_CURRENT_BG, SEARCH_MATCH_BG, TerminalOverlayKeyAction, TextSelection,
+        accepts_history_completion, accepts_inline_suggestion, app_owns_mouse,
+        build_install_popup_drag_script, build_manual_popup_layout_script, cell_style,
+        color_to_css, copy_text_to_clipboard, cursor_key_seq, event_cell_from_coords,
         finalize_selection_on_mouse_up, find_search_matches, is_find_shortcut,
         is_history_completion_shortcut, onekey_popup_key_action, online_search_url,
-        popup_fallback_top_px, popup_layout, scroll_thumb_geometry, search_query_from_selection,
-        suggestion_navigation_index, terminal_key_bytes, terminal_overlay_key_action,
-        terminal_selection_text, word_range_in_row,
+        parse_popup_drag_poll_response, popup_fallback_top_px, popup_layout, scroll_thumb_geometry,
+        search_query_from_selection, suggestion_navigation_index, terminal_key_bytes,
+        terminal_overlay_key_action, terminal_selection_text, word_range_in_row,
     };
     use dioxus::prelude::{Code, Key};
     use rusterm_core::terminal::{CellColor, RenderCell, RenderRow};
@@ -2916,6 +3170,99 @@ mod tests {
         // A prompt further down the screen: the fallback must track it so an
         // unmeasured popup never jumps back to the top of the terminal.
         assert_eq!(popup_fallback_top_px(20), 8.0 + 21.0 * 19.0);
+    }
+
+    #[test]
+    fn popup_drag_script_uses_document_capture_listeners_and_unique_globals() {
+        let script = build_install_popup_drag_script("terminal-input-abc", 123.5);
+        // Document-level capture listeners — element-level mousemove is
+        // unreliable in this webview (see splitter/tab/pane drags).
+        assert!(script.contains("document.addEventListener('mousemove', moveHandler, true)"));
+        assert!(script.contains("document.addEventListener('mouseup', upHandler, true)"));
+        assert!(script.contains("document.addEventListener('keydown', keyHandler, true)"));
+        assert!(script.contains("window.addEventListener('blur', blurHandler, true)"));
+        // Unique globals — must never collide with the other drag systems.
+        assert!(script.contains("window.__rusterm_popup_drag_state"));
+        assert!(script.contains("window._rusterm_popup_drag_remove"));
+        assert!(!script.contains("__rusterm_drag_pos"));
+        assert!(!script.contains("__rusterm_tab_drag_pos"));
+        assert!(!script.contains("__rusterm_pane_move_pos"));
+        // Anchors and inputs.
+        assert!(script.contains("getElementById('terminal-input-abc')"));
+        assert!(script.contains("var startY = 123.5;"));
+        assert!(script.contains("[data-rusterm-terminal-popup=\"true\"]"));
+        // Text selection is suppressed during the drag and restored after.
+        assert!(script.contains("document.body.style.webkitUserSelect = 'none'"));
+        assert!(script.contains("document.body.style.webkitUserSelect = ''"));
+        // The result is relative to the automatic anchor, so the habit
+        // follows the prompt row.
+        assert!(script.contains("getPropertyValue('--suggestion-top')"));
+        assert!(script.contains("'done:' + (lastTop - anchor).toFixed(2)"));
+    }
+
+    #[test]
+    fn popup_drag_poll_parsing_covers_pending_cancel_and_done() {
+        assert_eq!(parse_popup_drag_poll_response(""), PopupDragPoll::Pending);
+        assert_eq!(
+            parse_popup_drag_poll_response("active"),
+            PopupDragPoll::Pending
+        );
+        assert_eq!(
+            parse_popup_drag_poll_response("cancel"),
+            PopupDragPoll::Finished(None)
+        );
+        assert_eq!(
+            parse_popup_drag_poll_response("done:-57.25"),
+            PopupDragPoll::Finished(Some(-57.25))
+        );
+        // Garbage payloads finish without touching the stored preference.
+        assert_eq!(
+            parse_popup_drag_poll_response("done:not-a-number"),
+            PopupDragPoll::Finished(None)
+        );
+        assert_eq!(
+            parse_popup_drag_poll_response("done:NaN"),
+            PopupDragPoll::Finished(None)
+        );
+    }
+
+    #[test]
+    fn popup_drag_offsets_snap_to_automatic_and_clamp_extremes() {
+        // Dropping within a few px of the automatic anchor snaps back to
+        // fully automatic placement (including the above/below flip).
+        assert_eq!(
+            parse_popup_drag_poll_response("done:2.50"),
+            PopupDragPoll::Finished(Some(0.0))
+        );
+        assert_eq!(
+            parse_popup_drag_poll_response("done:-3.99"),
+            PopupDragPoll::Finished(Some(0.0))
+        );
+        // Just beyond the snap radius the offset is kept as-is.
+        assert_eq!(
+            parse_popup_drag_poll_response("done:4.00"),
+            PopupDragPoll::Finished(Some(4.0))
+        );
+        // Absurd values (should be impossible given the JS clamp, but the
+        // globals are writable) are clamped to a sane range.
+        assert_eq!(
+            parse_popup_drag_poll_response("done:99999"),
+            PopupDragPoll::Finished(Some(5000.0))
+        );
+    }
+
+    #[test]
+    fn manual_popup_layout_script_applies_offset_on_top_of_the_anchor() {
+        let script = build_manual_popup_layout_script("terminal-input-abc", -38.5);
+        assert!(script.contains("getElementById('terminal-input-abc')"));
+        // Reapplies the remembered offset relative to the measured anchor,
+        // clamped so a readable sliver always stays inside the pane.
+        assert!(script.contains("getPropertyValue('--suggestion-top')"));
+        assert!(script.contains("anchor + -38.5"));
+        assert!(script.contains("Math.min(Math.max("));
+        assert!(script.contains("setProperty('--suggestion-popup-top', top + 'px')"));
+        assert!(script.contains("setProperty('--suggestion-popup-bottom', 'auto')"));
+        assert!(script.contains("--suggestion-popup-max-height"));
     }
 
     #[test]

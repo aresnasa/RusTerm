@@ -1,3 +1,4 @@
+use dioxus::html::input_data::MouseButton;
 use dioxus::prelude::*;
 
 /// Atuin-style suggestion panel rendered BELOW the current cursor line.
@@ -60,6 +61,15 @@ pub fn SuggestionPopup(
     /// below the prompt from its very first frame; defaults to `2em`.
     #[props(default = "2em".to_string())]
     fallback_top: String,
+    /// Fired when the user presses the drag grip with the primary button.
+    /// Payload: the viewport `clientY` of the press. TerminalView installs
+    /// the document-level drag listeners that actually move the popup.
+    #[props(default)]
+    on_drag_start: EventHandler<f64>,
+    /// Fired when the user double-clicks the grip: forget the remembered
+    /// position and return to automatic placement.
+    #[props(default)]
+    on_position_reset: EventHandler<()>,
 ) -> Element {
     let _lang = crate::i18n::LANGUAGE();
     if suggestions.is_empty() {
@@ -116,6 +126,48 @@ pub fn SuggestionPopup(
             },
             onmouseup: move |e| e.stop_propagation(),
             onclick: move |e| e.stop_propagation(),
+            // Drag grip — lets the user move the popup out of the way. The
+            // final position is remembered (persisted) as a habit and reapplied
+            // whenever the popup opens; double-click restores automatic
+            // placement. The actual drag uses document-level listeners
+            // installed by TerminalView (element-level mousemove is unreliable
+            // in this webview).
+            div {
+                style: "
+                    display:flex;
+                    align-items:center;
+                    justify-content:center;
+                    height:12px;
+                    cursor:grab;
+                    background:#1a1b26;
+                    border-bottom:1px solid #2a2b3d;
+                    color:#565f89;
+                    font-size:9px;
+                    letter-spacing:3px;
+                    line-height:1;
+                    user-select:none;
+                    -webkit-user-select:none;
+                ",
+                title: crate::i18n::t("popup.drag_grip_tooltip"),
+                onpointerdown: move |e| {
+                    e.prevent_default();
+                    e.stop_propagation();
+                },
+                onmousedown: move |e| {
+                    e.prevent_default();
+                    e.stop_propagation();
+                    if e.trigger_button() == Some(MouseButton::Primary) {
+                        on_drag_start.call(e.client_coordinates().y);
+                    }
+                },
+                onmouseup: move |e| e.stop_propagation(),
+                onclick: move |e| e.stop_propagation(),
+                ondoubleclick: move |e| {
+                    e.stop_propagation();
+                    on_position_reset.call(());
+                },
+                "•••"
+            }
             if history_completion {
                 div {
                     style: "display:flex;align-items:center;justify-content:space-between;padding:4px 12px;border-bottom:1px solid #2a2b3d;background:#24283b;color:#c0caf5;font-size:11px;",

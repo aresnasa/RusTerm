@@ -20,6 +20,17 @@ const CONFIG_FILE_NAME: &str = "settings.json";
 const CONFIG_VERSION: u32 = 1;
 const KEY_DERIVATION_SALT: &[u8] = b"rusterm-master-key-salt-v1";
 
+/// Clamp a persisted popup vertical offset to a sane range. Non-finite
+/// values (hand-edited settings files) fall back to `0.0` (automatic
+/// placement); anything beyond ±5000px is clamped — no display needs more.
+pub fn normalize_suggestion_popup_offset(offset_y: f64) -> f64 {
+    if offset_y.is_finite() {
+        offset_y.clamp(-5000.0, 5000.0)
+    } else {
+        0.0
+    }
+}
+
 #[derive(Clone)]
 pub struct ConfigManager {
     config_path: PathBuf,
@@ -262,6 +273,7 @@ impl ConfigManager {
             language: existing.language,
             api_custom_templates: existing.api_custom_templates.clone(),
             qwen_local: existing.qwen_local.clone(),
+            suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
         };
 
         let json =
@@ -299,6 +311,7 @@ impl ConfigManager {
             language: existing.language,
             api_custom_templates: existing.api_custom_templates.clone(),
             qwen_local: existing.qwen_local.clone(),
+            suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
         };
 
         let json =
@@ -344,6 +357,7 @@ impl ConfigManager {
             language: existing.language,
             api_custom_templates: existing.api_custom_templates.clone(),
             qwen_local: existing.qwen_local.clone(),
+            suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
         };
 
         let json =
@@ -386,6 +400,7 @@ impl ConfigManager {
             language: existing.language,
             api_custom_templates: existing.api_custom_templates.clone(),
             qwen_local: existing.qwen_local.clone(),
+            suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
         };
 
         let json =
@@ -425,6 +440,7 @@ impl ConfigManager {
             language: existing.language,
             api_custom_templates: existing.api_custom_templates.clone(),
             qwen_local: existing.qwen_local.clone(),
+            suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
         };
         let json =
             serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
@@ -464,6 +480,7 @@ impl ConfigManager {
             language: existing.language,
             api_custom_templates: existing.api_custom_templates.clone(),
             qwen_local: existing.qwen_local.clone(),
+            suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
         };
         let json =
             serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
@@ -511,6 +528,53 @@ impl ConfigManager {
             language: existing.language,
             api_custom_templates: existing.api_custom_templates.clone(),
             qwen_local: existing.qwen_local.clone(),
+            suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
+        };
+
+        let json =
+            serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
+
+        let temp_path = self.config_path.with_extension("json.tmp");
+        fs::write(&temp_path, &json).context("Failed to write config file")?;
+        fs::rename(&temp_path, &self.config_path).context("Failed to rename temp config file")?;
+
+        Ok(())
+    }
+
+    /// Load the user's preferred vertical offset (px) for the terminal
+    /// suggestion / OneKey popups, relative to the automatic cursor anchor.
+    /// `0.0` means fully automatic placement. Non-finite or absurd values
+    /// (hand-edited settings files) are normalized back to a sane range.
+    pub fn load_suggestion_popup_offset(&self) -> f64 {
+        normalize_suggestion_popup_offset(self.read_persisted().suggestion_popup_offset_y)
+    }
+
+    /// Persist the popup-position habit learned from the user dragging the
+    /// popup. Read-modify-write: preserves every unrelated settings field.
+    pub fn save_suggestion_popup_offset(&self, offset_y: f64) -> Result<()> {
+        let offset_y = normalize_suggestion_popup_offset(offset_y);
+        let existing = self.read_persisted();
+        let persisted = PersistedConfig {
+            version: CONFIG_VERSION,
+            connections: existing.connections,
+            onekeys: existing.onekeys,
+            onekey_preferences: existing.onekey_preferences,
+            master_password_hash: self.master_password_hash.clone(),
+            restore_disabled: existing.restore_disabled,
+            confirm_close_on_exit: existing.confirm_close_on_exit,
+            comparison_diff_warning_enabled: existing.comparison_diff_warning_enabled,
+            focused_tab_appearance: existing.focused_tab_appearance,
+            suggestion_enabled: existing.suggestion_enabled,
+            suggestion_count: existing.suggestion_count,
+            sidebar: existing.sidebar,
+            workspace: existing.workspace,
+            keybindings: existing.keybindings,
+            skin: existing.skin,
+            collect_usage_habits: existing.collect_usage_habits,
+            language: existing.language,
+            api_custom_templates: existing.api_custom_templates.clone(),
+            qwen_local: existing.qwen_local.clone(),
+            suggestion_popup_offset_y: offset_y,
         };
 
         let json =
@@ -553,6 +617,7 @@ impl ConfigManager {
             language,
             api_custom_templates: existing.api_custom_templates.clone(),
             qwen_local: existing.qwen_local.clone(),
+            suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
         };
 
         let json =
@@ -594,6 +659,7 @@ impl ConfigManager {
             language: existing.language,
             api_custom_templates: existing.api_custom_templates.clone(),
             qwen_local: existing.qwen_local.clone(),
+            suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
         };
 
         let json =
@@ -635,6 +701,7 @@ impl ConfigManager {
             language: existing.language,
             api_custom_templates: existing.api_custom_templates.clone(),
             qwen_local: existing.qwen_local.clone(),
+            suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
         };
 
         let json =
@@ -674,6 +741,7 @@ impl ConfigManager {
             language: existing.language,
             api_custom_templates: existing.api_custom_templates.clone(),
             qwen_local: existing.qwen_local.clone(),
+            suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
         };
 
         let json =
@@ -755,6 +823,7 @@ impl ConfigManager {
             language: existing.language,
             api_custom_templates: existing.api_custom_templates.clone(),
             qwen_local: existing.qwen_local.clone(),
+            suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
         };
 
         let json =
@@ -789,6 +858,7 @@ impl ConfigManager {
             language: Language::default(),
             api_custom_templates: Vec::new(),
             qwen_local: Default::default(),
+            suggestion_popup_offset_y: 0.0,
         };
 
         let mut persisted = if self.config_path.exists() {
@@ -844,6 +914,7 @@ impl ConfigManager {
             language: existing.language,
             api_custom_templates: existing.api_custom_templates.clone(),
             qwen_local: existing.qwen_local.clone(),
+            suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
         };
 
         let json =
@@ -1357,6 +1428,36 @@ mod tests {
         // And flipping it back to true also roundtrips.
         cm.save_confirm_close_on_exit(true).unwrap();
         assert!(cm.load_confirm_close_on_exit());
+    }
+
+    #[test]
+    fn suggestion_popup_offset_defaults_roundtrips_and_survives_other_saves() {
+        let (cm, _dir) = test_config_manager();
+        // Fresh settings file: automatic placement.
+        assert_eq!(cm.load_suggestion_popup_offset(), 0.0);
+
+        // The dragged position must roundtrip and survive unrelated saves.
+        cm.save_suggestion_popup_offset(-57.25).unwrap();
+        assert_eq!(cm.load_suggestion_popup_offset(), -57.25);
+        cm.save_suggestion_settings(false, 10).unwrap();
+        cm.save_usage_habits_enabled(true).unwrap();
+        assert_eq!(cm.load_suggestion_popup_offset(), -57.25);
+
+        // Reset back to automatic.
+        cm.save_suggestion_popup_offset(0.0).unwrap();
+        assert_eq!(cm.load_suggestion_popup_offset(), 0.0);
+    }
+
+    #[test]
+    fn suggestion_popup_offset_normalization_rejects_garbage() {
+        // Non-finite values (NaN / ±∞) fall back to automatic placement.
+        assert_eq!(normalize_suggestion_popup_offset(f64::NAN), 0.0);
+        assert_eq!(normalize_suggestion_popup_offset(f64::INFINITY), 0.0);
+        assert_eq!(normalize_suggestion_popup_offset(f64::NEG_INFINITY), 0.0);
+        // Finite but absurd values are clamped to a sane range.
+        assert_eq!(normalize_suggestion_popup_offset(123456.0), 5000.0);
+        assert_eq!(normalize_suggestion_popup_offset(-123456.0), -5000.0);
+        assert_eq!(normalize_suggestion_popup_offset(-42.5), -42.5);
     }
 
     #[test]

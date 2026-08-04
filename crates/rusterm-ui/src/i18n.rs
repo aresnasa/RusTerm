@@ -243,6 +243,10 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
             "Ctrl+N/P selects · Enter inserts · Esc closes",
             "Ctrl+N/P 选择 · Enter 插入 · Esc 关闭",
         ),
+        "popup.drag_grip_tooltip" => (
+            "Drag to move the popup (position is remembered) · double-click to restore automatic placement",
+            "拖动可移动弹窗（位置会被记住）· 双击恢复自动位置",
+        ),
 
         // ── send.* — Send panel ──────────────────────────────────────────
         "send.placeholder" => (

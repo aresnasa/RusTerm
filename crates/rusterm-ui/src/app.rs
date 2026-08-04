@@ -3830,6 +3830,18 @@ fn render_terminal_pane(
                     },
                     row_diffs: row_diffs.clone(),
                     suggestion_max_rows: state.read().suggestion_count as usize,
+                    // Persist the popup-position habit whenever the user
+                    // finishes dragging a popup grip (or resets it).
+                    on_popup_offset_commit: move |offset: f64| {
+                        if let Some(cm) = state.read().config_manager.clone() {
+                            if let Err(e) = cm.save_suggestion_popup_offset(offset) {
+                                tracing::error!(
+                                    "Failed to save popup position preference: {}",
+                                    e
+                                );
+                            }
+                        }
+                    },
                 }
                 }
             }
@@ -16638,6 +16650,11 @@ pub fn App() -> Element {
                                 s.suggestion_enabled = sug_enabled;
                                 s.suggestion_count = sug_count;
                                 s.collect_usage_habits = cm.load_usage_habits_enabled();
+                                // Restore the popup-position habit (where the
+                                // user last dragged the suggestion/OneKey
+                                // popup) into the shared placement signal.
+                                *crate::components::terminal_view::SUGGESTION_POPUP_OFFSET_Y
+                                    .write() = cm.load_suggestion_popup_offset();
                                 s.language = cm.load_language();
                                 crate::i18n::init_language(s.language);
                                 s.keybindings = cm.load_keybindings();

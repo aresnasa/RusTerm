@@ -1407,6 +1407,13 @@ pub struct PersistedConfig {
     /// omit this field and get the disabled default.
     #[serde(default)]
     pub qwen_local: QwenLocalSettings,
+    /// User-adjusted vertical offset (px) for the terminal suggestion /
+    /// OneKey popups, relative to their automatic cursor-row anchor.
+    /// Learned from the user dragging the popup and reapplied on every
+    /// popup open so the preferred placement survives restarts.
+    /// `0.0` (the legacy default) means fully automatic placement.
+    #[serde(default)]
+    pub suggestion_popup_offset_y: f64,
 }
 
 /// Default for `PersistedConfig::confirm_close_on_exit`. Kept as a function
@@ -2339,11 +2346,22 @@ mod tests {
             language: Language::default(),
             api_custom_templates: Vec::new(),
             qwen_local: QwenLocalSettings::default(),
+            suggestion_popup_offset_y: -38.5,
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: PersistedConfig = serde_json::from_str(&json).unwrap();
         assert!(!parsed.suggestion_enabled);
         assert_eq!(parsed.suggestion_count, 10);
+        assert_eq!(parsed.suggestion_popup_offset_y, -38.5);
+    }
+
+    #[test]
+    fn suggestion_popup_offset_defaults_to_automatic_for_legacy_settings() {
+        // Settings files written before the drag-to-move popup feature must
+        // deserialize with the automatic-placement default (0.0).
+        let config: PersistedConfig =
+            serde_json::from_str(r#"{"version":1,"connections":[]}"#).unwrap();
+        assert_eq!(config.suggestion_popup_offset_y, 0.0);
     }
 
     #[test]
