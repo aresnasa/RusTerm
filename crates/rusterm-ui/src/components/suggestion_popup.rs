@@ -61,6 +61,14 @@ pub fn SuggestionPopup(
     /// below the prompt from its very first frame; defaults to `2em`.
     #[props(default = "2em".to_string())]
     fallback_top: String,
+    /// CSS length used for `left` when the measured `--suggestion-left`
+    /// variable is not (yet) set. TerminalView passes a pixel offset
+    /// computed from the typed command's start column so the popup opens
+    /// aligned under the text being typed; defaults to `0`. The measurement
+    /// loop refreshes `--suggestion-left` every tick, so the popup follows
+    /// the command dynamically instead of sticking to a fixed edge.
+    #[props(default = "0".to_string())]
+    fallback_left: String,
     /// Fired when the user presses the drag grip with the primary button.
     /// Payload: the viewport `clientY` of the press. TerminalView installs
     /// the document-level drag listeners that actually move the popup.
@@ -94,7 +102,9 @@ pub fn SuggestionPopup(
             "data-rusterm-terminal-popup": "true",
             style: "
                 position: absolute;
-                left: 0; right: 0;
+                left: var(--suggestion-left, {fallback_left});
+                min-width: 320px;
+                max-width: calc(100% - var(--suggestion-left, {fallback_left}));
                 top: var(--suggestion-popup-top, var(--suggestion-top, {fallback_top}));
                 bottom: var(--suggestion-popup-bottom, auto);
                 max-height: var(--suggestion-popup-max-height, calc(100% - var(--suggestion-top, {fallback_top})));

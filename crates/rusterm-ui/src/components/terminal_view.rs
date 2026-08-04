@@ -1222,6 +1222,64 @@ fn popup_anchor_row(rows: &[RenderRow], cursor_row: usize) -> usize {
         .unwrap_or(cursor_row)
 }
 
+/// Left padding of the terminal container (`padding: 8px 12px 4px 4px`).
+const TERMINAL_PADDING_LEFT_PX: f64 = 4.0;
+
+/// Approximate JetBrains Mono cell width at 13px. Fallback only — the 100ms
+/// measurement loop replaces it with the live DOM value on its first tick.
+const TERMINAL_CHAR_WIDTH_PX: f64 = 7.8;
+
+/// Right padding of the line-number gutter column (`padding-right:8px`).
+const GUTTER_PADDING_RIGHT_PX: f64 = 8.0;
+
+/// Minimum popup width (px) kept inside the pane when the measured left
+/// anchor is clamped against the right edge — wide enough for a typical
+/// command plus the × delete button.
+const POPUP_MIN_WIDTH_PX: f64 = 320.0;
+
+/// The column the suggestion/OneKey popup should align its LEFT edge to:
+/// the start of the command the user is typing on the cursor row.
+///
+/// The popup rows are full commands sharing the typed prefix, so aligning
+/// the popup under the command start makes the suggestions line up exactly
+/// with the text being typed (Atuin/IDE-completion style) instead of
+/// sticking to a fixed pane edge. Heuristic:
+///   1. last prompt terminator (`$ `, `# `, `> `, `% `) before the cursor →
+///      first non-space column after it;
+///   2. no terminator → first non-whitespace column of the row;
+///   3. nothing typed yet → the cursor column itself.
+fn popup_anchor_col(row: &RenderRow, cursor_col: usize) -> usize {
+    let cells = &row.cells;
+    let end = cursor_col.min(cells.len());
+
+    let mut from = 0;
+    let mut i = end;
+    while i >= 2 {
+        if cells[i - 1].character == ' ' && matches!(cells[i - 2].character, '$' | '#' | '>' | '%')
+        {
+            from = i;
+            break;
+        }
+        i -= 1;
+    }
+
+    cells[from..end]
+        .iter()
+        .position(|cell| !cell.character.is_whitespace())
+        .map(|offset| from + offset)
+        .unwrap_or(end)
+}
+
+/// Pane-relative `left` (px) aligning a popup with `anchor_col` on the cursor
+/// row, computed purely from render state — the CSS fallback for
+/// `--suggestion-left` until the measurement loop provides live DOM values.
+fn popup_fallback_left_px(gutter_cols: usize, anchor_col: usize) -> f64 {
+    TERMINAL_PADDING_LEFT_PX
+        + gutter_cols as f64 * TERMINAL_CHAR_WIDTH_PX
+        + GUTTER_PADDING_RIGHT_PX
+        + anchor_col as f64 * TERMINAL_CHAR_WIDTH_PX
+}
+
 // ── Draggable popup placement (user habit) ─────────────────────────
 
 /// User-adjusted vertical offset (px) applied to the suggestion / OneKey
@@ -1371,7 +1429,7 @@ pub(crate) fn build_install_popup_drag_script(container_id: &str, start_y: f64) 
 /// prompt.
 fn build_terminal_measure_script(measure_cid: &str, scroll_cid: &str) -> String {
     format!(
-        "return (function() {{ const el = document.getElementById('{measure_cid}'); if (!el) return 'no-el'; const rect = el.getBoundingClientRect(); if (rect.width <= 0 || rect.height <= 0) return 'zero'; const cs = getComputedStyle(el); const padH = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight); const padV = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom); const bw = parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth); const bh = parseFloat(cs.borderTopWidth) + parseFloat(cs.borderBottomWidth); const h = rect.height - padV - bh; if (h <= 0) return 'small'; const sd = document.getElementById('{scroll_cid}'); if (!sd) return 'no-scroll'; const sdRect = sd.getBoundingClientRect(); if (sdRect.width <= 0) return 'small'; let w = sdRect.width; if (sd.firstElementChild) {{ const gutterW = sd.firstElementChild.getBoundingClientRect().width; w = Math.max(0, sdRect.width - gutterW); }} if (w <= 0) return 'small'; const test = document.createElement('span'); test.textContent = 'M'; test.style.cssText = 'font-family:JetBrains Mono,Fira Code,Cascadia Code,monospace;font-size:13px;line-height:1.5;position:absolute;visibility:hidden;white-space:pre;'; document.body.appendChild(test); const tr = test.getBoundingClientRect(); document.body.removeChild(test); const cw = Math.max(1, tr.width); const ch = Math.max(1, tr.height); const cols = Math.max(1, Math.floor(w / cw)); const rows = Math.max(1, Math.floor(h / ch)); let popupAbove = -1; let popupBelow = -1; let popupDesired = -1; const cr_sug = el.querySelector('[data-cursor-row=\"1\"]'); if (cr_sug) {{ const anchor_sug = el.querySelector('[data-popup-anchor=\"1\"]') || cr_sug; const tr_sug = el.getBoundingClientRect(); const cr_r_sug = cr_sug.getBoundingClientRect(); const an_r_sug = anchor_sug.getBoundingClientRect(); el.style.setProperty('--suggestion-bottom', (tr_sug.bottom - cr_r_sug.top) + 'px'); el.style.setProperty('--suggestion-top', (an_r_sug.bottom - tr_sug.top) + 'px'); const popup = el.querySelector('[data-rusterm-terminal-popup=\"true\"]'); if (popup) {{ popupAbove = Math.max(0, cr_r_sug.top - tr_sug.top); popupBelow = Math.max(0, tr_sug.bottom - an_r_sug.bottom); popupDesired = Math.max(1, popup.scrollHeight); }} }} return cols + ',' + rows + ',' + cw.toFixed(2) + ',' + ch.toFixed(2) + ',' + popupAbove.toFixed(2) + ',' + popupBelow.toFixed(2) + ',' + popupDesired.toFixed(2); }})()"
+        "return (function() {{ const el = document.getElementById('{measure_cid}'); if (!el) return 'no-el'; const rect = el.getBoundingClientRect(); if (rect.width <= 0 || rect.height <= 0) return 'zero'; const cs = getComputedStyle(el); const padH = parseFloat(cs.paddingLeft) + parseFloat(cs.paddingRight); const padV = parseFloat(cs.paddingTop) + parseFloat(cs.paddingBottom); const bw = parseFloat(cs.borderLeftWidth) + parseFloat(cs.borderRightWidth); const bh = parseFloat(cs.borderTopWidth) + parseFloat(cs.borderBottomWidth); const h = rect.height - padV - bh; if (h <= 0) return 'small'; const sd = document.getElementById('{scroll_cid}'); if (!sd) return 'no-scroll'; const sdRect = sd.getBoundingClientRect(); if (sdRect.width <= 0) return 'small'; let w = sdRect.width; if (sd.firstElementChild) {{ const gutterW = sd.firstElementChild.getBoundingClientRect().width; w = Math.max(0, sdRect.width - gutterW); }} if (w <= 0) return 'small'; const test = document.createElement('span'); test.textContent = 'M'; test.style.cssText = 'font-family:JetBrains Mono,Fira Code,Cascadia Code,monospace;font-size:13px;line-height:1.5;position:absolute;visibility:hidden;white-space:pre;'; document.body.appendChild(test); const tr = test.getBoundingClientRect(); document.body.removeChild(test); const cw = Math.max(1, tr.width); const ch = Math.max(1, tr.height); const cols = Math.max(1, Math.floor(w / cw)); const rows = Math.max(1, Math.floor(h / ch)); let popupAbove = -1; let popupBelow = -1; let popupDesired = -1; const cr_sug = el.querySelector('[data-cursor-row=\"1\"]'); if (cr_sug) {{ const anchor_sug = el.querySelector('[data-popup-anchor=\"1\"]') || cr_sug; const tr_sug = el.getBoundingClientRect(); const cr_r_sug = cr_sug.getBoundingClientRect(); const an_r_sug = anchor_sug.getBoundingClientRect(); el.style.setProperty('--suggestion-bottom', (tr_sug.bottom - cr_r_sug.top) + 'px'); el.style.setProperty('--suggestion-top', (an_r_sug.bottom - tr_sug.top) + 'px'); const col_sug = parseInt(cr_sug.getAttribute('data-popup-col') || '', 10); if (!isNaN(col_sug)) {{ let left_sug = (cr_r_sug.left - tr_sug.left) + col_sug * cw; left_sug = Math.max(0, Math.min(left_sug, tr_sug.width - {POPUP_MIN_WIDTH_PX})); el.style.setProperty('--suggestion-left', left_sug.toFixed(2) + 'px'); }} const popup = el.querySelector('[data-rusterm-terminal-popup=\"true\"]'); if (popup) {{ popupAbove = Math.max(0, cr_r_sug.top - tr_sug.top); popupBelow = Math.max(0, tr_sug.bottom - an_r_sug.bottom); popupDesired = Math.max(1, popup.scrollHeight); }} }} return cols + ',' + rows + ',' + cw.toFixed(2) + ',' + ch.toFixed(2) + ',' + popupAbove.toFixed(2) + ',' + popupBelow.toFixed(2) + ',' + popupDesired.toFixed(2); }})()"
     )
 }
 
@@ -2231,6 +2289,15 @@ pub fn TerminalView(
     // output still painted under the prompt.
     let popup_anchor = popup_anchor_row(&render_output.rows, cursor_row);
 
+    // Horizontal anchor: the start column of the command being typed on the
+    // cursor row (see `popup_anchor_col`). The popup's left edge follows
+    // this column dynamically so suggestions line up under the typed text.
+    let popup_col = render_output
+        .rows
+        .get(cursor_row)
+        .map(|row| popup_anchor_col(row, cursor_col))
+        .unwrap_or(cursor_col);
+
     // Deterministic below-the-prompt fallback for popup positioning, used
     // until (or whenever) the DOM measurement loop hasn't provided
     // `--suggestion-top`. Anchored to `popup_anchor` (not the cursor row) so
@@ -2320,6 +2387,11 @@ pub fn TerminalView(
     // pixel X into a cell column.
     let max_line_num = (render_output.scrollback_capacity.max(10_000) + total_rows).max(1);
     let gutter_width = (max_line_num.ilog10() as usize + 1) + 1; // digits + 1 padding
+
+    // Deterministic left fallback for `--suggestion-left`, mirroring
+    // `popup_fallback_top` — keeps the popup under the typed command from
+    // its very first frame, before the measurement loop has run.
+    let popup_fallback_left = format!("{:.0}px", popup_fallback_left_px(gutter_width, popup_col));
 
     // ── Mouse handling: text selection (WindTerm-style) & app reporting ──
     //
@@ -2757,6 +2829,11 @@ pub fn TerminalView(
             html.push_str(row_bg);
             if is_cursor_row {
                 html.push_str("\" data-cursor-row=\"1");
+                // Column anchor for the popup's left edge — read by the
+                // measurement script to keep `--suggestion-left` tracking
+                // the typed command as the user edits the line.
+                html.push_str("\" data-popup-col=\"");
+                html.push_str(&popup_col.to_string());
             }
             if is_popup_anchor_row {
                 html.push_str("\" data-popup-anchor=\"1");
@@ -3101,6 +3178,7 @@ pub fn TerminalView(
                     history_completion: current_history_completion_visible,
                     max_rows: suggestion_max_rows,
                     fallback_top: popup_fallback_top.clone(),
+                    fallback_left: popup_fallback_left.clone(),
                     on_drag_start: move |client_y: f64| start_popup_drag(client_y),
                     on_position_reset: move |_: ()| reset_popup_offset(()),
                 }
@@ -3136,6 +3214,7 @@ pub fn TerminalView(
                         on_onekey_dismiss.call(());
                     },
                     fallback_top: popup_fallback_top.clone(),
+                    fallback_left: popup_fallback_left.clone(),
                     on_drag_start: move |client_y: f64| start_popup_drag_for_onekey(client_y),
                     on_position_reset: move |_: ()| reset_popup_offset_for_onekey(()),
                 }
@@ -3155,9 +3234,10 @@ mod tests {
         cursor_key_seq, event_cell_from_coords, finalize_selection_on_mouse_up,
         find_search_matches, is_find_shortcut, is_history_completion_shortcut,
         onekey_popup_key_action, online_search_url, parse_popup_drag_poll_response,
-        popup_anchor_row, popup_fallback_top_px, popup_layout, scroll_thumb_geometry,
-        search_query_from_selection, suggestion_navigation_index, terminal_key_bytes,
-        terminal_overlay_key_action, terminal_selection_text, word_range_in_row,
+        popup_anchor_col, popup_anchor_row, popup_fallback_left_px, popup_fallback_top_px,
+        popup_layout, scroll_thumb_geometry, search_query_from_selection,
+        suggestion_navigation_index, terminal_key_bytes, terminal_overlay_key_action,
+        terminal_selection_text, word_range_in_row,
     };
     use dioxus::prelude::{Code, Key};
     use rusterm_core::terminal::{CellColor, RenderCell, RenderRow};
@@ -3267,6 +3347,57 @@ mod tests {
     }
 
     #[test]
+    fn popup_anchor_col_aligns_to_the_typed_command_after_the_prompt() {
+        // Screenshot scenario: `…ter-0001:~# docker▊` — the popup's left edge
+        // must sit under "docker", not at the pane edge.
+        let row = row_from("host-0001:~# docker");
+        assert_eq!(popup_anchor_col(&row, 19), 13);
+        // `$ `-terminated prompts work the same way.
+        let row = row_from("user@host$ git s");
+        assert_eq!(popup_anchor_col(&row, 16), 11);
+    }
+
+    #[test]
+    fn popup_anchor_col_is_dynamic_as_the_command_start_moves() {
+        // The anchor is re-derived from the CURRENT row content on every
+        // render, so a redrawn/longer prompt moves the popup with it — it is
+        // never pinned to a previously measured position.
+        let short = row_from("$ ls");
+        assert_eq!(popup_anchor_col(&short, 4), 2);
+        let long = row_from("root@build-server:/var/www# ls");
+        assert_eq!(popup_anchor_col(&long, 30), 28);
+    }
+
+    #[test]
+    fn popup_anchor_col_without_prompt_uses_first_content_column() {
+        // No recognizable prompt terminator (e.g. a REPL or raw input line):
+        // align with the first non-whitespace character before the cursor.
+        let row = row_from("  some-input");
+        assert_eq!(popup_anchor_col(&row, 12), 2);
+    }
+
+    #[test]
+    fn popup_anchor_col_with_nothing_typed_uses_the_cursor_column() {
+        // Empty command: the anchor degrades to the cursor position itself
+        // (right after the prompt), so the popup still opens under the caret.
+        let row = row_from("host-0001:~# ");
+        assert_eq!(popup_anchor_col(&row, 13), 13);
+        // Fully empty row.
+        let row = row_from("");
+        assert_eq!(popup_anchor_col(&row, 0), 0);
+    }
+
+    #[test]
+    fn popup_fallback_left_accounts_for_gutter_and_padding() {
+        // 4px container padding + 6ch gutter + 8px gutter padding + col*cw.
+        assert_eq!(popup_fallback_left_px(6, 0), 4.0 + 6.0 * 7.8 + 8.0);
+        assert_eq!(
+            popup_fallback_left_px(6, 13),
+            4.0 + 6.0 * 7.8 + 8.0 + 13.0 * 7.8
+        );
+    }
+
+    #[test]
     fn measure_script_anchors_suggestion_top_to_popup_anchor_row() {
         let script = build_terminal_measure_script("terminal-input-x", "terminal-scroll-x");
         // The below-placement anchor prefers the marked anchor row and falls
@@ -3281,6 +3412,20 @@ mod tests {
         assert!(script.contains("popupAbove = Math.max(0, cr_r_sug.top - tr_sug.top)"));
         assert!(script.contains("terminal-input-x"));
         assert!(script.contains("terminal-scroll-x"));
+    }
+
+    #[test]
+    fn measure_script_tracks_suggestion_left_from_the_popup_col_marker() {
+        let script = build_terminal_measure_script("terminal-input-x", "terminal-scroll-x");
+        // The horizontal anchor is re-read from the cursor row's marker on
+        // every 100ms tick, so the popup follows the typed command instead
+        // of staying at a fixed position.
+        assert!(script.contains("cr_sug.getAttribute('data-popup-col')"));
+        // Left = cursor row's left edge + column * measured char width…
+        assert!(script.contains("(cr_r_sug.left - tr_sug.left) + col_sug * cw"));
+        // …clamped so at least a minimum popup width stays inside the pane.
+        assert!(script.contains("tr_sug.width - 320"));
+        assert!(script.contains("setProperty('--suggestion-left', left_sug.toFixed(2) + 'px')"));
     }
 
     #[test]
