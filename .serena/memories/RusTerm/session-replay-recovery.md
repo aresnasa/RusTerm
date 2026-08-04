@@ -1,47 +1,45 @@
 # RusTerm — 交互式会话操作录制 + 恢复回放 (2026-08-04)
 
 ## 目标
-让会话恢复（断线重连 `reconnect_session` + 启动恢复 `restore_sessions`）能"真的恢复" jumpserver 这类交互式 SSH 堡垒机会话：记录用户建立会话状态的交互输入（菜单导航：主机名/编号 + Enter），恢复时按序回放，让用户落回同一目标主机，而不是停在堡垒机菜单。
+让会话恢复（断线重连 `reconnect_session` + 启动恢复 `restore_sessions`）能"真的恢复" jumpserver 这类交互式 SSH 堡垒机会话：记录用户建立会话状态的交互输入（菜单导航：`/q`、编号 + Enter），恢复时按序回放，让用户落回**最后所在**的目标主机。
 
-提交：`d1b4648`（阶段 1 初版）→ `ded0d49 "fix: make jumpserver interactive-session recovery actually work"`（阶段 4 修复，语义有重大变更，以本文为准）。
+提交链：`d1b4648`（阶段 1 初版）→ `51e8089`（阶段 2 启动恢复弹框）→ `1bb56de`（阶段 3 Cmd+Q 弹框：2s 变更驱动保存）→ `ded0d49`（阶段 4 三根因修复）→ **`61a55f3`（阶段 5 "最后一次选择"语义，本文以此为准）**。
 
-## 阶段 4 修复的三个根因（全部有日志实证）
-1. **SSH 事件循环从未调用 `drive_login_script`**——只有 shell/telnet 循环挂钩。SSH 连接（堡垒机主通道）配置的登录导航脚本从未运行（全天日志零条 `[LOGIN-SCRIPT]`）。已在 SSH Output 分支 `check_onekey_match` 之后补上。
-2. **集成证据清空录制**（原设计缺陷）：用户手动穿过堡垒机落到目标主机后 OSC 133;D 到达 → 原 `note_shell_integration_evidence` 清空菜单导航 ops → 快照 `replay_ops` 恒空。现改为**冻结（freeze）**：保留 pre-evidence establishment 前缀供回放，仅永久停录。`replayable_ops` 不再按 `shell_integrated` 过滤。直连集成 shell 的 evidence 在用户输入前就到 → 冻结前缀为空 → 行为不变（cd 恢复）。
-3. **`schedule_cd_after_restore` 盲睡 800ms**：SSH sender 注册需数秒，cd 直接丢（日志 `[RESTORE] no input sender`）。现改为：等 sender + Connected（复用 REPLAY_CONNECT_WAIT_SECS=60/REPLAY_POLL_MS）→ 等输出静默（`wait_for_output_quiescence`，超时非致命照发）→ 发 cd。
+## 阶段 5（`61a55f3`）：回放用户的最后一次菜单选择
+1. **提示符分类录制**（app.rs on_input Enter 分支，`sent > 0` && 非凭据后）：
+   - `prompt_looks_like_shell(current_line)`（state.rs 纯函数）：`➜`/`❯` 开头、`PS ...>`、含 `"$ "`/`"# "`/`"% "`、或行尾 `$`/`#` → shell 类；**裸 `"> "` 故意算菜单**（JMS `Opt>` 优先；fish `~>` 误判为已接受劣化）。
+   - shell 类 → `note_shell_prompt_evidence`（冻结，对无 OSC 133 集成的堡垒机目标机也生效）；菜单类 → `record_replay_op`。
+2. **菜单重入解冻重录**：`record_replay_op` 遇 `shell_integrated == true` → `ops.clear(); shell_integrated = false;` 再录。快照永远持有最后一次导航序列。"post-evidence shell 命令不进日志"的保证移到调用方（分类器路由）。
+3. **录制 ops 优先于纯导航脚本**：`should_schedule_replay(login_script, ops)`——ops 非空时，仅当脚本含 `send_onekey`（`script_handles_credentials`，解析失败算 false）才让脚本赢；纯导航脚本被最后录制覆盖。
+4. **脚本压制**：`suppress_login_script(state, sid)` 预插 `LoginScriptRuntime { done: true, steps: [] }`——absent-only lazy-init 使脚本永不启动，避免与回放双重驱动菜单。`restore_sessions` 与 `reconnect_session` 在"回放赢且脚本非空"时调用。
+5. **strip_prompt 全角冒号**：end_markers 后加 `line.rfind('：')` 处理（`请选择目标资产：3` → `3`）；**不加 ASCII `": "`**。
 
-## 登录脚本生命周期（阶段 4 新语义）
-- `drive_login_script` 的 lazy-init 从 `done_or_absent`（完成即 re-arm，会在用户退回菜单时抢键盘重跑、失败脚本每 30s 重试风暴）改为 **absent-only：每个连接生命周期最多初始化一次**。
-- `reconnect_session` 清理块新增 `s.login_scripts.remove(&tab_id)` → 重连的新连接重跑脚本。restore 的新 tab_id 天然 fresh。
+## 阶段 4（`ded0d49`）修的三根因（沿用）
+1. SSH 事件循环补上 `drive_login_script`（原来只有 shell/telnet 有）；lazy-init 改 absent-only（每连接生命周期一次）；`reconnect_session` 清理块 `s.login_scripts.remove(&tab_id)` 让重连重跑。
+2. `note_shell_integration_evidence` 从清空改为**冻结**；`replayable_ops` 不按 `shell_integrated` 过滤。
+3. `schedule_cd_after_restore` 等 sender+Connected+静默（非盲睡）；`build_restore_cd_command(cwd)` 共用；`schedule_replay_after_reconnect` 带 `follow_up_cwd`（回放完追发 cd）。
 
-## restore_sessions SSH/Telnet 分支的建立优先级（阶段 4）
-1. 配置了 login_script → 脚本拥有全部建立流程（在新连接输出循环中自动重跑）；**回放与盲 cd 均跳过**（盲 cd 会打进堡垒机菜单成垃圾输入）。
-2. 有 replay_ops → `schedule_replay_after_reconnect(..., ps.cwd)`；若快照还带 cwd（回放落点是集成 shell），回放完成后等静默**追发 follow-up cd**。
+## restore_sessions SSH/Telnet 分支优先级（阶段 5 语义）
+1. `should_schedule_replay` 为真（ops 非空 && 脚本无凭据）→ 压制脚本 → 回放 ops（+follow-up cd）。
+2. 否则有 login_script → 脚本拥有建立流程，跳过 cd/回放。
 3. 纯集成 shell → `schedule_cd_after_restore`。
-`reconnect_session` 同样给回放传当前 tab.cwd 作 follow-up。
+`reconnect_session` 同构（follow_up_cwd 取当前 tab.cwd）。
 
-## 核心设计决策（沿用）
-- `SessionReplayRecorder { ops, shell_integrated }`，`AppState.session_replays`（serde-skip）；仅 Ssh/Telnet；仅 Enter 提交非空行（on_input，`sent > 0` 后）；`REPLAY_MAX_OPS=10` 前缀窗口；凭据提示行不录。
-- 挂钩点：`start_ssh_connection` Output 内联 `if exit_code.is_some()` + 共享 `process_session_exit_code()`。
-- 回放引擎：等 Connected（60s）→ `filter_replayable_ops`（只回 Safe）→ i18n 终端提示 → 逐条等静默（4×200ms，20s 超时）→ raw input sender 发 `{op}\r` → （新增）follow_up_cwd 的 cd。
-- `should_schedule_replay(login_script, ops)`：login_script 非空跳过。
-- 持久化：`PersistedSession.replay_ops`（serde default）；`build_session_state` 写 `replayable_ops`（现在含冻结前缀）。
-- 生命周期：断线保留；close 删除；restore 重播种（`shell_integrated: false`，落到目标后 evidence 再次冻结）。
+## 核心机制（沿用）
+- `SessionReplayRecorder { ops, shell_integrated }`，`AppState.session_replays`（serde-skip）；仅 Ssh/Telnet；`REPLAY_MAX_OPS=10`（未冻结且满窗拒录）；凭据提示行不录。
+- 回放引擎：等 Connected（60s）→ `filter_replayable_ops`（只回 Safe）→ i18n 提示 → 逐条等静默（4×200ms/20s 超时）→ `{op}\r` → follow-up cd。
+- 持久化：`PersistedSession.replay_ops`（serde default）；restore 重播种 `shell_integrated: false`（落到目标后 evidence 再冻结）。**bincode 非自描述，勿加字段**。
+- 生命周期：断线保留；close 删除。
 
-## 新增工具函数
-- `build_restore_cd_command(cwd) -> String`（app.rs）：单引号 + `'\''` 转义，schedule_cd_after_restore 与回放 follow-up 共用，有测试。
-
-## 测试（rusterm-ui 691 passed，rusterm-core 186）
-- state.rs `session_replay_tests`：`shell_integration_evidence_freezes_ops_and_disables_recording`（改）、`build_session_state_keeps_frozen_replay_ops_after_integration_evidence`（改）、其余沿用。
-- app.rs `session_replay_engine_tests`：+`restore_cd_command_quotes_paths`。
+## 测试（rusterm-ui 695 passed，rusterm-core 186）
+- state.rs `session_replay_tests`：`shell_evidence_freezes_the_establishment_prefix`、`menu_reentry_thaws_and_restarts_recording`、`prompt_classification_separates_menus_from_shells`（阶段 5 新/改）。
+- app.rs `session_replay_engine_tests`：`recorded_ops_override_pure_navigation_scripts_but_not_credential_ones`、`credential_detection_looks_for_send_onekey_steps`（阶段 5 改/新）、`restore_cd_command_quotes_paths`。
+- strip_prompt 测试：+`cjk_bastion_menu_prompt_strips_fullwidth_colon`。
 
 ## 用户环境实证（诊断用）
-- jumpserver 连接 `jump.zs.shaipower.online` **配置了 login_script**（齐治堡垒机：expect 资产分类列表 → send /cao → 11 → 2），所以该连接走"脚本重跑"路径，不走回放。无脚本的堡垒机连接才走 ops 回放。
-- 日志 JSON lines 在 `~/Library/Application Support/rusterm/logs/`；jumpserver 拒绝 exec channel（远端历史拉取失败是已知噪声）。
-- "正常退出不弹恢复框" 已由阶段 3（`1bb56de`，2s 变更驱动保存）修复，日志 07:07:21 `Prompting to restore` 实证。
+- jumpserver `jump.zs.shaipower.online`（齐治堡垒机，中文菜单），连接配置了**纯导航** login_script（expect 资产分类列表 → send /cao → 11 → 2，无 send_onekey）→ 阶段 5 后：一旦用户手动换过机器（录到 ops），恢复时脚本被压制、回放最后选择；从未手动导航（ops 空）时脚本照跑。
+- 日志 JSON lines `~/Library/Application Support/rusterm/logs/`（UTC）；关键标签 `[REPLAY]`/`[LOGIN-SCRIPT]`/`[RESTORE]`。
 
-## 未来工作
-- "最后一次操作"语义仍是**首次** establishment 前缀：用户在目标主机间切换后的新导航不会更新冻结的 ops。
-- 嵌套 ssh、凭据步骤、bare-Enter 分页确认仍不覆盖。
-- 静默检测可升级为 OSC 133;A prompt-start 标记。
-- bincode 非自描述：改 PersistedSession schema 会破坏旧快照（遗留问题）。
+## 已知接受的劣化 / 未来工作
+- 单键（无 Enter）菜单交互不录；fish/nu 远端普通命令可能被录为菜单 op（安全过滤兜底）；less 的 `/pattern` 等可能污染一条 op。
+- 嵌套 ssh、bare-Enter 分页确认不覆盖；静默检测可升级为 OSC 133;A。
