@@ -208,6 +208,29 @@ impl Detector {
             }
             ScanState::InFrame { fmt } => {
                 self.collector.buf.push(b);
+                // Overflow guard: if the collector has grown unreasonably
+                // large without completing a frame, the input is not a valid
+                // ZMODEM frame (corrupted data, wrong protocol, etc.). Reset
+                // to Idle and flush the collected bytes as passthrough so the
+                // user sees the raw data instead of the detector silently
+                // swallowing everything. 4 KiB is generous: the largest
+                // valid hex header is ~20 bytes, binary header ~14 bytes.
+                if self.collector.buf.len() > 4096 {
+                    tracing::warn!(
+                        "[ZMODEM-DETECT] InFrame overflow ({} bytes, no complete frame) — resetting to Idle",
+                        self.collector.buf.len()
+                    );
+                    if !self.armed {
+                        passthrough.push(ZPAD);
+                        passthrough.push(ZPAD);
+                        passthrough.push(ZDLE);
+                        passthrough.push(fmt);
+                        passthrough.extend_from_slice(&self.collector.buf);
+                    }
+                    self.collector = Collector::default();
+                    self.state = ScanState::Idle;
+                    return;
+                }
                 if let Some((detection, consumed)) = self.try_complete(fmt) {
                     self.armed = true;
                     // Update CRC mode based on the header format.
@@ -239,6 +262,19 @@ impl Detector {
             }
             ScanState::InData => {
                 self.collector.buf.push(b);
+                // Overflow guard: data subframes shouldn't exceed the max
+                // block size (typically 1024 bytes) + overhead. If the
+                // collector grows beyond 64 KiB without finding a terminator,
+                // the input is malformed — reset to Idle.
+                if self.collector.buf.len() > 65536 {
+                    tracing::warn!(
+                        "[ZMODEM-DETECT] InData overflow ({} bytes, no terminator) — resetting to Idle",
+                        self.collector.buf.len()
+                    );
+                    self.collector = Collector::default();
+                    self.state = ScanState::Idle;
+                    return;
+                }
                 if let Some((detection, consumed)) = self.try_complete_data() {
                     // Check if more data subframes are expected (Continue /
                     // AckContinue = more data follows; End / AckEnd = done).

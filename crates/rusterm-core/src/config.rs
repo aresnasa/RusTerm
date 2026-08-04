@@ -348,6 +348,66 @@ impl SkinPalette {
         }
     }
 
+    /// Tokyo Night Day — the light counterpart of Tokyo Night.
+    pub fn tokyo_night_light() -> Self {
+        Self {
+            background: "#e1e2e7".to_string(),
+            surface: "#e9eaff".to_string(),
+            surface_hover: "#d5d6e7".to_string(),
+            border: "#c8c9df".to_string(),
+            border_strong: "#a0a1c0".to_string(),
+            text: "#343b58".to_string(),
+            text_muted: "#8c8ca0".to_string(),
+            accent: "#2e7de9".to_string(),
+            accent_secondary: "#9854f1".to_string(),
+            success: "#587539".to_string(),
+            warning: "#8c6c3e".to_string(),
+            danger: "#f52a82".to_string(),
+        }
+    }
+
+    /// One Light — the light counterpart of One Dark (Atom One Light).
+    pub fn one_light() -> Self {
+        Self {
+            background: "#fafafa".to_string(),
+            surface: "#ffffff".to_string(),
+            surface_hover: "#f0f0f0".to_string(),
+            border: "#e5e5e6".to_string(),
+            border_strong: "#d0d0d3".to_string(),
+            text: "#383a42".to_string(),
+            text_muted: "#848891".to_string(),
+            accent: "#4078f2".to_string(),
+            accent_secondary: "#a626a4".to_string(),
+            success: "#50a14f".to_string(),
+            warning: "#c18401".to_string(),
+            danger: "#e45649".to_string(),
+        }
+    }
+
+    /// Solarized Light — the light counterpart of Solarized Dark.
+    pub fn solarized_light() -> Self {
+        Self {
+            background: "#fdf6e3".to_string(),
+            surface: "#eee8d5".to_string(),
+            surface_hover: "#e4dec8".to_string(),
+            border: "#ddd6c1".to_string(),
+            border_strong: "#c3bd9c".to_string(),
+            text: "#586e75".to_string(),
+            text_muted: "#93a1a1".to_string(),
+            accent: "#268bd2".to_string(),
+            accent_secondary: "#6c71c4".to_string(),
+            success: "#859900".to_string(),
+            warning: "#b58900".to_string(),
+            danger: "#dc322f".to_string(),
+        }
+    }
+
+    /// A neutral light palette used as the default for the user-editable
+    /// `custom_light` slot so users have a sensible starting point.
+    pub fn default_light() -> Self {
+        Self::tokyo_night_light()
+    }
+
     /// Normalize colors originating from manually edited settings files before
     /// using them in an inline style string.
     pub fn normalized(mut self) -> Self {
@@ -403,37 +463,104 @@ impl SkinKind {
     }
 }
 
+/// Appearance mode controlling whether the resolved skin palette uses the dark
+/// or light variant of the selected [`SkinKind`].
+///
+/// - `Dark`  — always use the dark palette.
+/// - `Light` — always use the light palette.
+/// - `System` — follow the OS dark/light preference, resolved at render time
+///   by the UI layer (which has access to the native window theme). The
+///   config layer never queries the OS itself, so `rusterm-core` stays free of
+///   platform dependencies.
+///
+/// Defaults to `Dark` for backward compatibility: every pre-existing skin was
+/// dark, so legacy configs (which lack this field) load unchanged.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ThemeMode {
+    #[default]
+    Dark,
+    Light,
+    System,
+}
+
+impl ThemeMode {
+    pub const ALL: [Self; 3] = [Self::Dark, Self::Light, Self::System];
+
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Dark => "Dark",
+            Self::Light => "Light",
+            Self::System => "System",
+        }
+    }
+
+    /// Resolve `System` to the concrete mode the OS currently reports.
+    /// `Dark`/`Light` pass through unchanged.
+    pub const fn resolve(self, system_is_dark: bool) -> Self {
+        match self {
+            Self::System => {
+                if system_is_dark {
+                    Self::Dark
+                } else {
+                    Self::Light
+                }
+            }
+            other => other,
+        }
+    }
+}
+
 /// Persisted application-chrome skin preferences. Terminal ANSI/xterm colors
 /// are intentionally separate and continue to be controlled by the terminal.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SkinSettings {
     #[serde(default)]
     pub kind: SkinKind,
+    /// Whether to render the dark or light variant of `kind`, or follow the OS
+    /// preference (`System`).
+    #[serde(default)]
+    pub mode: ThemeMode,
     #[serde(default)]
     pub custom: SkinPalette,
+    /// User-editable light variant used when `mode` resolves to `Light` and
+    /// `kind == Custom`. Defaults to a neutral light palette.
+    #[serde(default = "default_custom_light_palette")]
+    pub custom_light: SkinPalette,
 }
 
 impl Default for SkinSettings {
     fn default() -> Self {
         Self {
             kind: SkinKind::TokyoNight,
+            mode: ThemeMode::default(),
             custom: SkinPalette::default(),
+            custom_light: default_custom_light_palette(),
         }
     }
 }
 
 impl SkinSettings {
-    pub fn palette(&self) -> SkinPalette {
-        match self.kind {
-            SkinKind::TokyoNight => SkinPalette::tokyo_night(),
-            SkinKind::OneDark => SkinPalette::one_dark(),
-            SkinKind::SolarizedDark => SkinPalette::solarized_dark(),
-            SkinKind::Custom => self.custom.clone().normalized(),
+    /// Resolve the active palette. `system_is_dark` is supplied by the UI layer
+    /// (which reads the native window theme) so that `System` mode can follow
+    /// the OS without `rusterm-core` taking a platform dependency.
+    pub fn palette(&self, system_is_dark: bool) -> SkinPalette {
+        let light = self.mode.resolve(system_is_dark) == ThemeMode::Light;
+        match (self.kind, light) {
+            (SkinKind::TokyoNight, false) => SkinPalette::tokyo_night(),
+            (SkinKind::TokyoNight, true) => SkinPalette::tokyo_night_light(),
+            (SkinKind::OneDark, false) => SkinPalette::one_dark(),
+            (SkinKind::OneDark, true) => SkinPalette::one_light(),
+            (SkinKind::SolarizedDark, false) => SkinPalette::solarized_dark(),
+            (SkinKind::SolarizedDark, true) => SkinPalette::solarized_light(),
+            (SkinKind::Custom, false) => self.custom.clone().normalized(),
+            (SkinKind::Custom, true) => self.custom_light.clone().normalized(),
         }
     }
 
     pub fn normalized(mut self) -> Self {
         self.custom = self.custom.normalized();
+        self.custom_light = self.custom_light.normalized();
         self
     }
 }
@@ -490,6 +617,13 @@ fn default_skin_warning() -> String {
 
 fn default_skin_danger() -> String {
     "#f7768e".to_string()
+}
+
+/// Default for the `SkinSettings::custom_light` field. Uses the Tokyo Night
+/// Light palette so the light custom slot starts from a coherent, known-good
+/// set of values rather than the dark `SkinPalette::default()`.
+fn default_custom_light_palette() -> SkinPalette {
+    SkinPalette::default_light()
 }
 
 fn default_focused_tab_border_color() -> String {
@@ -2067,6 +2201,7 @@ mod tests {
                 accent: "not-a-color;display:none".to_string(),
                 ..SkinPalette::default()
             },
+            ..SkinSettings::default()
         }
         .normalized();
         assert_eq!(skin.custom.accent, SkinPalette::default().accent);

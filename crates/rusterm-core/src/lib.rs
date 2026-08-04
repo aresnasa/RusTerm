@@ -14,6 +14,7 @@ pub mod window_state;
 pub use command_safety::{CommandSafetyChecker, SafetyVerdict};
 pub use config::{
     ConnectionConfig, FocusedTabAppearance, HostConfig, SkinKind, SkinPalette, SkinSettings,
+    ThemeMode,
 };
 pub use config_manager::ConfigManager;
 pub use event::{SessionEvent, TerminalEvent};

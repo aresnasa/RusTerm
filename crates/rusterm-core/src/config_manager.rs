@@ -1235,6 +1235,7 @@ mod tests {
                 accent: "#4080c0".to_string(),
                 ..SkinPalette::default()
             },
+            ..SkinSettings::default()
         };
 
         cm.save_skin_settings(&skin).unwrap();

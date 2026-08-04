@@ -9694,6 +9694,252 @@ mod session_startup_tests {
         // ignored for kinds the dialog doesn't model.
         assert!(matches!(rebuilt.kind, ConnectionKind::Shell(_)));
     }
+
+    // ── disconnect / reconnect / copy-session (Task: 会话支持断开和重连 + 复制会话) ──
+
+    /// Build a minimal Connected session with a stored config, mirroring what
+    /// `open_connection` / `open_local_terminal` set up in production.
+    fn connected_session(state: &mut AppState, sid: &str, name: &str, kind: ConnectionKind) {
+        state.sessions.push(SessionTab {
+            id: sid.to_string(),
+            name: name.to_string(),
+            kind: match &kind {
+                ConnectionKind::Ssh(_) => SessionType::Ssh,
+                ConnectionKind::Shell(_) => SessionType::Shell,
+                ConnectionKind::Telnet(_) => SessionType::Telnet,
+                ConnectionKind::Serial(_) => SessionType::Serial,
+                ConnectionKind::Tcp(_) => SessionType::Tcp,
+            },
+            render_output: Default::default(),
+            version: 0,
+            suggestion: None,
+            suggestions: Vec::new(),
+            suggestion_corrections: std::collections::HashSet::new(),
+            suggestion_selected: 0,
+            suggestion_visible: false,
+            command_history: Vec::new(),
+            hostname: None,
+            cwd: None,
+            last_command_status: CommandStatus::default(),
+        });
+        state.session_configs.insert(
+            sid.to_string(),
+            ConnectionConfig {
+                id: sid.to_string(),
+                name: name.to_string(),
+                kind,
+                group: None,
+                tags: Vec::new(),
+                onekey: false,
+                login_script: None,
+            },
+        );
+        state
+            .session_connection_states
+            .insert(sid.to_string(), SessionConnectionState::Connected);
+    }
+
+    #[test]
+    fn disconnect_sets_state_to_disconnected_and_preserves_config_and_tab() {
+        let mut state = AppState::default();
+        connected_session(
+            &mut state,
+            "sess-a",
+            "alpha",
+            ConnectionKind::Shell(ShellConfig {
+                command: None,
+                args: Vec::new(),
+                env: Vec::new(),
+                working_dir: None,
+            }),
+        );
+        let mut senders: HashMap<String, mpsc::UnboundedSender<Vec<u8>>> = HashMap::new();
+        let (_tx, _rx) = mpsc::unbounded_channel::<Vec<u8>>();
+        // Don't insert a sender — disconnect must tolerate a missing sender.
+
+        let applied = disconnect_session_state(&mut state, &mut senders, "sess-a");
+
+        assert!(applied, "a Connected session must be disconnectable");
+        assert_eq!(
+            state.session_connection_states.get("sess-a"),
+            Some(&SessionConnectionState::Disconnected),
+        );
+        // The config MUST survive so reconnect works.
+        assert!(
+            state.session_configs.contains_key("sess-a"),
+            "disconnect must keep the stored login config for reconnect"
+        );
+        // The tab MUST survive so the user keeps their scrollback.
+        assert!(
+            state.sessions.iter().any(|t| t.id == "sess-a"),
+            "disconnect must keep the session tab"
+        );
+        // The command-status badge reflects the disconnect.
+        let tab = state.sessions.iter().find(|t| t.id == "sess-a").unwrap();
+        assert!(matches!(
+            tab.last_command_status,
+            CommandStatus::Disconnected(_)
+        ));
+    }
+
+    #[test]
+    fn disconnect_is_idempotent_for_already_disconnected_session() {
+        let mut state = AppState::default();
+        connected_session(
+            &mut state,
+            "sess-b",
+            "beta",
+            ConnectionKind::Shell(ShellConfig {
+                command: None,
+                args: Vec::new(),
+                env: Vec::new(),
+                working_dir: None,
+            }),
+        );
+        let mut senders = HashMap::new();
+        // First disconnect succeeds.
+        assert!(disconnect_session_state(&mut state, &mut senders, "sess-b"));
+        // Second disconnect is a no-op (already Disconnected).
+        assert!(
+            !disconnect_session_state(&mut state, &mut senders, "sess-b"),
+            "disconnecting an already-Disconnected session must be a no-op"
+        );
+        assert_eq!(
+            state.session_connection_states.get("sess-b"),
+            Some(&SessionConnectionState::Disconnected),
+        );
+    }
+
+    #[test]
+    fn disconnect_is_noop_for_unknown_session() {
+        let mut state = AppState::default();
+        let mut senders = HashMap::new();
+        assert!(
+            !disconnect_session_state(&mut state, &mut senders, "nope"),
+            "disconnecting an unknown session must be a no-op"
+        );
+    }
+
+    #[test]
+    fn disconnect_then_begin_reconnect_allows_retry() {
+        // Pins the full disconnect → reconnect contract: after a user-initiated
+        // disconnect, the session is Disconnected and begin_reconnect accepts
+        // it (the same path Enter / right-click take).
+        let mut state = AppState::default();
+        connected_session(
+            &mut state,
+            "sess-c",
+            "gamma",
+            ConnectionKind::Shell(ShellConfig {
+                command: None,
+                args: Vec::new(),
+                env: Vec::new(),
+                working_dir: None,
+            }),
+        );
+        let mut senders = HashMap::new();
+        assert!(disconnect_session_state(&mut state, &mut senders, "sess-c"));
+        // begin_reconnect only allows Disconnected → Reconnecting.
+        assert!(
+            begin_reconnect(&mut state, "sess-c"),
+            "after disconnect, begin_reconnect must accept the session"
+        );
+        assert_eq!(
+            state.session_connection_states.get("sess-c"),
+            Some(&SessionConnectionState::Reconnecting),
+        );
+    }
+
+    #[test]
+    fn copy_session_clones_full_login_logic_across_all_kinds() {
+        // Pins the "所有会话的登录逻辑都要支持复制" contract: copying a session
+        // must clone the full ConnectionConfig — kind + onekey flag + login_script
+        // — so the new session logs in identically. We test the clone+rename
+        // logic (what the on_copy_session handler does before open_connection)
+        // for each connection kind.
+        let cases: Vec<(&str, ConnectionKind)> = vec![
+            (
+                "ssh",
+                ConnectionKind::Ssh(SshConfig {
+                    host: "host".to_string(),
+                    port: 22,
+                    username: "user".to_string(),
+                    auth: rusterm_core::config::SshAuth::Agent,
+                    terminal_type: "xterm-256color".to_string(),
+                    proxy: None,
+                    proxy_jump: None,
+                    keepalive_interval: None,
+                    host_key_policy: "accept-new".to_string(),
+                }),
+            ),
+            (
+                "shell",
+                ConnectionKind::Shell(ShellConfig {
+                    command: None,
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    working_dir: None,
+                }),
+            ),
+            (
+                "telnet",
+                ConnectionKind::Telnet(TelnetConfig {
+                    host: "host".to_string(),
+                    port: 23,
+                }),
+            ),
+            (
+                "serial",
+                ConnectionKind::Serial(SerialConfig {
+                    port: "/dev/ttyUSB0".to_string(),
+                    baud_rate: 115200,
+                    data_bits: 8,
+                    parity: "none".to_string(),
+                    stop_bits: 1,
+                    flow_control: "none".to_string(),
+                }),
+            ),
+        ];
+
+        for (label, kind) in cases {
+            let original = ConnectionConfig {
+                id: "conn-1".to_string(),
+                name: format!("{label}-orig"),
+                kind: kind.clone(),
+                group: Some("g".to_string()),
+                tags: vec!["t".to_string()],
+                onekey: true,
+                login_script: Some(
+                    "expect $
+send hi\n"
+                        .to_string(),
+                ),
+            };
+            // The on_copy_session handler clones the config, keeps the id,
+            // and renames it with the copy suffix.
+            let mut new_conn = original.clone();
+            new_conn.name = crate::i18n::tf("connection.copy_name", &[("name", &original.name)]);
+
+            // The clone preserves everything except the name.
+            assert_eq!(new_conn.id, original.id, "{label}: connection id preserved");
+            assert_eq!(new_conn.kind, original.kind, "{label}: kind preserved");
+            assert_eq!(new_conn.group, original.group, "{label}: group preserved");
+            assert_eq!(new_conn.tags, original.tags, "{label}: tags preserved");
+            assert_eq!(
+                new_conn.onekey, original.onekey,
+                "{label}: onekey flag preserved"
+            );
+            assert_eq!(
+                new_conn.login_script, original.login_script,
+                "{label}: login_script preserved — this is the login logic that must be copyable"
+            );
+            assert_ne!(
+                new_conn.name, original.name,
+                "{label}: name changed to copy"
+            );
+            assert!(new_conn.name.contains("copy") || new_conn.name.contains("副本"));
+        }
+    }
 }
 
 fn start_ssh_connection(
@@ -12867,6 +13113,66 @@ fn open_connection(
     }
 }
 
+/// Pure state mutation for user-initiated disconnect, extracted so it can be
+/// unit-tested without a Dioxus runtime. Mirrors the `SessionEvent::Disconnected`
+/// handler's mutations: sets the connection state to `Disconnected`, clears
+/// per-session runtime maps (ssh/sftp/onekey/login-scripts/transfers), and
+/// removes the input sender — but KEEPS `session_configs`, `terminals`, and
+/// the `sessions` entry so the tab + scrollback + login config survive for
+/// reconnect.
+///
+/// Returns `true` if the disconnect was applied, `false` if the session was
+/// already Disconnected or unknown (idempotent guard).
+fn disconnect_session_state(
+    state: &mut AppState,
+    input_senders: &mut HashMap<String, mpsc::UnboundedSender<Vec<u8>>>,
+    tab_id: &str,
+) -> bool {
+    // Guard: only disconnect a session that is currently Connected (or
+    // mid-Reconnecting). Already-Disconnected / unknown sessions are a no-op
+    // so the button is safe to click repeatedly.
+    let can_disconnect = matches!(
+        state.session_connection_states.get(tab_id),
+        Some(SessionConnectionState::Connected) | Some(SessionConnectionState::Reconnecting)
+    );
+    if !can_disconnect {
+        return false;
+    }
+
+    let reason = crate::i18n::t("session.disconnected_by_user");
+    let _ = state.shadow_sandbox.fail_execution(tab_id, &reason);
+    state.ssh_sessions.remove(tab_id);
+    state.sftp_clients.remove(tab_id);
+    state.transfers.cancel_for_session(tab_id);
+    state.zmodem.lock().remove(tab_id);
+    let job_ids = state
+        .transfers
+        .jobs
+        .iter()
+        .filter(|job| job.session == tab_id)
+        .map(|job| job.id.clone())
+        .collect::<Vec<_>>();
+    for job_id in job_ids {
+        if let Some((_, token)) = state.transfer_cancellations.remove(&job_id) {
+            token.cancel();
+        }
+    }
+    state
+        .session_connection_states
+        .insert(tab_id.to_string(), SessionConnectionState::Disconnected);
+    state.onekey_popups.remove(tab_id);
+    state.onekey_submission_feedback.remove(tab_id);
+    state.onekey_submission_cooldown.remove(tab_id);
+    state.onekey_output_since_submission.remove(tab_id);
+    state.onekey_preference_attempts.remove(tab_id);
+    state.login_scripts.remove(tab_id);
+    if let Some(tab) = state.sessions.iter_mut().find(|t| t.id == tab_id) {
+        tab.last_command_status = CommandStatus::Disconnected(reason);
+    }
+    input_senders.remove(tab_id);
+    true
+}
+
 /// User-initiated disconnect (Task: 会话支持断开和重连).
 ///
 /// Tears down the live transport for `tab_id` but KEEPS the session tab,
@@ -12887,55 +13193,15 @@ fn disconnect_session(
     mut input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
     tab_id: String,
 ) {
-    // Guard: only disconnect a session that is currently Connected (or
-    // mid-Reconnecting). Already-Disconnected / unknown sessions are a no-op
-    // so the button is safe to click repeatedly.
-    let can_disconnect = matches!(
-        state.read().session_connection_states.get(&tab_id),
-        Some(SessionConnectionState::Connected) | Some(SessionConnectionState::Reconnecting)
-    );
-    if !can_disconnect {
+    flush_pending_renders(&mut state.write(), true);
+    let applied = disconnect_session_state(&mut state.write(), &mut input_senders.write(), &tab_id);
+    if !applied {
         tracing::debug!(
             "[DISCONNECT] session={} not connected; skipping",
             &tab_id[..tab_id.len().min(8)]
         );
         return;
     }
-
-    flush_pending_renders(&mut state.write(), true);
-    let reason = crate::i18n::t("session.disconnected_by_user");
-    {
-        let mut app = state.write();
-        let _ = app.shadow_sandbox.fail_execution(&tab_id, &reason);
-        app.ssh_sessions.remove(&tab_id);
-        app.sftp_clients.remove(&tab_id);
-        app.transfers.cancel_for_session(&tab_id);
-        app.zmodem.lock().remove(&tab_id);
-        let job_ids = app
-            .transfers
-            .jobs
-            .iter()
-            .filter(|job| job.session == tab_id)
-            .map(|job| job.id.clone())
-            .collect::<Vec<_>>();
-        for job_id in job_ids {
-            if let Some((_, token)) = app.transfer_cancellations.remove(&job_id) {
-                token.cancel();
-            }
-        }
-        app.session_connection_states
-            .insert(tab_id.clone(), SessionConnectionState::Disconnected);
-        app.onekey_popups.remove(&tab_id);
-        app.onekey_submission_feedback.remove(&tab_id);
-        app.onekey_submission_cooldown.remove(&tab_id);
-        app.onekey_output_since_submission.remove(&tab_id);
-        app.onekey_preference_attempts.remove(&tab_id);
-        app.login_scripts.remove(&tab_id);
-        if let Some(tab) = app.sessions.iter_mut().find(|t| t.id == tab_id) {
-            tab.last_command_status = CommandStatus::Disconnected(reason);
-        }
-    }
-    input_senders.write().remove(&tab_id);
 
     // Signal the background task to terminate. We remove the spent
     // close_sender + resize_sender so a later reconnect can install fresh
