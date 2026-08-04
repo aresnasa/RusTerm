@@ -14761,6 +14761,13 @@ const REPLAY_QUIESCENT_POLLS: u32 = 4;
 /// output for this long (e.g. a replayed op started a pager or log tail),
 /// the replay aborts rather than typing into an unknown remote state.
 const REPLAY_OP_TIMEOUT_SECS: u64 = 20;
+/// Bounded wait for a credential prompt (e.g. a replayed `sudo -i` asking
+/// for the password) to be resolved — by OneKey auto-submit or manual entry.
+/// Generous enough for OneKey auto-submit (near-instant) and a brief manual
+/// window; if the prompt persists the replay pauses and the user takes over
+/// (the remaining ops are not silently abandoned — they resume once the
+/// prompt clears, e.g. after the user types the password).
+const REPLAY_CREDENTIAL_WAIT_SECS: u64 = 30;
 
 /// Splits recorded replay ops into (safe-to-replay, skipped) using the same
 /// safety checker that gates live command submission. Only `Safe` verdicts
@@ -14977,6 +14984,32 @@ mod session_replay_engine_tests {
             "cd '/tmp/it'\\''s here'\r"
         );
     }
+
+    /// A replayed `sudo -i` triggers a sudo password prompt. Instead of
+    /// permanently abandoning the remaining ops, the replay now waits for
+    /// the prompt to be resolved (OneKey auto-submit or manual entry) before
+    /// resuming. This test documents the contract the wait loop relies on:
+    /// `credential_kind` returns `Some` for the sudo password prompt and
+    /// `None` once it's been resolved (root shell prompt), so the
+    /// [`wait_for_credential_prompt_resolution`] poll detects the transition.
+    #[test]
+    fn credential_prompt_resolution_is_detected_via_credential_kind() {
+        // A replayed `sudo -i` triggers the sudo password prompt.
+        let sudo_prompt = "[sudo] password for ecs-user: ";
+        assert!(credential_kind(sudo_prompt).is_some());
+        // After OneKey auto-submits (or the user types the password), sudo
+        // accepts it and drops to a root shell prompt — no longer a
+        // credential prompt, so the wait-for-resolution loop returns and the
+        // remaining ops (e.g. a follow-up `cd /root/MyProjects/bidbot`) are
+        // sent into the elevated shell instead of being abandoned.
+        let root_prompt = "root@bidbot-prod:~# ";
+        assert!(credential_kind(root_prompt).is_none());
+        // A wrong-password re-prompt is still a credential prompt — the wait
+        // continues until the prompt clears or the timeout fires.
+        let sudo_retry =
+            "[sudo] password for ecs-user: Sorry, try again.\n[sudo] password for ecs-user: ";
+        assert!(credential_kind(sudo_retry).is_some());
+    }
 }
 
 /// Waits until the session's terminal stops producing output: the tab's
@@ -15071,6 +15104,43 @@ fn notify_replay_paused_for_credentials(mut state: Signal<AppState>, tab_id: &st
             tab.render_output = render_result;
             tab.version += 1;
         }
+    }
+}
+
+/// Waits for a credential prompt (password/token/username) encountered
+/// during replay to be resolved — i.e. the current terminal line is no
+/// longer a credential prompt. Returns `true` if the prompt cleared within
+/// [`REPLAY_CREDENTIAL_WAIT_SECS`], `false` on timeout or disconnect.
+///
+/// This lets a replayed `sudo -i` (or any op that triggers a credential
+/// prompt) be resolved by OneKey auto-submit or manual entry, then the
+/// remaining ops resume — instead of permanently abandoning the replay the
+/// moment a credential prompt appears (secrets are never recorded, so
+/// without this wait the remaining ops were dropped the instant the sudo
+/// password prompt showed up, leaving the user half-restored).
+async fn wait_for_credential_prompt_resolution(state: Signal<AppState>, session_id: &str) -> bool {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(REPLAY_CREDENTIAL_WAIT_SECS);
+    loop {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        if state.read().session_connection_states.get(session_id)
+            != Some(&SessionConnectionState::Connected)
+        {
+            return false;
+        }
+        let current_line = {
+            let terminals = state.read().terminals.clone();
+            terminals
+                .get(session_id)
+                .map(|handle| handle.lock().terminal.extract_current_line())
+                .unwrap_or_default()
+        };
+        if credential_kind(&current_line).is_none() {
+            return true;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(REPLAY_POLL_MS)).await;
     }
 }
 
@@ -15214,9 +15284,12 @@ fn schedule_replay_after_reconnect(
             }
             // Credential guard: if the remote is showing a password/token
             // prompt (e.g. a replayed `sudo -i` is asking for the password),
-            // STOP — secrets are never recorded, so the remaining ops would
-            // be typed into the credential prompt. Tell the user to take
-            // over; OneKey / manual entry owns that step.
+            // the remaining ops would be typed into the credential prompt —
+            // secrets are never recorded, so they can't be replayed blindly.
+            // Instead of permanently abandoning the replay, WAIT briefly for
+            // the prompt to be resolved (OneKey auto-submit or manual entry).
+            // If it clears, the remaining ops resume; if it persists, the
+            // replay pauses and the user takes over.
             let current_line = {
                 let terminals = state.read().terminals.clone();
                 terminals
@@ -15226,13 +15299,34 @@ fn schedule_replay_after_reconnect(
             };
             if credential_kind(&current_line).is_some() {
                 tracing::info!(
-                    "[REPLAY] session {} hit a credential prompt before op {}/{} — pausing replay for manual input",
+                    "[REPLAY] session {} hit a credential prompt before op {}/{} — waiting for resolution (OneKey / manual)",
                     &tab_id[..tab_id.len().min(8)],
                     idx + 1,
                     total
                 );
-                notify_replay_paused_for_credentials(state, &tab_id);
-                return;
+                if !wait_for_credential_prompt_resolution(state, &tab_id).await {
+                    tracing::info!(
+                        "[REPLAY] session {} credential prompt not resolved within {}s — pausing replay for manual input",
+                        &tab_id[..tab_id.len().min(8)],
+                        REPLAY_CREDENTIAL_WAIT_SECS
+                    );
+                    notify_replay_paused_for_credentials(state, &tab_id);
+                    return;
+                }
+                tracing::info!(
+                    "[REPLAY] session {} credential prompt resolved — resuming replay at op {}/{}",
+                    &tab_id[..tab_id.len().min(8)],
+                    idx + 1,
+                    total
+                );
+                // The credential submission might have flipped the connection
+                // state (e.g. a wrong password rejected enough times that the
+                // remote dropped the session). Re-check before sending.
+                if state.read().session_connection_states.get(&tab_id)
+                    != Some(&SessionConnectionState::Connected)
+                {
+                    return;
+                }
             }
             let sender = input_senders.read().get(&tab_id).cloned();
             let Some(sender) = sender else {
@@ -15308,11 +15402,27 @@ fn schedule_replay_after_reconnect(
             };
             if credential_kind(&current_line).is_some() {
                 tracing::info!(
-                    "[REPLAY] session {} hit a credential prompt — skipping follow-up cd",
+                    "[REPLAY] session {} hit a credential prompt before follow-up cd — waiting for resolution (OneKey / manual)",
                     &tab_id[..tab_id.len().min(8)]
                 );
-                notify_replay_paused_for_credentials(state, &tab_id);
-                return;
+                if !wait_for_credential_prompt_resolution(state, &tab_id).await {
+                    tracing::info!(
+                        "[REPLAY] session {} credential prompt not resolved within {}s — skipping follow-up cd",
+                        &tab_id[..tab_id.len().min(8)],
+                        REPLAY_CREDENTIAL_WAIT_SECS
+                    );
+                    notify_replay_paused_for_credentials(state, &tab_id);
+                    return;
+                }
+                tracing::info!(
+                    "[REPLAY] session {} credential prompt resolved — sending follow-up cd",
+                    &tab_id[..tab_id.len().min(8)]
+                );
+                if state.read().session_connection_states.get(&tab_id)
+                    != Some(&SessionConnectionState::Connected)
+                {
+                    return;
+                }
             }
             let sender = input_senders.read().get(&tab_id).cloned();
             if let Some(sender) = sender {
