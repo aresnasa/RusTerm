@@ -117,6 +117,32 @@ on the content div, then logs results. Synthetic events trigger the same
 dioxus root-listener path as real ones. This was removed but can be re-added
 if more interactive debugging is needed.
 
+## Stale mouse-mode fix (2026-08-04, commit 205ab58)
+
+**Bug**: 会话中无法复制 + 鼠标操作把 `0;31;33M0;44;33m...` 注入远程 stdin
+(`0: command not found`)。这是 SGR 鼠标报告被发给了 bash：readline 吞掉
+`ESC[<` 前缀、回显剩余文本。根因：`mode_mouse_reporting` 滞留为 true——
+app 已退出但 RusTerm 仍认为鼠标跟踪开启，于是转发鼠标报告且禁用本地选择。
+`encode_mouse_report` 本身编码正确，不是前缀丢失问题。
+
+**两层修复（都在 `crates/rusterm-core/src/terminal.rs`）**：
+1. **alt-screen 不再保存/恢复鼠标模式**：`ScreenSwitchState` 移除了 4 个
+   mouse 字段。xterm/alacritty 语义中鼠标跟踪是全局模式，`?1049h/l` 只保存
+   光标。旧行为会在 app 于 alt screen 内 `?1000l` 后、`?1049l` 退出时把
+   进入前的"开启"状态恢复回来 → 确定性制造滞留模式。
+2. **OSC 133;D 清除滞留鼠标模式**（安全网，覆盖 app 被 kill / 堡垒机移交
+   等远端滞留）：`process()` 现在按 133;D 标记位置把缓冲区**分段**喂给
+   VTE（`find_exit_code_marker` 返回首个标记 + 退出码），每个标记处调用
+   `clear_stale_mouse_modes()`（清 reporting/sgr/button_motion/any_motion）。
+   分段保证**流序正确**：标记之后（下一条命令）启用的 `?1000h` 不受影响。
+   旧的 `scan_exit_codes` 整段预扫描已被此替代（`scan_cwd` 仍是预扫描）。
+
+**测试**：`mouse_tracking_modes_roundtrip` 更新为固定全局语义（alt-screen
+退出不恢复鼠标模式，双向都测）；新增
+`osc133_command_done_clears_stale_mouse_modes`（kill 场景 + 退出码仍记录）、
+`osc133_clear_respects_stream_order`（同一 buffer 内 133;D 后的 ?1002h 保留）。
+rusterm-core 188 tests，workspace 全绿。
+
 ## Known limitations
 - CJK word segmentation: all non-ASCII chars get class `Punct`, so adjacent
   CJK glyphs of the same class extend into one selection (e.g. double-clicking
