@@ -249,6 +249,19 @@ pub struct AppState {
     /// repeated prompt. A repeated matching prompt invalidates the preference.
     #[serde(skip)]
     pub onekey_preference_attempts: HashMap<String, OneKeyPreferenceAttempt>,
+    /// In-memory OneKey behavior history keyed by
+    /// `(connection_id, prompt_fingerprint)`, oldest-first, capped at
+    /// [`ONEKEY_HABIT_EVENTS_CAP`] per key. Warmed from DuckDB at unlock and
+    /// updated live; the habit resolver reads only this cache so prompt
+    /// handling never blocks on DuckDB.
+    #[serde(skip)]
+    pub onekey_habit_events: HashMap<(String, String), Vec<OneKeyBehaviorEvent>>,
+    /// Behavior events waiting to be flushed to the local DuckDB analytics
+    /// store. Populated by the (sync, unit-testable) OneKey decision code and
+    /// drained by callers running inside the Dioxus runtime, which spawn the
+    /// actual DB writes.
+    #[serde(skip)]
+    pub onekey_pending_analytics: Vec<OneKeyBehaviorEvent>,
     /// Per-session OneKey autofill popup state. Only shown when new output matches
     /// an OneKey's expect regex; persists across focus changes (no re-scan).
     #[serde(skip)]
@@ -594,6 +607,13 @@ pub struct OneKeyPopupState {
     pub connection_id: Option<String>,
     /// SHA-256 of the normalized current prompt. Prompt text is never persisted.
     pub prompt_fingerprint: Option<String>,
+    /// SHA-256 of the normalized current prompt, computed for EVERY prompt
+    /// (unlike `prompt_fingerprint`, which is only set for prompts safe to
+    /// remember as a persisted preference). Keys the habit-learning tier:
+    /// behavior events and habit lookups use this fingerprint, so generic
+    /// prompts (a bare `Password:`) can still learn per-connection habits.
+    /// For safe prompts both fingerprints are identical.
+    pub habit_fingerprint: Option<String>,
     /// Whether this concrete prompt is a sudo password request. Used only to
     /// preserve the existing host-bound relay elevation lease on auto-submit.
     pub is_sudo_password: bool,
@@ -627,6 +647,94 @@ pub struct OneKeyPreferenceAttempt {
     pub matched_expect: String,
 }
 
+/// What happened in one OneKey interaction. String forms are the `action`
+/// column values in the DuckDB `onekey_events` table.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OneKeyBehaviorKind {
+    /// The user explicitly picked a candidate in the chooser popup.
+    ManualSelect,
+    /// A remembered preference or learned habit submitted without a popup.
+    AutoSubmit,
+    /// The remote re-emitted the same prompt after a submission (wrong or
+    /// stale credential).
+    Rejected,
+    /// The chooser popup was shown (no habit, ambiguous, changed candidates,
+    /// or after an error).
+    PopupShown,
+}
+
+impl OneKeyBehaviorKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            OneKeyBehaviorKind::ManualSelect => "manual_select",
+            OneKeyBehaviorKind::AutoSubmit => "auto_submit",
+            OneKeyBehaviorKind::Rejected => "rejected",
+            OneKeyBehaviorKind::PopupShown => "popup_shown",
+        }
+    }
+
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "manual_select" => Some(OneKeyBehaviorKind::ManualSelect),
+            "auto_submit" => Some(OneKeyBehaviorKind::AutoSubmit),
+            "rejected" => Some(OneKeyBehaviorKind::Rejected),
+            "popup_shown" => Some(OneKeyBehaviorKind::PopupShown),
+            _ => None,
+        }
+    }
+}
+
+/// One observed OneKey behavior event. Metadata only: stable identifiers and
+/// SHA-256 fingerprints — never credential values, display names, or raw
+/// prompt text (mirrors the `OneKeyPreference` privacy contract).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OneKeyBehaviorEvent {
+    pub connection_id: String,
+    /// The habit fingerprint of the prompt (SHA-256, computed by the UI).
+    pub prompt_fingerprint: String,
+    /// Target candidate. Empty for [`OneKeyBehaviorKind::PopupShown`].
+    pub onekey_id: String,
+    pub step_id: String,
+    pub kind: OneKeyBehaviorKind,
+    /// Digest of the sorted candidate identifiers at event time. Detects
+    /// "the user added/removed a OneKey matching this prompt".
+    pub candidates_hash: String,
+}
+
+/// Cap on in-memory habit events per `(connection, prompt)` key. Habit
+/// resolution only ever inspects the newest few events; the rest exist so a
+/// rejection buried under a couple of newer selections still shows in
+/// diagnostics.
+pub const ONEKEY_HABIT_EVENTS_CAP: usize = 32;
+
+/// Insert a behavior event into the in-memory habit cache only (no DuckDB
+/// re-queue). Used when replaying persisted events at unlock and by
+/// [`record_onekey_behavior`] for live events. `PopupShown` events are
+/// excluded — the resolver only reasons about selections and rejections, and
+/// popup-noise between them must not evict useful history.
+pub fn seed_onekey_habit_event(state: &mut AppState, event: OneKeyBehaviorEvent) {
+    if event.kind == OneKeyBehaviorKind::PopupShown {
+        return;
+    }
+    let key = (
+        event.connection_id.clone(),
+        event.prompt_fingerprint.clone(),
+    );
+    let events = state.onekey_habit_events.entry(key).or_default();
+    events.push(event);
+    if events.len() > ONEKEY_HABIT_EVENTS_CAP {
+        let excess = events.len() - ONEKEY_HABIT_EVENTS_CAP;
+        events.drain(..excess);
+    }
+}
+
+/// Append a live behavior event to the in-memory habit cache and queue it
+/// for the DuckDB flush (see `flush_onekey_behavior_events` in `app.rs`).
+pub fn record_onekey_behavior(state: &mut AppState, event: OneKeyBehaviorEvent) {
+    seed_onekey_habit_event(state, event.clone());
+    state.onekey_pending_analytics.push(event);
+}
+
 impl std::fmt::Debug for OneKeyMatch {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("OneKeyMatch")
@@ -654,6 +762,69 @@ mod onekey_match_tests {
         let debug = format!("{entry:?}");
         assert!(debug.contains("<redacted>"));
         assert!(!debug.contains("never-log-this-secret"));
+    }
+}
+
+#[cfg(test)]
+mod onekey_behavior_cache_tests {
+    use super::{
+        AppState, ONEKEY_HABIT_EVENTS_CAP, OneKeyBehaviorEvent, OneKeyBehaviorKind,
+        record_onekey_behavior, seed_onekey_habit_event,
+    };
+
+    fn event(kind: OneKeyBehaviorKind, onekey_id: &str) -> OneKeyBehaviorEvent {
+        OneKeyBehaviorEvent {
+            connection_id: "conn".to_string(),
+            prompt_fingerprint: "fp".to_string(),
+            onekey_id: onekey_id.to_string(),
+            step_id: "step".to_string(),
+            kind,
+            candidates_hash: "hash".to_string(),
+        }
+    }
+
+    #[test]
+    fn record_caches_selections_and_queues_everything_for_analytics() {
+        let mut state = AppState::default();
+        record_onekey_behavior(&mut state, event(OneKeyBehaviorKind::ManualSelect, "a"));
+        record_onekey_behavior(&mut state, event(OneKeyBehaviorKind::PopupShown, ""));
+
+        let key = ("conn".to_string(), "fp".to_string());
+        let cached = state.onekey_habit_events.get(&key).unwrap();
+        assert_eq!(
+            cached.len(),
+            1,
+            "popup_shown must not enter the habit cache"
+        );
+        assert_eq!(cached[0].kind, OneKeyBehaviorKind::ManualSelect);
+        assert_eq!(
+            state.onekey_pending_analytics.len(),
+            2,
+            "every event is queued for the DuckDB flush"
+        );
+    }
+
+    #[test]
+    fn habit_cache_is_capped_keeping_the_newest_events() {
+        let mut state = AppState::default();
+        for index in 0..(ONEKEY_HABIT_EVENTS_CAP + 5) {
+            seed_onekey_habit_event(
+                &mut state,
+                event(OneKeyBehaviorKind::ManualSelect, &format!("ok-{index}")),
+            );
+        }
+        let key = ("conn".to_string(), "fp".to_string());
+        let cached = state.onekey_habit_events.get(&key).unwrap();
+        assert_eq!(cached.len(), ONEKEY_HABIT_EVENTS_CAP);
+        assert_eq!(
+            cached.last().unwrap().onekey_id,
+            format!("ok-{}", ONEKEY_HABIT_EVENTS_CAP + 4),
+            "the newest event survives the cap"
+        );
+        assert!(
+            state.onekey_pending_analytics.is_empty(),
+            "seeding (warm-load replay) must not re-queue analytics writes"
+        );
     }
 }
 
@@ -766,6 +937,8 @@ impl Default for AppState {
             onekeys: Vec::new(),
             onekey_preferences: Vec::new(),
             onekey_preference_attempts: HashMap::new(),
+            onekey_habit_events: HashMap::new(),
+            onekey_pending_analytics: Vec::new(),
             onekey_popups: HashMap::new(),
             onekey_submission_feedback: HashMap::new(),
             onekey_submission_cooldown: HashMap::new(),
@@ -7551,6 +7724,135 @@ pub fn record_replay_op(state: &mut AppState, session_id: &str, op: &str) -> boo
     true
 }
 
+/// Whether a shell command establishes a *lasting session context* the user
+/// would expect a recovery replay to re-establish: privilege escalation into
+/// a login/interactive shell (`sudo -i`, `sudo -s`, `sudo su`, `su`), nested
+/// remote hops (`ssh`, `telnet`), and container attach/exec shells
+/// (`docker exec`, `kubectl exec`, …).
+///
+/// One-shot commands are deliberately excluded — replaying `sudo systemctl
+/// restart nginx` on reconnect would repeat a side effect, not restore
+/// state. That's why plain `sudo <cmd>` (no `-i`/`-s`, target not a shell)
+/// returns `false`.
+pub fn is_context_command(command: &str) -> bool {
+    const SHELLS: &[&str] = &[
+        "su", "bash", "sh", "zsh", "fish", "dash", "ksh", "csh", "tcsh",
+    ];
+    let mut tokens = command.split_whitespace();
+    let Some(head) = tokens.next() else {
+        return false;
+    };
+    match head {
+        // `su` alone or `su - user` always swaps the shell context.
+        "su" => true,
+        // Nested interactive hops.
+        "ssh" | "telnet" => true,
+        "sudo" | "doas" => {
+            // Context-establishing iff it requests a login/interactive shell
+            // (`-i`/`-s`) or its target command is itself a shell / `su`.
+            let mut saw_shell_flag = false;
+            let mut rest = tokens;
+            while let Some(tok) = rest.next() {
+                match tok {
+                    "-i" | "--login" | "-s" | "--shell" => saw_shell_flag = true,
+                    // Flags that consume a separate argument — skip it so a
+                    // username like `-u root` is not mistaken for the target
+                    // command.
+                    "-u" | "--user" | "-g" | "--group" | "-h" | "--host" | "-p" | "--prompt" => {
+                        rest.next();
+                    }
+                    _ if tok.starts_with('-') => {}
+                    // First non-flag token: the command sudo/doas runs.
+                    _ => return SHELLS.contains(&tok),
+                }
+            }
+            saw_shell_flag
+        }
+        "docker" | "podman" | "nerdctl" | "kubectl" | "oc" => {
+            matches!(tokens.next(), Some("exec") | Some("attach"))
+        }
+        _ => false,
+    }
+}
+
+/// Whether a shell command *leaves* a session context established by an
+/// [`is_context_command`] input (kept deliberately narrow: `exit`/`logout`).
+/// Used to pop the trailing context command off the replay log so a
+/// `sudo -i` → work → `exit` round trip leaves no stale escalation to
+/// replay.
+pub fn is_context_exit_command(command: &str) -> bool {
+    matches!(command.trim(), "exit" | "logout")
+}
+
+/// Records a *context-establishing* shell command (see
+/// [`is_context_command`]) into the session's replay recorder, appending it
+/// after the frozen establishment prefix WITHOUT thawing the freeze.
+///
+/// This is the shell-prompt counterpart of [`record_replay_op`]: menu
+/// submissions record (and thaw on reentry), regular shell commands never
+/// record, but commands like `sudo -i` sit in between — they are typed at a
+/// shell prompt yet change the session state a recovery must re-establish.
+/// Appending under freeze preserves both invariants: the bastion navigation
+/// prefix stays intact (a thaw would clear it) and ordinary shell commands
+/// typed afterwards still never enter the log.
+///
+/// Returns `false` for non-context commands, non-SSH/Telnet sessions, empty
+/// input, and a full window ([`REPLAY_MAX_OPS`]).
+pub fn record_context_command(state: &mut AppState, session_id: &str, command: &str) -> bool {
+    let command = command.trim();
+    if command.is_empty() || !is_context_command(command) {
+        return false;
+    }
+    let is_interactive_remote = matches!(
+        state.session_configs.get(session_id).map(|c| &c.kind),
+        Some(rusterm_core::config::ConnectionKind::Ssh(_))
+            | Some(rusterm_core::config::ConnectionKind::Telnet(_))
+    );
+    if !is_interactive_remote {
+        return false;
+    }
+    let rec = state
+        .session_replays
+        .entry(session_id.to_string())
+        .or_default();
+    if rec.ops.len() >= REPLAY_MAX_OPS {
+        return false;
+    }
+    rec.ops.push(command.to_string());
+    // Typing at a shell prompt is itself shell evidence — make sure the
+    // recorder is frozen so subsequent ordinary commands stay unrecorded
+    // (matters for direct-connect targets that never emitted OSC 133;D).
+    rec.shell_integrated = true;
+    true
+}
+
+/// Pops the trailing context command off the replay log when the user exits
+/// the context it established (`exit`/`logout` typed at a shell prompt after
+/// e.g. `sudo -i`). Returns the popped op, or `None` when nothing applies.
+///
+/// Guards: only a frozen recorder is touched (an unfrozen one is still in
+/// menu-navigation phase), and only when the trailing op IS a context
+/// command — `exit` typed on the target host itself (dropping back to the
+/// bastion menu) must not eat the menu-navigation prefix; the subsequent
+/// menu reentry thaws and re-records instead.
+pub fn pop_context_command(
+    state: &mut AppState,
+    session_id: &str,
+    command: &str,
+) -> Option<String> {
+    if !is_context_exit_command(command) {
+        return None;
+    }
+    let rec = state.session_replays.get_mut(session_id)?;
+    if !rec.shell_integrated {
+        return None;
+    }
+    if !rec.ops.last().is_some_and(|op| is_context_command(op)) {
+        return None;
+    }
+    rec.ops.pop()
+}
+
 /// Heuristic classifier for the terminal line the cursor sits on when the
 /// user presses Enter: does it look like a *shell* prompt (as opposed to an
 /// interactive bastion/jump-host menu prompt)?
@@ -7740,6 +8042,126 @@ mod session_replay_tests {
             replayable_ops(&state, "sess"),
             vec!["/w".to_string(), "3".to_string()]
         );
+    }
+
+    /// Context-establishing shell commands (`sudo -i`, `su`, nested `ssh`,
+    /// container exec shells) are recognized; one-shot commands and plain
+    /// shell work are not — replaying them would repeat side effects, not
+    /// restore state.
+    #[test]
+    fn context_command_classifier_separates_context_from_oneshot() {
+        for ctx in [
+            "sudo -i",
+            "sudo -s",
+            "sudo --login",
+            "sudo su",
+            "sudo su -",
+            "sudo -u admin -i",
+            "sudo -u root bash",
+            "su",
+            "su - deploy",
+            "doas -s",
+            "ssh internal-db-01",
+            "telnet 10.0.0.5",
+            "docker exec -it app bash",
+            "kubectl exec -it pod-0 -- sh",
+            "podman attach web",
+        ] {
+            assert!(is_context_command(ctx), "context-class: {ctx:?}");
+        }
+        for oneshot in [
+            "sudo systemctl restart nginx",
+            "sudo rm -rf /tmp/scratch",
+            "sudo -u postgres psql",
+            "ls -la",
+            "htop",
+            "docker ps",
+            "kubectl get pods",
+            "sudoedit /etc/hosts",
+            "",
+        ] {
+            assert!(!is_context_command(oneshot), "oneshot-class: {oneshot:?}");
+        }
+    }
+
+    /// The sudo-after-bastion flow: menu navigation records, landing on the
+    /// target freezes, and `sudo -i` typed at the target's shell prompt
+    /// APPENDS to the frozen log without thawing — the replay must cross the
+    /// bastion first and then re-escalate, in that order. Ordinary shell
+    /// commands before/after still never enter the log.
+    #[test]
+    fn context_commands_append_to_the_frozen_establishment_log() {
+        let mut state = state_with_session("sess", ssh_kind());
+        assert!(record_replay_op(&mut state, "sess", "/q"));
+        assert!(record_replay_op(&mut state, "sess", "2"));
+        note_shell_integration_evidence(&mut state, "sess");
+        // Ordinary shell commands are rejected by the classifier gate.
+        assert!(!record_context_command(&mut state, "sess", "ls -la"));
+        // `sudo -i` appends under freeze; the prefix stays intact.
+        assert!(record_context_command(&mut state, "sess", "sudo -i"));
+        assert_eq!(
+            replayable_ops(&state, "sess"),
+            vec!["/q".to_string(), "2".to_string(), "sudo -i".to_string()]
+        );
+        // Still frozen: a later menu reentry thaws and re-records from
+        // scratch, exactly as before.
+        assert!(record_replay_op(&mut state, "sess", "/w"));
+        assert_eq!(replayable_ops(&state, "sess"), vec!["/w".to_string()]);
+    }
+
+    /// Context commands respect the same recording gates as menu ops: only
+    /// SSH/Telnet sessions, and never past the window cap.
+    #[test]
+    fn context_commands_respect_recording_gates() {
+        let mut shell = state_with_session(
+            "sh",
+            ConnectionKind::Shell(ShellConfig {
+                command: None,
+                args: Vec::new(),
+                env: Vec::new(),
+                working_dir: None,
+            }),
+        );
+        assert!(!record_context_command(&mut shell, "sh", "sudo -i"));
+
+        let mut state = state_with_session("sess", ssh_kind());
+        for i in 0..REPLAY_MAX_OPS {
+            assert!(record_replay_op(&mut state, "sess", &format!("op-{i}")));
+        }
+        note_shell_integration_evidence(&mut state, "sess");
+        assert!(!record_context_command(&mut state, "sess", "sudo -i"));
+        assert_eq!(replayable_ops(&state, "sess").len(), REPLAY_MAX_OPS);
+    }
+
+    /// `exit` after `sudo -i` pops the escalation off the log (the user
+    /// dropped back to the unprivileged shell — replaying the sudo would
+    /// restore the WRONG state). But `exit` on the target host itself (no
+    /// trailing context op) must NOT eat the bastion navigation prefix.
+    #[test]
+    fn exit_pops_the_trailing_context_command_but_not_the_navigation_prefix() {
+        let mut state = state_with_session("sess", ssh_kind());
+        assert!(record_replay_op(&mut state, "sess", "/q"));
+        assert!(record_replay_op(&mut state, "sess", "2"));
+        note_shell_integration_evidence(&mut state, "sess");
+        assert!(record_context_command(&mut state, "sess", "sudo -i"));
+
+        // exit → pops sudo -i.
+        assert_eq!(
+            pop_context_command(&mut state, "sess", "exit"),
+            Some("sudo -i".to_string())
+        );
+        assert_eq!(
+            replayable_ops(&state, "sess"),
+            vec!["/q".to_string(), "2".to_string()]
+        );
+        // A second exit (leaving the target host) finds no trailing context
+        // op — the navigation prefix survives untouched.
+        assert_eq!(pop_context_command(&mut state, "sess", "exit"), None);
+        assert_eq!(replayable_ops(&state, "sess").len(), 2);
+        // Non-exit commands never pop.
+        assert!(record_context_command(&mut state, "sess", "sudo -i"));
+        assert_eq!(pop_context_command(&mut state, "sess", "whoami"), None);
+        assert_eq!(replayable_ops(&state, "sess").len(), 3);
     }
 
     /// The prompt classifier separates shell prompts (whose submissions

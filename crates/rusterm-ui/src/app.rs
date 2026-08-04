@@ -51,17 +51,19 @@ use crate::keybindings::action_for_event;
 use crate::layout::{PaneLayout, SplitAxis, SplitDirection};
 use crate::skin::css_variables;
 use crate::state::{
-    AppState, CommandStatus, Modal, OneKeyMatch, OneKeyPopupState, OneKeyPreferenceAttempt,
-    OneKeySubmissionFeedback, PendingCommandPayload, PendingDangerousCommand,
-    SessionConnectionState, SessionTab, TabDropOutcome, TerminalEntry, UnlockState,
-    activate_session, append_pane_to_active, available_send_targets, begin_floating_pane_move,
-    clear_terminal_command_lines, close_pane, close_session, close_workspace, command_send_targets,
-    distribute_sessions_across_panes, enqueue_pending_exit, execute_tab_drop_on_pane,
-    execute_tab_drop_on_pane_at, focus_pane_for_layout, focused_pane_session, invert_send_targets,
-    move_floating_pane_for_active, move_session_to_leftmost, note_shell_integration_evidence,
-    note_shell_prompt_evidence, prepare_split_for_sidebar_drop, prepare_split_for_sidebar_drop_at,
-    prompt_looks_like_shell, push_workspace_tab, record_replay_op, replayable_ops,
-    resize_layout_split, rollback_pending_exit, scroll_sync_targets, select_all_send_targets,
+    AppState, CommandStatus, Modal, OneKeyBehaviorEvent, OneKeyBehaviorKind, OneKeyMatch,
+    OneKeyPopupState, OneKeyPreferenceAttempt, OneKeySubmissionFeedback, PendingCommandPayload,
+    PendingDangerousCommand, SessionConnectionState, SessionTab, TabDropOutcome, TerminalEntry,
+    UnlockState, activate_session, append_pane_to_active, available_send_targets,
+    begin_floating_pane_move, clear_terminal_command_lines, close_pane, close_session,
+    close_workspace, command_send_targets, distribute_sessions_across_panes, enqueue_pending_exit,
+    execute_tab_drop_on_pane, execute_tab_drop_on_pane_at, focus_pane_for_layout,
+    focused_pane_session, invert_send_targets, move_floating_pane_for_active,
+    move_session_to_leftmost, note_shell_integration_evidence, note_shell_prompt_evidence,
+    pop_context_command, prepare_split_for_sidebar_drop, prepare_split_for_sidebar_drop_at,
+    prompt_looks_like_shell, push_workspace_tab, record_context_command, record_onekey_behavior,
+    record_replay_op, replayable_ops, resize_layout_split, rollback_pending_exit,
+    scroll_sync_targets, seed_onekey_habit_event, select_all_send_targets,
     selected_send_target_ids, set_active_tab, set_pane_session_for_layout,
     set_send_target_selected, source_pane_for_copy, suppress_comparison_diff_warning,
     toggle_comparison_mode, toggle_pane_zoom, toggle_split_mode, track_terminal_input,
@@ -2728,22 +2730,87 @@ fn render_terminal_pane(
                                         // never replay), menu prompts record —
                                         // thawing a frozen recorder on menu
                                         // reentry so the last navigation wins.
+                                        // Context-establishing shell commands
+                                        // (`sudo -i`, `su`, nested `ssh`, …) are
+                                        // the exception: they append to the
+                                        // frozen establishment log so a recovery
+                                        // replays them after the bastion
+                                        // navigation, and `exit`/`logout` pops
+                                        // the escalation they established.
                                         let shell_like =
                                             prompt_looks_like_shell(&current_line);
                                         let mut app = state_for_cmd.write();
                                         for target in &input_targets {
                                             if shell_like {
                                                 note_shell_prompt_evidence(&mut app, target);
-                                            } else if record_replay_op(&mut app, target, &command)
-                                            {
-                                                tracing::debug!(
-                                                    "[REPLAY] recorded op for session={} ops_len={}",
-                                                    &target[..target.len().min(8)],
-                                                    app.session_replays
-                                                        .get(target)
-                                                        .map(|r| r.ops.len())
-                                                        .unwrap_or(0)
-                                                );
+                                                if record_context_command(
+                                                    &mut app, target, &command,
+                                                ) {
+                                                    tracing::info!(
+                                                        "[REPLAY] recorded context command for session={} op={:?} ops_len={}",
+                                                        &target[..target.len().min(8)],
+                                                        command,
+                                                        app.session_replays
+                                                            .get(target)
+                                                            .map(|r| r.ops.len())
+                                                            .unwrap_or(0)
+                                                    );
+                                                    persist_replay_event(
+                                                        &app,
+                                                        target,
+                                                        "context",
+                                                        Some(command.clone()),
+                                                    );
+                                                } else if let Some(popped) =
+                                                    pop_context_command(
+                                                        &mut app, target, &command,
+                                                    )
+                                                {
+                                                    tracing::info!(
+                                                        "[REPLAY] context exit popped op for session={} popped={:?} ops_len={}",
+                                                        &target[..target.len().min(8)],
+                                                        popped,
+                                                        app.session_replays
+                                                            .get(target)
+                                                            .map(|r| r.ops.len())
+                                                            .unwrap_or(0)
+                                                    );
+                                                    persist_replay_event(
+                                                        &app, target, "pop", None,
+                                                    );
+                                                }
+                                            } else {
+                                                // Menu reentry thaws the frozen
+                                                // recorder (clearing its ops) — the
+                                                // event log mirrors that with a
+                                                // "reset" so a fold reproduces the
+                                                // in-memory state.
+                                                let was_frozen = app
+                                                    .session_replays
+                                                    .get(target)
+                                                    .is_some_and(|r| r.shell_integrated);
+                                                if record_replay_op(&mut app, target, &command) {
+                                                    tracing::info!(
+                                                        "[REPLAY] recorded op for session={} op={:?} ops_len={}",
+                                                        &target[..target.len().min(8)],
+                                                        command,
+                                                        app.session_replays
+                                                            .get(target)
+                                                            .map(|r| r.ops.len())
+                                                            .unwrap_or(0)
+                                                    );
+                                                    if was_frozen {
+                                                        persist_replay_event(
+                                                            &app, target, "reset", None,
+                                                        );
+                                                    }
+                                                    persist_replay_event(
+                                                        &app,
+                                                        target,
+                                                        "op",
+                                                        Some(command.clone()),
+                                                    );
+                                                }
                                             }
                                         }
                                     }
@@ -3610,18 +3677,37 @@ fn render_terminal_pane(
                                     );
                                     app.onekey_output_since_submission
                                         .insert(sid_for_ok_sel.clone(), String::new());
-                                    if let Some(preference) = selection.preference.clone() {
-                                        remember_onekey_preference(&mut app, preference.clone());
+                                    if let Some(behavior) = selection.behavior.clone() {
+                                        // Track the attempt for every manual
+                                        // submission (not just multi-match safe
+                                        // prompts) so a repeated prompt records a
+                                        // rejection into the habit history.
                                         app.onekey_preference_attempts.insert(
                                             sid_for_ok_sel.clone(),
                                             OneKeyPreferenceAttempt {
-                                                preference,
+                                                preference: OneKeyPreference {
+                                                    connection_id: behavior.connection_id.clone(),
+                                                    prompt_fingerprint: behavior
+                                                        .prompt_fingerprint
+                                                        .clone(),
+                                                    onekey_id: behavior.onekey_id.clone(),
+                                                    step_id: behavior.step_id.clone(),
+                                                    step_index: None,
+                                                },
                                                 matched_expect: selection.matched_expect.clone(),
                                             },
                                         );
+                                        // Learn the choice: two consistent manual
+                                        // selections establish a habit that then
+                                        // auto-submits without a popup.
+                                        record_onekey_behavior(&mut app, behavior);
+                                    }
+                                    if let Some(preference) = selection.preference.clone() {
+                                        remember_onekey_preference(&mut app, preference);
                                     }
                                     app.session_configs.get(&sid_for_ok_sel).cloned()
                                 };
+                                flush_onekey_behavior_events(state_for_cmd);
                                 if is_sudo_prompt {
                                     if let Some(connection) = connection {
                                         crate::relay_tunnel::cache_sudo_credential(
@@ -7244,6 +7330,12 @@ struct OneKeySelection {
     matched_expect: String,
     /// Present only for a multi-match popup with a stable saved connection.
     preference: Option<OneKeyPreference>,
+    /// Habit-tier identity of the selection — present whenever the popup has
+    /// a stable connection and a habit fingerprint (i.e. for every prompt of
+    /// a saved connection, including single-match and generic prompts).
+    /// Drives behavior recording and rejection tracking; never persisted to
+    /// settings.json.
+    behavior: Option<OneKeyBehaviorEvent>,
 }
 
 /// Atomically resolve and remove one popup selection. Removing the popup in the
@@ -7266,10 +7358,23 @@ fn take_onekey_selection(
                     })
                 })
                 .flatten();
+            let behavior = popup
+                .connection_id
+                .clone()
+                .zip(popup.habit_fingerprint.clone())
+                .map(|(connection_id, prompt_fingerprint)| OneKeyBehaviorEvent {
+                    connection_id,
+                    prompt_fingerprint,
+                    onekey_id: entry.onekey_id.clone(),
+                    step_id: entry.step_id.clone(),
+                    kind: OneKeyBehaviorKind::ManualSelect,
+                    candidates_hash: onekey_candidates_hash(&popup.matches),
+                });
             OneKeySelection {
                 credential: entry.send.clone(),
                 matched_expect: entry.matched_expect.clone(),
                 preference,
+                behavior,
             }
         })
     });
@@ -7704,6 +7809,9 @@ fn onekey_popup_for_output(
             .map(|config| config.id.clone()),
         prompt_fingerprint: onekey_prompt_is_safe_to_remember(last_line)
             .then(|| onekey_prompt_fingerprint(last_line)),
+        // The habit tier fingerprints EVERY prompt (see the field docs) so
+        // generic prompts can still learn per-connection habits.
+        habit_fingerprint: Some(onekey_prompt_fingerprint(last_line)),
         is_sudo_password: is_sudo_password_prompt(last_line),
         matches,
         selected: 0,
@@ -7811,15 +7919,18 @@ fn apply_onekey_popup(
     session_id: &str,
     popup: OneKeyPopupState,
 ) {
+    let sid_short = &session_id[..session_id.len().min(8)];
     // An auto/manual remembered attempt is rejected only by the same concrete
     // prompt scope. A Git password prompt and a sudo password prompt can share
     // the same broad expect regex, so expect equality alone is insufficient.
+    // Comparison uses the habit fingerprint, which is computed for every
+    // prompt and equals the safe `prompt_fingerprint` when the latter exists.
     let attempt_matches_prompt = state
         .onekey_preference_attempts
         .get(session_id)
         .map(|attempt| {
             popup.connection_id.as_deref() == Some(attempt.preference.connection_id.as_str())
-                && popup.prompt_fingerprint.as_deref()
+                && popup.habit_fingerprint.as_deref()
                     == Some(attempt.preference.prompt_fingerprint.as_str())
                 && popup
                     .matches
@@ -7831,6 +7942,12 @@ fn apply_onekey_popup(
         state.onekey_submission_feedback.remove(session_id);
     }
 
+    let candidates_hash = onekey_candidates_hash(&popup.matches);
+    let habit_key = popup
+        .connection_id
+        .clone()
+        .zip(popup.habit_fingerprint.clone());
+
     let repeated_prompt = note_onekey_prompt_after_submission(state, session_id, &popup);
     if repeated_prompt {
         state.onekey_submission_cooldown.remove(session_id);
@@ -7839,33 +7956,144 @@ fn apply_onekey_popup(
             if forget_onekey_preference(state, &attempt.preference) {
                 tracing::info!(
                     "[ONEKEY-PREFERENCE] session={} invalidated after repeated prompt",
-                    &session_id[..session_id.len().min(8)]
+                    sid_short
                 );
             }
+            // Record the rejection so the habit tier stops auto-submitting
+            // this candidate until the user explicitly confirms a choice
+            // again. Metadata only — no credential values.
+            record_onekey_behavior(
+                state,
+                OneKeyBehaviorEvent {
+                    connection_id: attempt.preference.connection_id.clone(),
+                    prompt_fingerprint: attempt.preference.prompt_fingerprint.clone(),
+                    onekey_id: attempt.preference.onekey_id.clone(),
+                    step_id: attempt.preference.step_id.clone(),
+                    kind: OneKeyBehaviorKind::Rejected,
+                    candidates_hash: candidates_hash.clone(),
+                },
+            );
         }
         state.onekey_popups.insert(session_id.to_string(), popup);
         return;
     }
 
-    let Some(preference) = preference_for_popup(state, &popup) else {
-        state.onekey_popups.insert(session_id.to_string(), popup);
-        return;
-    };
-    let Some(candidate) = popup
-        .matches
-        .iter()
-        .find(|candidate| {
-            candidate.onekey_id == preference.onekey_id && candidate.step_id == preference.step_id
-        })
-        .cloned()
-    else {
-        // The OneKey or step was deleted/reordered. Never guess another entry;
-        // drop the dangling record and return to the explicit chooser.
-        forget_onekey_preference(state, &preference);
-        state.onekey_popups.insert(session_id.to_string(), popup);
-        return;
-    };
+    // "Library changed" gate: when the set of OneKeys matching this prompt
+    // differs from the set recorded with the newest remembered selection, the
+    // user added or removed a relevant OneKey. Ask explicitly once — their
+    // next manual choice re-baselines the candidate set. Applies to both the
+    // persisted-preference tier and the learned-habit tier.
+    if let Some((connection_id, fingerprint)) = &habit_key {
+        let changed = state
+            .onekey_habit_events
+            .get(&(connection_id.clone(), fingerprint.clone()))
+            .is_some_and(|events| onekey_candidates_changed(events, &candidates_hash));
+        if changed {
+            tracing::info!(
+                "[ONEKEY-HABIT] session={} matching OneKey set changed — showing chooser",
+                sid_short
+            );
+            record_popup_shown_behavior(state, &popup, &candidates_hash);
+            state.onekey_popups.insert(session_id.to_string(), popup);
+            return;
+        }
+    }
 
+    // Tier 1: persisted preference (safe prompts, remembered explicitly).
+    if let Some(preference) = preference_for_popup(state, &popup) {
+        let candidate = popup
+            .matches
+            .iter()
+            .find(|candidate| {
+                candidate.onekey_id == preference.onekey_id
+                    && candidate.step_id == preference.step_id
+            })
+            .cloned();
+        match candidate {
+            Some(candidate) => {
+                submit_remembered_onekey(
+                    state,
+                    senders,
+                    session_id,
+                    popup,
+                    candidate,
+                    preference,
+                    &candidates_hash,
+                    "preference",
+                );
+            }
+            None => {
+                // The OneKey or step was deleted/reordered. Never guess
+                // another entry; drop the dangling record and return to the
+                // explicit chooser.
+                forget_onekey_preference(state, &preference);
+                record_popup_shown_behavior(state, &popup, &candidates_hash);
+                state.onekey_popups.insert(session_id.to_string(), popup);
+            }
+        }
+        return;
+    }
+
+    // Tier 2: learned habit. When the user's recorded behavior for this exact
+    // (connection, prompt) shows a stable choice — the last two selections
+    // targeted the same OneKey step, the candidate set is unchanged, and the
+    // most recent outcome wasn't a rejection — submit it silently. Covers
+    // single-match prompts and generic prompts that are not safe to remember
+    // as a persisted preference.
+    if let Some((connection_id, fingerprint)) = &habit_key {
+        let habit_target = state
+            .onekey_habit_events
+            .get(&(connection_id.clone(), fingerprint.clone()))
+            .and_then(|events| resolve_onekey_habit(events, &candidates_hash));
+        if let Some((onekey_id, step_id)) = habit_target {
+            let candidate = popup
+                .matches
+                .iter()
+                .find(|candidate| candidate.onekey_id == onekey_id && candidate.step_id == step_id)
+                .cloned();
+            if let Some(candidate) = candidate {
+                let preference = OneKeyPreference {
+                    connection_id: connection_id.clone(),
+                    prompt_fingerprint: fingerprint.clone(),
+                    onekey_id,
+                    step_id,
+                    step_index: None,
+                };
+                submit_remembered_onekey(
+                    state,
+                    senders,
+                    session_id,
+                    popup,
+                    candidate,
+                    preference,
+                    &candidates_hash,
+                    "habit",
+                );
+                return;
+            }
+        }
+    }
+
+    record_popup_shown_behavior(state, &popup, &candidates_hash);
+    state.onekey_popups.insert(session_id.to_string(), popup);
+}
+
+/// Submit a remembered/learned credential without showing the chooser. On
+/// success this arms the same rejection-detection state as a manual
+/// submission and records an `auto_submit` behavior event; on send failure
+/// the popup falls back to the explicit chooser.
+#[allow(clippy::too_many_arguments)]
+fn submit_remembered_onekey(
+    state: &mut AppState,
+    senders: &HashMap<String, mpsc::UnboundedSender<Vec<u8>>>,
+    session_id: &str,
+    popup: OneKeyPopupState,
+    candidate: OneKeyMatch,
+    preference: OneKeyPreference,
+    candidates_hash: &str,
+    source: &'static str,
+) {
+    let sid_short = &session_id[..session_id.len().min(8)];
     match send_onekey_submission(senders, session_id, &candidate.send) {
         Ok(()) => {
             state.onekey_submission_feedback.insert(
@@ -7881,6 +8109,17 @@ fn apply_onekey_popup(
             state
                 .onekey_output_since_submission
                 .insert(session_id.to_string(), String::new());
+            record_onekey_behavior(
+                state,
+                OneKeyBehaviorEvent {
+                    connection_id: preference.connection_id.clone(),
+                    prompt_fingerprint: preference.prompt_fingerprint.clone(),
+                    onekey_id: preference.onekey_id.clone(),
+                    step_id: preference.step_id.clone(),
+                    kind: OneKeyBehaviorKind::AutoSubmit,
+                    candidates_hash: candidates_hash.to_string(),
+                },
+            );
             state.onekey_preference_attempts.insert(
                 session_id.to_string(),
                 OneKeyPreferenceAttempt {
@@ -7898,18 +8137,284 @@ fn apply_onekey_popup(
                 }
             }
             tracing::info!(
-                "[ONEKEY-PREFERENCE] session={} automatically submitted remembered credential",
-                &session_id[..session_id.len().min(8)]
+                "[ONEKEY-PREFERENCE] session={} automatically submitted remembered credential source={}",
+                sid_short,
+                source
             );
         }
         Err(error) => {
             tracing::warn!(
-                "[ONEKEY-PREFERENCE] session={} auto-submit failed: {:?}",
-                &session_id[..session_id.len().min(8)],
+                "[ONEKEY-PREFERENCE] session={} auto-submit failed source={} error={:?}",
+                sid_short,
+                source,
                 error
             );
             state.onekey_popups.insert(session_id.to_string(), popup);
         }
+    }
+}
+
+/// Record that the explicit chooser was shown for a habit-trackable prompt.
+/// Analytics only — popup-shown events never enter the habit cache.
+fn record_popup_shown_behavior(
+    state: &mut AppState,
+    popup: &OneKeyPopupState,
+    candidates_hash: &str,
+) {
+    let Some((connection_id, fingerprint)) = popup
+        .connection_id
+        .clone()
+        .zip(popup.habit_fingerprint.clone())
+    else {
+        return;
+    };
+    record_onekey_behavior(
+        state,
+        OneKeyBehaviorEvent {
+            connection_id,
+            prompt_fingerprint: fingerprint,
+            onekey_id: String::new(),
+            step_id: String::new(),
+            kind: OneKeyBehaviorKind::PopupShown,
+            candidates_hash: candidates_hash.to_string(),
+        },
+    );
+}
+
+/// Digest of the sorted candidate identifiers of a match set. Two prompts
+/// share a hash exactly when the same OneKey steps match them, so comparing
+/// hashes across time detects library changes relevant to this prompt.
+fn onekey_candidates_hash(matches: &[OneKeyMatch]) -> String {
+    let mut ids: Vec<String> = matches
+        .iter()
+        .map(|candidate| format!("{}\0{}", candidate.onekey_id, candidate.step_id))
+        .collect();
+    ids.sort();
+    format!("{:x}", Sha256::digest(ids.join("\n").as_bytes()))
+}
+
+/// True when remembered selections exist for this prompt but the newest one
+/// saw a different candidate set than the current prompt — i.e. the user
+/// added or removed a matching OneKey since they last chose. No events, or a
+/// matching baseline, mean "nothing changed".
+fn onekey_candidates_changed(
+    events: &[OneKeyBehaviorEvent],
+    current_candidates_hash: &str,
+) -> bool {
+    events
+        .iter()
+        .rev()
+        .find(|event| {
+            matches!(
+                event.kind,
+                OneKeyBehaviorKind::ManualSelect | OneKeyBehaviorKind::AutoSubmit
+            )
+        })
+        .is_some_and(|event| event.candidates_hash != current_candidates_hash)
+}
+
+/// Resolve the user's habitual OneKey step for one (connection, prompt) from
+/// its behavior history (oldest-first). Returns `Some((onekey_id, step_id))`
+/// only when the habit is unambiguous and trustworthy:
+///
+/// - the two most recent selections (manual or auto) targeted the SAME step,
+/// - no rejection is newer than either of them, and
+/// - the newest selection saw the same candidate set as the current prompt.
+///
+/// A rejection therefore always demotes back to the explicit chooser, and a
+/// habit only (re)forms after the user confirms the same choice twice in a
+/// row. Auto-submissions extend an established habit, but can never start
+/// one — the first two events are necessarily manual selections.
+fn resolve_onekey_habit(
+    events: &[OneKeyBehaviorEvent],
+    current_candidates_hash: &str,
+) -> Option<(String, String)> {
+    let mut relevant = events.iter().rev().filter(|event| {
+        matches!(
+            event.kind,
+            OneKeyBehaviorKind::ManualSelect
+                | OneKeyBehaviorKind::AutoSubmit
+                | OneKeyBehaviorKind::Rejected
+        )
+    });
+    let newest = relevant.next()?;
+    if newest.kind == OneKeyBehaviorKind::Rejected {
+        return None;
+    }
+    if newest.candidates_hash != current_candidates_hash {
+        return None;
+    }
+    let second = relevant.next()?;
+    if second.kind == OneKeyBehaviorKind::Rejected {
+        return None;
+    }
+    if second.onekey_id != newest.onekey_id || second.step_id != newest.step_id {
+        return None;
+    }
+    Some((newest.onekey_id.clone(), newest.step_id.clone()))
+}
+
+/// Drain queued OneKey behavior events and persist them to the local DuckDB
+/// analytics store off the output path. Must be called from within the
+/// Dioxus runtime (spawns the write). A no-op without pending events and
+/// without the `analytics` feature (the stub handle discards records).
+fn flush_onekey_behavior_events(mut state: Signal<AppState>) {
+    if state.read().onekey_pending_analytics.is_empty() {
+        return;
+    }
+    let (events, analytics) = {
+        let mut s = state.write();
+        (
+            std::mem::take(&mut s.onekey_pending_analytics),
+            s.analytics.clone(),
+        )
+    };
+    spawn(async move {
+        for event in events {
+            let record = crate::analytics::OneKeyUsageRecord {
+                connection_id: event.connection_id,
+                prompt_fingerprint: event.prompt_fingerprint,
+                onekey_id: event.onekey_id,
+                step_id: event.step_id,
+                action: event.kind.as_str().to_string(),
+                candidates_hash: event.candidates_hash,
+            };
+            if let Err(error) = analytics.record_onekey_usage(&record) {
+                tracing::warn!("[ONEKEY-HABIT] failed to record behavior event: {error}");
+                break;
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+mod onekey_habit_resolution_tests {
+    use super::{onekey_candidates_changed, onekey_candidates_hash, resolve_onekey_habit};
+    use crate::state::{OneKeyBehaviorEvent, OneKeyBehaviorKind, OneKeyMatch};
+
+    fn event(
+        onekey_id: &str,
+        kind: OneKeyBehaviorKind,
+        candidates_hash: &str,
+    ) -> OneKeyBehaviorEvent {
+        OneKeyBehaviorEvent {
+            connection_id: "conn".to_string(),
+            prompt_fingerprint: "fp".to_string(),
+            onekey_id: onekey_id.to_string(),
+            step_id: format!("{onekey_id}-step"),
+            kind,
+            candidates_hash: candidates_hash.to_string(),
+        }
+    }
+
+    #[test]
+    fn habit_requires_two_consecutive_selections_of_the_same_step() {
+        use OneKeyBehaviorKind::*;
+        assert_eq!(resolve_onekey_habit(&[], "h"), None);
+        assert_eq!(
+            resolve_onekey_habit(&[event("a", ManualSelect, "h")], "h"),
+            None
+        );
+        assert_eq!(
+            resolve_onekey_habit(
+                &[event("a", ManualSelect, "h"), event("a", ManualSelect, "h")],
+                "h"
+            ),
+            Some(("a".to_string(), "a-step".to_string()))
+        );
+        assert_eq!(
+            resolve_onekey_habit(
+                &[event("a", ManualSelect, "h"), event("b", ManualSelect, "h")],
+                "h"
+            ),
+            None,
+            "switching targets resets the habit"
+        );
+    }
+
+    #[test]
+    fn auto_submissions_extend_but_never_start_a_habit() {
+        use OneKeyBehaviorKind::*;
+        assert_eq!(
+            resolve_onekey_habit(
+                &[
+                    event("a", ManualSelect, "h"),
+                    event("a", ManualSelect, "h"),
+                    event("a", AutoSubmit, "h"),
+                ],
+                "h"
+            ),
+            Some(("a".to_string(), "a-step".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_rejection_blocks_the_habit_until_reconfirmed_twice() {
+        use OneKeyBehaviorKind::*;
+        let rejected_newest = [
+            event("a", ManualSelect, "h"),
+            event("a", ManualSelect, "h"),
+            event("a", Rejected, "h"),
+        ];
+        assert_eq!(resolve_onekey_habit(&rejected_newest, "h"), None);
+
+        let one_confirmation = [
+            event("a", ManualSelect, "h"),
+            event("a", Rejected, "h"),
+            event("a", ManualSelect, "h"),
+        ];
+        assert_eq!(
+            resolve_onekey_habit(&one_confirmation, "h"),
+            None,
+            "one post-rejection confirmation is not yet a habit"
+        );
+
+        let two_confirmations = [
+            event("a", Rejected, "h"),
+            event("a", ManualSelect, "h"),
+            event("a", ManualSelect, "h"),
+        ];
+        assert_eq!(
+            resolve_onekey_habit(&two_confirmations, "h"),
+            Some(("a".to_string(), "a-step".to_string()))
+        );
+    }
+
+    #[test]
+    fn a_changed_candidate_set_blocks_the_habit() {
+        use OneKeyBehaviorKind::*;
+        let events = [
+            event("a", ManualSelect, "old"),
+            event("a", ManualSelect, "old"),
+        ];
+        assert_eq!(resolve_onekey_habit(&events, "new"), None);
+        assert!(onekey_candidates_changed(&events, "new"));
+        assert!(!onekey_candidates_changed(&events, "old"));
+        assert!(!onekey_candidates_changed(&[], "anything"));
+        // Rejections carry the hash too but are not a selection baseline.
+        assert!(!onekey_candidates_changed(
+            &[event("a", Rejected, "other")],
+            "anything"
+        ));
+    }
+
+    #[test]
+    fn candidates_hash_is_order_independent_and_id_sensitive() {
+        let m = |onekey_id: &str, step_id: &str| OneKeyMatch {
+            onekey_id: onekey_id.to_string(),
+            step_id: step_id.to_string(),
+            name: "name".to_string(),
+            label: "label".to_string(),
+            send: "secret".to_string(),
+            matched_expect: "password:".to_string(),
+        };
+        let ab = onekey_candidates_hash(&[m("a", "s1"), m("b", "s2")]);
+        let ba = onekey_candidates_hash(&[m("b", "s2"), m("a", "s1")]);
+        assert_eq!(ab, ba, "match order must not matter");
+        let abc = onekey_candidates_hash(&[m("a", "s1"), m("b", "s2"), m("c", "s3")]);
+        assert_ne!(ab, abc, "adding a candidate changes the hash");
+        let a2 = onekey_candidates_hash(&[m("a", "s9"), m("b", "s2")]);
+        assert_ne!(ab, a2, "a different step id changes the hash");
     }
 }
 
@@ -8014,8 +8519,13 @@ fn check_onekey_match(
     };
     match outcome {
         Ok(popup) => {
-            let senders = input_senders.read();
-            apply_onekey_popup(&mut state.write(), &senders, session_id, popup);
+            {
+                let senders = input_senders.read();
+                apply_onekey_popup(&mut state.write(), &senders, session_id, popup);
+            }
+            // Persist any behavior events the decision produced (auto-submit,
+            // rejection, popup shown) to the local DuckDB store.
+            flush_onekey_behavior_events(state);
         }
         Err(reason) => {
             let mut s = state.write();
@@ -8039,6 +8549,12 @@ const SHELL_INTEGRATION_QUIET_PERIOD: std::time::Duration = std::time::Duration:
 /// is typically well under 1 s even on a slow link; 3 s gives ample margin
 /// without hiding a real wrong-password rejection for too long.
 const ONEKEY_SUBMISSION_COOLDOWN: std::time::Duration = std::time::Duration::from_secs(3);
+
+/// How many persisted OneKey behavior events to replay into the in-memory
+/// habit cache at unlock. Events are tiny (identifiers + hashes) and per-key
+/// caching caps growth, so a generous window keeps habits for many
+/// connections alive across restarts.
+const ONEKEY_HABIT_LOAD_LIMIT: u32 = 512;
 const SHELL_INTEGRATION_ERASE_ECHO_LINE: &[u8] = b"\r\x1b[2K";
 
 /// Debounces the remote shell's initial output before injecting shell
@@ -8560,6 +9076,7 @@ mod session_startup_tests {
             visible: true,
             connection_id: None,
             prompt_fingerprint: None,
+            habit_fingerprint: None,
             is_sudo_password: false,
             matches: vec![OneKeyMatch {
                 onekey_id: "account-id".to_string(),
@@ -8576,6 +9093,7 @@ mod session_startup_tests {
             visible: true,
             connection_id: None,
             prompt_fingerprint: None,
+            habit_fingerprint: None,
             is_sudo_password: false,
             matches: vec![OneKeyMatch {
                 onekey_id: "account-id".to_string(),
@@ -8834,6 +9352,303 @@ mod session_startup_tests {
 
         assert!(selection.preference.is_none());
         assert!(state.onekey_preferences.is_empty());
+    }
+
+    /// Mirror the `on_onekey_select` handler's state mutations for a manual
+    /// popup selection (submission feedback, cooldown, attempt tracking,
+    /// behavior recording, and — when available — the persisted preference).
+    fn simulate_manual_selection(
+        state: &mut AppState,
+        session_id: &str,
+        index: usize,
+    ) -> OneKeySelection {
+        let selection = take_onekey_selection(&mut state.onekey_popups, session_id, index)
+            .expect("selection index should resolve");
+        state.onekey_submission_feedback.insert(
+            session_id.to_string(),
+            OneKeySubmissionFeedback::Submitted {
+                matched_expect: selection.matched_expect.clone(),
+            },
+        );
+        state.onekey_submission_cooldown.insert(
+            session_id.to_string(),
+            (selection.matched_expect.clone(), std::time::Instant::now()),
+        );
+        state
+            .onekey_output_since_submission
+            .insert(session_id.to_string(), String::new());
+        if let Some(behavior) = selection.behavior.clone() {
+            state.onekey_preference_attempts.insert(
+                session_id.to_string(),
+                OneKeyPreferenceAttempt {
+                    preference: OneKeyPreference {
+                        connection_id: behavior.connection_id.clone(),
+                        prompt_fingerprint: behavior.prompt_fingerprint.clone(),
+                        onekey_id: behavior.onekey_id.clone(),
+                        step_id: behavior.step_id.clone(),
+                        step_index: None,
+                    },
+                    matched_expect: selection.matched_expect.clone(),
+                },
+            );
+            record_onekey_behavior(state, behavior);
+        }
+        if let Some(preference) = selection.preference.clone() {
+            remember_onekey_preference(state, preference);
+        }
+        selection
+    }
+
+    /// Simulate "the remote accepted the credential and the user moved on":
+    /// clears the per-submission runtime state so the next prompt is treated
+    /// as a fresh exchange (like after a reconnect).
+    fn simulate_credential_accepted(state: &mut AppState, session_id: &str) {
+        state.onekey_submission_feedback.clear();
+        state.onekey_submission_cooldown.clear();
+        state.onekey_output_since_submission.clear();
+        state.onekey_preference_attempts.remove(session_id);
+    }
+
+    #[test]
+    fn generic_prompt_learns_the_habit_after_two_consistent_manual_selections() {
+        let session_id = "sudo-pane";
+        let prompt = b"Password: ";
+        // A bare `Password:` prompt is NOT safe to persist as a preference,
+        // so before the habit tier it popped the chooser on every login.
+        let mut state = state_with_enabled_onekey_for_prompt(r"password:", prompt);
+        state.onekeys.push(OneKey {
+            id: "other".to_string(),
+            name: "other".to_string(),
+            steps: vec![OneKeyStep {
+                id: "other-step".to_string(),
+                label: "Password".to_string(),
+                expect: r"password:".to_string(),
+                send: "other-secret".to_string(),
+            }],
+        });
+
+        // First login: chooser, user picks the second credential.
+        check_onekey_match_in_state(&mut state, session_id, prompt);
+        let first = simulate_manual_selection(&mut state, session_id, 1);
+        assert!(
+            first.preference.is_none(),
+            "generic prompt stays unpersisted"
+        );
+        simulate_credential_accepted(&mut state, session_id);
+
+        // Second login: still the chooser (one observation is not a habit).
+        check_onekey_match_in_state(&mut state, session_id, prompt);
+        assert!(
+            state
+                .onekey_popups
+                .get(session_id)
+                .is_some_and(|popup| popup.visible),
+            "a single observation must not auto-submit"
+        );
+        simulate_manual_selection(&mut state, session_id, 1);
+        simulate_credential_accepted(&mut state, session_id);
+
+        // Third login: the habit is established — submit without a popup.
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let senders = HashMap::from([(session_id.to_string(), sender)]);
+        check_onekey_match_with_senders_in_state(&mut state, &senders, session_id, prompt);
+
+        assert!(
+            !state.onekey_popups.contains_key(session_id),
+            "an established habit should submit without a popup"
+        );
+        assert_eq!(receiver.try_recv().unwrap(), b"other-secret\r");
+        // The auto-submission itself is recorded for the next resolution and
+        // queued for the DuckDB flush.
+        let key = (
+            session_id.to_string(),
+            onekey_prompt_fingerprint("Password: "),
+        );
+        let events = state.onekey_habit_events.get(&key).unwrap();
+        assert_eq!(
+            events.last().map(|event| event.kind),
+            Some(crate::state::OneKeyBehaviorKind::AutoSubmit)
+        );
+        assert!(
+            state
+                .onekey_pending_analytics
+                .iter()
+                .any(|event| event.kind == crate::state::OneKeyBehaviorKind::AutoSubmit),
+            "auto-submit must be queued for the analytics store"
+        );
+    }
+
+    #[test]
+    fn alternating_selections_never_form_a_habit() {
+        let session_id = "sudo-pane";
+        let prompt = b"Password: ";
+        let mut state = state_with_enabled_onekey_for_prompt(r"password:", prompt);
+        state.onekeys.push(OneKey {
+            id: "other".to_string(),
+            name: "other".to_string(),
+            steps: vec![OneKeyStep {
+                id: "other-step".to_string(),
+                label: "Password".to_string(),
+                expect: r"password:".to_string(),
+                send: "other-secret".to_string(),
+            }],
+        });
+
+        check_onekey_match_in_state(&mut state, session_id, prompt);
+        simulate_manual_selection(&mut state, session_id, 0);
+        simulate_credential_accepted(&mut state, session_id);
+        check_onekey_match_in_state(&mut state, session_id, prompt);
+        simulate_manual_selection(&mut state, session_id, 1);
+        simulate_credential_accepted(&mut state, session_id);
+
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let senders = HashMap::from([(session_id.to_string(), sender)]);
+        check_onekey_match_with_senders_in_state(&mut state, &senders, session_id, prompt);
+
+        assert!(
+            state
+                .onekey_popups
+                .get(session_id)
+                .is_some_and(|popup| popup.visible),
+            "an inconsistent choice history must keep asking"
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn adding_a_new_matching_onekey_reopens_the_chooser_once() {
+        let session_id = "sudo-pane";
+        let prompt = b"Password: ";
+        let mut state = state_with_enabled_onekey_for_prompt(r"password:", prompt);
+
+        // Two consistent selections of the single existing credential.
+        for _ in 0..2 {
+            check_onekey_match_in_state(&mut state, session_id, prompt);
+            simulate_manual_selection(&mut state, session_id, 0);
+            simulate_credential_accepted(&mut state, session_id);
+        }
+        // Habit works: silent submit.
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let senders = HashMap::from([(session_id.to_string(), sender)]);
+        check_onekey_match_with_senders_in_state(&mut state, &senders, session_id, prompt);
+        assert_eq!(receiver.try_recv().unwrap(), b"test-secret\r");
+        simulate_credential_accepted(&mut state, session_id);
+
+        // The user adds another OneKey that also matches this prompt: the
+        // chooser must reappear so they can switch (or confirm).
+        state.onekeys.push(OneKey {
+            id: "new-credential".to_string(),
+            name: "new".to_string(),
+            steps: vec![OneKeyStep {
+                id: "new-step".to_string(),
+                label: "Password".to_string(),
+                expect: r"password:".to_string(),
+                send: "new-secret".to_string(),
+            }],
+        });
+        check_onekey_match_with_senders_in_state(&mut state, &senders, session_id, prompt);
+        assert!(
+            state
+                .onekey_popups
+                .get(session_id)
+                .is_some_and(|popup| popup.visible && popup.matches.len() == 2),
+            "a changed candidate set must reopen the chooser"
+        );
+        assert!(receiver.try_recv().is_err(), "no silent submit on change");
+
+        // One confirmation re-baselines the candidate set and the habit
+        // resumes immediately (same target as before).
+        simulate_manual_selection(&mut state, session_id, 0);
+        simulate_credential_accepted(&mut state, session_id);
+        check_onekey_match_with_senders_in_state(&mut state, &senders, session_id, prompt);
+        assert!(!state.onekey_popups.contains_key(session_id));
+        assert_eq!(receiver.try_recv().unwrap(), b"test-secret\r");
+    }
+
+    #[test]
+    fn rejected_habit_submission_falls_back_to_the_chooser() {
+        let session_id = "sudo-pane";
+        let prompt = b"Password: ";
+        let mut state = state_with_enabled_onekey_for_prompt(r"password:", prompt);
+
+        for _ in 0..2 {
+            check_onekey_match_in_state(&mut state, session_id, prompt);
+            simulate_manual_selection(&mut state, session_id, 0);
+            simulate_credential_accepted(&mut state, session_id);
+        }
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let senders = HashMap::from([(session_id.to_string(), sender)]);
+        check_onekey_match_with_senders_in_state(&mut state, &senders, session_id, prompt);
+        assert_eq!(receiver.try_recv().unwrap(), b"test-secret\r");
+
+        // The remote re-prompts after the cooldown elapsed — the habit
+        // submission was rejected.
+        state.onekey_submission_cooldown.insert(
+            session_id.to_string(),
+            (
+                r"password:".to_string(),
+                std::time::Instant::now()
+                    - ONEKEY_SUBMISSION_COOLDOWN
+                    - std::time::Duration::from_secs(1),
+            ),
+        );
+        check_onekey_match_with_senders_in_state(&mut state, &senders, session_id, prompt);
+        assert!(
+            state
+                .onekey_popups
+                .get(session_id)
+                .is_some_and(|popup| popup.visible),
+            "a rejection must fall back to the explicit chooser"
+        );
+        let key = (
+            session_id.to_string(),
+            onekey_prompt_fingerprint("Password: "),
+        );
+        assert_eq!(
+            state
+                .onekey_habit_events
+                .get(&key)
+                .and_then(|events| events.last())
+                .map(|event| event.kind),
+            Some(crate::state::OneKeyBehaviorKind::Rejected)
+        );
+
+        // And the habit stays disabled until the user re-confirms twice.
+        state.onekey_popups.remove(session_id);
+        simulate_credential_accepted(&mut state, session_id);
+        check_onekey_match_with_senders_in_state(&mut state, &senders, session_id, prompt);
+        assert!(
+            state
+                .onekey_popups
+                .get(session_id)
+                .is_some_and(|popup| popup.visible),
+            "one rejection blocks auto-submission on the next prompt"
+        );
+        assert!(receiver.try_recv().is_err());
+    }
+
+    #[test]
+    fn manual_selection_produces_a_behavior_event_for_the_chosen_candidate() {
+        let session_id = "sudo-pane";
+        let prompt = b"Password: ";
+        let mut state = state_with_enabled_onekey_for_prompt(r"password:", prompt);
+
+        check_onekey_match_in_state(&mut state, session_id, prompt);
+        let selection = take_onekey_selection(&mut state.onekey_popups, session_id, 0).unwrap();
+        let behavior = selection
+            .behavior
+            .expect("saved connection should track behavior");
+        assert_eq!(behavior.connection_id, session_id);
+        assert_eq!(behavior.onekey_id, "sudo-credential");
+        assert_eq!(
+            behavior.kind,
+            crate::state::OneKeyBehaviorKind::ManualSelect
+        );
+        assert_eq!(
+            behavior.prompt_fingerprint,
+            onekey_prompt_fingerprint("Password: ")
+        );
+        assert!(!behavior.candidates_hash.is_empty());
     }
 
     #[test]
@@ -13881,6 +14696,40 @@ fn suppress_login_script(state: &mut AppState, session_id: &str) {
     );
 }
 
+/// In-process monotonic tiebreaker for replay-event ordering. The DuckDB
+/// fold orders by `(ts_micros, seq)`: the timestamp separates app runs, the
+/// seq separates events captured within the same microsecond (e.g. a
+/// broadcast Enter recording into several sessions in one loop).
+static REPLAY_EVENT_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// Persists one replay-recorder mutation (`op`/`context`/`pop`/`reset`) to
+/// the DuckDB time-series log, keyed by the session's *connection* id so the
+/// record survives reconnects (fresh session UUIDs) and app restarts.
+///
+/// Ordering metadata (`ts_micros` + [`REPLAY_EVENT_SEQ`]) is captured
+/// synchronously HERE, in user-input order; only the DB insert runs on a
+/// spawned task — so writes may land out of order without corrupting the
+/// fold. Without the `analytics` feature the handle is a no-op stub and
+/// recovery falls back to the bincode snapshot's `replay_ops`.
+fn persist_replay_event(app: &AppState, session_id: &str, event: &'static str, op: Option<String>) {
+    let Some(connection_id) = app.session_configs.get(session_id).map(|c| c.id.clone()) else {
+        return;
+    };
+    let ts_micros = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_micros() as i64)
+        .unwrap_or(0);
+    let seq = REPLAY_EVENT_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let analytics = app.analytics.clone();
+    spawn(async move {
+        if let Err(e) =
+            analytics.record_replay_event(&connection_id, ts_micros, seq, event, op.as_deref())
+        {
+            tracing::warn!("[REPLAY] failed to persist replay event: {e}");
+        }
+    });
+}
+
 #[cfg(test)]
 mod session_replay_engine_tests {
     use super::*;
@@ -14004,6 +14853,64 @@ async fn wait_for_output_quiescence(state: Signal<AppState>, session_id: &str) -
     true
 }
 
+/// Waits until the session's terminal produces ANY output after `baseline`
+/// (the tab `version` captured right after an op was sent). Returns `false`
+/// on timeout ([`REPLAY_OP_TIMEOUT_SECS`]) or when the tab disappeared.
+///
+/// This is the first half of echo-driven replay pacing. Quiescence alone is
+/// not enough: right after an op is sent the terminal is *already* quiet
+/// (the previous menu finished printing), so a quiescence-only wait fires
+/// immediately and the next op reaches the remote before it even echoed the
+/// previous one — the ops then get consumed out of order by the bastion.
+/// Requiring "the remote responded" *before* "the remote went quiet again"
+/// paces the replay exactly like a human: type, watch the menu react, type
+/// the next selection.
+async fn wait_for_output_response(
+    state: Signal<AppState>,
+    session_id: &str,
+    baseline: u64,
+) -> bool {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(REPLAY_OP_TIMEOUT_SECS);
+    loop {
+        let version = state
+            .read()
+            .sessions
+            .iter()
+            .find(|t| t.id == session_id)
+            .map(|t| t.version);
+        match version {
+            None => return false,
+            Some(version) if version != baseline => return true,
+            Some(_) => {}
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(REPLAY_POLL_MS)).await;
+    }
+}
+
+/// Prints the "replay paused at a credential prompt" notice into the
+/// session's terminal (same terminal-notice pattern as the reconnect
+/// prompt). Secrets are never recorded, so when a replayed op lands on a
+/// password/token prompt the automatic flow stops and the user takes over.
+fn notify_replay_paused_for_credentials(mut state: Signal<AppState>, tab_id: &str) {
+    let msg = format!(
+        "\r\n{}\r\n",
+        crate::i18n::t("session.replay_paused_credential")
+    );
+    let terminals = state.read().terminals.clone();
+    if let Some(handle) = terminals.get(tab_id) {
+        let render_result = handle.lock().process_and_render(msg.as_bytes());
+        let mut s = state.write();
+        if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == tab_id) {
+            tab.render_output = render_result;
+            tab.version += 1;
+        }
+    }
+}
+
 /// Replays the recorded establishment ops into a session once its reconnect
 /// (or startup restore) reaches `Connected`. Pacing is output-driven: each op
 /// is sent only after the remote has been quiet for a while (banner/menu
@@ -14095,12 +15002,29 @@ fn schedule_replay_after_reconnect(
             }
         }
 
-        // 4. Send each op once the remote has gone quiet. The ops go through
-        // the raw input sender (not the command-submission dispatcher) so
-        // they are neither re-recorded nor enqueued for exit-code tracking —
-        // they are a replay of past input, not new commands.
+        // 4. Send each op once the remote has (a) responded to the previous
+        // op and (b) gone quiet again — echo-driven pacing. A quiescence-only
+        // wait fires immediately after a send (the terminal is already quiet
+        // then), which used to push ops out before the bastion had even
+        // echoed the previous one, so the menu consumed them out of order.
+        // The ops go through the raw input sender (not the
+        // command-submission dispatcher) so they are neither re-recorded nor
+        // enqueued for exit-code tracking — they are a replay of past input,
+        // not new commands.
         let total = safe_ops.len();
+        let mut version_after_send: Option<u64> = None;
         for (idx, op) in safe_ops.into_iter().enumerate() {
+            if let Some(baseline) = version_after_send {
+                if !wait_for_output_response(state, &tab_id, baseline).await {
+                    tracing::warn!(
+                        "[REPLAY] session {} remote never echoed op {}/{} — aborting replay",
+                        &tab_id[..tab_id.len().min(8)],
+                        idx,
+                        total
+                    );
+                    return;
+                }
+            }
             if !wait_for_output_quiescence(state, &tab_id).await {
                 tracing::warn!(
                     "[REPLAY] session {} output never went quiet before op {}/{} — aborting replay",
@@ -14121,6 +15045,28 @@ fn schedule_replay_after_reconnect(
                 );
                 return;
             }
+            // Credential guard: if the remote is showing a password/token
+            // prompt (e.g. a replayed `sudo -i` is asking for the password),
+            // STOP — secrets are never recorded, so the remaining ops would
+            // be typed into the credential prompt. Tell the user to take
+            // over; OneKey / manual entry owns that step.
+            let current_line = {
+                let terminals = state.read().terminals.clone();
+                terminals
+                    .get(&tab_id)
+                    .map(|handle| handle.lock().terminal.extract_current_line())
+                    .unwrap_or_default()
+            };
+            if credential_kind(&current_line).is_some() {
+                tracing::info!(
+                    "[REPLAY] session {} hit a credential prompt before op {}/{} — pausing replay for manual input",
+                    &tab_id[..tab_id.len().min(8)],
+                    idx + 1,
+                    total
+                );
+                notify_replay_paused_for_credentials(state, &tab_id);
+                return;
+            }
             let sender = input_senders.read().get(&tab_id).cloned();
             let Some(sender) = sender else {
                 tracing::warn!(
@@ -14129,6 +15075,14 @@ fn schedule_replay_after_reconnect(
                 );
                 return;
             };
+            // Capture the version BEFORE the send: any change after this
+            // point is remote output (the echo/response to this op).
+            version_after_send = state
+                .read()
+                .sessions
+                .iter()
+                .find(|t| t.id == tab_id)
+                .map(|t| t.version);
             if sender.send(format!("{op}\r").into_bytes()).is_err() {
                 tracing::warn!(
                     "[REPLAY] session {} input channel closed — aborting replay",
@@ -14137,10 +15091,11 @@ fn schedule_replay_after_reconnect(
                 return;
             }
             tracing::info!(
-                "[REPLAY] session {} sent op {}/{}",
+                "[REPLAY] session {} sent op {}/{}: {:?}",
                 &tab_id[..tab_id.len().min(8)],
                 idx + 1,
-                total
+                total,
+                op
             );
         }
         tracing::info!(
@@ -14151,9 +15106,20 @@ fn schedule_replay_after_reconnect(
 
         // 5. Optional follow-up: restore the working directory on the shell
         // the replay landed on. Only meaningful when the snapshot carried a
-        // cwd (integrated target shell); quiescence keeps the `cd` from
-        // interleaving with the target host's login banner.
+        // cwd (integrated target shell); echo-then-quiescence keeps the `cd`
+        // from interleaving with the target host's login banner, and the
+        // credential guard keeps it out of a password prompt (e.g. a
+        // replayed `sudo -i` asking for the password).
         if let Some(cwd) = follow_up_cwd {
+            if let Some(baseline) = version_after_send {
+                if !wait_for_output_response(state, &tab_id, baseline).await {
+                    tracing::warn!(
+                        "[REPLAY] session {} remote never echoed the last op — skipping follow-up cd",
+                        &tab_id[..tab_id.len().min(8)]
+                    );
+                    return;
+                }
+            }
             if !wait_for_output_quiescence(state, &tab_id).await {
                 tracing::warn!(
                     "[REPLAY] session {} output never went quiet — skipping follow-up cd",
@@ -14164,6 +15130,21 @@ fn schedule_replay_after_reconnect(
             if state.read().session_connection_states.get(&tab_id)
                 != Some(&SessionConnectionState::Connected)
             {
+                return;
+            }
+            let current_line = {
+                let terminals = state.read().terminals.clone();
+                terminals
+                    .get(&tab_id)
+                    .map(|handle| handle.lock().terminal.extract_current_line())
+                    .unwrap_or_default()
+            };
+            if credential_kind(&current_line).is_some() {
+                tracing::info!(
+                    "[REPLAY] session {} hit a credential prompt — skipping follow-up cd",
+                    &tab_id[..tab_id.len().min(8)]
+                );
+                notify_replay_paused_for_credentials(state, &tab_id);
                 return;
             }
             let sender = input_senders.read().get(&tab_id).cloned();
@@ -15454,7 +16435,56 @@ pub fn App() -> Element {
                                 } else {
                                     tracing::debug!("No logged-in session state found for startup restore");
                                 }
+                                let analytics_for_habits = s.analytics.clone();
                                 drop(s);
+                                // Warm the OneKey habit cache from the local
+                                // DuckDB store so habit-based auto-submit
+                                // works from the first prompt after startup.
+                                // No-op without the `analytics` feature (the
+                                // stub returns an empty list); errors are
+                                // fail-soft (the chooser popup still works).
+                                spawn(async move {
+                                    let records = match analytics_for_habits
+                                        .recent_onekey_usage(ONEKEY_HABIT_LOAD_LIMIT)
+                                    {
+                                        Ok(records) => records,
+                                        Err(error) => {
+                                            tracing::debug!(
+                                                "[ONEKEY-HABIT] habit warm-load skipped: {error}"
+                                            );
+                                            return;
+                                        }
+                                    };
+                                    if records.is_empty() {
+                                        return;
+                                    }
+                                    let mut s = state.write();
+                                    let mut seeded = 0usize;
+                                    for record in records {
+                                        let Some(kind) =
+                                            OneKeyBehaviorKind::parse(&record.action)
+                                        else {
+                                            continue;
+                                        };
+                                        seed_onekey_habit_event(
+                                            &mut s,
+                                            OneKeyBehaviorEvent {
+                                                connection_id: record.connection_id,
+                                                prompt_fingerprint: record.prompt_fingerprint,
+                                                onekey_id: record.onekey_id,
+                                                step_id: record.step_id,
+                                                kind,
+                                                candidates_hash: record.candidates_hash,
+                                            },
+                                        );
+                                        seeded += 1;
+                                    }
+                                    tracing::info!(
+                                        "[ONEKEY-HABIT] warmed habit cache: {} events across {} prompts",
+                                        seeded,
+                                        s.onekey_habit_events.len()
+                                    );
+                                });
                             }
                             Err(e) => {
                                 let msg = if e.to_string().contains("Invalid") {
@@ -17462,6 +18492,7 @@ mod onekey_tests {
                 visible: true,
                 connection_id: None,
                 prompt_fingerprint: None,
+                habit_fingerprint: None,
                 is_sudo_password: false,
                 matches: vec![OneKeyMatch {
                     onekey_id: "saved-account-id".to_string(),

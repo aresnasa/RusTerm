@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use crate::openai::OpenAIClient;
 use crate::anthropic::AnthropicClient;
+use crate::openai::OpenAIClient;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub enum AiProvider {
@@ -153,7 +153,9 @@ mod tests {
         let engine = SuggestionEngine::new();
         // No providers configured, should return empty
         let rt = tokio::runtime::Runtime::new().unwrap();
-        let result = rt.block_on(engine.suggest("ctx", "ls", AiProvider::OpenAI)).unwrap();
+        let result = rt
+            .block_on(engine.suggest("ctx", "ls", AiProvider::OpenAI))
+            .unwrap();
         assert!(result.is_empty());
     }
 

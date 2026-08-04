@@ -1,5 +1,5 @@
-pub mod manager;
 pub mod host;
+pub mod manager;
 
-pub use manager::PluginManager;
 pub use host::PluginHost;
+pub use manager::PluginManager;

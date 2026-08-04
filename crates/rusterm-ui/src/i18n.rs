@@ -693,6 +693,10 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
             "Skipped {count} potentially dangerous operation(s) during replay",
             "回放时已跳过 {count} 条潜在危险操作",
         ),
+        "session.replay_paused_credential" => (
+            "Replay paused: the remote is asking for credentials — please enter them manually to continue",
+            "回放已暂停：远程正在请求凭据，请手动输入密码后继续",
+        ),
         "session.shell_failed" => ("Failed to start shell: {error}", "启动 shell 失败：{error}"),
         "session.starting_shell" => ("Starting local shell…", "正在启动本地终端…"),
         // Tab-bar context-menu actions (Task: disconnect/reconnect/copy session).

@@ -18,6 +18,22 @@ pub struct LearnedCorrection {
     pub observations: u64,
 }
 
+/// One OneKey behavior event as stored in (and loaded from) the local DuckDB.
+/// Identifiers and SHA-256 fingerprints only — credential values, OneKey
+/// display names, and raw prompt text never appear here. Shared by both the
+/// enabled and disabled `AnalyticsHandle` implementations so app code can use
+/// it without `#[cfg]` guards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OneKeyUsageRecord {
+    pub connection_id: String,
+    pub prompt_fingerprint: String,
+    pub onekey_id: String,
+    pub step_id: String,
+    /// One of `manual_select`, `auto_submit`, `rejected`, `popup_shown`.
+    pub action: String,
+    pub candidates_hash: String,
+}
+
 /// Whether the user has opted in to local usage-habit collection. Encapsulates
 /// the gating policy so call sites stay clean. This is the in-memory mirror of
 /// `PersistedConfig::collect_usage_habits`.
@@ -133,6 +149,48 @@ pub mod enabled {
             Ok(())
         }
 
+        /// Persist one OneKey behavior event (metadata only — see
+        /// [`super::OneKeyUsageRecord`]). Powers habit-based OneKey switching
+        /// across app restarts.
+        pub fn record_onekey_usage(&self, record: &super::OneKeyUsageRecord) -> Result<()> {
+            self.ensure_open()?;
+            let guard = self.inner.lock();
+            if let Some(db) = guard.as_ref() {
+                db.record_onekey_event(&rusterm_analytics::OneKeyUsageEvent {
+                    connection_id: record.connection_id.clone(),
+                    prompt_fingerprint: record.prompt_fingerprint.clone(),
+                    onekey_id: record.onekey_id.clone(),
+                    step_id: record.step_id.clone(),
+                    action: record.action.clone(),
+                    candidates_hash: record.candidates_hash.clone(),
+                    created_at: String::new(),
+                })?;
+            }
+            Ok(())
+        }
+
+        /// The newest `limit` OneKey behavior events across all connections,
+        /// oldest-first. Used at unlock to warm the in-memory habit cache.
+        pub fn recent_onekey_usage(&self, limit: u32) -> Result<Vec<super::OneKeyUsageRecord>> {
+            self.ensure_open()?;
+            let guard = self.inner.lock();
+            let events = guard
+                .as_ref()
+                .context("analytics db not open")?
+                .recent_onekey_events(limit)?;
+            Ok(events
+                .into_iter()
+                .map(|event| super::OneKeyUsageRecord {
+                    connection_id: event.connection_id,
+                    prompt_fingerprint: event.prompt_fingerprint,
+                    onekey_id: event.onekey_id,
+                    step_id: event.step_id,
+                    action: event.action,
+                    candidates_hash: event.candidates_hash,
+                })
+                .collect())
+        }
+
         pub fn command_corrections_for(&self, typo: &str) -> Result<Vec<LearnedCorrection>> {
             self.ensure_open()?;
             let guard = self.inner.lock();
@@ -243,6 +301,40 @@ pub mod enabled {
                 .context("analytics db not open")?
                 .behavior_summary()
         }
+
+        /// Append one session-recovery replay event to the DuckDB time-series
+        /// log. `ts_micros`/`seq` are captured synchronously at input time by
+        /// the caller — they define the fold order, so this call is safe to
+        /// run on a spawned task that lands out of order.
+        pub fn record_replay_event(
+            &self,
+            connection_id: &str,
+            ts_micros: i64,
+            seq: u64,
+            event: &str,
+            op: Option<&str>,
+        ) -> Result<()> {
+            self.ensure_open()?;
+            let guard = self.inner.lock();
+            guard
+                .as_ref()
+                .context("analytics db not open")?
+                .record_replay_event(connection_id, ts_micros, seq, event, op)
+        }
+
+        /// The connection's current replayable establishment ops (its replay
+        /// events folded in submission order). Preferred over the bincode
+        /// snapshot's `replay_ops` at restore time: each event row is written
+        /// as the input happens, so the fold can't lose ops to the snapshot's
+        /// save debounce.
+        pub fn latest_replay_ops(&self, connection_id: &str) -> Result<Vec<String>> {
+            self.ensure_open()?;
+            let guard = self.inner.lock();
+            guard
+                .as_ref()
+                .context("analytics db not open")?
+                .latest_replay_ops(connection_id)
+        }
     }
 
     impl AnalyticsHandle {
@@ -345,6 +437,25 @@ pub mod disabled {
             Ok(Vec::new())
         }
 
+        /// Feature-off stub: OneKey behavior events are not persisted. The
+        /// in-memory habit cache still works within a single app run, so
+        /// habit-based OneKey switching degrades gracefully (it just doesn't
+        /// survive restarts).
+        pub fn record_onekey_usage(
+            &self,
+            _record: &super::OneKeyUsageRecord,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        /// Feature-off stub: no persisted OneKey behavior history.
+        pub fn recent_onekey_usage(
+            &self,
+            _limit: u32,
+        ) -> anyhow::Result<Vec<super::OneKeyUsageRecord>> {
+            Ok(Vec::new())
+        }
+
         /// Feature-off stub: DuckDB is not compiled in, so there are no
         /// frequency rankings. Returns an empty vec so call sites (Send
         /// panel completion, terminal suggestion pipeline) work without
@@ -370,6 +481,27 @@ pub mod disabled {
         /// Feature-off stub: no embeddings to backfill.
         pub fn backfill_embeddings(&self) -> anyhow::Result<u64> {
             Ok(0)
+        }
+
+        /// Feature-off stub: replay events are not persisted — session
+        /// recovery falls back to the bincode snapshot's `replay_ops`, which
+        /// still replays the last recorded establishment sequence (it can
+        /// just lose the final ops to the snapshot save debounce).
+        pub fn record_replay_event(
+            &self,
+            _connection_id: &str,
+            _ts_micros: i64,
+            _seq: u64,
+            _event: &str,
+            _op: Option<&str>,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        /// Feature-off stub: no persisted replay-event log. Empty means the
+        /// restore path uses the snapshot's `replay_ops` instead.
+        pub fn latest_replay_ops(&self, _connection_id: &str) -> anyhow::Result<Vec<String>> {
+            Ok(Vec::new())
         }
     }
 

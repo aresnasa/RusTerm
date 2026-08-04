@@ -541,9 +541,11 @@ mod tests {
         let enc = crate::frame::encode_hex_header(&frame);
         s.feed(&enc);
         let events = s.take_events();
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, SessionEvent::ReceiveOffered)));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::ReceiveOffered))
+        );
         // The session should have emitted a ZRINIT back to the PTY.
         let pty = s.take_pty_output();
         assert!(pty.starts_with(&[ZPAD, ZPAD, ZDLE, ZHEX]));
@@ -562,9 +564,11 @@ mod tests {
         let enc = crate::frame::encode_hex_header(&frame);
         s.feed(&enc);
         let events = s.take_events();
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, SessionEvent::SendOffered { .. })));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::SendOffered { .. }))
+        );
         assert_eq!(s.direction(), Direction::Send);
     }
 
@@ -669,9 +673,11 @@ mod tests {
         };
         s.feed(&crate::frame::encode_hex_header(&zrqinit));
         let events = s.take_events();
-        assert!(events
-            .iter()
-            .any(|e| matches!(e, SessionEvent::ReceiveOffered)));
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, SessionEvent::ReceiveOffered))
+        );
         // Session should have emitted ZRINIT.
         assert!(!s.take_pty_output().is_empty());
 

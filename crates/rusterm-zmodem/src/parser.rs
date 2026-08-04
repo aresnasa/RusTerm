@@ -10,7 +10,7 @@
 
 use crate::crc::{crc16_init, crc32_init};
 use crate::frame::{
-    zdle_decode, zdle_decode_n, CrcMode, DataEnd, FrameType, HeaderFrame, ZmodemFrame,
+    CrcMode, DataEnd, FrameType, HeaderFrame, ZmodemFrame, zdle_decode, zdle_decode_n,
 };
 use crate::{ZBIN, ZBIN32, ZDLE, ZHEX, ZPAD};
 
@@ -379,8 +379,8 @@ impl Detector {
             return None; // need at least one more byte after CR
         }
         let mut consumed = cr_idx + 1; // hex + CR
-                                       // lrzsz terminates hex headers with CR LF, but some implementations
-                                       // send CR 0x8A (high-bit LF variant) or CR 0x80. Accept all.
+        // lrzsz terminates hex headers with CR LF, but some implementations
+        // send CR 0x8A (high-bit LF variant) or CR 0x80. Accept all.
         let next = buf[consumed];
         if next == b'\n' || next == 0x80 || next == 0x8A {
             consumed += 1;
@@ -543,7 +543,7 @@ const _: [u8; 3] = BIN32_LEADER;
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::frame::{encode_bin32_header, encode_bin_header, encode_hex_header, DataEnd};
+    use crate::frame::{DataEnd, encode_bin_header, encode_bin32_header, encode_hex_header};
 
     fn make_header(ft: FrameType, data: [u8; 4]) -> HeaderFrame {
         HeaderFrame {

@@ -1,5 +1,5 @@
-use argon2::{Argon2, Algorithm, Version, Params};
-use argon2::password_hash::{SaltString, PasswordHash, PasswordHasher, PasswordVerifier};
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
+use argon2::{Algorithm, Argon2, Params, Version};
 
 pub fn derive_key(password: &str, salt: &[u8]) -> anyhow::Result<[u8; 32]> {
     let params = Params::new(
@@ -11,8 +11,7 @@ pub fn derive_key(password: &str, salt: &[u8]) -> anyhow::Result<[u8; 32]> {
     .map_err(|e| anyhow::anyhow!("Params error: {}", e))?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, params);
 
-    let salt = SaltString::encode_b64(salt)
-        .map_err(|e| anyhow::anyhow!("Salt error: {}", e))?;
+    let salt = SaltString::encode_b64(salt).map_err(|e| anyhow::anyhow!("Salt error: {}", e))?;
 
     let hash = argon2
         .hash_password(password.as_bytes(), &salt)
@@ -29,8 +28,7 @@ pub fn derive_key(password: &str, salt: &[u8]) -> anyhow::Result<[u8; 32]> {
 }
 
 pub fn verify_password(password: &str, hash: &str) -> anyhow::Result<bool> {
-    let parsed = PasswordHash::new(hash)
-        .map_err(|e| anyhow::anyhow!("Parse error: {}", e))?;
+    let parsed = PasswordHash::new(hash).map_err(|e| anyhow::anyhow!("Parse error: {}", e))?;
     let argon2 = Argon2::new(Algorithm::Argon2id, Version::V0x13, Params::default());
     Ok(argon2.verify_password(password.as_bytes(), &parsed).is_ok())
 }
@@ -41,11 +39,17 @@ mod tests {
 
     fn make_salt() -> Vec<u8> {
         // SaltString::encode_b64 needs at least 8 bytes of valid data
-        vec![0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89]
+        vec![
+            0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89, 0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45,
+            0x67, 0x89,
+        ]
     }
 
     fn make_salt_2() -> Vec<u8> {
-        vec![0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE, 0xFF, 0x00]
+        vec![
+            0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD, 0xEE,
+            0xFF, 0x00,
+        ]
     }
 
     #[test]

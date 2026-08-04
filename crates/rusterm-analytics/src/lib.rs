@@ -136,6 +136,34 @@ pub struct CommandCorrection {
     pub last_seen: String,
 }
 
+/// One observed OneKey behavior event. This is metadata only: identifiers,
+/// a SHA-256 prompt fingerprint produced by the UI, and an action label.
+/// Credential values, OneKey display names, and raw prompt text are never
+/// stored here (mirrors the privacy contract of `OneKeyPreference` in
+/// settings.json).
+///
+/// `candidates_hash` is a digest of the sorted (onekey_id, step_id) pairs
+/// that matched the prompt when the event happened. Comparing it against the
+/// current match set detects "the user added/removed a OneKey affecting this
+/// prompt" — the one situation where the chooser popup must reappear even
+/// though a habit exists.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OneKeyUsageEvent {
+    pub connection_id: String,
+    /// SHA-256 of the normalized prompt (computed by the UI). Never raw text.
+    pub prompt_fingerprint: String,
+    /// Stable OneKey/step identifiers. Empty for events that don't target a
+    /// specific candidate (e.g. `popup_shown`).
+    pub onekey_id: String,
+    pub step_id: String,
+    /// One of `manual_select`, `auto_submit`, `rejected`, `popup_shown`.
+    pub action: String,
+    /// Digest of the sorted candidate identifiers at event time.
+    pub candidates_hash: String,
+    /// UTC timestamp (RFC3339).
+    pub created_at: String,
+}
+
 /// Aggregated (hour_of_day, count) row from `usage_patterns_by_time_of_day()`.
 /// `hour` is in [0, 23] UTC.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -337,6 +365,46 @@ impl AnalyticsDB {
                 command   VARCHAR PRIMARY KEY,
                 embedding VARCHAR NOT NULL
             );
+
+            -- OneKey behavior events: which saved credential entry the user
+            -- (or the auto-submit path) used for which prompt on which
+            -- connection, and whether the remote rejected it. Identifiers and
+            -- hashes only — credential values, display names, and raw prompt
+            -- text never reach this table. Powers habit-based OneKey
+            -- switching (auto-submit without a popup once a stable habit is
+            -- observed).
+            CREATE TABLE IF NOT EXISTS onekey_events (
+                connection_id      VARCHAR NOT NULL,
+                prompt_fingerprint VARCHAR NOT NULL,
+                onekey_id          VARCHAR NOT NULL,
+                step_id            VARCHAR NOT NULL,
+                action             VARCHAR NOT NULL,
+                candidates_hash    VARCHAR NOT NULL,
+                created_at         VARCHAR NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_onekey_events_scope
+                ON onekey_events(connection_id, prompt_fingerprint);
+
+            -- Session-recovery replay event log (time-series). One row per
+            -- replay-recorder mutation, in user-input order: 'op' /
+            -- 'context' append an input line, 'pop' removes the trailing
+            -- one (exit after sudo -i), 'reset' clears the log (bastion
+            -- menu reentry thawed the recorder). Ordering is
+            -- (ts_micros, seq): the timestamp is captured synchronously at
+            -- input time and seq is an in-process monotonic tiebreaker, so
+            -- a fold replays rows in exact submission order even though
+            -- the DB writes happen on spawned tasks that may land out of
+            -- order. Keyed by connection id (session ids are fresh UUIDs
+            -- on every reconnect, so they can't join across restarts).
+            CREATE TABLE IF NOT EXISTS replay_events (
+                connection_id VARCHAR NOT NULL,
+                ts_micros     BIGINT NOT NULL,
+                seq           BIGINT NOT NULL,
+                event         VARCHAR NOT NULL,
+                op            VARCHAR
+            );
+            CREATE INDEX IF NOT EXISTS idx_replay_events_conn
+                ON replay_events(connection_id, ts_micros, seq);
             ",
         )?;
         Ok(())
@@ -520,6 +588,117 @@ impl AnalyticsDB {
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    /// Append one OneKey behavior event. `created_at` is stamped here (UTC
+    /// RFC3339) when the caller leaves it empty, so callers only describe
+    /// *what* happened. Inputs are identifiers/hashes produced by the UI —
+    /// no sanitization pass is needed because no free-form user text enters
+    /// this table.
+    pub fn record_onekey_event(&self, event: &OneKeyUsageEvent) -> Result<()> {
+        let conn = self.conn.lock();
+        let created_at = if event.created_at.is_empty() {
+            Utc::now().to_rfc3339()
+        } else {
+            event.created_at.clone()
+        };
+        conn.execute(
+            "INSERT INTO onekey_events
+                (connection_id, prompt_fingerprint, onekey_id, step_id,
+                 action, candidates_hash, created_at)
+             VALUES (?, ?, ?, ?, ?, ?, ?)",
+            duckdb::params![
+                event.connection_id,
+                event.prompt_fingerprint,
+                event.onekey_id,
+                event.step_id,
+                event.action,
+                event.candidates_hash,
+                created_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// The most recent OneKey behavior events across all connections,
+    /// returned oldest-first so callers can replay them into an append-only
+    /// in-memory cache. `limit` caps the window (newest `limit` rows are
+    /// selected, then re-ordered ascending).
+    pub fn recent_onekey_events(&self, limit: u32) -> Result<Vec<OneKeyUsageEvent>> {
+        let conn = self.conn.lock();
+        let mut statement = conn.prepare(
+            "SELECT connection_id, prompt_fingerprint, onekey_id, step_id,
+                    action, candidates_hash, created_at
+             FROM (
+                 SELECT *, row_number() OVER (ORDER BY created_at DESC) AS rn
+                 FROM onekey_events
+             )
+             WHERE rn <= ?
+             ORDER BY created_at ASC",
+        )?;
+        let rows = statement
+            .query_map(duckdb::params![limit], |row| {
+                Ok(OneKeyUsageEvent {
+                    connection_id: row.get(0)?,
+                    prompt_fingerprint: row.get(1)?,
+                    onekey_id: row.get(2)?,
+                    step_id: row.get(3)?,
+                    action: row.get(4)?,
+                    candidates_hash: row.get(5)?,
+                    created_at: row.get(6)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    /// Append one session-recovery replay event (see the `replay_events`
+    /// schema comment for the event grammar). `ts_micros` and `seq` are
+    /// captured synchronously by the caller at input time — they define the
+    /// fold order, so this insert may safely run on a spawned task that
+    /// lands out of order. Free-form op text goes through the credential
+    /// sanitizer; secret-looking lines drop the whole event (defense in
+    /// depth — the UI already refuses to record credential-prompt input).
+    pub fn record_replay_event(
+        &self,
+        connection_id: &str,
+        ts_micros: i64,
+        seq: u64,
+        event: &str,
+        op: Option<&str>,
+    ) -> Result<()> {
+        let op = match op {
+            Some(raw) => match sanitize::sanitize_command(raw) {
+                Some(clean) => Some(clean),
+                // Secret-looking payload: dropping just the op would replay
+                // a hole in the sequence — drop the event entirely.
+                None => return Ok(()),
+            },
+            None => None,
+        };
+        let conn = self.conn.lock();
+        conn.execute(
+            "INSERT INTO replay_events (connection_id, ts_micros, seq, event, op)\n             VALUES (?, ?, ?, ?, ?)",
+            duckdb::params![connection_id, ts_micros, seq as i64, event, op],
+        )?;
+        Ok(())
+    }
+
+    /// The current replayable establishment ops for a connection: all its
+    /// replay events folded in (ts_micros, seq) order. This reproduces the
+    /// in-memory recorder's final state, surviving app restarts and the
+    /// snapshot debounce (each event row is written as the input happens).
+    pub fn latest_replay_ops(&self, connection_id: &str) -> Result<Vec<String>> {
+        let conn = self.conn.lock();
+        let mut statement = conn.prepare(
+            "SELECT event, op FROM replay_events\n             WHERE connection_id = ?\n             ORDER BY ts_micros ASC, seq ASC",
+        )?;
+        let rows = statement
+            .query_map(duckdb::params![connection_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(fold_replay_events(rows))
     }
 
     /// Total row count in the `commands` table. Used by tests and the
@@ -1063,9 +1242,34 @@ impl AnalyticsDB {
     /// analytics" UI action.
     pub fn clear(&self) -> Result<()> {
         let conn = self.conn.lock();
-        conn.execute_batch("DELETE FROM commands; DELETE FROM command_corrections; DELETE FROM command_embeddings;")?;
+        conn.execute_batch("DELETE FROM commands; DELETE FROM command_corrections; DELETE FROM command_embeddings; DELETE FROM onekey_events; DELETE FROM replay_events;")?;
         Ok(())
     }
+}
+
+/// Folds an ordered replay-event stream into the current replayable ops —
+/// the pure core of [`AnalyticsDB::latest_replay_ops`]. Event grammar:
+/// `op` / `context` push their op line, `pop` removes the trailing line
+/// (the user exited a `sudo -i`-style context), `reset` clears everything
+/// (bastion menu reentry re-records from scratch). Unknown event kinds are
+/// ignored so older binaries keep working against a newer log.
+pub fn fold_replay_events(events: Vec<(String, Option<String>)>) -> Vec<String> {
+    let mut ops = Vec::new();
+    for (event, op) in events {
+        match event.as_str() {
+            "op" | "context" => {
+                if let Some(op) = op {
+                    ops.push(op);
+                }
+            }
+            "pop" => {
+                ops.pop();
+            }
+            "reset" => ops.clear(),
+            _ => {}
+        }
+    }
+    ops
 }
 
 /// Convenience helper: parse an RFC3339 timestamp string into a `DateTime<Utc>`.
@@ -1500,6 +1704,195 @@ mod tests {
         db.clear().unwrap();
         assert_eq!(db.total_commands().unwrap(), 0);
         assert!(db.command_corrections_for("gti status").unwrap().is_empty());
+    }
+
+    // ── OneKey behavior-event tests ─────────────────────────────────
+
+    fn onekey_event(
+        onekey_id: &str,
+        action: &str,
+        candidates_hash: &str,
+        created_at: &str,
+    ) -> OneKeyUsageEvent {
+        OneKeyUsageEvent {
+            connection_id: "conn-1".to_string(),
+            prompt_fingerprint: "fp-1".to_string(),
+            onekey_id: onekey_id.to_string(),
+            step_id: format!("{onekey_id}-step"),
+            action: action.to_string(),
+            candidates_hash: candidates_hash.to_string(),
+            created_at: created_at.to_string(),
+        }
+    }
+
+    #[test]
+    fn onekey_events_roundtrip_oldest_first() {
+        let db = AnalyticsDB::open_in_memory().unwrap();
+        db.record_onekey_event(&onekey_event(
+            "ok-a",
+            "manual_select",
+            "hash-1",
+            "2026-08-01T10:00:00Z",
+        ))
+        .unwrap();
+        db.record_onekey_event(&onekey_event(
+            "ok-a",
+            "auto_submit",
+            "hash-1",
+            "2026-08-02T10:00:00Z",
+        ))
+        .unwrap();
+        db.record_onekey_event(&onekey_event(
+            "ok-b",
+            "rejected",
+            "hash-2",
+            "2026-08-03T10:00:00Z",
+        ))
+        .unwrap();
+
+        let events = db.recent_onekey_events(100).unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].action, "manual_select");
+        assert_eq!(events[1].action, "auto_submit");
+        assert_eq!(events[2].action, "rejected");
+        assert_eq!(events[2].onekey_id, "ok-b");
+        assert_eq!(events[2].candidates_hash, "hash-2");
+    }
+
+    #[test]
+    fn recent_onekey_events_limit_keeps_the_newest_rows() {
+        let db = AnalyticsDB::open_in_memory().unwrap();
+        for day in 1..=5 {
+            db.record_onekey_event(&onekey_event(
+                "ok-a",
+                "manual_select",
+                "hash-1",
+                &format!("2026-08-0{day}T10:00:00Z"),
+            ))
+            .unwrap();
+        }
+        let events = db.recent_onekey_events(2).unwrap();
+        assert_eq!(events.len(), 2);
+        // Newest two, still ordered oldest-first.
+        assert_eq!(events[0].created_at, "2026-08-04T10:00:00Z");
+        assert!(events[0].created_at < events[1].created_at);
+    }
+
+    #[test]
+    fn record_onekey_event_stamps_missing_created_at() {
+        let db = AnalyticsDB::open_in_memory().unwrap();
+        db.record_onekey_event(&onekey_event("ok-a", "popup_shown", "hash-1", ""))
+            .unwrap();
+        let events = db.recent_onekey_events(10).unwrap();
+        assert_eq!(events.len(), 1);
+        assert!(!events[0].created_at.is_empty());
+    }
+
+    #[test]
+    fn clear_wipes_onekey_events() {
+        let db = AnalyticsDB::open_in_memory().unwrap();
+        db.record_onekey_event(&onekey_event(
+            "ok-a",
+            "manual_select",
+            "hash-1",
+            "2026-08-01T10:00:00Z",
+        ))
+        .unwrap();
+        db.clear().unwrap();
+        assert!(db.recent_onekey_events(10).unwrap().is_empty());
+    }
+
+    // ── session-recovery replay-event tests ─────────────────────────
+
+    /// The full jumpserver + sudo round trip: menu ops and the context
+    /// command fold back in exact (ts, seq) submission order, and a `pop`
+    /// (exit after sudo -i) removes only the escalation.
+    #[test]
+    fn replay_events_fold_in_submission_order() {
+        let db = AnalyticsDB::open_in_memory().unwrap();
+        db.record_replay_event("conn-1", 1_000, 1, "op", Some("/q"))
+            .unwrap();
+        db.record_replay_event("conn-1", 2_000, 2, "op", Some("2"))
+            .unwrap();
+        db.record_replay_event("conn-1", 3_000, 3, "context", Some("sudo -i"))
+            .unwrap();
+        assert_eq!(
+            db.latest_replay_ops("conn-1").unwrap(),
+            vec!["/q", "2", "sudo -i"]
+        );
+        db.record_replay_event("conn-1", 4_000, 4, "pop", None)
+            .unwrap();
+        assert_eq!(db.latest_replay_ops("conn-1").unwrap(), vec!["/q", "2"]);
+        // Other connections are unaffected.
+        assert!(db.latest_replay_ops("conn-2").unwrap().is_empty());
+    }
+
+    /// Rows may be INSERTed out of order (spawned tasks) — the fold orders
+    /// by (ts_micros, seq), so the result is still the user's input order.
+    #[test]
+    fn replay_events_out_of_order_inserts_still_fold_by_timestamp() {
+        let db = AnalyticsDB::open_in_memory().unwrap();
+        db.record_replay_event("conn-1", 2_000, 2, "op", Some("11"))
+            .unwrap();
+        db.record_replay_event("conn-1", 1_000, 1, "op", Some("/cao"))
+            .unwrap();
+        db.record_replay_event("conn-1", 3_000, 3, "op", Some("2"))
+            .unwrap();
+        assert_eq!(
+            db.latest_replay_ops("conn-1").unwrap(),
+            vec!["/cao", "11", "2"]
+        );
+    }
+
+    /// A `reset` event (bastion menu reentry thawed the recorder) discards
+    /// everything before it — only the navigation recorded afterwards
+    /// replays, matching the in-memory "last selection wins" semantics.
+    #[test]
+    fn replay_events_reset_starts_a_fresh_recording() {
+        let db = AnalyticsDB::open_in_memory().unwrap();
+        db.record_replay_event("conn-1", 1_000, 1, "op", Some("/q"))
+            .unwrap();
+        db.record_replay_event("conn-1", 2_000, 2, "op", Some("2"))
+            .unwrap();
+        db.record_replay_event("conn-1", 3_000, 3, "reset", None)
+            .unwrap();
+        db.record_replay_event("conn-1", 4_000, 4, "op", Some("/w"))
+            .unwrap();
+        db.record_replay_event("conn-1", 5_000, 5, "op", Some("3"))
+            .unwrap();
+        assert_eq!(db.latest_replay_ops("conn-1").unwrap(), vec!["/w", "3"]);
+    }
+
+    /// Secret-looking op payloads drop the whole event (never a hole in the
+    /// sequence), unknown event kinds are ignored by the fold, and `clear`
+    /// wipes the table.
+    #[test]
+    fn replay_events_are_sanitized_and_clearable() {
+        let db = AnalyticsDB::open_in_memory().unwrap();
+        db.record_replay_event("conn-1", 1_000, 1, "op", Some("web-01"))
+            .unwrap();
+        // A PEM header is the sanitizer's canonical "secret" — dropped.
+        db.record_replay_event(
+            "conn-1",
+            2_000,
+            2,
+            "op",
+            Some("-----BEGIN RSA PRIVATE KEY-----"),
+        )
+        .unwrap();
+        assert_eq!(db.latest_replay_ops("conn-1").unwrap(), vec!["web-01"]);
+        assert_eq!(
+            fold_replay_events(vec![
+                ("op".to_string(), Some("a".to_string())),
+                ("future-kind".to_string(), Some("b".to_string())),
+                ("pop".to_string(), None),
+                // pop on empty is a no-op, not a panic.
+                ("pop".to_string(), None),
+            ]),
+            Vec::<String>::new()
+        );
+        db.clear().unwrap();
+        assert!(db.latest_replay_ops("conn-1").unwrap().is_empty());
     }
 
     // ── habit-memory / vector-storage tests ─────────────────────────────
