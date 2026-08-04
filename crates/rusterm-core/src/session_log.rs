@@ -198,29 +198,26 @@ impl SessionLog {
 
     /// Close the log: signal the background thread to drain pending entries,
     /// flush the file, and exit. Subsequent `log_*` calls are no-ops.
+    ///
+    /// This blocks until the background thread has flushed all pending
+    /// entries to disk. The drain is bounded by how much output was enqueued
+    /// before `close` (the channel is unbounded but only holds what the
+    /// session actually produced), so the wait is short in practice. `close`
+    /// is called on session teardown (not per-chunk), so a brief blocking wait
+    /// is acceptable and ensures no log entries are lost.
     pub fn close(&self) {
         // Take the sender out of the mutex so no further sends can succeed.
         let tx_taken = self.tx.lock().ok().and_then(|mut g| g.take());
         if let Some(tx) = tx_taken {
-            // `Close` is best-effort — if the thread already exited, the send
-            // errors and we just proceed to join.
-            let _ = tx.send(LogCommand::Close);
-            // Dropping `tx` here closes the channel for real, which lets the
-            // background thread's `rx.recv()` loop return `None` even if the
-            // `Close` command was somehow lost (e.g. the channel was full —
-            // it's unbounded, so this can't happen, but defense-in-depth).
+            // Dropping `tx` closes the channel, which lets the background
+            // thread's `rx.recv()` loop return `None` after it drains.
+            drop(tx);
         }
         // Join the thread so pending entries are flushed to disk before we
-        // return. A timeout guards against a stuck thread hanging `Drop`.
+        // return. The writer thread exits promptly once the channel closes.
         let handle_taken = self.handle.lock().ok().and_then(|mut g| g.take());
         if let Some(handle) = handle_taken {
-            // The thread should exit promptly once the channel closes; give it
-            // a bounded grace period rather than waiting forever.
-            let _ = thread::Builder::new()
-                .name("session-log-joiner".to_string())
-                .spawn(move || {
-                    let _ = handle.join();
-                });
+            let _ = handle.join();
         }
     }
 
