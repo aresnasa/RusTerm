@@ -528,7 +528,7 @@ pub fn ChatPanel(
             if *show_agent_config.peek() {
                 div {
                     style: "position:absolute;top:{CHAT_TITLE_HEIGHT}px;left:0;right:0;bottom:0;z-index:20;background:var(--skin-surface);overflow-y:auto;",
-                    { render_agent_config(state.clone(), active_agent.clone(), draft_name, draft_model, draft_base_url, draft_prompt, draft_api_key, on_save_chat.clone()) }
+                    { render_agent_config(state.clone(), active_agent.clone(), draft_name, draft_model, draft_base_url, draft_prompt, draft_api_key, show_agent_config, on_save_chat.clone()) }
                 }
             }
 
@@ -658,6 +658,7 @@ fn render_agent_config(
     mut draft_base_url: Signal<String>,
     mut draft_prompt: Signal<String>,
     mut draft_api_key: Signal<String>,
+    mut show_agent_config: Signal<bool>,
     on_save_chat: EventHandler<ChatSettings>,
 ) -> Element {
     let agent = match agent {
@@ -717,22 +718,31 @@ fn render_agent_config(
                 button {
                     style: "background:var(--skin-accent);color:var(--skin-bg);border:0;border-radius:4px;padding:4px 12px;font-size:11px;cursor:pointer;",
                     onclick: move |_| {
+                        // Saving must produce an immediate, visible change:
+                        // apply the draft, close the overlay (so the header
+                        // summary row showing the new values is revealed) and
+                        // surface a status message. Without this the click
+                        // felt like a no-op because the overlay covered the
+                        // status row at the bottom of the panel.
                         let mut s = state.write();
+                        let mut saved_name = String::new();
                         if let Some(a) = s.chat_settings.agents.iter_mut().find(|a| a.id == agent_id) {
                             a.name = draft_name();
                             a.model = draft_model();
                             a.base_url = draft_base_url();
                             a.system_prompt = draft_prompt();
+                            saved_name = a.name.clone();
                         }
-                        // API key held in memory only — stored on a parallel
-                        // map would be ideal, but for the v1 we stash it on
-                        // chat_status as a transient note so the user knows
-                        // it was captured. (TODO: real keychain integration.)
+                        let mut feedback = format!("{} · {}", crate::i18n::t("chat.saved"), saved_name);
+                        // API key held in memory only (TODO: keychain).
                         if !draft_api_key().is_empty() {
-                            s.chat_status = Some(format!("API key captured (in-memory, {} chars)", draft_api_key().len()));
+                            feedback.push_str(&format!(" ({})", crate::i18n::t("chat.api_key_in_memory")));
                         }
+                        s.chat_status = Some(feedback);
                         let updated = s.chat_settings.clone();
                         drop(s);
+                        show_agent_config.set(false);
+                        tracing::info!(target: "rusterm.chat", "agent config saved: {saved_name}");
                         on_save_chat.call(updated);
                     },
                     { crate::i18n::t("chat.save") }
