@@ -80,6 +80,13 @@ pub struct SessionLog {
     /// are flushed before the `SessionLog` is torn down.
     handle: Mutex<Option<JoinHandle<()>>>,
     session_id: String,
+    /// Path to the encrypted `.rusl` file on disk. Stored so the UI can
+    /// locate the file later for "copy full session" — without this, the
+    /// path is lost because `new()` builds it internally and only hands the
+    /// file handle to the background thread. The path is computed from the
+    /// session id + a timestamp at creation time, so it is stable for the
+    /// lifetime of the log.
+    path: PathBuf,
 }
 
 impl std::fmt::Debug for SessionLog {
@@ -87,6 +94,7 @@ impl std::fmt::Debug for SessionLog {
         f.debug_struct("SessionLog")
             .field("session_id", &self.session_id)
             .field("key", &"<redacted>")
+            .field("path", &self.path.display().to_string())
             .finish()
     }
 }
@@ -160,6 +168,7 @@ impl SessionLog {
             tx: Mutex::new(Some(tx)),
             handle: Mutex::new(Some(handle)),
             session_id: session_id.to_string(),
+            path,
         })
     }
 
@@ -221,6 +230,17 @@ impl SessionLog {
 
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// The on-disk path of the encrypted `.rusl` file. Exposed so the UI can
+    /// locate the file for "copy full interactive session" — the path is
+    /// otherwise unreachable because `new()` builds it internally and hands
+    /// the file handle to the background thread.
+    ///
+    /// Note: the file is appended to for the lifetime of the `SessionLog`;
+    /// the path is stable and never changes.
+    pub fn path(&self) -> &std::path::Path {
+        &self.path
     }
 
     /// Decrypt an entire session-log file (all records). Returns the parsed
@@ -287,6 +307,199 @@ impl SessionLog {
         }
         Ok(records)
     }
+}
+
+/// Convert a decrypted session-log record stream into a single human-readable
+/// text transcript suitable for clipboard copy. This is what powers the
+/// "copy full interactive session" feature — it preserves the chronological
+/// flow of prompts and user input that the rendered-terminal `render_all()`
+/// path loses (password prompts, vim buffers, anything scrolled off-screen).
+///
+/// The transform applied to each record's raw PTY bytes:
+///
+/// 1. **CSI / escape sequences stripped**: `\x1b[...X` (CSI), `\x1b]...\x07`
+///   (OSC), `\x1bP...\x1b\\` (DCS), single-char `\x1bX` controls. These are
+///   rendering instructions; keeping them would produce gibberish.
+/// 2. **Control characters normalized**: `\r` is dropped (carriage return
+///   before `\n` is redundant on Unix PTYs), `\n` is kept as the line
+///   separator, `\t` is preserved, other C0 controls below 0x20 are dropped.
+/// 3. **Backspace (`\x08`) handling**: applies a destructive backspace on
+///   the in-progress line buffer so the transcript reflects the final visible
+///   text rather than every keystroke of a corrected word.
+/// 4. **Direction markers**: by default `IN` records are prefixed with a faint
+///   `[in] ` marker so the user can see what they typed (e.g. at a password
+///   prompt) vs. what the host printed. `OUT` records are emitted verbatim
+///   (they already contain their own newlines from the remote side). Pass
+///   `DirectionMarker::None` to drop the markers for a clean transcript.
+///
+/// Bytes that are not valid UTF-8 are replaced with `U+FFFD` per the standard
+/// `String::from_utf8_lossy` semantics.
+///
+/// # Security
+///
+/// This function does NOT attempt to mask password input. The raw `IN` bytes
+/// are exactly what the user typed. If the caller is presenting this to the
+/// user via the clipboard and the user typed a password at an interactive
+/// prompt, that password will appear in the transcript. This matches user
+/// expectation for a "copy what I did" feature, but callers must NOT log the
+/// returned text or send it anywhere off-device.
+pub fn records_to_transcript(records: &[(String, String, Vec<u8>)]) -> String {
+    let mut out = String::with_capacity(records.len() * 64);
+    for (_ts, direction, data) in records {
+        let cleaned = strip_pty_control(data);
+        if cleaned.is_empty() {
+            continue;
+        }
+        if direction == "IN" {
+            // User input. Prefix with a marker so the reader can tell prompt
+            // output from typed input. Keep the trailing newline if any —
+            // shells echo the user's keystrokes back to OUT, so an `IN` entry
+            // is typically just the typed bytes without a newline (the
+            // terminal driver adds `\r` on Enter, which we strip).
+            out.push_str("[in] ");
+            out.push_str(&cleaned);
+            // If the user's input did not end with a newline, the following
+            // OUT record will continue on the same line — which is exactly
+            // what the user saw (the prompt output appeared after their
+            // input on the same line). Don't force a newline here.
+            if !cleaned.ends_with('\n') {
+                out.push('\n');
+            }
+        } else {
+            // Terminal output — emit verbatim. The remote side controls its
+            // own newlines.
+            out.push_str(&cleaned);
+        }
+    }
+    out
+}
+
+/// Strip ANSI/VT100 escape sequences and normalize control characters from a
+/// raw PTY byte stream, returning a readable `String`.
+///
+/// Handles:
+/// - CSI sequences: `ESC [ ... <final byte 0x40-0x7E>`
+/// - OSC sequences: `ESC ] ... (BEL | ESC \\)`
+/// - DCS sequences: `ESC P ... ESC \\`
+/// - Other escape sequences: `ESC <single char>`
+/// - Backspace (`\b`, 0x08): destructive on the in-progress line
+/// - Carriage return (`\r`, 0x0D): dropped (redundant before `\n` on Unix)
+/// - Other C0 controls (< 0x20): dropped, except `\n` (0x0A) and `\t` (0x09)
+///
+/// Bytes that don't form valid UTF-8 are handled lossily.
+pub fn strip_pty_control(data: &[u8]) -> String {
+    // We process byte-by-byte for the control-sequence state machine, then
+    // collect the surviving bytes into a UTF-8 string at the end. This avoids
+    // needing to track UTF-8 continuation boundaries inside escape sequences
+    // (which can't appear there anyway).
+    let mut out: Vec<u8> = Vec::with_capacity(data.len());
+    let mut i = 0;
+    while i < data.len() {
+        let b = data[i];
+        if b == 0x1b {
+            // Escape. Determine the kind of sequence and skip it.
+            i += 1;
+            if i >= data.len() {
+                break;
+            }
+            match data[i] {
+                // CSI: ESC [ ... <0x40-0x7E>
+                b'[' => {
+                    i += 1;
+                    let mut final_byte = 0u8;
+                    while i < data.len() {
+                        let c = data[i];
+                        i += 1;
+                        // Final byte is in range 0x40..=0x7E (params/intermediates are 0x20..=0x3F).
+                        if (0x40..=0x7E).contains(&c) {
+                            final_byte = c;
+                            break;
+                        }
+                    }
+                    // Full-screen TUIs (koko/jumpserver menus, htop, vim,
+                    // ...) redraw rows via absolute/relative cursor motion
+                    // plus screen clears, without emitting newlines. If we
+                    // silently drop those sequences, every positioned row
+                    // gets concatenated onto its neighbors and the menu
+                    // turns into one long unreadable blob. Treat vertical
+                    // cursor motion and display clears as line boundaries so
+                    // each redrawn row lands on its own transcript line.
+                    //
+                    //   H/f : CUP/HVP  — absolute row;col positioning
+                    //   A/B : CUU/CUD  — up/down relative motion
+                    //   E/F : CNL/CPL  — next/previous line
+                    //   J   : ED       — erase display (frame boundary)
+                    //
+                    // Horizontal-only motion (C/D/G/`) and line-local erase
+                    // (K) keep the current line intact. Collapse runs of
+                    // boundaries to a single '\n' (e.g. the common
+                    // `ESC[2J` `ESC[H` clear+home combo) and never emit a
+                    // leading newline for a clear/home at the very start.
+                    if matches!(final_byte, b'H' | b'f' | b'A' | b'B' | b'E' | b'F' | b'J')
+                        && out.last().is_some_and(|&c| c != b'\n')
+                    {
+                        out.push(b'\n');
+                    }
+                }
+                // OSC: ESC ] ... (BEL \x07 | ST = ESC \\)
+                b']' => {
+                    i += 1;
+                    while i < data.len() {
+                        if data[i] == 0x07 {
+                            i += 1;
+                            break;
+                        }
+                        if data[i] == 0x1b && i + 1 < data.len() && data[i + 1] == b'\\' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                // DCS: ESC P ... ST (ESC \\)
+                b'P' => {
+                    i += 1;
+                    while i < data.len() {
+                        if data[i] == 0x1b && i + 1 < data.len() && data[i + 1] == b'\\' {
+                            i += 2;
+                            break;
+                        }
+                        i += 1;
+                    }
+                }
+                // All other ESC sequences: ESC <single char>. This covers
+                // ESC = / ESC > (keypad mode), ESC c (reset), ESC 7/8 (save
+                // cursor), ESC D/M/E (index/RI/NEL), etc.
+                _ => {
+                    i += 1;
+                }
+            }
+        } else if b == 0x08 {
+            // Backspace: destructive. Pop the last byte from the output if it
+            // isn't a newline (newlines are structural — don't eat them).
+            if out.last().is_some_and(|&c| c != b'\n') {
+                out.pop();
+            }
+            i += 1;
+        } else if b == 0x0d {
+            // Carriage return: drop. On Unix PTYs, `\r\n` is the usual
+            // sequence and the `\r` is redundant. A lone `\r` (cursor to
+            // column 0 without newline) is rare in interactive sessions and
+            // would only matter for progress spinners, which we don't want
+            // in a transcript anyway.
+            i += 1;
+        } else if b == 0x0a || b == 0x09 || b >= 0x20 {
+            // Newline, tab, or printable byte — keep.
+            out.push(b);
+            i += 1;
+        } else {
+            // Other C0 control character (< 0x20, not `\n`/`\t`/`\b`/`\r`):
+            // drop. This covers `\x00` (NUL), `\x07` (BEL), `\x0b` (VT),
+            // `\x0c` (FF), `\x0e`/`\x0f` (SO/SI), `\x1c`-`\x1f` (FS/GS/RS/US).
+            i += 1;
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 /// Background writer loop. Owns the file handle + the per-session AEAD key,
@@ -534,5 +747,338 @@ mod tests {
         // These must not panic / block.
         log.log_output(b"after close");
         log.log_input(b"after close");
+    }
+
+    // ── transcript / strip_pty_control tests ──────────────────────────────
+
+    #[test]
+    fn strip_pty_control_strips_csi_sequences() {
+        // SGR "set color to red"
+        let input = b"\x1b[31mhello\x1b[0m world";
+        assert_eq!(strip_pty_control(input), "hello world");
+    }
+
+    #[test]
+    fn strip_pty_control_strips_csi_cursor_moves() {
+        // CUU (cursor up 1) + CUF (cursor forward 3)
+        let input = b"line1\n\x1b[1A\x1b[3Coverwrite";
+        assert_eq!(strip_pty_control(input), "line1\noverwrite");
+    }
+
+    #[test]
+    fn strip_pty_control_strips_osc_sequences_bel_terminated() {
+        // OSC 0 ; title BEL
+        let input = b"\x1b]0;my window title\x07prompt$ ";
+        assert_eq!(strip_pty_control(input), "prompt$ ");
+    }
+
+    #[test]
+    fn strip_pty_control_strips_osc_sequences_st_terminated() {
+        // OSC 2 ; title ST (ESC \\)
+        let input = b"\x1b]2;my title\x1b\\prompt$ ";
+        assert_eq!(strip_pty_control(input), "prompt$ ");
+    }
+
+    #[test]
+    fn strip_pty_control_strips_dcs_sequences() {
+        // DCS sixel-ish payload ST-terminated
+        let input = b"\x1bPq...binary...\x1b\\done";
+        assert_eq!(strip_pty_control(input), "done");
+    }
+
+    #[test]
+    fn strip_pty_control_strips_single_char_escapes() {
+        // ESC = (keypad application mode), ESC > (keypad numeric mode),
+        // ESC c (reset), ESC 7 (save cursor), ESC 8 (restore cursor)
+        let input = b"\x1b=\x1b>\x1bcstart\x1b7mid\x1b8end";
+        assert_eq!(strip_pty_control(input), "startmidend");
+    }
+
+    #[test]
+    fn strip_pty_control_handles_backspace_destructively() {
+        // User typed "helo" then BS twice then "llo" → "hello"
+        let input = b"helo\x08\x08llo";
+        assert_eq!(strip_pty_control(input), "hello");
+    }
+
+    #[test]
+    fn strip_pty_control_backspace_does_not_eat_newline() {
+        // BS at a line boundary must not consume the newline — it's structural.
+        let input = b"done\n\x08more";
+        assert_eq!(strip_pty_control(input), "done\nmore");
+    }
+
+    #[test]
+    fn strip_pty_control_drops_carriage_return() {
+        // The classic `\r\n` line ending on Unix PTYs
+        let input = b"line1\r\nline2\r\n";
+        assert_eq!(strip_pty_control(input), "line1\nline2\n");
+    }
+
+    #[test]
+    fn strip_pty_control_drops_other_c0_controls() {
+        // NUL, BEL, VT, FF, SO, SI between printable letters. The control
+        // bytes must all be dropped, the printable letters preserved.
+        let input = b"\x00a\x07b\x0bc\x0cd\x0ee\x0ff";
+        assert_eq!(strip_pty_control(input), "abcdef");
+    }
+
+    #[test]
+    fn strip_pty_control_preserves_tab_and_newline() {
+        let input = b"\tcol1\tcol2\n";
+        assert_eq!(strip_pty_control(input), "\tcol1\tcol2\n");
+    }
+
+    #[test]
+    fn strip_pty_control_preserves_utf8() {
+        let input = "héllo wörld 中文 🦀".as_bytes();
+        assert_eq!(strip_pty_control(input), "héllo wörld 中文 🦀");
+    }
+
+    #[test]
+    fn strip_pty_control_replaces_invalid_utf8() {
+        // 0xff is not valid UTF-8 in any position
+        let input = &[b'a', 0xff, b'b'];
+        let out = strip_pty_control(input);
+        assert_eq!(out, "a\u{FFFD}b");
+    }
+
+    #[test]
+    fn strip_pty_control_positioned_rows_each_on_own_line() {
+        // koko/jumpserver-style menu frame: rows painted via absolute cursor
+        // positioning (CUP) with no \r\n between them. Each row must land on
+        // its own transcript line instead of being concatenated into a blob.
+        let input = b"\x1b[1;36m  assets \x1b[0m\
+                      \x1b[3;1H26: k8s-node-a\
+                      \x1b[4;1H27: storage-b\
+                      \x1b[5;1H28: jump-c";
+        let out = strip_pty_control(input);
+        assert_eq!(out, "  assets \n26: k8s-node-a\n27: storage-b\n28: jump-c");
+    }
+
+    #[test]
+    fn strip_pty_control_clear_and_home_collapse_to_one_boundary() {
+        // The classic full-redraw prefix `ESC[2J` `ESC[H` must produce a
+        // single line boundary, not two. Also: a clear at the very start of
+        // the buffer must not produce a leading empty line.
+        let input = b"\x1b[2J\x1b[Hmenu row";
+        assert_eq!(strip_pty_control(input), "menu row");
+        // Between content chunks, the pair collapses to exactly one \n.
+        let input = b"prev\x1b[2J\x1b[Hnext";
+        assert_eq!(strip_pty_control(input), "prev\nnext");
+    }
+
+    #[test]
+    fn strip_pty_control_color_and_inline_sequences_add_no_boundaries() {
+        // SGR colors (final 'm'), horizontal cursor moves (C/D), erase-in-
+        // line (K) and mode sets (h/l) must NOT introduce line boundaries.
+        let input = b"\x1b[1;31mred \x1b[0mplain\x1b[2Cgap\x1b[Kend\x1b[?25l";
+        assert_eq!(strip_pty_control(input), "red plaingapend");
+    }
+
+    #[test]
+    fn records_to_transcript_interactive_tui_login_flow_is_readable() {
+        // Synthetic jumpserver session: ssh banner + login prompt, then the
+        // koko asset menu (TUI frame via cursor positioning), then the user
+        // types a selection, koko prints an error row and redraws. Every
+        // menu row and interaction must appear on its own line, in order.
+        let records = vec![
+            (
+                "t1".into(),
+                "OUT".into(),
+                b"Welcome to jumpserver\r\nlogin: ".to_vec(),
+            ),
+            ("t2".into(), "IN".into(), b"ops\r".to_vec()),
+            (
+                "t3".into(),
+                "OUT".into(),
+                b"ops\r\n\x1b[2J\x1b[H\x1b[1;36m  \xe8\xb5\x84\xe4\xba\xa7\xe5\x88\x86\xe7\xb1\xbb\xe5\x88\x97\xe8\xa1\xa8\x1b[0m\
+                  \x1b[3;1H26: engine-k8s-node\
+                  \x1b[4;1H27: storage-node"
+                    .to_vec(),
+            ),
+            ("t4".into(), "IN".into(), b"33\r".to_vec()),
+            (
+                "t5".into(),
+                "OUT".into(),
+                b"\x1b[2J\x1b[H\x1b[3;1Hinvalid input, choose asset class\
+                  \x1b[4;1H26: engine-k8s-node"
+                    .to_vec(),
+            ),
+        ];
+        let transcript = records_to_transcript(&records);
+        let lines: Vec<&str> = transcript.lines().collect();
+        // Login phase in order.
+        assert_eq!(lines[0], "Welcome to jumpserver");
+        assert_eq!(lines[1], "login: [in] ops");
+        assert_eq!(lines[2], "ops");
+        // Menu rows each on their own line.
+        assert!(transcript.contains("  资产分类列表"));
+        assert!(transcript.contains("\n26: engine-k8s-node"));
+        assert!(transcript.contains("\n27: storage-node"));
+        // The user's selection is visible as input.
+        assert!(transcript.contains("[in] 33"));
+        // The follow-up frame is separated, not pasted onto the old rows.
+        assert!(transcript.contains("\ninvalid input, choose asset class"));
+    }
+
+    #[test]
+    fn records_to_transcript_emits_in_and_out_in_order() {
+        let records = vec![
+            ("t1".into(), "OUT".into(), b"login: ".to_vec()),
+            ("t2".into(), "IN".into(), b"root\n".to_vec()),
+            ("t3".into(), "OUT".into(), b"Password: ".to_vec()),
+            ("t4".into(), "IN".into(), b"secret".to_vec()),
+            ("t5".into(), "OUT".into(), b"\r\n$ ".to_vec()),
+            ("t6".into(), "IN".into(), b"ls\n".to_vec()),
+            ("t7".into(), "OUT".into(), b"file1 file2\r\n$ ".to_vec()),
+        ];
+        let transcript = records_to_transcript(&records);
+        // Note the `\n\n` after `secret`: the IN record added a synthetic
+        // newline (input had none), then the OUT record opened with `\r\n`
+        // (the remote echoing back the Enter keystroke) whose `\r` is
+        // stripped, leaving a second `\n`. This is the authentic PTY flow —
+        // the user typed `secret<Enter>` and the host echoed the Enter.
+        assert_eq!(
+            transcript,
+            "login: [in] root\nPassword: [in] secret\n\n$ [in] ls\nfile1 file2\n$ "
+        );
+    }
+
+    #[test]
+    fn records_to_transcript_strips_ansi_from_output() {
+        // A colored prompt with SGR codes
+        let records = vec![
+            (
+                "t1".into(),
+                "OUT".into(),
+                b"\x1b[32mroot@host\x1b[0m:~$ \x1b[36m".to_vec(),
+            ),
+            ("t2".into(), "IN".into(), b"ls\n".to_vec()),
+            ("t3".into(), "OUT".into(), b"\x1b[0mfile1\n".to_vec()),
+        ];
+        let transcript = records_to_transcript(&records);
+        assert_eq!(transcript, "root@host:~$ [in] ls\nfile1\n");
+    }
+
+    #[test]
+    fn records_to_transcript_skips_empty_records() {
+        let records = vec![
+            ("t1".into(), "OUT".into(), b"".to_vec()),
+            ("t2".into(), "OUT".into(), b"\x1b[2J\x1b[H".to_vec()), // clear screen
+            ("t3".into(), "OUT".into(), b"hello\n".to_vec()),
+        ];
+        let transcript = records_to_transcript(&records);
+        assert_eq!(transcript, "hello\n");
+    }
+
+    /// The full "copy interactive session" path: write records via the
+    /// SessionLog background writer, close (flush), decrypt, and convert to
+    /// a transcript. Proves the entire pipeline works end-to-end.
+    #[test]
+    fn full_session_log_to_transcript_round_trip() {
+        let key = test_key();
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let nonce = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let session_id = format!("rusterm_test_transcript_{}_{}", std::process::id(), nonce);
+
+        // Clean up stale files with this prefix
+        let log_dir = dirs::data_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("rusterm")
+            .join("session_logs");
+        if let Ok(entries) = fs::read_dir(&log_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.file_name().and_then(|n| n.to_str()).is_some_and(|n| {
+                    n.starts_with("rusterm_test_transcript_") && n.ends_with(".rusl")
+                }) {
+                    let _ = fs::remove_file(&p);
+                }
+            }
+        }
+
+        let log = SessionLog::new(&session_id, key).unwrap();
+        // Simulate an interactive login: prompt, user input, output, command, output.
+        log.log_output(b"\x1b[?2004hlogin: ");
+        log.log_input(b"admin\n");
+        log.log_output(b"\r\nPassword: ");
+        log.log_input(b"hunter2");
+        log.log_output(b"\r\n$ ");
+        log.log_input(b"ls -la\n");
+        log.log_output(b"\x1b[0mtotal 0\r\ndrwxr-xr-x 2 admin admin 64 Jan 1 00:00 .\r\n$ ");
+        // The path() accessor is what powers the UI's ability to find the file.
+        let path = log.path().to_path_buf();
+        log.close();
+
+        let records = SessionLog::decrypt_file(&path, &key).expect("decrypt should succeed");
+        assert_eq!(records.len(), 7, "all 7 records must be present");
+
+        let transcript = records_to_transcript(&records);
+        // Verify the interactive flow is preserved: prompt → input → prompt → input → output.
+        assert!(
+            transcript.contains("login: [in] admin"),
+            "login prompt + input must appear"
+        );
+        assert!(
+            transcript.contains("Password: [in] hunter2"),
+            "password prompt + input must appear"
+        );
+        assert!(transcript.contains("total 0"), "ls output must appear");
+        assert!(
+            transcript.contains("drwxr-xr-x"),
+            "directory listing must appear"
+        );
+        // The SGR escape sequences must be stripped.
+        assert!(
+            !transcript.contains('\x1b'),
+            "no escape characters should survive"
+        );
+        // Bracketed paste mode sequence (ESC [ ? 2004 h) must be stripped.
+        assert!(
+            !transcript.contains("2004"),
+            "bracketed paste mode CSI must be stripped"
+        );
+
+        let _ = fs::remove_file(&path);
+    }
+
+    /// `path()` must return the on-disk location of the `.rusl` file so the
+    /// UI can find it for decryption without having to reconstruct the path
+    /// from session_id + timestamp (which would race the background writer).
+    #[test]
+    fn session_log_path_accessor_returns_actual_file() {
+        let key = test_key();
+        let session_id = format!("rusterm_test_path_{}", std::process::id());
+        let log_dir = dirs::data_dir()
+            .unwrap_or_else(|| PathBuf::from("."))
+            .join("rusterm")
+            .join("session_logs");
+        // Clean any stale file
+        if let Ok(entries) = fs::read_dir(&log_dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("rusterm_test_path_") && n.ends_with(".rusl"))
+                {
+                    let _ = fs::remove_file(&p);
+                }
+            }
+        }
+        let log = SessionLog::new(&session_id, key).unwrap();
+        let path = log.path().to_path_buf();
+        log.close();
+        assert!(path.exists(), "path() must point at a real file");
+        assert!(
+            path.to_string_lossy().ends_with(".rusl"),
+            "must be a .rusl file"
+        );
+        assert!(
+            path.to_string_lossy().contains(&session_id),
+            "filename must contain the session_id"
+        );
+        let _ = fs::remove_file(&path);
     }
 }

@@ -29,3 +29,12 @@ Thumbs.db
 # Keep it out of git.
 /sync.json
 crates/rusterm-sync/.env
+
+# E2B sandbox runner — local-only script with embedded endpoints / keys.
+# Also ignore its local-only runtime artifacts.
+upload_and_run.py
+test_s3.py
+test.txt
+wheels.tar.gz
+wheels/
+ceph_proxy.py

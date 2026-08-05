@@ -864,6 +864,50 @@ impl Terminal {
         }
     }
 
+    /// Render the **entire** scrollable session — every line in the
+    /// scrollback deque followed by every row of the current grid — as a
+    /// single `Vec<RenderRow>`. Used by the "copy full session" shortcut
+    /// (Cmd+A / Ctrl+Shift+A): the existing `render_with_scroll` is capped at
+    /// `visible_rows` (it only fills the on-screen viewport), so calling it
+    /// with `scroll_offset = scrollback_len()` returns only the topmost
+    /// `visible_rows` of history, NOT the whole session. This method builds
+    /// the complete history so the clipboard receives every line.
+    ///
+    /// When the alternate screen is active (vim / less / tmux), the primary
+    /// screen's scrollback is irrelevant to the user's current view, so only
+    /// the alt-screen grid is emitted — matching `render_with_scroll(0)` in
+    /// that state.
+    pub fn render_all(&self) -> Vec<RenderRow> {
+        let render_row = |row: &Row| RenderRow {
+            cells: row
+                .cells
+                .iter()
+                .map(|c| RenderCell {
+                    character: c.character,
+                    fg: self.resolve_render_color(c.fg, ansi::NamedColor::Foreground),
+                    bg: self.resolve_render_color(c.bg, ansi::NamedColor::Background),
+                    flags: c.flags,
+                    wide: c.wide,
+                    wide_next: c.wide_next,
+                })
+                .collect(),
+            wrapped: row.wrapped,
+        };
+
+        // On the alternate screen the scrollback belongs to the primary
+        // screen's prior session — emitting it would splice unrelated history
+        // above the alt-screen content the user is actually looking at.
+        if self.using_alt_screen {
+            return self.grid.iter().map(render_row).collect();
+        }
+
+        let total = self.scrollback.len() + self.grid.len();
+        let mut out: Vec<RenderRow> = Vec::with_capacity(total);
+        out.extend(self.scrollback.iter().map(render_row));
+        out.extend(self.grid.iter().map(render_row));
+        out
+    }
+
     pub fn scrollback_len(&self) -> usize {
         self.scrollback.len()
     }
@@ -2357,6 +2401,73 @@ mod tests {
         assert!(
             !text2.contains('b'),
             "bbb should be evicted after fff/ggg, got {text2:?}"
+        );
+    }
+
+    /// `render_all` must emit every retained line (scrollback + grid), not
+    /// just the `visible_rows` viewport. This is the regression guard for the
+    /// "copy full session" shortcut: the previous implementation called
+    /// `render_with_scroll(scrollback_len)`, which is capped at `visible_rows`
+    /// and so only copied the topmost visible window of history.
+    #[test]
+    fn render_all_emits_full_history_not_just_viewport() {
+        let mut term = Terminal::new(TerminalSize {
+            cols: 4,
+            rows: 2,
+            ..Default::default()
+        });
+        term.scrollback_capacity = 100;
+        let mut parser = vte::ansi::Processor::new();
+        // Push 5 lines through a 2-row grid. After processing AAAA..EEEE:
+        //   scrollback = [AAAA, BBBB, CCCC]  (3 lines scrolled off)
+        //   grid       = [DDDD, EEEE]        (cursor stopped on row 1, no trailing \n)
+        // So render_all must return 3 + 2 = 5 rows — the full history, not
+        // the 2-row viewport that render_with_scroll(scrollback_len) returns.
+        term.process(b"AAAA\r\nBBBB\r\nCCCC\r\nDDDD\r\nEEEE", &mut parser);
+        assert_eq!(term.scrollback_len(), 3);
+
+        let all_rows = term.render_all();
+        // 3 scrollback + 2 grid rows = 5 total — the full history, not the
+        // 2-row viewport that `render_with_scroll(scrollback_len)` would return.
+        assert_eq!(
+            all_rows.len(),
+            5,
+            "render_all must return scrollback + grid, not just the viewport"
+        );
+
+        // The lines must appear in chronological order: oldest first.
+        let text: Vec<String> = all_rows
+            .iter()
+            .map(|r| {
+                r.cells
+                    .iter()
+                    .filter(|c| !c.wide_next)
+                    .map(|c| c.character)
+                    .collect::<String>()
+                    .trim()
+                    .to_string()
+            })
+            .collect();
+        assert_eq!(
+            text,
+            vec![
+                "AAAA".to_string(),
+                "BBBB".to_string(),
+                "CCCC".to_string(),
+                "DDDD".to_string(),
+                "EEEE".to_string(),
+            ],
+            "render_all must preserve chronological order"
+        );
+
+        // Sanity-check the old bug is really gone: render_with_scroll with the
+        // full scrollback offset only returns the viewport (2 rows), proving
+        // why render_all is necessary for the copy-full-session feature.
+        let viewport_only = term.render_with_scroll(term.scrollback_len());
+        assert_eq!(
+            viewport_only.rows.len(),
+            2,
+            "render_with_scroll is capped at visible_rows — that's the bug render_all fixes"
         );
     }
 

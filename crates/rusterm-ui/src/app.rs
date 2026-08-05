@@ -2591,6 +2591,7 @@ fn render_terminal_pane(
             let sid_for_scroll_down = tab.id.clone();
             let sid_for_scroll_bottom = tab.id.clone();
             let sid_for_copy_all = tab.id.clone();
+            let sid_for_copy_session_log = tab.id.clone();
             let sid_for_sug_nav = tab.id.clone();
             let sid_for_history_completion = tab.id.clone();
             let sid_for_sug_accept = tab.id.clone();
@@ -3254,19 +3255,21 @@ fn render_terminal_pane(
                         }
                     },
                     on_copy_all: move |_: ()| {
-                        // Render the full scrollback + visible grid, extract all
-                        // text, and copy to clipboard. This gives the user the
-                        // entire session history, not just the visible viewport.
+                        // Copy the entire session (scrollback + visible grid) to
+                        // the clipboard. `render_with_scroll` is capped at
+                        // `visible_rows` (it only fills the on-screen viewport),
+                        // so we use `render_all` which emits every retained
+                        // line. This gives the user the whole session history,
+                        // not just the topmost visible window.
                         let terminals = state_for_cmd.read().terminals.clone();
                         if let Some(handle) = terminals.get(&sid_for_copy_all) {
                             let entry = handle.lock();
-                            let max_scroll = entry.terminal.scrollback_len();
-                            let full_render = entry.terminal.render_with_scroll(max_scroll);
-                            let last_row = full_render.rows.len();
+                            let all_rows = entry.terminal.render_all();
+                            let last_row = all_rows.len();
                             if last_row > 0 {
-                                let last_col = full_render.rows[last_row - 1].cells.len().saturating_sub(1);
+                                let last_col = all_rows[last_row - 1].cells.len().saturating_sub(1);
                                 let text = rusterm_core::terminal::extract_selection(
-                                    &full_render.rows,
+                                    &all_rows,
                                     (0, 0),
                                     (last_row - 1, last_col),
                                 );
@@ -3281,6 +3284,134 @@ fn render_terminal_pane(
                                         _ => {}
                                     }
                                 }
+                            }
+                        }
+                    },
+                    on_copy_session_log: move |_: ()| {
+                        // Copy the full interactive session log as a readable
+                        // transcript. Unlike `on_copy_all` (which copies the
+                        // rendered terminal state), this decrypts the session's
+                        // `.rusl` file and emits every PTY byte — prompts,
+                        // user input, output — including content that scrolled
+                        // off-screen or was overwritten by alt-screen apps.
+                        //
+                        // Requires the app to be unlocked (the per-session key
+                        // is derived from the master key) AND the session log
+                        // to have been created for this tab. If either is
+                        // missing, we fall back to `render_all()` so the user
+                        // still gets *something* on the clipboard rather than
+                        // a silent no-op.
+                        let s = state_for_cmd.read();
+                        let session_log = s.session_logs.get(&sid_for_copy_session_log).cloned();
+                        let config_manager = s.config_manager.clone();
+                        drop(s);
+
+                        let fallback = || {
+                            // Best-effort fallback: copy the rendered scrollback
+                            // so the shortcut is never a complete no-op.
+                            let terminals = state_for_cmd.read().terminals.clone();
+                            if let Some(handle) = terminals.get(&sid_for_copy_session_log) {
+                                let entry = handle.lock();
+                                let all_rows = entry.terminal.render_all();
+                                let last_row = all_rows.len();
+                                if last_row > 0 {
+                                    let last_col = all_rows[last_row - 1].cells.len().saturating_sub(1);
+                                    let text = rusterm_core::terminal::extract_selection(
+                                        &all_rows,
+                                        (0, 0),
+                                        (last_row - 1, last_col),
+                                    );
+                                    if !text.is_empty() {
+                                        if let crate::components::terminal_view::ClipboardCopyOutcome::Copied(n) =
+                                            crate::components::terminal_view::copy_text_to_clipboard(text)
+                                        {
+                                            tracing::info!(
+                                                "[COPY] CopySessionLog fell back to render_all ({n} chars) for session {:?}",
+                                                &sid_for_copy_session_log[..sid_for_copy_session_log.len().min(8)]
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        };
+
+                        // Need both the SessionLog (to get the file path) and
+                        // the ConfigManager (to re-derive the per-session key).
+                        let Some(log) = session_log else {
+                            tracing::info!(
+                                "[COPY] CopySessionLog: no session log for session {:?} (app locked or logging disabled) — falling back to render_all",
+                                &sid_for_copy_session_log[..sid_for_copy_session_log.len().min(8)]
+                            );
+                            fallback();
+                            return;
+                        };
+                        let Some(cm) = config_manager else {
+                            tracing::info!(
+                                "[COPY] CopySessionLog: no ConfigManager for session {:?} (app locked) — falling back to render_all",
+                                &sid_for_copy_session_log[..sid_for_copy_session_log.len().min(8)]
+                            );
+                            fallback();
+                            return;
+                        };
+
+                        // Re-derive the per-session key. The master key +
+                        // session id deterministically produce the same key that
+                        // was used to encrypt the log on write (see
+                        // `ConfigManager::derive_session_key`).
+                        let key = match cm.derive_session_key(&sid_for_copy_session_log) {
+                            Ok(k) => k,
+                            Err(e) => {
+                                tracing::error!(
+                                    "[COPY] CopySessionLog: failed to derive session key for {:?}: {e}",
+                                    &sid_for_copy_session_log[..sid_for_copy_session_log.len().min(8)]
+                                );
+                                fallback();
+                                return;
+                            }
+                        };
+
+                        // Get the file path from the live SessionLog. The path
+                        // is stable for the lifetime of the log (set at creation
+                        // in `SessionLog::new`); taking it under the lock is
+                        // cheap and doesn't touch the background writer.
+                        let path = log.lock().path().to_path_buf();
+
+                        // Decrypt + transcribe. This reads the whole file, so
+                        // it's O(log size) — typically a few hundred KB for an
+                        // interactive session. The decryption + ANSI stripping
+                        // is cheap (microseconds per record).
+                        match rusterm_core::session_log::SessionLog::decrypt_file(&path, &key) {
+                            Ok(records) => {
+                                let transcript = rusterm_core::session_log::records_to_transcript(&records);
+                                if transcript.is_empty() {
+                                    tracing::info!(
+                                        "[COPY] CopySessionLog: transcript empty for session {:?} — falling back to render_all",
+                                        &sid_for_copy_session_log[..sid_for_copy_session_log.len().min(8)]
+                                    );
+                                    fallback();
+                                    return;
+                                }
+                                match crate::components::terminal_view::copy_text_to_clipboard(transcript.clone()) {
+                                    crate::components::terminal_view::ClipboardCopyOutcome::Copied(n) => {
+                                        tracing::info!(
+                                            "[COPY] CopySessionLog copied {n} chars (full interactive transcript) for session {:?}",
+                                            &sid_for_copy_session_log[..sid_for_copy_session_log.len().min(8)]
+                                        );
+                                    }
+                                    _ => {
+                                        tracing::warn!(
+                                            "[COPY] CopySessionLog: clipboard write failed for session {:?}",
+                                            &sid_for_copy_session_log[..sid_for_copy_session_log.len().min(8)]
+                                        );
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                tracing::error!(
+                                    "[COPY] CopySessionLog: failed to decrypt session log for {:?}: {e} — falling back to render_all",
+                                    &sid_for_copy_session_log[..sid_for_copy_session_log.len().min(8)]
+                                );
+                                fallback();
                             }
                         }
                     },
@@ -13920,6 +14051,16 @@ fn create_terminal_with_size(id: String, size: TerminalSize, state: &mut Signal<
         .as_ref()
         .and_then(|cm| cm.derive_session_key(&id).ok());
     if let Some(key) = session_key {
+        // Keep an existing log for this tab: reconnect (and other flows that
+        // rebuild the terminal) call us again with the same session id, and
+        // replacing the entry here would orphan the original .rusl file —
+        // losing the login flow and making "copy full session" start from
+        // the reconnect point. The output pumps look the log up in the map
+        // on every chunk, so retaining the entry keeps appending to the same
+        // file across reconnects.
+        if state.read().session_logs.contains_key(&id) {
+            return;
+        }
         match SessionLog::new(&id, key) {
             Ok(log) => {
                 state

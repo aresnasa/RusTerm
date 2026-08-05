@@ -427,6 +427,13 @@ enum TerminalOverlayKeyAction {
     /// Cmd+A (macOS) or Ctrl+Shift+A (other platforms): select all visible
     /// terminal content and copy it to the clipboard.
     SelectAll,
+    /// Cmd+Shift+L (macOS) or Ctrl+Shift+L (other platforms): copy the full
+    /// encrypted session log (every PTY byte — prompts, user input, output)
+    /// to the clipboard as a readable transcript. Unlike `SelectAll`, which
+    /// only copies the rendered terminal state, this captures interactive
+    /// exchanges that scrolled off-screen or were overwritten by alt-screen
+    /// apps (vim, less, tmux).
+    CopySessionLog,
     OneKey(OneKeyKeyAction),
     None,
 }
@@ -456,6 +463,14 @@ fn terminal_overlay_key_action(
     let is_a = matches!(key, Key::Character(s) if s.eq_ignore_ascii_case("a"));
     if is_a && ((meta && !ctrl && !alt) || (ctrl && shift && !alt && !meta)) {
         return TerminalOverlayKeyAction::SelectAll;
+    }
+    // Cmd+Shift+L (macOS) or Ctrl+Shift+L (other platforms): copy the full
+    // interactive session log as a readable transcript. This captures PTY
+    // I/O that `SelectAll` misses (password prompts, scrolled-off lines,
+    // alt-screen apps). Requires the session log to be enabled (app unlocked).
+    let is_l = matches!(key, Key::Character(s) if s.eq_ignore_ascii_case("l"));
+    if is_l && ((meta && shift && !ctrl && !alt) || (ctrl && shift && !alt && !meta)) {
+        return TerminalOverlayKeyAction::CopySessionLog;
     }
     if onekey_visible && onekey_len > 0 {
         return TerminalOverlayKeyAction::OneKey(onekey_popup_key_action(
@@ -1484,6 +1499,14 @@ pub fn TerminalView(
     /// callback, SelectAll would only copy the visible rows, not the entire
     /// session history.
     on_copy_all: EventHandler<()>,
+    /// Copy the full encrypted session log (every PTY byte — prompts, user
+    /// input, output) as a readable transcript. Called by Cmd+Shift+L /
+    /// Ctrl+Shift+L. Unlike `on_copy_all`, this captures interactive
+    /// exchanges that scrolled off-screen or were overwritten by alt-screen
+    /// apps (vim, less, tmux). The handler in `app.rs` decrypts the current
+    /// session's `.rusl` file using the per-session key (derived from the
+    /// master key + session id) and copies the resulting transcript.
+    on_copy_session_log: EventHandler<()>,
     on_suggestion_navigate: EventHandler<Option<usize>>,
     on_suggestion_accept: EventHandler<String>,
     on_history_completion: EventHandler<()>,
@@ -1731,6 +1754,17 @@ pub fn TerminalView(
                 // callback. The handler in app.rs renders the full scrollback
                 // and copies all text to the clipboard.
                 on_copy_all.call(());
+                return;
+            }
+            TerminalOverlayKeyAction::CopySessionLog => {
+                e.prevent_default();
+                e.stop_propagation();
+                // Decrypt the current session's `.rusl` log file and copy the
+                // full interactive transcript (prompts + user input + output)
+                // to the clipboard. The handler in app.rs derives the per-session
+                // key from the master key + session id, locates the log file,
+                // and produces a readable transcript.
+                on_copy_session_log.call(());
                 return;
             }
         }
@@ -3929,6 +3963,37 @@ mod tests {
         // control sequence — move to line start).
         assert_eq!(
             terminal_overlay_key_action(&key, true, false, false, false, false, 0, 0, false),
+            TerminalOverlayKeyAction::None
+        );
+    }
+
+    #[test]
+    fn copy_session_log_shortcut_detected_on_cmd_shift_l_and_ctrl_shift_l() {
+        let key = Key::Character("l".into());
+        // Cmd+Shift+L (macOS)
+        assert_eq!(
+            terminal_overlay_key_action(&key, false, false, true, true, false, 0, 0, false),
+            TerminalOverlayKeyAction::CopySessionLog
+        );
+        // Ctrl+Shift+L (other platforms)
+        assert_eq!(
+            terminal_overlay_key_action(&key, true, false, false, true, false, 0, 0, false),
+            TerminalOverlayKeyAction::CopySessionLog
+        );
+        // Cmd+L without Shift should NOT trigger CopySessionLog (it's a
+        // terminal control sequence — clear screen / form feed on some shells).
+        assert_eq!(
+            terminal_overlay_key_action(&key, false, false, true, false, false, 0, 0, false),
+            TerminalOverlayKeyAction::None
+        );
+        // Ctrl+L without Shift should NOT trigger CopySessionLog either.
+        assert_eq!(
+            terminal_overlay_key_action(&key, true, false, false, false, false, 0, 0, false),
+            TerminalOverlayKeyAction::None
+        );
+        // Alt+Shift+L should NOT trigger it (must be Cmd/Ctrl).
+        assert_eq!(
+            terminal_overlay_key_action(&key, false, true, false, true, false, 0, 0, false),
             TerminalOverlayKeyAction::None
         );
     }
