@@ -2334,11 +2334,32 @@ fn run_keybinding_action(
             }
         }
         KeybindingAction::ToggleChat => {
-            let now_visible = !state.read().chat_visible;
-            state.write().chat_visible = now_visible;
+            let now_visible = toggle_chat_visibility(&mut state.write());
+            // Persist the mirrored `chat_settings.visible` so the panel state
+            // survives restarts (same path the panel's own close button uses).
+            let (settings, cm) = {
+                let s = state.read();
+                (s.chat_settings.clone(), s.config_manager.clone())
+            };
+            if let Some(cm) = cm {
+                if let Err(e) = cm.save_chat_settings(&settings) {
+                    tracing::error!("Failed to persist chat visibility: {e}");
+                }
+            }
             tracing::info!("[KEYBINDING] toggled agent chat: visible={now_visible}");
         }
     }
+}
+
+/// Toggle the agent chat panel (issue #122): flips the in-memory
+/// `chat_visible` flag and keeps the persisted mirror
+/// (`chat_settings.visible`) in sync. Returns the new visibility.
+/// Pure so it's unit-testable; persistence happens at the call site.
+fn toggle_chat_visibility(app: &mut AppState) -> bool {
+    let now_visible = !app.chat_visible;
+    app.chat_visible = now_visible;
+    app.chat_settings.visible = now_visible;
+    now_visible
 }
 
 /// Preserve groups already present in older connection records. Before custom
@@ -18006,6 +18027,28 @@ pub fn App() -> Element {
                             },
                             { crate::i18n::t("status.right") }
                         }
+                        // Agent chat toggle (issue #122): a visible affordance
+                        // so the panel is discoverable even when the keyboard
+                        // shortcut is shadowed (plain Cmd+Space is macOS
+                        // Spotlight's hotkey and never reaches the app). Routes
+                        // through the same action as the Cmd+Shift+Space
+                        // keybinding, so visibility + persistence stay in sync.
+                        span {
+                            style: if state.read().chat_visible {
+                                "cursor:pointer;color:var(--skin-accent);border:1px solid var(--skin-accent);border-radius:3px;padding:1px 5px;"
+                            } else {
+                                "cursor:pointer;color:var(--skin-text-muted);border:1px solid var(--skin-border);border-radius:3px;padding:1px 5px;"
+                            },
+                            title: crate::i18n::t("status.toggle_chat"),
+                            onclick: move |_| {
+                                run_keybinding_action(
+                                    KeybindingAction::ToggleChat,
+                                    state,
+                                    input_senders,
+                                );
+                            },
+                            { crate::i18n::t("status.chat") }
+                        }
 
                         // --- Multi-pane layout controls ---
                         // The layout toolbar lets the user append one pane at a
@@ -21503,6 +21546,30 @@ mod tab_drag_tests {
         assert!(!is_arrow_key_seq(&[0x0d]));
         assert!(!is_arrow_key_seq(b"ls"));
         assert!(!is_arrow_key_seq(&[]));
+    }
+}
+
+#[cfg(test)]
+mod chat_toggle_tests {
+    use crate::app::toggle_chat_visibility;
+    use crate::state::AppState;
+
+    #[test]
+    fn toggle_chat_visibility_flips_and_mirrors() {
+        // Issue #122: the panel renders only when `chat_visible` is true, and
+        // `chat_settings.visible` is the persisted mirror — both must flip
+        // together or the state drifts across restarts.
+        let mut app = AppState::default();
+        assert!(!app.chat_visible);
+        assert!(!app.chat_settings.visible);
+
+        assert!(toggle_chat_visibility(&mut app));
+        assert!(app.chat_visible);
+        assert!(app.chat_settings.visible);
+
+        assert!(!toggle_chat_visibility(&mut app));
+        assert!(!app.chat_visible);
+        assert!(!app.chat_settings.visible);
     }
 }
 

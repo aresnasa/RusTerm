@@ -749,6 +749,7 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         // ── status.* — status bar controls ─────────────────────────────
         "status.ai" => ("AI", "AI"),
         "status.bottom" => ("Bottom", "底部"),
+        "status.chat" => ("Chat", "聊天"),
         "status.left" => ("Left", "左侧"),
         "status.llm_opt_in" => ("LLM opt-in", "LLM 已选择加入"),
         "status.local" => ("Local", "本地"),
@@ -760,6 +761,10 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         "status.right" => ("Right", "右侧"),
         "status.sessions" => ("{count} sessions", "{count} 个会话"),
         "status.toggle_bottom_dock" => ("Toggle bottom dock", "切换底部面板"),
+        "status.toggle_chat" => (
+            "Toggle agent chat (Cmd+Shift+Space)",
+            "切换智能体聊天（Cmd+Shift+空格）",
+        ),
         "status.toggle_left_dock" => ("Toggle left dock", "切换左侧面板"),
         "status.toggle_right_dock" => ("Toggle right dock", "切换右侧面板"),
         "status.tunnels" => ("Tunnels", "隧道"),

@@ -31,6 +31,20 @@ Tab/Esc hands focus back to the terminal.
   a terminal has focus. Best-effort — macOS Spotlight intercepts it by default;
   the user must rebind Spotlight for it to reach the app.
 
+## Discoverability fix (user reported "no chat popup visible")
+Root cause was NOT a render bug — the panel renders fine when `chat_visible`
+is true, but nothing visible ever set it: plain Cmd+Space is macOS Spotlight's
+hotkey (never reaches the app), and Cmd+Shift+Space was undocumented/unknown.
+Fix (all in `crates/rusterm-ui/src/app.rs` + `i18n.rs`):
+- Status-bar toggle button `status.chat` ("Chat"/"聊天") next to the
+  left/bottom/right dock toggles. Highlighted (accent border) when open.
+  It calls `run_keybinding_action(KeybindingAction::ToggleChat, …)` so there
+  is ONE code path for keybinding + button.
+- `ToggleChat` arm now also mirrors `chat_visible` → `chat_settings.visible`
+  and persists via `save_chat_settings`, so open-state survives restarts.
+- Pure helper `toggle_chat_visibility(&mut AppState) -> bool` does the flip +
+  mirror; unit-tested in `chat_toggle_tests`.
+
 ## Drag mechanism
 Mirrors the proven document-capture + ~60Hz polling pattern used by pane-move /
 splitter-resize / tab-drag. Title bar `onmousedown` installs capture-phase
