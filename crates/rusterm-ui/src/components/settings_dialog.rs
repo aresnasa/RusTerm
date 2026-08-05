@@ -36,6 +36,7 @@ const fn keybinding_action_key(action: KeybindingAction) -> &'static str {
         KeybindingAction::AppendPane => "settings.keybinding_append_pane",
         KeybindingAction::ToggleComparison => "settings.keybinding_toggle_comparison",
         KeybindingAction::TogglePaneZoom => "settings.keybinding_toggle_pane_zoom",
+        KeybindingAction::ToggleChat => "settings.keybinding_toggle_chat",
     }
 }
 
@@ -65,6 +66,7 @@ const fn keybinding_target(action: KeybindingAction) -> &'static str {
         KeybindingAction::AppendPane => "settings-keybinding-append-pane",
         KeybindingAction::ToggleComparison => "settings-keybinding-toggle-comparison",
         KeybindingAction::TogglePaneZoom => "settings-keybinding-toggle-pane-zoom",
+        KeybindingAction::ToggleChat => "settings-keybinding-toggle-chat",
     }
 }
 

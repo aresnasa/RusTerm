@@ -8,12 +8,12 @@ use base64::{Engine as _, engine::general_purpose::STANDARD as BASE64};
 use rand::RngCore;
 
 use crate::config::{
-    ConnectionConfig, ConnectionKind, CustomApiTemplate, DEFAULT_ONEKEY_PASSWORD_EXPECT,
-    EncryptedValue, FocusedTabAppearance, Keybindings, Language, OneKey, OneKeyPreference,
-    OneKeyStep, OtpWebhookConfig, PersistedConfig, PersistedConnection, PersistedConnectionKind,
-    PersistedOneKey, PersistedOneKeyStep, PersistedProxyConfig, PersistedSshAuth,
-    PersistedSshConfig, ProxyConfig, QwenLocalSettings, SidebarPreferences, SkinSettings, SshAuth,
-    SshConfig, WorkspacePreferences,
+    ChatSettings, ConnectionConfig, ConnectionKind, CustomApiTemplate,
+    DEFAULT_ONEKEY_PASSWORD_EXPECT, EncryptedValue, FocusedTabAppearance, Keybindings, Language,
+    OneKey, OneKeyPreference, OneKeyStep, OtpWebhookConfig, PersistedConfig, PersistedConnection,
+    PersistedConnectionKind, PersistedOneKey, PersistedOneKeyStep, PersistedProxyConfig,
+    PersistedSshAuth, PersistedSshConfig, ProxyConfig, QwenLocalSettings, SidebarPreferences,
+    SkinSettings, SshAuth, SshConfig, WorkspacePreferences,
 };
 use rusterm_crypto::{KeyringStore, decrypt_data, encrypt_data};
 
@@ -276,6 +276,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            chat: existing.chat.clone(),
         };
 
         let json =
@@ -315,6 +316,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            chat: existing.chat.clone(),
         };
 
         let json =
@@ -362,6 +364,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            chat: existing.chat.clone(),
         };
 
         let json =
@@ -406,6 +409,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            chat: existing.chat.clone(),
         };
 
         let json =
@@ -447,6 +451,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            chat: existing.chat.clone(),
         };
         let json =
             serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
@@ -488,6 +493,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            chat: existing.chat.clone(),
         };
         let json =
             serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
@@ -537,6 +543,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            chat: existing.chat.clone(),
         };
 
         let json =
@@ -584,6 +591,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            chat: existing.chat.clone(),
         };
 
         let json =
@@ -628,6 +636,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            chat: existing.chat.clone(),
         };
 
         let json =
@@ -671,6 +680,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            chat: existing.chat.clone(),
         };
 
         let json =
@@ -714,6 +724,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            chat: existing.chat.clone(),
         };
 
         let json =
@@ -755,6 +766,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            chat: existing.chat.clone(),
         };
 
         let json =
@@ -838,6 +850,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            chat: existing.chat.clone(),
         };
 
         let json =
@@ -874,6 +887,7 @@ impl ConfigManager {
             qwen_local: Default::default(),
             suggestion_popup_offset_y: 0.0,
             otp_webhook: None,
+            chat: ChatSettings::default().normalized(),
         };
 
         let mut persisted = if self.config_path.exists() {
@@ -885,6 +899,7 @@ impl ConfigManager {
             default_config()
         };
         persisted.workspace = persisted.workspace.normalized();
+        persisted.chat = persisted.chat.normalized();
         persisted
     }
 
@@ -931,6 +946,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            chat: existing.chat.clone(),
         };
 
         let json =
@@ -1014,6 +1030,29 @@ impl ConfigManager {
         persisted.version = CONFIG_VERSION;
         persisted.master_password_hash = self.master_password_hash.clone();
         persisted.qwen_local = settings.clone();
+        let json =
+            serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
+        let temp_path = self.config_path.with_extension("json.tmp");
+        fs::write(&temp_path, &json).context("Failed to write config file")?;
+        fs::rename(&temp_path, &self.config_path).context("Failed to rename temp config file")?;
+        Ok(())
+    }
+
+    /// Load the agent chat box settings (issue #122). Always returns a
+    /// normalized value — legacy settings files omit the `chat` field and
+    /// get the disabled default (hidden panel, built-in OpenAI agent).
+    pub fn load_chat_settings(&self) -> ChatSettings {
+        self.read_persisted().chat
+    }
+
+    /// Persist the agent chat box settings (agents, drag position, last
+    /// visibility). Read-modify-write preserves every unrelated setting.
+    /// API keys are NOT stored here — see `AgentConfig::api_key_id`.
+    pub fn save_chat_settings(&self, settings: &ChatSettings) -> Result<()> {
+        let mut persisted = self.read_persisted_for_update()?;
+        persisted.version = CONFIG_VERSION;
+        persisted.master_password_hash = self.master_password_hash.clone();
+        persisted.chat = settings.clone().normalized();
         let json =
             serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
         let temp_path = self.config_path.with_extension("json.tmp");

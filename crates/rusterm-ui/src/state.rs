@@ -561,6 +561,83 @@ pub struct AppState {
     pub pending_renders: HashMap<String, RenderOutput>,
     #[serde(skip)]
     pub next_render_allowed: HashMap<String, std::time::Instant>,
+
+    // ── Agent chat box (issue #122) ───────────────────────────────────────
+    //
+    // Runtime state for the floating, draggable chat panel. The persisted
+    // bits (agents, position, last visibility) live in `PersistedConfig::chat`
+    // (mirrored into the fields below at unlock time); these fields hold the
+    // live, in-memory state that's NOT worth persisting (the message log,
+    // the current input, the fuzzy command-search results, the drag offset).
+    //
+    // `chat_visible` is duplicated on `AppState` (rather than read straight
+    // from `chat_settings`) so the `ToggleChat` keybinding + the panel's own
+    // close button can flip it without borrowing the whole `chat_settings`
+    // — and so `run_keybinding_action` (which only has `Signal<AppState>`)
+    // doesn't need a config round-trip to toggle.
+    #[serde(skip)]
+    pub chat_visible: bool,
+    /// Mirror of `PersistedConfig::chat` — the source of truth for agents /
+    /// position / size. Edited in place and flushed to disk by the panel.
+    #[serde(skip)]
+    pub chat_settings: rusterm_core::config::ChatSettings,
+    /// In-memory message log for the current session. Not persisted (a fresh
+    //  open starts a clean slate — matches how most chat UIs behave).
+    #[serde(skip)]
+    pub chat_messages: Vec<ChatMessage>,
+    /// Current contents of the chat input box.
+    #[serde(skip)]
+    pub chat_input: String,
+    /// `true` while the input is in `/` command-search mode (palette).
+    #[serde(skip)]
+    pub chat_command_mode: bool,
+    /// Fuzzy-filtered command candidates shown in the palette dropdown.
+    #[serde(skip)]
+    pub chat_command_results: Vec<ChatCommandEntry>,
+    /// Index of the highlighted row in `chat_command_results`.
+    #[serde(skip)]
+    pub chat_command_selected: usize,
+    /// Live drag offset (delta from panel origin to grab point) while the
+    /// title-bar handle is being dragged. `None` when idle.
+    #[serde(skip)]
+    pub chat_drag_offset: Option<(f64, f64)>,
+    /// Transient status line shown under the input (e.g. "thinking…",
+    /// "no API key configured", error text). Cleared on next send.
+    #[serde(skip)]
+    pub chat_status: Option<String>,
+}
+
+/// One turn in the chat log. `role` mirrors OpenAI's convention so the same
+/// vector can be serialized straight into a chat-completions request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct ChatMessage {
+    pub role: ChatRole,
+    pub content: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum ChatRole {
+    User,
+    Assistant,
+    System,
+}
+
+/// A single entry in the command-palette dropdown. `source` is surfaced in the
+/// UI so the user can tell apart history hits from built-in app commands.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
+pub struct ChatCommandEntry {
+    pub command: String,
+    pub source: ChatCommandSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub enum ChatCommandSource {
+    History,
+    AppCommand,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1012,6 +1089,15 @@ impl Default for AppState {
             tunnel_panel_open: false,
             pending_renders: HashMap::new(),
             next_render_allowed: HashMap::new(),
+            chat_visible: false,
+            chat_settings: rusterm_core::config::ChatSettings::default().normalized(),
+            chat_messages: Vec::new(),
+            chat_input: String::new(),
+            chat_command_mode: false,
+            chat_command_results: Vec::new(),
+            chat_command_selected: 0,
+            chat_drag_offset: None,
+            chat_status: None,
         }
     }
 }

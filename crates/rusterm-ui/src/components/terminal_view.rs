@@ -1797,6 +1797,20 @@ pub fn TerminalView(
             return;
         }
 
+        // ── Plain Cmd+Space (macOS) → toggle chat (issue #122) ──────────
+        // Honor the user's requested hotkey from within the terminal too.
+        // Plain Cmd+Space is Spotlight's system hotkey on macOS and usually
+        // never reaches the app, but if the user rebound Spotlight we honor
+        // it here. The configurable `ToggleChat` keybinding (Cmd+Shift+Space
+        // by default) is resolved by `action_for_event` below.
+        let is_space = matches!(key, Key::Character(ref c) if c == " ");
+        if is_space && cfg!(target_os = "macos") && meta && !ctrl && !alt && !shift {
+            e.prevent_default();
+            e.stop_propagation();
+            on_keybinding.call(KeybindingAction::ToggleChat);
+            return;
+        }
+
         if let Some(action) =
             crate::keybindings::action_for_event(&keybindings, &key, ctrl, alt, meta, shift)
         {

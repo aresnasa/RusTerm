@@ -1191,14 +1191,25 @@ pub enum KeybindingAction {
     AppendPane,
     ToggleComparison,
     TogglePaneZoom,
+    /// Toggle the floating agent chat box (issue #122).
+    ///
+    /// Default chord is Cmd/Ctrl + Shift + Space — this is the lowest-friction
+    /// binding that satisfies `KeyChord::is_safe_application_shortcut`
+    /// (primary && shift) AND actually reaches the app on macOS. Plain
+    /// Cmd+Space is intercepted by Spotlight at the OS level, so it can't be
+    /// the default; the global `onkeydown` in `rusterm-ui::app` still
+    /// best-effort toggles the chat on plain Cmd+Space for users who've
+    /// rebound Spotlight.
+    ToggleChat,
 }
 
 impl KeybindingAction {
-    pub const ALL: [Self; 4] = [
+    pub const ALL: [Self; 5] = [
         Self::CloseFocusedPane,
         Self::AppendPane,
         Self::ToggleComparison,
         Self::TogglePaneZoom,
+        Self::ToggleChat,
     ];
 
     pub const fn label(self) -> &'static str {
@@ -1207,6 +1218,7 @@ impl KeybindingAction {
             Self::AppendPane => "Add split pane",
             Self::ToggleComparison => "Toggle synchronized input",
             Self::TogglePaneZoom => "Toggle pane zoom",
+            Self::ToggleChat => "Toggle agent chat",
         }
     }
 }
@@ -1222,6 +1234,10 @@ pub struct Keybindings {
     pub toggle_comparison: Option<KeyChord>,
     #[serde(default = "default_toggle_pane_zoom_keybinding")]
     pub toggle_pane_zoom: Option<KeyChord>,
+    /// Toggle the floating agent chat box (issue #122).
+    /// Default Cmd/Ctrl + Shift + Space — see `KeybindingAction::ToggleChat`.
+    #[serde(default = "default_toggle_chat_keybinding")]
+    pub toggle_chat: Option<KeyChord>,
 }
 
 fn default_key_chord(key: &str) -> Option<KeyChord> {
@@ -1249,6 +1265,20 @@ fn default_toggle_pane_zoom_keybinding() -> Option<KeyChord> {
     default_key_chord("f")
 }
 
+/// Cmd/Ctrl + Shift + Space. `KeyChord::key` for the space bar is the
+/// literal string "space" (see `rusterm_ui::keybindings::key_name` — the
+/// space character is whitespace so the `trim().is_empty()` arm maps it to
+/// "space"). This chord passes `is_safe_application_shortcut` (primary &&
+/// shift) and is reachable on macOS (unlike plain Cmd+Space → Spotlight).
+fn default_toggle_chat_keybinding() -> Option<KeyChord> {
+    Some(KeyChord {
+        key: "space".to_string(),
+        primary: true,
+        alt: false,
+        shift: true,
+    })
+}
+
 impl Default for Keybindings {
     fn default() -> Self {
         Self {
@@ -1256,6 +1286,7 @@ impl Default for Keybindings {
             append_pane: default_append_pane_keybinding(),
             toggle_comparison: default_toggle_comparison_keybinding(),
             toggle_pane_zoom: default_toggle_pane_zoom_keybinding(),
+            toggle_chat: default_toggle_chat_keybinding(),
         }
     }
 }
@@ -1275,6 +1306,7 @@ impl Keybindings {
             KeybindingAction::AppendPane => self.append_pane.as_ref(),
             KeybindingAction::ToggleComparison => self.toggle_comparison.as_ref(),
             KeybindingAction::TogglePaneZoom => self.toggle_pane_zoom.as_ref(),
+            KeybindingAction::ToggleChat => self.toggle_chat.as_ref(),
         }
     }
 
@@ -1284,6 +1316,7 @@ impl Keybindings {
             KeybindingAction::AppendPane => self.append_pane = chord,
             KeybindingAction::ToggleComparison => self.toggle_comparison = chord,
             KeybindingAction::TogglePaneZoom => self.toggle_pane_zoom = chord,
+            KeybindingAction::ToggleChat => self.toggle_chat = chord,
         }
     }
 
@@ -1301,6 +1334,187 @@ impl Keybindings {
         KeybindingAction::ALL.into_iter().find(|other| {
             *other != action && self.chord(*other).is_some_and(|binding| binding == chord)
         })
+    }
+}
+
+// ===========================================================================
+// Agent chat box (issue #122)
+// ===========================================================================
+//
+// A floating, draggable chat panel that lives in the bottom-left of the app
+// window by default. It can talk to a configurable AI agent (OpenAI /
+// Anthropic / local Qwen) and doubles as a command palette: typing `/` puts
+// the input into command-search mode, fuzzy-filtering the user's shell
+// history (via `rusterm-history`) plus a built-in list of app commands.
+//
+// PERSISTENCE: `ChatSettings` is stored under `PersistedConfig::chat`. The
+// panel position and the configured agents survive restarts. API keys are
+// NOT stored here — they go through the existing secret/redaction path
+// (`EncryptedValue` / keychain) to match the project's credential policy.
+// The `AgentConfig` here only carries non-secret metadata.
+
+/// Which AI backend an agent routes its prompts to. Mirrors
+/// `rusterm_ai::AiProvider` but is defined here in core so the persistence
+/// layer doesn't depend on the AI crate (and so the enum can grow
+/// independently of the runtime client).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ChatAgentProvider {
+    OpenAI,
+    Anthropic,
+    /// On-device Qwen model (feature-gated `qwen-local`).
+    Local,
+}
+
+impl Default for ChatAgentProvider {
+    fn default() -> Self {
+        Self::OpenAI
+    }
+}
+
+/// Non-secret description of a configured chat agent. The API key lives in
+/// the secret store and is looked up by `api_key_id` at runtime — it is
+/// deliberately never serialized into `settings.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AgentConfig {
+    /// Stable opaque id (uuid v4). Used as the foreign key into the secret
+    /// store and as the `active_agent_id` selection.
+    pub id: String,
+    /// Human-readable label shown in the agent dropdown.
+    pub name: String,
+    /// Which provider backend to route prompts to.
+    #[serde(default)]
+    pub provider: ChatAgentProvider,
+    /// Model identifier (e.g. `gpt-4o-mini`, `claude-3-5-sonnet-20241022`,
+    /// or the local model id from `QwenLocalSettings`).
+    #[serde(default)]
+    pub model: String,
+    /// Optional OpenAI-compatible base URL override (e.g. for self-hosted
+    /// proxies / Azure OpenAI). Empty string means "use the provider default".
+    #[serde(default)]
+    pub base_url: String,
+    /// Opaque id used to look up the API key in the secret store. Empty
+    /// string means "no key configured" — the panel shows a prompt instead
+    /// of erroring.
+    #[serde(default)]
+    pub api_key_id: String,
+    /// Optional system prompt prepended to every chat turn. Empty string
+    /// means "no system prompt".
+    #[serde(default)]
+    pub system_prompt: String,
+}
+
+impl AgentConfig {
+    /// Built-in default agent so the panel is usable on first launch with
+    /// no configuration. The user just needs to paste an API key.
+    pub fn default_openai() -> Self {
+        Self {
+            id: "default".to_string(),
+            name: "Default".to_string(),
+            provider: ChatAgentProvider::OpenAI,
+            model: "gpt-4o-mini".to_string(),
+            base_url: String::new(),
+            api_key_id: "default".to_string(),
+            system_prompt: String::new(),
+        }
+    }
+}
+
+/// Floating-panel position in logical pixels, relative to the `#main`
+/// container's top-left corner. `(0.0, 0.0)` is the sentinel meaning
+/// "not yet placed — use the bottom-left default on first show".
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize, Default)]
+pub struct ChatPosition {
+    #[serde(default)]
+    pub x: f64,
+    #[serde(default)]
+    pub y: f64,
+}
+
+impl ChatPosition {
+    /// `true` when the user has actually dragged the panel at least once.
+    /// Used to decide whether to honor the stored coords or fall back to the
+    /// bottom-left anchor on the next render.
+    pub fn is_set(&self) -> bool {
+        self.x != 0.0 || self.y != 0.0
+    }
+}
+
+/// Persisted settings for the agent chat box (issue #122). Stored under
+/// `PersistedConfig::chat`. All fields `#[serde(default)]` so legacy
+/// settings files load cleanly (chat box just starts hidden with the
+/// built-in default agent).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatSettings {
+    /// Whether the panel was visible when the app last closed. Restored on
+    /// launch so the user's workflow isn't interrupted.
+    #[serde(default)]
+    pub visible: bool,
+    /// Configured agents. Always non-empty (the default OpenAI agent is
+    /// guaranteed by `normalized`).
+    #[serde(default = "default_chat_agents")]
+    pub agents: Vec<AgentConfig>,
+    /// Id of the currently-selected agent. `None` means "none selected";
+    /// `normalized` clamps it to a valid agent id or the first agent.
+    #[serde(default)]
+    pub active_agent_id: Option<String>,
+    /// Last dragged position. `(0,0)` sentinel → bottom-left default.
+    #[serde(default)]
+    pub position: ChatPosition,
+    /// Panel size in logical pixels. `0.0` → built-in default.
+    #[serde(default)]
+    pub width: f64,
+    #[serde(default)]
+    pub height: f64,
+}
+
+fn default_chat_agents() -> Vec<AgentConfig> {
+    vec![AgentConfig::default_openai()]
+}
+
+impl Default for ChatSettings {
+    fn default() -> Self {
+        Self {
+            visible: false,
+            agents: default_chat_agents(),
+            active_agent_id: Some("default".to_string()),
+            position: ChatPosition::default(),
+            width: 0.0,
+            height: 0.0,
+        }
+    }
+}
+
+impl ChatSettings {
+    /// Repair untrusted/legacy state: guarantee at least one agent, and make
+    /// sure `active_agent_id` points at a real agent (fall back to the
+    /// first). Also clamps panel size to sane minimums.
+    pub fn normalized(mut self) -> Self {
+        if self.agents.is_empty() {
+            self.agents = default_chat_agents();
+        }
+        let valid = self
+            .active_agent_id
+            .as_ref()
+            .and_then(|id| self.agents.iter().find(|a| &a.id == id))
+            .map(|a| a.id.clone());
+        self.active_agent_id = Some(valid.unwrap_or_else(|| self.agents[0].id.clone()));
+        if self.width < 240.0 {
+            self.width = 360.0;
+        }
+        if self.height < 160.0 {
+            self.height = 320.0;
+        }
+        self
+    }
+
+    /// Borrow the active agent, if any. Returns `None` only when the list is
+    /// empty (which `normalized` prevents, but callers stay defensive).
+    pub fn active_agent(&self) -> Option<&AgentConfig> {
+        self.active_agent_id
+            .as_ref()
+            .and_then(|id| self.agents.iter().find(|a| &a.id == id))
+            .or_else(|| self.agents.first())
     }
 }
 
@@ -1425,6 +1639,13 @@ pub struct PersistedConfig {
     /// to manual entry through the existing OneKey / credential prompt UI.
     #[serde(default)]
     pub otp_webhook: Option<OtpWebhookConfig>,
+
+    /// Floating agent chat box (issue #122): configurable agents, drag
+    /// position, and last visibility. Legacy settings files omit this field
+    /// and get the disabled default (panel hidden, built-in OpenAI agent).
+    /// API keys are NOT stored here — see `AgentConfig::api_key_id`.
+    #[serde(default)]
+    pub chat: ChatSettings,
 }
 
 // ── OTP / MFA webhook provider ────────────────────────────────────────
@@ -2570,6 +2791,7 @@ mod tests {
             qwen_local: QwenLocalSettings::default(),
             suggestion_popup_offset_y: -38.5,
             otp_webhook: None,
+            chat: ChatSettings::default(),
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: PersistedConfig = serde_json::from_str(&json).unwrap();
@@ -2779,5 +3001,111 @@ mod tests {
         };
         let m = resolve_model(&s);
         assert_eq!(m.id, "qwen25-coder-1.5b");
+    }
+
+    // ── Agent chat box (issue #122) ─────────────────────────────────────
+    #[test]
+    fn chat_settings_default_has_one_openai_agent_selected() {
+        let s = ChatSettings::default().normalized();
+        assert_eq!(s.agents.len(), 1);
+        assert_eq!(s.agents[0].id, "default");
+        assert_eq!(s.agents[0].provider, ChatAgentProvider::OpenAI);
+        assert_eq!(s.active_agent_id.as_deref(), Some("default"));
+        // Panel starts hidden on a fresh install.
+        assert!(!s.visible);
+        // Default size is sane (normalized clamps the 0.0 sentinel).
+        assert!(s.width >= 240.0);
+        assert!(s.height >= 160.0);
+    }
+
+    #[test]
+    fn chat_settings_normalized_repairs_empty_agents_and_dangling_active_id() {
+        // Hand-craft a degenerate config: no agents, active id points nowhere.
+        let s = ChatSettings {
+            visible: true,
+            agents: vec![],
+            active_agent_id: Some("ghost".to_string()),
+            position: ChatPosition { x: 42.0, y: 99.0 },
+            width: 0.0,
+            height: 0.0,
+        };
+        let n = s.normalized();
+        // The default OpenAI agent is restored.
+        assert_eq!(n.agents.len(), 1);
+        // The dangling active id is clamped to the (only) real agent.
+        assert_eq!(n.active_agent_id.as_deref(), Some("default"));
+        // The user's dragged position survives (only agents/id are repaired).
+        assert_eq!(n.position, ChatPosition { x: 42.0, y: 99.0 });
+        // Zero size sentinel is clamped to the built-in defaults.
+        assert!(n.width >= 240.0);
+        assert!(n.height >= 160.0);
+    }
+
+    #[test]
+    fn chat_settings_roundtrip_preserves_agents_position_and_visibility() {
+        let s = ChatSettings {
+            visible: true,
+            agents: vec![
+                AgentConfig::default_openai(),
+                AgentConfig {
+                    id: "anthropic-1".to_string(),
+                    name: "Claude".to_string(),
+                    provider: ChatAgentProvider::Anthropic,
+                    model: "claude-3-5-sonnet-20241022".to_string(),
+                    base_url: String::new(),
+                    api_key_id: "anthropic-1".to_string(),
+                    system_prompt: "Be terse.".to_string(),
+                },
+            ],
+            active_agent_id: Some("anthropic-1".to_string()),
+            position: ChatPosition { x: 120.0, y: 300.0 },
+            width: 420.0,
+            height: 400.0,
+        }
+        .normalized();
+        let json = serde_json::to_string(&s).unwrap();
+        let parsed: ChatSettings = serde_json::from_str(&json).unwrap();
+        let parsed = parsed.normalized();
+        assert_eq!(parsed, s);
+        assert_eq!(
+            parsed.active_agent().map(|a| a.id.as_str()),
+            Some("anthropic-1")
+        );
+        assert_eq!(parsed.position, ChatPosition { x: 120.0, y: 300.0 });
+    }
+
+    #[test]
+    fn legacy_config_without_chat_field_loads_with_disabled_default() {
+        // Settings files written before issue #122 omit the `chat` field
+        // entirely. They must deserialize into the disabled default so the
+        // panel doesn't pop open on upgrade.
+        let config: PersistedConfig =
+            serde_json::from_str(r#"{"version":1,"connections":[]}"#).unwrap();
+        assert!(!config.chat.visible);
+        assert_eq!(config.chat.agents.len(), 1);
+        assert_eq!(config.chat.agents[0].provider, ChatAgentProvider::OpenAI);
+    }
+
+    #[test]
+    fn toggle_chat_keybinding_defaults_to_primary_shift_space() {
+        // The default chord MUST pass `is_safe_application_shortcut`
+        // (primary && shift) so it's reachable on macOS and doesn't collide
+        // with plain terminal control chords. Plain Cmd+Space (no shift) is
+        // handled by a special-case in the global onkeydown, NOT by this
+        // keybinding, because it's Spotlight's system hotkey.
+        let kb = Keybindings::default();
+        // Clone the chord so we don't partially-move `kb` before the
+        // `action_for` lookup below.
+        let chord = kb
+            .toggle_chat
+            .clone()
+            .expect("toggle_chat must have a default chord");
+        assert_eq!(chord.key, "space");
+        assert!(chord.primary);
+        assert!(chord.shift);
+        assert!(!chord.alt);
+        assert!(chord.is_safe_application_shortcut());
+        // And it resolves to the ToggleChat action.
+        assert_eq!(kb.action_for(&chord), Some(KeybindingAction::ToggleChat));
     }
 }

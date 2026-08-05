@@ -1,5 +1,6 @@
 pub mod ai_panel;
 pub mod api_panel;
+pub mod chat_panel;
 pub mod close_confirmation_dialog;
 pub mod command_status_badge;
 pub mod connection_dialog;
@@ -26,6 +27,7 @@ pub mod workspace_panels;
 
 pub use ai_panel::AiPanel;
 pub use api_panel::ApiPanel;
+pub use chat_panel::ChatPanel;
 pub use close_confirmation_dialog::CloseConfirmationDialog;
 pub use command_status_badge::CommandStatusBadge;
 pub use connection_dialog::ConnectionDialog;

@@ -1250,6 +1250,7 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         "settings.keybinding_append_pane" => ("Add split pane", "添加分屏窗格"),
         "settings.keybinding_toggle_comparison" => ("Toggle synchronized input", "切换同步输入"),
         "settings.keybinding_toggle_pane_zoom" => ("Toggle pane zoom", "切换窗格缩放"),
+        "settings.keybinding_toggle_chat" => ("Toggle agent chat", "切换智能体聊天"),
         "settings.keybinding_press_shortcut" => ("Press shortcut…", "请按快捷键…"),
         "settings.keybinding_disabled" => ("Disabled", "已禁用"),
         "settings.keybinding_error_unsafe" => (
@@ -1451,6 +1452,32 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         "shadow.do_not_share" => ("Do not share", "不分享"),
         "shadow.confirm_send_to_model" => ("Confirm send to model", "确认发送给模型"),
 
+        // ── chat.* — agent chat box (issue #122) ───────────────────────
+        "chat.title" => ("Agent Chat", "智能体聊天"),
+        "chat.empty" => (
+            "Ask the agent for a command, or type / to search your history.",
+            "向智能体提问，或输入 / 搜索历史命令。",
+        ),
+        "chat.placeholder" => (
+            "Message the agent…  ( / for commands, Tab for terminal )",
+            "给智能体发消息…（ / 搜索命令，Tab 回到终端 ）",
+        ),
+        "chat.hint" => ("Tab / Esc returns to terminal", "Tab / Esc 回到终端"),
+        "chat.send" => ("Send", "发送"),
+        "chat.run" => ("Run", "运行"),
+        "chat.thinking" => ("thinking…", "思考中…"),
+        "chat.stub_reply" => (
+            "(LLM round-trip not yet wired — configure an agent and API key, then this surface will call rusterm-ai.)",
+            "（尚未接入 LLM——请配置智能体与 API Key，之后将调用 rusterm-ai。）",
+        ),
+        "chat.no_agent" => ("No agent configured", "未配置智能体"),
+        "chat.agent_name" => ("Name", "名称"),
+        "chat.agent_model" => ("Model", "模型"),
+        "chat.agent_base_url" => ("Base URL (optional)", "Base URL（可选）"),
+        "chat.agent_api_key" => ("API key (in-memory only)", "API Key（仅存内存）"),
+        "chat.agent_system_prompt" => ("System prompt", "系统提示词"),
+        "chat.save" => ("Save", "保存"),
+
         // Fallback: unknown key.
         _ => return None,
     };
@@ -1484,6 +1511,7 @@ mod tests {
         "settings.keybinding_close_focused_pane",
         "settings.keybinding_toggle_comparison",
         "settings.keybinding_toggle_pane_zoom",
+        "settings.keybinding_toggle_chat",
         "settings.skin_custom",
         "settings.skin_one_dark",
         "settings.skin_solarized_dark",

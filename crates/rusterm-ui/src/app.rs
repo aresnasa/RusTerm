@@ -10,10 +10,10 @@ use tokio_util::sync::CancellationToken;
 
 use rusterm_core::LoginStep;
 use rusterm_core::config::{
-    BottomPanelTab, ConnectionConfig, ConnectionGroup, ConnectionKind, DockZone, KeybindingAction,
-    Keybindings, OneKey, OneKeyPreference, OneKeyStep, PanelId, ProxyConfig, ProxyKind,
-    RightPanelTab, SerialConfig, ShellConfig, SidebarPreferences, SkinSettings, SshAuth, SshConfig,
-    TelnetConfig, WorkspacePreferences,
+    BottomPanelTab, ChatSettings, ConnectionConfig, ConnectionGroup, ConnectionKind, DockZone,
+    KeybindingAction, Keybindings, OneKey, OneKeyPreference, OneKeyStep, PanelId, ProxyConfig,
+    ProxyKind, RightPanelTab, SerialConfig, ShellConfig, SidebarPreferences, SkinSettings, SshAuth,
+    SshConfig, TelnetConfig, WorkspacePreferences,
 };
 use rusterm_core::config_manager::ConfigManager;
 use rusterm_core::event::SessionEvent;
@@ -22,6 +22,7 @@ use rusterm_core::session_log::SessionLog;
 use rusterm_core::terminal::{Terminal, TerminalSize};
 
 use crate::components::AiPanel;
+use crate::components::ChatPanel;
 use crate::components::CloseConfirmationDialog;
 use crate::components::CommandStatusBadge;
 use crate::components::ConnectionDialog;
@@ -2331,6 +2332,11 @@ fn run_keybinding_action(
                 let toggled = toggle_pane_zoom(&mut state.write(), &session_id);
                 tracing::info!("[KEYBINDING] zoom for {}: applied={}", session_id, toggled);
             }
+        }
+        KeybindingAction::ToggleChat => {
+            let now_visible = !state.read().chat_visible;
+            state.write().chat_visible = now_visible;
+            tracing::info!("[KEYBINDING] toggled agent chat: visible={now_visible}");
         }
     }
 }
@@ -17040,6 +17046,12 @@ pub fn App() -> Element {
                                 crate::i18n::init_language(s.language);
                                 s.keybindings = cm.load_keybindings();
                                 s.skin = cm.load_skin_settings();
+                                // Agent chat box (issue #122): restore the
+                                // user's agents, drag position, and last
+                                // visibility from settings.json.
+                                let chat_settings = cm.load_chat_settings();
+                                s.chat_visible = chat_settings.visible;
+                                s.chat_settings = chat_settings;
                                 s.config_manager = Some(cm);
                                 s.sidebar_preferences = sidebar_preferences;
                                 s.workspace_preferences = workspace_preferences;
@@ -17215,6 +17227,30 @@ pub fn App() -> Element {
             onkeydown: move |e: KeyboardEvent| {
                 let mods = e.modifiers();
                 let keybindings = state.read().keybindings.clone();
+
+                // ── Plain Cmd+Space (macOS) → toggle chat (issue #122) ──────
+                // The user asked for "command+空格" to open the chat. The
+                // configurable `ToggleChat` keybinding defaults to
+                // Cmd+Shift+Space because plain Cmd+Space is Spotlight's
+                // system-wide hotkey and never reaches the app under normal
+                // macOS config. BUT: if the user has rebound Spotlight (or
+                // the platform didn't intercept it), we honor plain Cmd+Space
+                // here as a best-effort extra trigger. This runs BEFORE the
+                // configurable-keybinding resolver so it can't be shadowed.
+                let is_space = matches!(e.key(), Key::Character(ref c) if c == " ");
+                if is_space
+                    && cfg!(target_os = "macos")
+                    && mods.meta()
+                    && !mods.ctrl()
+                    && !mods.alt()
+                    && !mods.shift()
+                {
+                    e.prevent_default();
+                    e.stop_propagation();
+                    run_keybinding_action(KeybindingAction::ToggleChat, state, input_senders);
+                    return;
+                }
+
                 if let Some(action) = action_for_event(
                     &keybindings,
                     &e.key(),
@@ -18063,6 +18099,26 @@ pub fn App() -> Element {
             drag: dock_drag(),
         }
         DockDragGhost { drag: dock_drag() }
+
+        // Agent chat box (issue #122): floating, draggable, bottom-left by
+        // default. `position: fixed` so it overlays the whole window. The
+        // panel reads its visibility + settings straight off `AppState`.
+        ChatPanel {
+            state,
+            on_save_chat: move |settings: ChatSettings| {
+                // Mirror into AppState and persist to settings.json via the
+                // dedicated `save_chat_settings` read-modify-write path.
+                state.write().chat_settings = settings.clone();
+                if let Some(cm) = state.read().config_manager.clone() {
+                    if let Err(e) = cm.save_chat_settings(&settings) {
+                        tracing::error!("Failed to save chat settings: {e}");
+                    }
+                }
+            },
+            on_focus_terminal: move |_| {
+                restore_focus_to_active_session(state, 50);
+            },
+        }
 
         if matches!(modal(), Modal::Settings) {
             SettingsDialog {
