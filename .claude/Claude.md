@@ -241,3 +241,4 @@ Linux gpu-muxi-001.x86.test.brainpp.dev 5.15.0-119-generic #1，将API 脚本放
 119. ssh正常的终端也需要有这个成功的绿色图标[@Image](zed:///agent/pasted-image?name=Image) ，检查一下相关逻辑
 120. 弹窗提示可以关闭，但是暗色的历史提示可以不用关闭，调整一下相关逻辑
 121. 继续改造并适配 jumpserver 需要 OTP 二次验证吗交互逻辑，这里需要用户填入一个二次验证码才能登录 jumpserver，可以接入飞书的一个机器人，把这个作为一个 settings 中的 webhook 配置项，能够支持用户配置一下 feishubot 或者其他方式来获取这个验证码，实现这个功能。
+122. 在本项目的左下角集成一个可以改变位置的聊天框，支持配置智能体，或者按 command+空格打开聊天，快速搜索命令，然后 table 进终端。
