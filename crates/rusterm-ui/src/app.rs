@@ -18281,8 +18281,13 @@ pub fn App() -> Element {
         // Agent chat box (issue #122): floating, draggable, bottom-left by
         // default. `position: fixed` so it overlays the whole window. The
         // panel reads its visibility + settings straight off `AppState`.
+        //
+        // NOTE: rendered OUTSIDE `#main`, so it can't inherit the `--skin-*`
+        // custom properties declared there — it receives the skin settings and
+        // re-declares them on its own root to stay themed.
         ChatPanel {
             state,
+            skin: state.read().skin.clone(),
             on_save_chat: move |settings: ChatSettings| {
                 // Mirror into AppState and persist to settings.json via the
                 // dedicated `save_chat_settings` read-modify-write path.

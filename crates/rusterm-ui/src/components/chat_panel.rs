@@ -27,7 +27,9 @@
 
 use dioxus::prelude::*;
 
-use rusterm_core::config::{AgentConfig, ChatAgentProvider, ChatPosition, ChatSettings};
+use rusterm_core::config::{
+    AgentConfig, ChatAgentProvider, ChatPosition, ChatSettings, SkinSettings,
+};
 
 use crate::state::{AppState, ChatCommandEntry, ChatCommandSource, ChatMessage, ChatRole};
 
@@ -54,10 +56,21 @@ const APP_COMMANDS: &[(&str, &str)] = &[
 #[component]
 pub fn ChatPanel(
     state: Signal<AppState>,
+    /// Current UI skin. The panel root is rendered OUTSIDE `#main` (where the
+    /// `--skin-*` custom properties are declared), so it must re-declare them
+    /// itself for its inline styles / `render_message` bubbles to resolve
+    /// instead of falling back to browser defaults.
+    skin: SkinSettings,
     on_save_chat: EventHandler<ChatSettings>,
     on_focus_terminal: EventHandler<()>,
 ) -> Element {
     let _lang = crate::i18n::LANGUAGE();
+    // Same OS-theme read as the main window chrome (see App / SettingsDialog).
+    let system_is_dark = matches!(
+        dioxus::desktop::window().theme(),
+        dioxus::desktop::tao::window::Theme::Dark
+    );
+    let skin_style = crate::skin::css_variables(&skin, system_is_dark);
 
     // ALL hooks must run unconditionally and in the same order every render
     // (Dioxus hooks rules). The visibility check happens AFTER the hooks so
@@ -333,6 +346,7 @@ pub fn ChatPanel(
         div {
             id: "rusterm-chat-panel",
             style: "
+                {skin_style}
                 position: fixed;
                 left: {position.x}px;
                 top: {position.y}px;
