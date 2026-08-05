@@ -207,7 +207,7 @@ pub fn TabBar(
                 overflow-x: auto;
             ",
 
-            for tab in tabs {
+            for (tab_index, tab) in tabs.into_iter().enumerate() {
                 {
                     let (session_id, session_name, kind) = resolve_tab_display(&tab, &sessions);
                     let is_active = active.as_ref() == Some(&tab.id);
@@ -231,6 +231,14 @@ pub fn TabBar(
                         focused_tab_chrome(is_pane_focused, &focused_appearance);
                     let tab_id = tab.id.clone();
                     let tab_id2 = tab.id.clone();
+                    // 1-based positional tab number. Reflects the current
+                    // order in `state.tabs` (so it updates after a reorder).
+                    // Shown in a muted colour so it reads as a quiet index,
+                    // not a primary label — the session name is still the
+                    // main identifier. The number makes it easier to refer
+                    // to tabs ("tab 3 disconnected") and disambiguates
+                    // same-named sessions.
+                    let tab_number = tab_index + 1;
 
                     // Clone the session id + name for the mousedown handler.
                     // When the user presses the primary mouse button on
@@ -252,6 +260,14 @@ pub fn TabBar(
                     rsx! {
                         div {
                             key: "{tab.id}",
+                            // `data-rusterm-tab-id` lets the tab-drag JS
+                            // hit-test (`document.elementFromPoint` →
+                            // `closest('[data-rusterm-tab-id]')`) detect when
+                            // the cursor is over a tab in the top bar. This
+                            // drives the drag-to-reorder gesture: dropping a
+                            // session-drag onto another tab reorders the top
+                            // tab bar instead of splitting a pane.
+                            "data-rusterm-tab-id": "{tab.id}",
                             style: "
                                 display: flex;
                                 align-items: center;
@@ -317,6 +333,15 @@ pub fn TabBar(
                                     c.y,
                                 )));
                             },
+
+                            // Positional tab number (1-based). Shown muted
+                            // so the session name remains the primary label.
+                            // Reflects current tab order — updates after a
+                            // reorder.
+                            span {
+                                style: "color: var(--skin-text-muted); font-variant-numeric: tabular-nums; flex-shrink: 0; min-width: 12px; text-align: right;",
+                                "{tab_number}"
+                            }
 
                             // Connection-state indicator dot. Colour follows
                             // the connection lifecycle (blue while connecting,

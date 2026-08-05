@@ -64,7 +64,7 @@ use crate::state::{
     note_shell_prompt_evidence, pop_context_command, prepare_split_for_sidebar_drop,
     prepare_split_for_sidebar_drop_at, prompt_looks_like_shell, prompt_return_completion_target,
     push_workspace_tab, record_context_command, record_onekey_behavior, record_replay_op,
-    replayable_ops, resize_layout_split, rollback_pending_exit, scroll_sync_targets,
+    reorder_tab, replayable_ops, resize_layout_split, rollback_pending_exit, scroll_sync_targets,
     seed_onekey_habit_event, select_all_send_targets, selected_send_target_ids, set_active_tab,
     set_pane_session_for_layout, set_send_target_selected, source_pane_for_copy,
     suppress_comparison_diff_warning, toggle_comparison_mode, toggle_pane_zoom, toggle_split_mode,
@@ -4969,9 +4969,35 @@ pub(crate) fn install_tab_drag_js_listeners(initial_x: f64, initial_y: f64) {
 /// separated by the ASCII unit separator so a legacy group id may safely
 /// contain commas. The six fields are x, y, done, container left/top, and the
 /// hovered connection-group id (empty when no group header is under the cursor).
+/// Hovered-tab hit-test result returned by `poll_tab_drag_state` alongside
+/// the cursor position. `None` when the cursor isn't over a tab in the top
+/// tab bar (e.g. it's over a pane, the sidebar, or empty space). When the
+/// cursor IS over a tab, `tab_id` is the hovered tab's `data-rusterm-tab-id`
+/// and `before` is `true` when the cursor is on the tab's left half (insert
+/// before) or `false` when it's on the right half (insert after). This
+/// drives the drag-to-reorder gesture in `finish_tab_drag`.
+#[derive(Clone, Debug, PartialEq)]
+pub(crate) struct TabDragHover {
+    pub(crate) tab_id: String,
+    pub(crate) before: bool,
+}
+
+/// The full set of fields the JS poll returns. Returning a struct would be
+/// cleaner, but every existing call site already destructures this as a
+/// tuple — keeping it a tuple avoids a wider refactor. The 7-tuple is
+/// admittedly complex (clippy agrees), hence the explicit allow.
+#[allow(clippy::type_complexity)]
 pub(crate) fn parse_tab_drag_poll_response(
     s: &str,
-) -> Option<(f64, f64, bool, f64, f64, Option<String>)> {
+) -> Option<(
+    f64,
+    f64,
+    bool,
+    f64,
+    f64,
+    Option<String>,
+    Option<TabDragHover>,
+)> {
     if s.is_empty() {
         return None;
     }
@@ -4982,11 +5008,37 @@ pub(crate) fn parse_tab_drag_poll_response(
     let container_left = parts.next()?.parse::<f64>().ok()?;
     let container_top = parts.next()?.parse::<f64>().ok()?;
     let group_id = parts.next()?;
+    let tab_id = parts.next()?;
+    let tab_before = parts.next()?;
     if parts.next().is_some() {
         return None;
     }
     let group_id = (!group_id.is_empty()).then(|| group_id.to_string());
-    Some((x, y, done, container_left, container_top, group_id))
+    // Build the hovered-tab descriptor only when a tab id is present. The
+    // `before` field is "1"/"0" from the JS side; anything else is treated
+    // as "no tab" (defensive against a malformed poll response).
+    let tab_hover = if tab_id.is_empty() {
+        None
+    } else {
+        let before = match tab_before {
+            "1" => true,
+            "0" => false,
+            _ => return None,
+        };
+        Some(TabDragHover {
+            tab_id: tab_id.to_string(),
+            before,
+        })
+    };
+    Some((
+        x,
+        y,
+        done,
+        container_left,
+        container_top,
+        group_id,
+        tab_hover,
+    ))
 }
 
 /// Read the current mouse position, "done" flag, and container offset
@@ -5001,7 +5053,16 @@ pub(crate) fn parse_tab_drag_poll_response(
 /// reflows. The install-time capture in `build_install_tab_drag_script`
 /// is kept as a fallback for the very first poll (before this re-measure
 /// lands) but is overwritten here on every subsequent tick.
-async fn poll_tab_drag_state() -> Option<(f64, f64, bool, f64, f64, Option<String>)> {
+#[allow(clippy::type_complexity)]
+async fn poll_tab_drag_state() -> Option<(
+    f64,
+    f64,
+    bool,
+    f64,
+    f64,
+    Option<String>,
+    Option<TabDragHover>,
+)> {
     let result = dioxus::document::eval(
         "return (function() {\n\
             var pos = window.__rusterm_tab_drag_pos || '';\n\
@@ -5019,7 +5080,22 @@ async fn poll_tab_drag_state() -> Option<(f64, f64, bool, f64, f64, Option<Strin
             var hit = document.elementFromPoint(Number(coords[0]), Number(coords[1]));\n\
             var groupEl = hit && hit.closest ? hit.closest('[data-rusterm-group-id]') : null;\n\
             var groupId = groupEl ? (groupEl.getAttribute('data-rusterm-group-id') || '') : '';\n\
-            return [coords[0], coords[1], done, r.left, r.top, groupId].join('\\u001f');\n\
+            // Tab-bar reorder hit-test: find the closest ancestor tagged\n\
+            // with `data-rusterm-tab-id` (each tab div in the top TabBar\n\
+            // carries this attribute). When the cursor is over a tab,\n\
+            // compute whether it's on the tab's left half (insert before)\n\
+            // or right half (insert after) from the tab's bounding rect.\n\
+            // Empty tabId/tabBefore when the cursor isn't over any tab.\n\
+            var tabEl = hit && hit.closest ? hit.closest('[data-rusterm-tab-id]') : null;\n\
+            var tabId = '';\n\
+            var tabBefore = '';\n\
+            if (tabEl) {\n\
+                tabId = tabEl.getAttribute('data-rusterm-tab-id') || '';\n\
+                var tr = tabEl.getBoundingClientRect();\n\
+                var mid = tr.left + tr.width / 2;\n\
+                tabBefore = Number(coords[0]) < mid ? '1' : '0';\n\
+            }\n\
+            return [coords[0], coords[1], done, r.left, r.top, groupId, tabId, tabBefore].join('\\u001f');\n\
         })()",
     )
     .await
@@ -5511,9 +5587,17 @@ fn clear_tab_drag_state(
 }
 
 /// Finish a tab drag: do the final hit-test at the release position,
-/// call `execute_tab_drop_on_pane` (the single source of truth for drop
-/// dispatch), log the outcome, and restore focus if a new pane was
+/// dispatch the drop, log the outcome, and restore focus if a new pane was
 /// created. Clears `tab_drag` and `drag_over_pane`.
+///
+/// Drop dispatch order (mutually exclusive):
+///  1. `DragKind::Connection` dropped on a sidebar group header →
+///     `assign_connection_to_group` (configuration move).
+///  2. `DragKind::Session` dropped on a tab in the top tab bar →
+///     `reorder_tab` (drag-to-reorder gesture). The hovered tab + side
+///     (before/after) come from `drop_tab_hover`.
+///  3. Otherwise → pane hit-test (`execute_tab_drop_on_pane`): swap / move /
+///     split / self-drop-expand.
 ///
 /// Called from the polling `use_future` when it detects the JS-side
 /// `__rusterm_tab_drag_done` flag is set AND `dragging == true`. If
@@ -5538,6 +5622,14 @@ pub(crate) fn finish_tab_drag(
     container_left: f64,
     container_top: f64,
     drop_group_id: Option<String>,
+    // Hovered-tab hit-test result from the JS poll. When `Some`, the cursor
+    // was over a tab in the top tab bar at drop time — this triggers the
+    // drag-to-reorder gesture (instead of the pane split/swap/move path).
+    // Only consulted for `DragKind::Session` drags; `Connection` drags
+    // that land on a tab fall through to the pane hit-test (a sidebar
+    // connection dropped on the tab bar opens in the active pane, mirroring
+    // the pre-reorder behaviour).
+    drop_tab_hover: Option<TabDragHover>,
 ) {
     // Read the drag state. Clone the session_id out so we can release
     // the borrow before mutating `state` below (avoids holding a
@@ -5574,6 +5666,47 @@ pub(crate) fn finish_tab_drag(
                 group_id,
                 changed
             );
+            clear_tab_drag_state(tab_drag, drag_over_pane, drag_over_group);
+            restore_focus_to_active_session(state, 20);
+            return;
+        }
+    }
+
+    // Drag-to-reorder: if a SESSION drag landed on a tab in the top tab bar
+    // (the JS poll set `drop_tab_hover`), reorder `state.tabs` instead of
+    // running the pane split/swap/move hit-test. This keeps the two drop
+    // destinations mutually exclusive: dropping on a tab reorders; dropping
+    // on a pane splits/swaps/moves. Connection drags deliberately DON'T
+    // reorder — a sidebar connection dropped on the tab bar opens as a new
+    // session in the active pane (the pre-reorder behaviour), which the
+    // pane hit-test below handles.
+    if let (DragKind::Session(dragged_sid), Some(hover)) = (&drag_kind, drop_tab_hover.as_ref()) {
+        // Skip when the user dropped the tab onto itself — `reorder_tab`
+        // would return `false` anyway, but we also want to avoid the
+        // `clear_tab_drag_state` + `restore_focus` dance for a true no-op.
+        let source_is_target = state.read().tabs.iter().any(|t| {
+            t.anchor_session_id.as_deref() == Some(dragged_sid.as_str()) && t.id == hover.tab_id
+        });
+        if !source_is_target {
+            let moved = reorder_tab(&mut state.write(), dragged_sid, &hover.tab_id, hover.before);
+            if moved {
+                tracing::info!(
+                    "[TAB-DRAG] reordered tab (session {}) {} target tab {}",
+                    &dragged_sid[..dragged_sid.len().min(8)],
+                    if hover.before { "before" } else { "after" },
+                    &hover.tab_id[..hover.tab_id.len().min(8)],
+                );
+                // Tab order is runtime-only state (not persisted in
+                // `PersistedConfig`), so there's no config to save here —
+                // unlike a connection-drop which may change sidebar grouping.
+            } else {
+                tracing::debug!(
+                    "[TAB-DRAG] tab reorder was a no-op (session {}, target tab {}, before={})",
+                    &dragged_sid[..dragged_sid.len().min(8)],
+                    &hover.tab_id[..hover.tab_id.len().min(8)],
+                    hover.before,
+                );
+            }
             clear_tab_drag_state(tab_drag, drag_over_pane, drag_over_group);
             restore_focus_to_active_session(state, 20);
             return;
@@ -16227,12 +16360,13 @@ pub fn App() -> Element {
     //
     // The loop:
     //  1. If `tab_drag` is `None`: sleep 32ms, continue.
-    //  2. Poll `poll_tab_drag_state()` → `(x, y, done, left, top, group)`.
+    //  2. Poll `poll_tab_drag_state()` → `(x, y, done, left, top, group, tab_hover)`.
     //  3. Update `tab_drag`'s `cur_x`/`cur_y`. If `!dragging` and the
     //     cursor has crossed the threshold, set `dragging = true`.
     //  4. If `done` (user released the mouse button):
     //     - If `dragging == true`: call `finish_tab_drag` (hit-test +
-    //       `execute_tab_drop_on_pane` + focus restore + cleanup).
+    //       `execute_tab_drop_on_pane` OR `reorder_tab` if the cursor is
+    //       over a tab in the top bar + focus restore + cleanup).
     //     - Else (it was a click, not a drag): just clean up the signal.
     //       The tab's `onclick` fires normally.
     //  5. Else if `dragging`: live hit-test → `drag_over_group` or
@@ -16249,7 +16383,7 @@ pub fn App() -> Element {
             }
             // Read the JS-side mouse position + done flag + container offset.
             match poll_tab_drag_state().await {
-                Some((x, y, done, left, top, hovered_group_id)) => {
+                Some((x, y, done, left, top, hovered_group_id, hovered_tab)) => {
                     let drag_opt = tab_drag();
                     let Some(drag) = drag_opt else {
                         // Drag was cleared between the check above and now —
@@ -16293,6 +16427,7 @@ pub fn App() -> Element {
                                 left,
                                 top,
                                 hovered_group_id,
+                                hovered_tab,
                             );
                         } else {
                             // It was a click, not a drag. Clean up the
@@ -20618,15 +20753,23 @@ mod tab_drag_tests {
 
     #[test]
     fn tab_drag_parse_valid_in_progress_response_without_group() {
-        let response = drag_poll_response(&["123.4", "567.8", "0", "80.0", "60.0", ""]);
+        let response = drag_poll_response(&["123.4", "567.8", "0", "80.0", "60.0", "", "", ""]);
         let result = parse_tab_drag_poll_response(&response).unwrap();
-        assert_eq!(result, (123.4, 567.8, false, 80.0, 60.0, None));
+        assert_eq!(result, (123.4, 567.8, false, 80.0, 60.0, None, None));
     }
 
     #[test]
     fn tab_drag_parse_valid_done_response_with_group() {
-        let response =
-            drag_poll_response(&["100.0", "200.0", "1", "80.0", "60.0", "group,with,commas"]);
+        let response = drag_poll_response(&[
+            "100.0",
+            "200.0",
+            "1",
+            "80.0",
+            "60.0",
+            "group,with,commas",
+            "",
+            "",
+        ]);
         let result = parse_tab_drag_poll_response(&response).unwrap();
         assert_eq!(
             result,
@@ -20637,6 +20780,7 @@ mod tab_drag_tests {
                 80.0,
                 60.0,
                 Some("group,with,commas".to_string()),
+                None,
             )
         );
     }
@@ -20650,31 +20794,84 @@ mod tab_drag_tests {
         );
         assert_eq!(
             parse_tab_drag_poll_response(&drag_poll_response(&[
-                "1", "2", "0", "4", "5", "", "extra",
+                "1", "2", "0", "4", "5", "", "", "", "extra",
             ])),
+            None
+        );
+        // 6 fields (the old format) is now too few — must be rejected.
+        assert_eq!(
+            parse_tab_drag_poll_response(&drag_poll_response(&["1", "2", "0", "4", "5", "",])),
+            None
+        );
+        // 7 fields is also wrong.
+        assert_eq!(
+            parse_tab_drag_poll_response(&drag_poll_response(&["1", "2", "0", "4", "5", "", "",])),
             None
         );
     }
 
     #[test]
     fn tab_drag_parse_non_numeric_returns_none() {
-        let response = drag_poll_response(&["abc", "200", "0", "80", "60", ""]);
+        let response = drag_poll_response(&["abc", "200", "0", "80", "60", "", "", ""]);
         assert_eq!(parse_tab_drag_poll_response(&response), None);
     }
 
     #[test]
     fn tab_drag_parse_negative_and_integer_coordinates() {
-        let negative = drag_poll_response(&["-50.0", "-100.0", "0", "80", "60", ""]);
+        let negative = drag_poll_response(&["-50.0", "-100.0", "0", "80", "60", "", "", ""]);
         assert_eq!(
             parse_tab_drag_poll_response(&negative),
-            Some((-50.0, -100.0, false, 80.0, 60.0, None))
+            Some((-50.0, -100.0, false, 80.0, 60.0, None, None))
         );
 
-        let integer = drag_poll_response(&["100", "200", "0", "0", "0", ""]);
+        let integer = drag_poll_response(&["100", "200", "0", "0", "0", "", "", ""]);
         assert_eq!(
             parse_tab_drag_poll_response(&integer),
-            Some((100.0, 200.0, false, 0.0, 0.0, None))
+            Some((100.0, 200.0, false, 0.0, 0.0, None, None))
         );
+    }
+
+    /// A hovered tab with `before=1` parses into `Some(TabDragHover { before: true })`.
+    #[test]
+    fn tab_drag_parse_hovered_tab_before() {
+        let response =
+            drag_poll_response(&["100.0", "200.0", "1", "80.0", "60.0", "", "tab-abc", "1"]);
+        let result = parse_tab_drag_poll_response(&response).unwrap();
+        let hover = result.6.as_ref().expect("hovered tab must be Some");
+        assert_eq!(hover.tab_id, "tab-abc");
+        assert!(hover.before);
+    }
+
+    /// A hovered tab with `before=0` parses into `Some(TabDragHover { before: false })`.
+    #[test]
+    fn tab_drag_parse_hovered_tab_after() {
+        let response =
+            drag_poll_response(&["100.0", "200.0", "1", "80.0", "60.0", "", "tab-xyz", "0"]);
+        let result = parse_tab_drag_poll_response(&response).unwrap();
+        let hover = result.6.as_ref().expect("hovered tab must be Some");
+        assert_eq!(hover.tab_id, "tab-xyz");
+        assert!(!hover.before);
+    }
+
+    /// A tab id present but an invalid `before` value (not "0"/"1") is a
+    /// malformed poll response — `parse_tab_drag_poll_response` rejects it
+    /// rather than guessing a side.
+    #[test]
+    fn tab_drag_parse_hovered_tab_invalid_before_is_rejected() {
+        let response = drag_poll_response(&[
+            "100.0", "200.0", "1", "80.0", "60.0", "", "tab-abc", "maybe",
+        ]);
+        assert_eq!(parse_tab_drag_poll_response(&response), None);
+    }
+
+    /// Empty tab id + empty before = no tab hovered (cursor over a pane or
+    /// empty space). The group field is still parsed independently.
+    #[test]
+    fn tab_drag_parse_no_tab_hovered_with_group() {
+        let response = drag_poll_response(&["100.0", "200.0", "0", "80.0", "60.0", "grp", "", ""]);
+        let result = parse_tab_drag_poll_response(&response).unwrap();
+        assert_eq!(result.5.as_deref(), Some("grp"));
+        assert!(result.6.is_none(), "no tab hovered");
     }
 
     // ------------------------------------------------------------------

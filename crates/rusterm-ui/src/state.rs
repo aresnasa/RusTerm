@@ -2062,6 +2062,92 @@ pub fn move_session_to_leftmost(state: &mut AppState, session_id: &str) -> bool 
     true
 }
 
+/// Reorder workspace tabs: move the tab whose anchor session is
+/// `dragged_session_id` so that it sits immediately before (or after)
+/// the tab whose id is `target_tab_id`. This is the top-tab-bar reorder
+/// gesture (drag a tab onto another tab in the bar).
+///
+/// `before` selects the insertion side: `true` inserts the dragged tab
+/// immediately before the target; `false` inserts it immediately after.
+/// The JS hit-test computes this from the cursor's x position relative
+/// to the target tab's horizontal midpoint.
+///
+/// Returns `true` if a reorder actually occurred. Returns `false` when:
+///   - the dragged session has no tab (its anchor isn't any tab's anchor),
+///   - the target tab id isn't in `state.tabs`,
+///   - source and target are the same tab,
+///   - the dragged tab is already in the requested position (no-op).
+///
+/// The active tab is preserved: if the moved tab was active, it stays
+/// active after the move (its id doesn't change — only its position in
+/// `state.tabs` does). `active_session` is unchanged because the anchor
+/// session id is unchanged.
+///
+/// Takes `&mut AppState` (rather than `&mut Signal<AppState>`) so it's
+/// unit-testable without a dioxus runtime. Callers in `app.rs` pass
+/// `&mut state.write()`.
+pub fn reorder_tab(
+    state: &mut AppState,
+    dragged_session_id: &str,
+    target_tab_id: &str,
+    before: bool,
+) -> bool {
+    let src_pos = state
+        .tabs
+        .iter()
+        .position(|t| t.anchor_session_id.as_deref() == Some(dragged_session_id));
+    let Some(src_pos) = src_pos else {
+        return false;
+    };
+    let tgt_pos = state.tabs.iter().position(|t| t.id == target_tab_id);
+    let Some(tgt_pos) = tgt_pos else {
+        return false;
+    };
+    if src_pos == tgt_pos {
+        // Dragging a tab onto itself — no-op.
+        return false;
+    }
+    // Compute the insertion index in the post-removal vector. Remove the
+    // source tab first, then figure out where the target now sits, then
+    // adjust for the `before`/`after` side.
+    let src_tab = state.tabs.remove(src_pos);
+    // After removal, the target's index may have shifted left by one if
+    // the source was before it.
+    let tgt_pos_after = state
+        .tabs
+        .iter()
+        .position(|t| t.id == target_tab_id)
+        .unwrap_or_else(|| state.tabs.len().saturating_sub(1));
+    let insert_at = if before {
+        tgt_pos_after
+    } else {
+        // Insert after the target. Saturating-add guards against the
+        // (impossible-in-practice) case where the target is the last tab.
+        tgt_pos_after.saturating_add(1)
+    };
+    // No-op check: if the computed insertion index matches the source's
+    // original position (adjusted for the removal), the tab would land in
+    // the same slot — skip the insert to avoid a redundant write and to
+    // return a truthful `false`.
+    //
+    // Concretely: if `before` and src was immediately before tgt, removing
+    // src shifts tgt left into src's old slot, and `insert_at == tgt_pos_after`
+    // equals `src_pos` — a no-op. Same for `after` when src was immediately
+    // after tgt.
+    let would_be_noop = match (before, src_pos.cmp(&tgt_pos)) {
+        (true, std::cmp::Ordering::Less) => insert_at == src_pos,
+        (false, std::cmp::Ordering::Greater) => insert_at == src_pos,
+        _ => false,
+    };
+    if would_be_noop {
+        // Put the tab back where it was.
+        state.tabs.insert(src_pos, src_tab);
+        return false;
+    }
+    state.tabs.insert(insert_at, src_tab);
+    true
+}
+
 /// Apply a layout preset to the active tab. Builds a fresh `PaneLayout`
 /// from the preset using the active tab's anchor session as the first pane,
 /// then fills the remaining pane slots with other open sessions (in tab
@@ -4002,6 +4088,175 @@ mod tests {
             vec!["alpha".to_string(), "beta".to_string()],
             "order must be unchanged when the tab id isn't found"
         );
+    }
+
+    // ------------------------------------------------------------------
+    // reorder_tab tests (top-tab-bar drag-to-reorder)
+    // ------------------------------------------------------------------
+
+    /// Helper: extract the tab anchor-session ids in order. The
+    /// `state_with_active_session` helper sets each tab's `id` equal to its
+    /// anchor session id, so this also reflects the tab ids — convenient for
+    /// asserting reorder outcomes.
+    fn tab_anchors(state: &AppState) -> Vec<String> {
+        state
+            .tabs
+            .iter()
+            .map(|t| t.anchor_session_id.clone().unwrap_or_default())
+            .collect()
+    }
+
+    /// Dragging the first tab onto the third tab with `before=true` moves
+    /// the dragged tab immediately before the target. [A,B,C] → drag A
+    /// before C → [B,A,C].
+    #[test]
+    fn reorder_tab_before_target_moves_source_immediately_before() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma"]);
+        let moved = reorder_tab(&mut state, "alpha", "gamma", true);
+        assert!(moved, "alpha should have been reordered before gamma");
+        assert_eq!(
+            tab_anchors(&state),
+            vec!["beta", "alpha", "gamma"],
+            "alpha must land immediately before gamma"
+        );
+    }
+
+    /// Dragging the first tab onto the second tab with `after=true` moves
+    /// the dragged tab immediately after the target. [A,B,C] → drag A after
+    /// B → [B,A,C].
+    #[test]
+    fn reorder_tab_after_target_moves_source_immediately_after() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma"]);
+        let moved = reorder_tab(&mut state, "alpha", "beta", false);
+        assert!(moved, "alpha should have been reordered after beta");
+        assert_eq!(
+            tab_anchors(&state),
+            vec!["beta", "alpha", "gamma"],
+            "alpha must land immediately after beta"
+        );
+    }
+
+    /// Dragging a tab forward onto a later tab with `before=true`. [A,B,C,D]
+    /// → drag B before D → [A,C,B,D].
+    #[test]
+    fn reorder_tab_forward_before_target() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma", "delta"]);
+        let moved = reorder_tab(&mut state, "beta", "delta", true);
+        assert!(moved);
+        assert_eq!(
+            tab_anchors(&state),
+            vec!["alpha", "gamma", "beta", "delta"],
+            "beta must land immediately before delta"
+        );
+    }
+
+    /// Dragging a tab backward onto an earlier tab with `before=true`.
+    /// [A,B,C,D] → drag D before B → [A,D,B,C].
+    #[test]
+    fn reorder_tab_backward_before_target() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma", "delta"]);
+        let moved = reorder_tab(&mut state, "delta", "beta", true);
+        assert!(moved);
+        assert_eq!(
+            tab_anchors(&state),
+            vec!["alpha", "delta", "beta", "gamma"],
+            "delta must land immediately before beta"
+        );
+    }
+
+    /// Dragging a tab backward onto an earlier tab with `after=true`.
+    /// [A,B,C,D] → drag D after B → [A,B,D,C].
+    #[test]
+    fn reorder_tab_backward_after_target() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma", "delta"]);
+        let moved = reorder_tab(&mut state, "delta", "beta", false);
+        assert!(moved);
+        assert_eq!(
+            tab_anchors(&state),
+            vec!["alpha", "beta", "delta", "gamma"],
+            "delta must land immediately after beta"
+        );
+    }
+
+    /// Dragging a tab onto itself is a no-op and returns `false`.
+    #[test]
+    fn reorder_tab_onto_self_is_noop() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma"]);
+        let moved = reorder_tab(&mut state, "beta", "beta", true);
+        assert!(!moved, "reordering a tab onto itself must be a no-op");
+        assert_eq!(
+            tab_anchors(&state),
+            vec!["alpha", "beta", "gamma"],
+            "order must be unchanged when source == target"
+        );
+    }
+
+    /// Dragging a tab immediately before the tab it's ALREADY before is a
+    /// no-op. [A,B,C] → drag A before B → still [A,B,C], returns `false`.
+    #[test]
+    fn reorder_tab_before_already_preceding_is_noop() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma"]);
+        let moved = reorder_tab(&mut state, "alpha", "beta", true);
+        assert!(
+            !moved,
+            "alpha is already immediately before beta — no reorder should occur"
+        );
+        assert_eq!(
+            tab_anchors(&state),
+            vec!["alpha", "beta", "gamma"],
+            "order must be unchanged when the tab is already in the requested slot"
+        );
+    }
+
+    /// Dragging a tab immediately after the tab it's ALREADY after is a
+    /// no-op. [A,B,C] → drag C after B → still [A,B,C], returns `false`.
+    #[test]
+    fn reorder_tab_after_already_following_is_noop() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma"]);
+        let moved = reorder_tab(&mut state, "gamma", "beta", false);
+        assert!(
+            !moved,
+            "gamma is already immediately after beta — no reorder should occur"
+        );
+        assert_eq!(tab_anchors(&state), vec!["alpha", "beta", "gamma"],);
+    }
+
+    /// Unknown dragged session id → `false`, no mutation.
+    #[test]
+    fn reorder_tab_unknown_source_session_is_noop() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        let moved = reorder_tab(&mut state, "nonexistent", "beta", true);
+        assert!(!moved);
+        assert_eq!(tab_anchors(&state), vec!["alpha", "beta"]);
+    }
+
+    /// Unknown target tab id → `false`, no mutation.
+    #[test]
+    fn reorder_tab_unknown_target_tab_is_noop() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        let moved = reorder_tab(&mut state, "alpha", "nonexistent", true);
+        assert!(!moved);
+        assert_eq!(tab_anchors(&state), vec!["alpha", "beta"]);
+    }
+
+    /// The active tab stays active after being reordered. This is the key
+    /// UX invariant: dragging the focused tab to a new position must NOT
+    /// deactivate it.
+    #[test]
+    fn reorder_tab_preserves_active_tab() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma"]);
+        // Make `beta` the active tab.
+        set_active_tab(&mut state, "beta");
+        assert_eq!(state.active_tab.as_deref(), Some("beta"));
+        assert_eq!(state.active_session.as_deref(), Some("beta"));
+
+        let moved = reorder_tab(&mut state, "beta", "gamma", false);
+        assert!(moved);
+        // beta moved after gamma → [alpha, gamma, beta].
+        assert_eq!(tab_anchors(&state), vec!["alpha", "gamma", "beta"]);
+        // Active tab + session unchanged.
+        assert_eq!(state.active_tab.as_deref(), Some("beta"));
+        assert_eq!(state.active_session.as_deref(), Some("beta"));
     }
 
     /// Verifies the timing-window guard for failed-command suggestions.
