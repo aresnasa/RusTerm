@@ -1,7 +1,11 @@
 //! Floating, draggable agent chat box (issue #122).
 //!
-//! Lives in the bottom-left of the `#main` container by default and can be
-//! repositioned by dragging its title bar. The panel doubles as a command
+//! In floating mode the panel is anchored to the bottom-left of the window
+//! by default and can be repositioned by dragging its title bar (clamped to
+//! the window bounds). A title-bar toggle cycles floating → right dock →
+//! bottom dock; in the docked modes `app.rs` renders the panel inside
+//! `#main` so it merges into the main window layout instead of overlapping
+//! the terminals. The panel doubles as a command
 //! palette: typing `/` as the first character switches the input into
 //! command-search mode, fuzzy-filtering the user's command history (from the
 //! DuckDB-backed `rusterm_db::history` store) plus a small built-in list of
@@ -9,7 +13,9 @@
 //! terminal pane — the "Tab into terminal" gesture.
 //!
 //! Agent configuration (provider / model / base URL / system prompt) is edited
-//! inline via a small popover and persisted to `PersistedConfig::chat`. API
+//! via a popover rendered as a scrollable overlay (so the Save button can
+//! never be clipped by the panel bounds) and persisted to
+//! `PersistedConfig::chat`. API
 //! keys are NOT stored in config — they're entered per-session in the popover
 //! and held only in memory for the lifetime of the app (matching the project's
 //! "never persist secrets in settings.json" policy; a future change can route
@@ -28,7 +34,7 @@
 use dioxus::prelude::*;
 
 use rusterm_core::config::{
-    AgentConfig, ChatAgentProvider, ChatPosition, ChatSettings, SkinSettings,
+    AgentConfig, ChatAgentProvider, ChatDock, ChatPosition, ChatSettings, SkinSettings,
 };
 
 use crate::state::{AppState, ChatCommandEntry, ChatCommandSource, ChatMessage, ChatRole};
@@ -41,6 +47,9 @@ const DEFAULT_CHAT_HEIGHT: f64 = 360.0;
 /// Padding from the container edge when the panel is first anchored to the
 /// bottom-left.
 const DEFAULT_EDGE_PADDING: f64 = 12.0;
+/// Fixed title-bar height (logical px) so the agent-config popover overlay
+/// can anchor directly below it.
+const CHAT_TITLE_HEIGHT: f64 = 33.0;
 
 /// Built-in app commands surfaced in the `/` palette. These are intentionally
 /// a tiny, high-value starter set — the palette is extensible later.
@@ -99,15 +108,30 @@ pub fn ChatPanel(
             }
             match poll_chat_drag().await {
                 Some((x, y, done)) => {
-                    // Copy the drag offset out of the read guard BEFORE taking
-                    // a write guard — `state.read()` returns a temporary
-                    // guard that can't overlap `state.write()`.
-                    let offset = state.read().chat_drag_offset;
+                    // Copy the drag offset + current panel size out of the
+                    // read guard BEFORE taking a write guard — `state.read()`
+                    // returns a temporary guard that can't overlap
+                    // `state.write()`.
+                    let (offset, pw, ph) = {
+                        let s = state.read();
+                        let (pw, ph) = panel_size(&s.chat_settings);
+                        (s.chat_drag_offset, pw, ph)
+                    };
                     if let Some((off_x, off_y)) = offset {
-                        let new_pos = ChatPosition {
-                            x: (x - off_x).max(0.0),
-                            y: (y - off_y).max(0.0),
-                        };
+                        // Clamp to the window bounds so the panel can never
+                        // be dragged off-screen (where its position would
+                        // then persist and the panel would be "lost").
+                        let (win_w, win_h) = window_logical_size();
+                        let new_pos = clamp_position(
+                            ChatPosition {
+                                x: x - off_x,
+                                y: y - off_y,
+                            },
+                            pw,
+                            ph,
+                            win_w,
+                            win_h,
+                        );
                         state.write().chat_settings.position = new_pos;
                     }
                     if done {
@@ -170,6 +194,11 @@ pub fn ChatPanel(
         .unwrap_or_else(|| crate::i18n::t("chat.hint").to_string());
 
     let start_drag = move |e: MouseEvent| {
+        // Docked panels participate in the window layout — dragging their
+        // title bar must not start the floating-panel drag loop.
+        if state.read().chat_settings.dock != ChatDock::Floating {
+            return;
+        }
         // Capture the offset between the cursor and the panel origin so the
         // panel doesn't jump to put the cursor at its top-left corner. We
         // use client (viewport) coordinates to match the JS-side
@@ -331,8 +360,14 @@ pub fn ChatPanel(
     };
 
     let mut on_close = move |_| {
-        state.write().chat_visible = false;
-        let updated = state.read().chat_settings.clone();
+        // Mirror the hidden state into `chat_settings.visible` BEFORE saving —
+        // otherwise the persisted settings still say `visible: true` and the
+        // panel reappears on the next launch ("config doesn't save").
+        let mut s = state.write();
+        s.chat_visible = false;
+        s.chat_settings.visible = false;
+        let updated = s.chat_settings.clone();
+        drop(s);
         on_save_chat.call(updated);
     };
 
@@ -341,39 +376,60 @@ pub fn ChatPanel(
         .as_ref()
         .map(|a| a.name.clone())
         .unwrap_or_else(|| "(no agent)".to_string());
+    let dock = settings.dock;
+    let floating = dock == ChatDock::Floating;
+
+    // Root style depends on the dock mode: floating panels are `position:
+    // fixed` overlays placed at the dragged coords; docked panels are plain
+    // flex children of `#main` (rendered inside it by `app.rs`) so they push
+    // the terminal content aside — the "merge into main window" behavior.
+    // `position: relative` on the docked roots anchors the agent-config
+    // popover overlay. Title-bar height is fixed so the popover's `top`
+    // offset lines up.
+    let root_style = match dock {
+        ChatDock::Floating => format!(
+            "{skin_style}position:fixed;left:{}px;top:{}px;width:{}px;height:{}px;\
+             z-index:200;border:1px solid var(--skin-border-strong);border-radius:8px;\
+             box-shadow:0 8px 32px rgba(0,0,0,0.35);",
+            position.x, position.y, width, height
+        ),
+        ChatDock::Right => format!(
+            "{skin_style}position:relative;width:{}px;height:100%;flex:none;\
+             border-left:1px solid var(--skin-border-strong);",
+            width
+        ),
+        ChatDock::Bottom => format!(
+            "{skin_style}position:relative;width:100%;height:{}px;flex:none;\
+             border-top:1px solid var(--skin-border-strong);",
+            height
+        ),
+    };
+    let title_cursor = if floating { "grab" } else { "default" };
 
     rsx! {
         div {
             id: "rusterm-chat-panel",
-            style: "
-                {skin_style}
-                position: fixed;
-                left: {position.x}px;
-                top: {position.y}px;
-                width: {width}px;
-                height: {height}px;
+            style: "{root_style}
                 background: var(--skin-surface);
-                border: 1px solid var(--skin-border-strong);
-                border-radius: 8px;
                 display: flex;
                 flex-direction: column;
-                z-index: 200;
                 color: var(--skin-text);
-                box-shadow: 0 8px 32px rgba(0,0,0,0.35);
                 overflow: hidden;
                 font-size: 12px;
             ",
 
-            // ── Title bar (drag handle) ───────────────────────────────────
+            // ── Title bar (drag handle in floating mode) ──────────────────
             div {
                 style: "
                     display: flex;
                     align-items: center;
                     justify-content: space-between;
-                    padding: 7px 10px;
+                    height: {CHAT_TITLE_HEIGHT}px;
+                    box-sizing: border-box;
+                    padding: 0 10px;
                     background: var(--skin-bg);
                     border-bottom: 1px solid var(--skin-border);
-                    cursor: grab;
+                    cursor: {title_cursor};
                     user-select: none;
                     -webkit-user-select: none;
                 ",
@@ -389,6 +445,22 @@ pub fn ChatPanel(
                     }
                 }
                 div { style: "display:flex;align-items:center;gap:6px;",
+                    // Merge-into-main-window toggle: cycles floating → right
+                    // dock → bottom dock. Persisted via on_save_chat, so the
+                    // layout survives restarts like every other chat setting.
+                    button {
+                        style: agent_button_style(),
+                        title: crate::i18n::t("chat.dock_tooltip"),
+                        onclick: move |e| {
+                            e.stop_propagation();
+                            let mut s = state.write();
+                            s.chat_settings.dock = s.chat_settings.dock.next();
+                            let updated = s.chat_settings.clone();
+                            drop(s);
+                            on_save_chat.call(updated);
+                        },
+                        if floating { "⊞" } else { "⧉" }
+                    }
                     button {
                         style: agent_button_style(),
                         title: "Configure agent",
@@ -423,7 +495,7 @@ pub fn ChatPanel(
                 }
             }
 
-            // ── Agent selector + config popover ───────────────────────────
+            // ── Agent selector ────────────────────────────────────────────
             div {
                 style: "padding:6px 10px;border-bottom:1px solid var(--skin-border);background:var(--skin-bg);",
                 select {
@@ -445,8 +517,17 @@ pub fn ChatPanel(
                         }
                     }
                 }
+            }
 
-                if *show_agent_config.peek() {
+            // ── Agent config popover ──────────────────────────────────────
+            // Rendered as an overlay anchored below the title bar (not inline
+            // in the selector row). The panel's fixed height + overflow:hidden
+            // used to clip the popover so the 保存 button was unreachable;
+            // the overlay owns a scroll region so the button is always
+            // clickable regardless of panel height.
+            if *show_agent_config.peek() {
+                div {
+                    style: "position:absolute;top:{CHAT_TITLE_HEIGHT}px;left:0;right:0;bottom:0;z-index:20;background:var(--skin-surface);overflow-y:auto;",
                     { render_agent_config(state.clone(), active_agent.clone(), draft_name, draft_model, draft_base_url, draft_prompt, draft_api_key, on_save_chat.clone()) }
                 }
             }
@@ -593,7 +674,7 @@ fn render_agent_config(
 
     rsx! {
         div {
-            style: "padding:8px;border-top:1px solid var(--skin-border);display:flex;flex-direction:column;gap:6px;background:var(--skin-surface);",
+            style: "padding:8px;display:flex;flex-direction:column;gap:6px;background:var(--skin-surface);",
             label { style: label_style(), { crate::i18n::t("chat.agent_name") }
                 input {
                     style: input_style(),
@@ -677,26 +758,42 @@ fn panel_size(settings: &ChatSettings) -> (f64, f64) {
     (w, h)
 }
 
+/// Live window inner size in logical px (the panel's CSS uses logical px).
+/// Mirrors the window-state persistence code in app.rs.
+/// `dioxus::desktop::window()` derefs to tao::Window, available synchronously
+/// on desktop.
+fn window_logical_size() -> (f64, f64) {
+    let desktop = dioxus::desktop::window();
+    let logical = desktop
+        .inner_size()
+        .to_logical::<f64>(desktop.scale_factor());
+    (logical.width, logical.height)
+}
+
+/// Clamp a panel position so the whole panel stays inside a `win_w × win_h`
+/// window. Prevents the panel from being dragged (or restored) off-screen.
+fn clamp_position(p: ChatPosition, w: f64, h: f64, win_w: f64, win_h: f64) -> ChatPosition {
+    ChatPosition {
+        x: p.x.clamp(0.0, (win_w - w).max(0.0)),
+        y: p.y.clamp(0.0, (win_h - h).max(0.0)),
+    }
+}
+
 /// Resolve the panel position: use the persisted drag position if set,
 /// otherwise anchor to the bottom-left of the window. The bottom-left
 /// anchor is computed from the live window's inner height so it actually
 /// sits at the bottom regardless of window size. Once the user drags, the
-/// persisted `position` takes over.
-fn resolved_position(settings: &ChatSettings, _w: f64, h: f64) -> ChatPosition {
+/// persisted `position` takes over. A persisted position is clamped back
+/// into the window (the window may have shrunk since it was saved).
+fn resolved_position(settings: &ChatSettings, w: f64, h: f64) -> ChatPosition {
     if settings.position.is_set() {
-        settings.position
+        let (win_w, win_h) = window_logical_size();
+        clamp_position(settings.position, w, h, win_w, win_h)
     } else {
-        // Read the live window's inner height and convert physical → logical
-        // px (the panel's CSS uses logical px). Mirrors the window-state
-        // persistence code in app.rs. `dioxus::desktop::window()` derefs to
-        // tao::Window, available synchronously on desktop.
-        let desktop = dioxus::desktop::window();
-        let inner = desktop.inner_size();
-        let scale_factor = desktop.scale_factor();
-        let logical = inner.to_logical::<f64>(scale_factor);
+        let (_win_w, win_h) = window_logical_size();
         ChatPosition {
             x: DEFAULT_EDGE_PADDING,
-            y: (logical.height - h - DEFAULT_EDGE_PADDING).max(DEFAULT_EDGE_PADDING),
+            y: (win_h - h - DEFAULT_EDGE_PADDING).max(DEFAULT_EDGE_PADDING),
         }
     }
 }

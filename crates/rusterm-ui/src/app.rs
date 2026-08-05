@@ -10,10 +10,10 @@ use tokio_util::sync::CancellationToken;
 
 use rusterm_core::LoginStep;
 use rusterm_core::config::{
-    BottomPanelTab, ChatSettings, ConnectionConfig, ConnectionGroup, ConnectionKind, DockZone,
-    KeybindingAction, Keybindings, OneKey, OneKeyPreference, OneKeyStep, PanelId, ProxyConfig,
-    ProxyKind, RightPanelTab, SerialConfig, ShellConfig, SidebarPreferences, SkinSettings, SshAuth,
-    SshConfig, TelnetConfig, WorkspacePreferences,
+    BottomPanelTab, ChatDock, ChatSettings, ConnectionConfig, ConnectionGroup, ConnectionKind,
+    DockZone, KeybindingAction, Keybindings, OneKey, OneKeyPreference, OneKeyStep, PanelId,
+    ProxyConfig, ProxyKind, RightPanelTab, SerialConfig, ShellConfig, SidebarPreferences,
+    SkinSettings, SshAuth, SshConfig, TelnetConfig, WorkspacePreferences,
 };
 use rusterm_core::config_manager::ConfigManager;
 use rusterm_core::event::SessionEvent;
@@ -17366,6 +17366,28 @@ pub fn App() -> Element {
         )
     });
 
+    // ── Agent chat panel shared bindings (issue #122) ───────────────────
+    // The panel renders in one of three places depending on the persisted
+    // `chat_settings.dock` mode: floating overlay outside `#main`, right-dock
+    // column inside `#main`, or bottom strip inside the main area column.
+    // Share the props so all three call sites behave identically.
+    let chat_dock = state.read().chat_settings.dock;
+    let chat_skin = state.read().skin.clone();
+    let chat_on_save: EventHandler<ChatSettings> =
+        EventHandler::new(move |settings: ChatSettings| {
+            // Mirror into AppState and persist to settings.json via the
+            // dedicated `save_chat_settings` read-modify-write path.
+            state.write().chat_settings = settings.clone();
+            if let Some(cm) = state.read().config_manager.clone() {
+                if let Err(e) = cm.save_chat_settings(&settings) {
+                    tracing::error!("Failed to save chat settings: {e}");
+                }
+            }
+        });
+    let chat_on_focus: EventHandler<()> = EventHandler::new(move |_| {
+        restore_focus_to_active_session(state, 50);
+    });
+
     rsx! {
         div {
             id: "main",
@@ -17851,6 +17873,18 @@ pub fn App() -> Element {
                     dock_drag,
                 )}
 
+                // Agent chat docked to the bottom of the main area (issue
+                // #122): a full-width strip that participates in the column
+                // layout instead of floating over the terminals.
+                if chat_dock == ChatDock::Bottom {
+                    ChatPanel {
+                        state,
+                        skin: chat_skin.clone(),
+                        on_save_chat: chat_on_save.clone(),
+                        on_focus_terminal: chat_on_focus.clone(),
+                    }
+                }
+
                 // Status bar
                 div {
                     style: "
@@ -18270,6 +18304,17 @@ pub fn App() -> Element {
                 tab_drag,
                 dock_drag,
             )}
+
+            // Agent chat docked to the right of the whole window (issue
+            // #122): a full-height column merged into the `#main` flex row.
+            if chat_dock == ChatDock::Right {
+                ChatPanel {
+                    state,
+                    skin: chat_skin.clone(),
+                    on_save_chat: chat_on_save.clone(),
+                    on_focus_terminal: chat_on_focus.clone(),
+                }
+            }
         }
 
         DockHiddenDropTargets {
@@ -18278,29 +18323,22 @@ pub fn App() -> Element {
         }
         DockDragGhost { drag: dock_drag() }
 
-        // Agent chat box (issue #122): floating, draggable, bottom-left by
-        // default. `position: fixed` so it overlays the whole window. The
-        // panel reads its visibility + settings straight off `AppState`.
+        // Agent chat box (issue #122), floating mode: draggable, bottom-left
+        // by default. `position: fixed` so it overlays the whole window. The
+        // panel reads its visibility + settings straight off `AppState`. When
+        // `chat_settings.dock` is Right/Bottom the panel renders inside
+        // `#main` instead (see the call sites above).
         //
         // NOTE: rendered OUTSIDE `#main`, so it can't inherit the `--skin-*`
         // custom properties declared there — it receives the skin settings and
         // re-declares them on its own root to stay themed.
-        ChatPanel {
-            state,
-            skin: state.read().skin.clone(),
-            on_save_chat: move |settings: ChatSettings| {
-                // Mirror into AppState and persist to settings.json via the
-                // dedicated `save_chat_settings` read-modify-write path.
-                state.write().chat_settings = settings.clone();
-                if let Some(cm) = state.read().config_manager.clone() {
-                    if let Err(e) = cm.save_chat_settings(&settings) {
-                        tracing::error!("Failed to save chat settings: {e}");
-                    }
-                }
-            },
-            on_focus_terminal: move |_| {
-                restore_focus_to_active_session(state, 50);
-            },
+        if chat_dock == ChatDock::Floating {
+            ChatPanel {
+                state,
+                skin: chat_skin.clone(),
+                on_save_chat: chat_on_save.clone(),
+                on_focus_terminal: chat_on_focus.clone(),
+            }
         }
 
         if matches!(modal(), Modal::Settings) {

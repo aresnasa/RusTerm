@@ -1440,6 +1440,31 @@ impl ChatPosition {
     }
 }
 
+/// How the agent chat panel is attached to the main window (issue #122).
+/// `Floating` is the legacy behavior: a draggable, `position: fixed` overlay
+/// rendered outside `#main`. `Right` / `Bottom` merge the panel into the main
+/// window layout so it participates in the flex flow instead of overlapping
+/// the terminal content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatDock {
+    #[default]
+    Floating,
+    Right,
+    Bottom,
+}
+
+impl ChatDock {
+    /// Cycle order for the title-bar dock toggle button.
+    pub fn next(self) -> Self {
+        match self {
+            ChatDock::Floating => ChatDock::Right,
+            ChatDock::Right => ChatDock::Bottom,
+            ChatDock::Bottom => ChatDock::Floating,
+        }
+    }
+}
+
 /// Persisted settings for the agent chat box (issue #122). Stored under
 /// `PersistedConfig::chat`. All fields `#[serde(default)]` so legacy
 /// settings files load cleanly (chat box just starts hidden with the
@@ -1466,6 +1491,10 @@ pub struct ChatSettings {
     pub width: f64,
     #[serde(default)]
     pub height: f64,
+    /// How the panel attaches to the main window. Legacy settings files omit
+    /// this field and get the floating overlay.
+    #[serde(default)]
+    pub dock: ChatDock,
 }
 
 fn default_chat_agents() -> Vec<AgentConfig> {
@@ -1481,6 +1510,7 @@ impl Default for ChatSettings {
             position: ChatPosition::default(),
             width: 0.0,
             height: 0.0,
+            dock: ChatDock::Floating,
         }
     }
 }
@@ -3028,6 +3058,7 @@ mod tests {
             position: ChatPosition { x: 42.0, y: 99.0 },
             width: 0.0,
             height: 0.0,
+            dock: ChatDock::Floating,
         };
         let n = s.normalized();
         // The default OpenAI agent is restored.
@@ -3061,6 +3092,7 @@ mod tests {
             position: ChatPosition { x: 120.0, y: 300.0 },
             width: 420.0,
             height: 400.0,
+            dock: ChatDock::Right,
         }
         .normalized();
         let json = serde_json::to_string(&s).unwrap();
@@ -3072,6 +3104,20 @@ mod tests {
             Some("anthropic-1")
         );
         assert_eq!(parsed.position, ChatPosition { x: 120.0, y: 300.0 });
+        // The dock mode survives the roundtrip too.
+        assert_eq!(parsed.dock, ChatDock::Right);
+    }
+
+    #[test]
+    fn chat_dock_cycles_through_all_modes_and_defaults_to_floating() {
+        assert_eq!(ChatDock::default(), ChatDock::Floating);
+        assert_eq!(ChatDock::Floating.next(), ChatDock::Right);
+        assert_eq!(ChatDock::Right.next(), ChatDock::Bottom);
+        assert_eq!(ChatDock::Bottom.next(), ChatDock::Floating);
+        // Legacy settings files omit `dock` entirely → floating overlay.
+        let legacy = r#"{"visible":true}"#;
+        let parsed: ChatSettings = serde_json::from_str(legacy).unwrap();
+        assert_eq!(parsed.dock, ChatDock::Floating);
     }
 
     #[test]

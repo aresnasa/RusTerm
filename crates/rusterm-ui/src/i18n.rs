@@ -1482,6 +1482,10 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         "chat.agent_api_key" => ("API key (in-memory only)", "API Key（仅存内存）"),
         "chat.agent_system_prompt" => ("System prompt", "系统提示词"),
         "chat.save" => ("Save", "保存"),
+        "chat.dock_tooltip" => (
+            "Merge into main window (cycles: right dock → bottom dock → floating)",
+            "合并到主体窗口（点击切换：右侧停靠 → 底部停靠 → 浮动）",
+        ),
 
         // Fallback: unknown key.
         _ => return None,
