@@ -11,9 +11,9 @@ use tokio_util::sync::CancellationToken;
 use rusterm_core::LoginStep;
 use rusterm_core::config::{
     BottomPanelTab, ChatDock, ChatSettings, ConnectionConfig, ConnectionGroup, ConnectionKind,
-    DockZone, KeybindingAction, Keybindings, OneKey, OneKeyPreference, OneKeyStep, PanelId,
-    ProxyConfig, ProxyKind, RightPanelTab, SerialConfig, ShellConfig, SidebarPreferences,
-    SkinSettings, SshAuth, SshConfig, TelnetConfig, WorkspacePreferences,
+    DockZone, KeybindingAction, Keybindings, OneKey, OneKeyPreference, OneKeyStep,
+    OtpWebhookConfig, PanelId, ProxyConfig, ProxyKind, RightPanelTab, SerialConfig, ShellConfig,
+    SidebarPreferences, SkinSettings, SshAuth, SshConfig, TelnetConfig, WorkspacePreferences,
 };
 use rusterm_core::config_manager::ConfigManager;
 use rusterm_core::event::SessionEvent;
@@ -18811,6 +18811,8 @@ pub fn App() -> Element {
                 qwen_local_settings: state.read().config_manager.as_ref()
                     .map(|cm| cm.load_qwen_local_settings())
                     .unwrap_or_default(),
+                otp_webhook: state.read().config_manager.as_ref()
+                    .and_then(|cm| cm.load_otp_webhook()),
                 qwen_local_warning: {
                     #[cfg(feature = "qwen-local")]
                     {
@@ -18975,6 +18977,17 @@ pub fn App() -> Element {
                         "[QWEN-LOCAL] template generation {} (model: {})",
                         if settings.enabled { "enabled" } else { "disabled" },
                         settings.active_model_id
+                    );
+                },
+                on_save_otp_webhook: move |cfg: Option<OtpWebhookConfig>| {
+                    if let Some(cm) = state.read().config_manager.clone() {
+                        if let Err(e) = cm.save_otp_webhook(cfg.as_ref()) {
+                            tracing::error!("Failed to save OTP webhook setting: {}", e);
+                        }
+                    }
+                    tracing::info!(
+                        "[OTP] webhook provider set to {:?}",
+                        cfg.as_ref().map(std::mem::discriminant)
                     );
                 },
             }

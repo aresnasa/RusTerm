@@ -2,7 +2,7 @@ use dioxus::prelude::*;
 
 use rusterm_core::FocusedTabAppearance;
 use rusterm_core::config::{
-    KeybindingAction, Keybindings, Language, SkinKind, SkinSettings, ThemeMode,
+    KeybindingAction, Keybindings, Language, OtpWebhookConfig, SkinKind, SkinSettings, ThemeMode,
 };
 
 use crate::keybindings::{event_chord, format_key_chord};
@@ -341,6 +341,13 @@ fn settings_search_items(
             "settings.export_report",
             Some("settings.export_report_help"),
             "json download sanitized privacy 导出 下载 清理 隐私报告",
+        ),
+        (
+            "settings-otp-webhook",
+            "settings.otp_webhook",
+            "settings.otp_webhook",
+            Some("settings.otp_webhook_help"),
+            "otp mfa 2fa jumpServer jumpserver otp feishu webhook verification one time password second factor 二次认证 验证码 飞书 堡垒机 机器人 webhook",
         ),
         (
             "settings-local-ai",
@@ -766,6 +773,310 @@ fn render_model_download(
     rsx! {}
 }
 
+/// Default Feishu-bot OTP webhook used when the user switches the provider
+/// selector to `feishubot` and no prior config exists.
+fn otp_default_feishubot() -> OtpWebhookConfig {
+    OtpWebhookConfig::Feishubot {
+        app_id: String::new(),
+        app_secret: String::new(),
+        chat_id: String::new(),
+        code_pattern: rusterm_core::config::default_otp_code_pattern(),
+        sender_open_id: None,
+        max_age_secs: rusterm_core::config::default_otp_max_age_secs(),
+        base_url: rusterm_core::config::default_feishu_base_url(),
+    }
+}
+
+/// Default generic HTTP OTP webhook used when the user switches the provider
+/// selector to `http` and no prior config exists.
+fn otp_default_http() -> OtpWebhookConfig {
+    OtpWebhookConfig::Http {
+        url: String::new(),
+        method: "get".to_string(),
+        body: None,
+        headers: Vec::new(),
+        code_pattern: rusterm_core::config::default_otp_code_pattern(),
+        timeout_secs: 10,
+    }
+}
+
+const OTP_INPUT_STYLE: &str = "width: 100%; box-sizing: border-box; padding: 6px 8px; border: 1px solid var(--settings-border); border-radius: 4px; background: var(--settings-bg); color: var(--settings-text); font-size: 12px;";
+
+fn render_otp_webhook_settings(mut setting: Signal<Option<OtpWebhookConfig>>) -> Element {
+    let current = setting();
+    let kind = match current {
+        Some(OtpWebhookConfig::Feishubot { .. }) => "feishubot",
+        Some(OtpWebhookConfig::Http { .. }) => "http",
+        Some(OtpWebhookConfig::Manual) | None => "manual",
+    };
+
+    let feishubot_fields = match current {
+        Some(OtpWebhookConfig::Feishubot {
+            ref app_id,
+            ref app_secret,
+            ref chat_id,
+            ref code_pattern,
+            ref sender_open_id,
+            max_age_secs,
+            ..
+        }) => Some((
+            app_id.clone(),
+            app_secret.clone(),
+            chat_id.clone(),
+            code_pattern.clone(),
+            sender_open_id.clone().unwrap_or_default(),
+            max_age_secs,
+        )),
+        _ => None,
+    };
+
+    let http_fields = match current {
+        Some(OtpWebhookConfig::Http {
+            ref url,
+            ref method,
+            ref body,
+            ref code_pattern,
+            timeout_secs,
+            ..
+        }) => Some((
+            url.clone(),
+            method.clone(),
+            body.clone().unwrap_or_default(),
+            code_pattern.clone(),
+            timeout_secs,
+        )),
+        _ => None,
+    };
+
+    rsx! {
+        h3 {
+            id: "settings-otp-webhook",
+            style: "margin: 24px 0 6px; font-size: 16px;",
+            { crate::i18n::t("settings.otp_webhook") }
+        }
+        p {
+            style: "margin: 0 0 12px; color: var(--settings-text-muted); font-size: 12px; line-height: 1.5;",
+            { crate::i18n::t("settings.otp_webhook_help") }
+        }
+
+        // Provider selector — `manual` maps to `None` on disk (the safe
+        // default; OTP prompts fall back to the OneKey popup).
+        div {
+            style: "display: flex; align-items: center; justify-content: space-between; gap: 16px;",
+            label {
+                style: "font-size: 12px; color: var(--settings-text);",
+                { crate::i18n::t("settings.otp_provider") }
+            }
+            select {
+                style: "min-width: 180px; background: var(--settings-bg); color: var(--settings-text); border: 1px solid var(--settings-border-strong); border-radius: 4px; padding: 5px 8px; font-size: 12px; cursor: pointer;",
+                value: kind,
+                onchange: move |e| {
+                    match e.value().as_str() {
+                        "feishubot" => setting.set(Some(otp_default_feishubot())),
+                        "http" => setting.set(Some(otp_default_http())),
+                        _ => setting.set(None),
+                    }
+                },
+                option { value: "manual", selected: kind == "manual", { crate::i18n::t("settings.otp_provider_manual") } }
+                option { value: "feishubot", selected: kind == "feishubot", { crate::i18n::t("settings.otp_provider_feishubot") } }
+                option { value: "http", selected: kind == "http", { crate::i18n::t("settings.otp_provider_http") } }
+            }
+        }
+
+        if let Some((app_id, app_secret, chat_id, code_pattern, sender_open_id, max_age_secs)) = feishubot_fields {
+            div {
+                style: "display: flex; flex-direction: column; gap: 10px; margin-top: 12px; background: var(--settings-bg); border: 1px solid var(--settings-border); border-radius: 6px; padding: 12px;",
+                div {
+                    label { style: "font-size: 11px; color: var(--settings-text-muted); display: block; margin-bottom: 2px;", { crate::i18n::t("settings.otp_feishu_app_id") } }
+                    input {
+                        r#type: "text",
+                        value: "{app_id}",
+                        placeholder: "cli_xxxx",
+                        style: OTP_INPUT_STYLE,
+                        oninput: move |e| {
+                            let mut cur = setting();
+                            if let Some(OtpWebhookConfig::Feishubot { app_id, .. }) = cur.as_mut() {
+                                *app_id = e.value();
+                                setting.set(cur);
+                            }
+                        },
+                    }
+                }
+                div {
+                    label { style: "font-size: 11px; color: var(--settings-text-muted); display: block; margin-bottom: 2px;", { crate::i18n::t("settings.otp_feishu_app_secret") } }
+                    input {
+                        r#type: "password",
+                        value: "{app_secret}",
+                        style: OTP_INPUT_STYLE,
+                        oninput: move |e| {
+                            let mut cur = setting();
+                            if let Some(OtpWebhookConfig::Feishubot { app_secret, .. }) = cur.as_mut() {
+                                *app_secret = e.value();
+                                setting.set(cur);
+                            }
+                        },
+                    }
+                }
+                div {
+                    label { style: "font-size: 11px; color: var(--settings-text-muted); display: block; margin-bottom: 2px;", { crate::i18n::t("settings.otp_feishu_chat_id") } }
+                    input {
+                        r#type: "text",
+                        value: "{chat_id}",
+                        placeholder: "oc_xxxx",
+                        style: OTP_INPUT_STYLE,
+                        oninput: move |e| {
+                            let mut cur = setting();
+                            if let Some(OtpWebhookConfig::Feishubot { chat_id, .. }) = cur.as_mut() {
+                                *chat_id = e.value();
+                                setting.set(cur);
+                            }
+                        },
+                    }
+                }
+                div {
+                    label { style: "font-size: 11px; color: var(--settings-text-muted); display: block; margin-bottom: 2px;", { crate::i18n::t("settings.otp_feishu_sender_open_id") } }
+                    input {
+                        r#type: "text",
+                        value: "{sender_open_id}",
+                        placeholder: "ou_xxxx",
+                        style: OTP_INPUT_STYLE,
+                        oninput: move |e| {
+                            let mut cur = setting();
+                            if let Some(OtpWebhookConfig::Feishubot { sender_open_id, .. }) = cur.as_mut() {
+                                let v = e.value();
+                                *sender_open_id = (!v.trim().is_empty()).then_some(v);
+                                setting.set(cur);
+                            }
+                        },
+                    }
+                }
+                div {
+                    label { style: "font-size: 11px; color: var(--settings-text-muted); display: block; margin-bottom: 2px;", { crate::i18n::t("settings.otp_code_pattern") } }
+                    input {
+                        r#type: "text",
+                        value: "{code_pattern}",
+                        placeholder: "\\b\\d{{4,8}}\\b",
+                        style: OTP_INPUT_STYLE,
+                        oninput: move |e| {
+                            let mut cur = setting();
+                            if let Some(OtpWebhookConfig::Feishubot { code_pattern, .. }) = cur.as_mut() {
+                                *code_pattern = e.value();
+                                setting.set(cur);
+                            }
+                        },
+                    }
+                }
+                div {
+                    label { style: "font-size: 11px; color: var(--settings-text-muted); display: block; margin-bottom: 2px;", { crate::i18n::t("settings.otp_max_age_secs") } }
+                    input {
+                        r#type: "number",
+                        min: "1",
+                        value: "{max_age_secs}",
+                        style: OTP_INPUT_STYLE,
+                        oninput: move |e| {
+                            if let Ok(v) = e.value().trim().parse::<u64>() {
+                                let mut cur = setting();
+                                if let Some(OtpWebhookConfig::Feishubot { max_age_secs, .. }) = cur.as_mut() {
+                                    *max_age_secs = v;
+                                    setting.set(cur);
+                                }
+                            }
+                        },
+                    }
+                }
+            }
+        }
+
+        if let Some((url, method, body, code_pattern, timeout_secs)) = http_fields {
+            div {
+                style: "display: flex; flex-direction: column; gap: 10px; margin-top: 12px; background: var(--settings-bg); border: 1px solid var(--settings-border); border-radius: 6px; padding: 12px;",
+                div {
+                    label { style: "font-size: 11px; color: var(--settings-text-muted); display: block; margin-bottom: 2px;", { crate::i18n::t("settings.otp_http_url") } }
+                    input {
+                        r#type: "text",
+                        value: "{url}",
+                        placeholder: "https://totp.example.local/current",
+                        style: OTP_INPUT_STYLE,
+                        oninput: move |e| {
+                            let mut cur = setting();
+                            if let Some(OtpWebhookConfig::Http { url, .. }) = cur.as_mut() {
+                                *url = e.value();
+                                setting.set(cur);
+                            }
+                        },
+                    }
+                }
+                div {
+                    label { style: "font-size: 11px; color: var(--settings-text-muted); display: block; margin-bottom: 2px;", { crate::i18n::t("settings.otp_http_method") } }
+                    select {
+                        style: OTP_INPUT_STYLE,
+                        value: method.clone(),
+                        onchange: move |e| {
+                            let mut cur = setting();
+                            if let Some(OtpWebhookConfig::Http { method, .. }) = cur.as_mut() {
+                                *method = e.value();
+                                setting.set(cur);
+                            }
+                        },
+                        option { value: "get", selected: method == "get", "GET" }
+                        option { value: "post", selected: method == "post", "POST" }
+                    }
+                }
+                div {
+                    label { style: "font-size: 11px; color: var(--settings-text-muted); display: block; margin-bottom: 2px;", { crate::i18n::t("settings.otp_http_body") } }
+                    input {
+                        r#type: "text",
+                        value: "{body}",
+                        style: OTP_INPUT_STYLE,
+                        oninput: move |e| {
+                            let mut cur = setting();
+                            if let Some(OtpWebhookConfig::Http { body, .. }) = cur.as_mut() {
+                                let v = e.value();
+                                *body = (!v.trim().is_empty()).then_some(v);
+                                setting.set(cur);
+                            }
+                        },
+                    }
+                }
+                div {
+                    label { style: "font-size: 11px; color: var(--settings-text-muted); display: block; margin-bottom: 2px;", { crate::i18n::t("settings.otp_code_pattern") } }
+                    input {
+                        r#type: "text",
+                        value: "{code_pattern}",
+                        placeholder: "\\b\\d{{4,8}}\\b",
+                        style: OTP_INPUT_STYLE,
+                        oninput: move |e| {
+                            let mut cur = setting();
+                            if let Some(OtpWebhookConfig::Http { code_pattern, .. }) = cur.as_mut() {
+                                *code_pattern = e.value();
+                                setting.set(cur);
+                            }
+                        },
+                    }
+                }
+                div {
+                    label { style: "font-size: 11px; color: var(--settings-text-muted); display: block; margin-bottom: 2px;", { crate::i18n::t("settings.otp_timeout_secs") } }
+                    input {
+                        r#type: "number",
+                        min: "1",
+                        value: "{timeout_secs}",
+                        style: OTP_INPUT_STYLE,
+                        oninput: move |e| {
+                            if let Ok(v) = e.value().trim().parse::<u64>() {
+                                let mut cur = setting();
+                                if let Some(OtpWebhookConfig::Http { timeout_secs, .. }) = cur.as_mut() {
+                                    *timeout_secs = v;
+                                    setting.set(cur);
+                                }
+                            }
+                        },
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Settings dialog for appearance, suggestions, comparison warnings, keyboard
 /// shortcuts, and application skin. Each `on_save_*` callback lets the caller
 /// persist its setting group through the matching `ConfigManager` method.
@@ -805,6 +1116,12 @@ pub fn SettingsDialog(
     /// Full local-AI settings: mirror URL, active model, custom models.
     #[props(default)]
     qwen_local_settings: rusterm_core::config::QwenLocalSettings,
+    /// Current OTP / MFA webhook provider config (from settings.json).
+    #[props(default)]
+    otp_webhook: Option<OtpWebhookConfig>,
+    /// Fires with the new OTP webhook config when the user clicks Save.
+    #[props(default)]
+    on_save_otp_webhook: EventHandler<Option<OtpWebhookConfig>>,
     /// Hardware warning text for the local AI toggle (empty if OK).
     #[props(default)]
     qwen_local_warning: String,
@@ -834,6 +1151,8 @@ pub fn SettingsDialog(
     let mut usage_habits = use_signal(|| usage_habits_enabled);
     let initial_model_download_state = model_download_status_for(&qwen_local_settings);
     let mut qwen_local = use_signal(|| qwen_local_settings.clone());
+    // OTP webhook draft — edited locally, committed on Save.
+    let mut otp_webhook_setting = use_signal(|| otp_webhook.clone());
     let mut model_download_state = use_signal(|| initial_model_download_state);
     let model_download_task = use_signal(|| None::<(String, String)>);
     // Custom-model form state (collapsible "Add custom model" section).
@@ -1354,6 +1673,9 @@ pub fn SettingsDialog(
                     { crate::i18n::t("settings.export_report_help") }
                 }
 
+                // ── OTP / MFA webhook (JumpServer 二次认证) ──────────────
+                { render_otp_webhook_settings(otp_webhook_setting) }
+
                 // ── Local AI template generation ───────────────────────
                 h3 {
                     id: "settings-local-ai",
@@ -1747,6 +2069,7 @@ pub fn SettingsDialog(
                             sug_count.set(3);
                             comparison_warning_enabled.set(true);
                             usage_habits.set(false);
+                            otp_webhook_setting.set(None);
                             qwen_local.set(rusterm_core::config::QwenLocalSettings::default());
                             show_custom_form.set(false);
                             custom_name.set(String::new());
@@ -1778,6 +2101,7 @@ pub fn SettingsDialog(
                                 on_save_skin.call(skin_draft().normalized());
                                 on_save_usage_habits.call(usage_habits());
                                 on_save_qwen_local.call(qwen_local());
+                                on_save_otp_webhook.call(otp_webhook_setting());
                             },
                             { crate::i18n::t("common.save") }
                         }

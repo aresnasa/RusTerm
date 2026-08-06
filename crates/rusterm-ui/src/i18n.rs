@@ -158,6 +158,23 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         "settings.comparison_diff_warning" => {
             ("Warn before highlighting large diffs", "高亮大量差异前警告")
         }
+        "settings.otp_webhook" => ("OTP 二次认证 webhook", "OTP 二次认证 webhook"),
+        "settings.otp_provider" => ("Provider", "提供方式"),
+        "settings.otp_provider_manual" => ("Manual (prompt only)", "手动（仅提示）"),
+        "settings.otp_provider_feishubot" => ("Feishu bot chat", "飞书机器人聊天"),
+        "settings.otp_provider_http" => ("Generic HTTP webhook", "通用 HTTP webhook"),
+        "settings.otp_feishu_app_id" => ("Feishu App ID", "飞书 App ID"),
+        "settings.otp_feishu_app_secret" => ("Feishu App Secret", "飞书 App Secret"),
+        "settings.otp_feishu_chat_id" => ("Feishu Chat ID", "飞书聊天 ID"),
+        "settings.otp_feishu_sender_open_id" => {
+            ("Sender open id (optional)", "发送者 open id（可选）")
+        }
+        "settings.otp_http_url" => ("Webhook URL", "Webhook URL"),
+        "settings.otp_http_method" => ("HTTP method", "请求方法"),
+        "settings.otp_http_body" => ("POST body (optional)", "POST 请求体（可选）"),
+        "settings.otp_code_pattern" => ("Code extraction regex", "验证码提取正则"),
+        "settings.otp_max_age_secs" => ("Max code age (seconds)", "验证码最大时效（秒）"),
+        "settings.otp_timeout_secs" => ("Timeout (seconds)", "超时（秒）"),
         "settings.keybindings" => ("Keyboard shortcuts", "键盘快捷键"),
         "settings.skin" => ("Skin", "皮肤"),
         "settings.usage_habits" => ("Usage habits & privacy", "使用习惯与隐私"),
@@ -1205,6 +1222,10 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         "settings.comparison_help" => (
             "Control the warning shown before highlighting a comparison where more than half of the visible rows differ.",
             "控制在高亮超过半数可见行存在差异的比对结果前是否显示警告。",
+        ),
+        "settings.otp_webhook_help" => (
+            "When an SSH login (e.g. JumpServer) asks for an OTP / MFA code, RusTerm can fetch the code automatically from a Feishu bot chat or a generic HTTP webhook. With Manual, the OneKey popup asks you to type the code instead. Refer to https://open.feishu.cn/community/articles/7271149634339422210 for the Feishu bot setup.",
+            "当 SSH 登录（例如 JumpServer）要求输入 OTP / MFA 验证码时，本软件可以自动从飞书机器人聊天或通用 HTTP webhook 获取验证码。选择手动时，会通过 OneKey 弹窗要求用户输入。飞书机器人配置可参考 https://open.feishu.cn/community/articles/7271149634339422210。",
         ),
         "settings.usage_habits_help" => (
             "Opt in to local command-habit learning. Data stays on this machine in a local DuckDB file unless you explicitly export it below.",
