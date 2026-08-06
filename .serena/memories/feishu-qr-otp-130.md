@@ -49,6 +49,35 @@ Root causes and fixes (all in rusterm-ui):
    `… detected begin={} attempts_before={} status_before={in_flight|delivered|failed|none}`.
    `FeishuOtpFetch` imported into app.rs use crate::state::{…}.
 
+## Session 4 (v0.2 iteration): embedded browser replaces self-rendered QR
+User reported (image_12.png) OneKey popup at `2nd Password:` + "还是没法正确的生成二维码"; cited
+obscura (github.com/h4ckf0r0day/obscura) as the pattern → integrate a minimal embedded browser.
+
+**Root cause of the QR approach being fundamentally broken:** rendering the authorize URL as a QR
+and scanning it moves BOTH login and OAuth redirect onto the phone — the phone has no
+`127.0.0.1:8878` listener, so the desktop never receives the code.
+
+**Fix — embedded wry browser window (new module `crates/rusterm-ui/src/feishu_browser.rs`):**
+- `open_feishu_login_window(url)`: `dioxus::desktop::window().new_window(VirtualDom::new(FeishuBrowserLoading), cfg)`
+  (dioxus-desktop 0.7 `PendingDesktopContext::try_resolve().await` → `ctx.webview.load_url(&url)`)
+  navigates a second WebView window to the Feishu authorize page. Feishu renders its OFFICIAL QR
+  there; phone scan authorizes the desktop webview → redirect reaches the loopback listener →
+  existing exchange pipeline unchanged. WKWebView persistent cookies ⇒ next sign-in auto-completes
+  without re-scan (satisfies "reuse valid session").
+  Window: 480x700, always-on-top, `WindowCloseBehaviour::WindowCloses` (child must really close;
+  main window uses WindowHides). Handle kept in thread-local `Weak<DesktopService>`; reopen
+  re-focuses + `load_url`s the existing window.
+- `close_feishu_login_window()`: called from `handle_feishu_oauth_event` as soon as a recognized
+  callback drains (Exchange or Failed plan; Ignore returns early), and from popup `on_close`.
+- `start_feishu_auth_session` now captures `insert_pending_auth`'s returned authorize_url and calls
+  `open_feishu_login_window`.
+- `FeishuQrPopupView` (components/feishu_qr_popup.rs): qrcode SVG block REMOVED → instruction panel
+  (📱 + `feishu.qr_embedded_hint`); new `on_embedded` handler/button (primary) reopens the window;
+  browser-open + rescan kept. `qrcode` dep removed from rusterm-ui/Cargo.toml (workspace entry stays).
+- i18n: new keys `feishu.qr_embedded_hint`, `feishu.qr_open_embedded`, `feishu.browser_title`,
+  `feishu.browser_loading`; subtitle/help/rescan texts reworded (重新授权).
+- All feishu_browser fns require Dioxus runtime scope (all call sites are component handlers/futures).
+
 ## Verified
 `cargo check --workspace` clean; `cargo test -p rusterm-ui` 814 pass. All work still uncommitted on main.
 

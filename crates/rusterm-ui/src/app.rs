@@ -20099,6 +20099,7 @@ pub fn App() -> Element {
                 let popup_session_for_close = popup.session.clone();
                 let popup_session_for_rescan = popup.session.clone();
                 let popup_url = popup.authorize_url.clone();
+                let popup_url_embedded = popup.authorize_url.clone();
                 rsx! {
                     crate::components::FeishuQrPopupView {
                 popup: popup.clone(),
@@ -20108,6 +20109,9 @@ pub fn App() -> Element {
                     cancel_feishu_auth(&mut s, session.as_deref());
                     drop(s);
                     crate::feishu_browser::close_feishu_login_window();
+                },
+                on_embedded: move |_| {
+                    crate::feishu_browser::open_feishu_login_window(popup_url_embedded.clone());
                 },
                 on_browser: move |_| {
                     let url = popup_url.clone();
