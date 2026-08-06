@@ -6,7 +6,7 @@ use dioxus::html::input_data::MouseButton;
 use rusterm_core::config::{KeybindingAction, Keybindings};
 use rusterm_core::terminal::{
     CellColor, CellFlags, MouseReportKind, RenderCell, RenderOutput, RenderRow,
-    encode_mouse_report, extract_selection,
+    encode_mouse_report, extract_selection, normalize_selection,
 };
 
 use crate::components::OneKeyPopup;
@@ -80,14 +80,71 @@ fn paste_from_clipboard(on_input: &EventHandler<Vec<u8>>, bracketed: bool) {
 
 // ── Mouse selection ──────────────────────────────────────────────────
 
-/// A mouse-drag text selection over the rendered rows. Coordinates are
-/// (row, col) cell indices into `render_output.rows` at the moment the
-/// drag happened; `text` is captured at mouseup so Ctrl+Shift+C and Cmd+C
-/// can re-copy without re-hit-testing a possibly-shifted buffer.
-#[derive(Clone, Copy)]
+/// A mouse-drag text selection over the terminal content. Coordinates are
+/// ABSOLUTE `(row, col)` cell indices into the full session — scrollback
+/// followed by the live grid, i.e. the row space of `Terminal::render_all`
+/// — NOT viewport rows. Anchoring in absolute space keeps the highlight
+/// glued to its content while the user scrolls, and lets a drag that
+/// auto-scrolls past the viewport edge extend into history so the copy is
+/// complete (WindTerm behaviour). Viewport row `v` maps to absolute row
+/// `viewport_base(..) + v`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 struct TextSelection {
     anchor: (usize, usize),
     head: (usize, usize),
+}
+
+/// First absolute row currently visible: the viewport shows absolute rows
+/// `[base, base + rows.len())` where `base = scrollback_total -
+/// scrollback_offset` (`render_with_scroll` fills the window starting at
+/// `scrollback_len - offset`).
+fn viewport_base(scrollback_total: usize, scrollback_offset: usize) -> usize {
+    scrollback_total - scrollback_offset.min(scrollback_total)
+}
+
+/// Convert an absolute selection to viewport-relative endpoints when the
+/// WHOLE normalized range is visible. Returns `None` when any part lies
+/// outside the viewport — the visible rows alone cannot produce the full
+/// text, so the caller must extract from the complete session instead
+/// (`on_copy_range` → `Terminal::render_all` in app.rs).
+fn selection_in_viewport(
+    selection: TextSelection,
+    base: usize,
+    rows_len: usize,
+) -> Option<((usize, usize), (usize, usize))> {
+    let ((sr, sc), (er, ec)) = normalize_selection(selection.anchor, selection.head);
+    if sr < base || er >= base + rows_len {
+        return None;
+    }
+    Some(((sr - base, sc), (er - base, ec)))
+}
+
+/// Max rows scrolled per auto-scroll tick while dragging past an edge.
+/// With a 60ms tick this caps edge-scrolling at ~80 rows/s — fast enough
+/// to traverse a long scrollback, slow enough to release precisely.
+const DRAG_AUTOSCROLL_MAX_ROWS_PER_TICK: i32 = 5;
+
+/// Signed rows-per-tick auto-scroll velocity for a drag-selection whose
+/// pointer sits at `y` (client px) relative to the viewport's content band
+/// `[top, bottom]`. Negative scrolls up (into history), positive scrolls
+/// down (toward live), `None` inside the band. The speed grows with the
+/// overshoot distance — one extra row per cell-height beyond the edge —
+/// so a small overshoot scrolls gently and a long pull scrolls fast.
+fn drag_autoscroll_velocity(y: f64, top: f64, bottom: f64, cell_h: f64) -> Option<i32> {
+    let overshoot = if y < top {
+        y - top
+    } else if y > bottom {
+        y - bottom
+    } else {
+        return None;
+    };
+    let cell_h = cell_h.max(1.0);
+    let magnitude = (1 + (overshoot.abs() / cell_h) as i32).min(DRAG_AUTOSCROLL_MAX_ROWS_PER_TICK);
+    Some(if overshoot < 0.0 {
+        -magnitude
+    } else {
+        magnitude
+    })
 }
 
 /// Finalize a drag at the button-release cell. Browsers may coalesce or omit
@@ -105,10 +162,15 @@ fn finalize_selection_on_mouse_up(
 /// The cached text is normally populated on mouseup. Keeping this fallback at
 /// the copy boundary also covers a drag released outside the terminal before
 /// its mouseup handler can update that cache.
+///
+/// `base` is the viewport's first absolute row (`viewport_base`). A selection
+/// that extends beyond the visible rows returns an empty string — the caller
+/// must delegate to `on_copy_range` so app.rs extracts from the full session.
 fn terminal_selection_text(
     cached: &str,
     selection: Option<TextSelection>,
     rows: &[RenderRow],
+    base: usize,
 ) -> String {
     if !cached.is_empty() {
         return cached.to_owned();
@@ -121,7 +183,10 @@ fn terminal_selection_text(
         return String::new();
     }
 
-    extract_selection(rows, selection.anchor, selection.head)
+    let Some((start, end)) = selection_in_viewport(selection, base, rows.len()) else {
+        return String::new();
+    };
+    extract_selection(rows, start, end)
 }
 
 // ── Terminal key encoding helpers ──────────────────────────────────
@@ -913,8 +978,9 @@ fn search_query_from_selection(
     cached: &str,
     selection: Option<TextSelection>,
     rows: &[RenderRow],
+    base: usize,
 ) -> Option<String> {
-    let text = terminal_selection_text(cached, selection, rows);
+    let text = terminal_selection_text(cached, selection, rows, base);
     let text = text.trim();
     (!text.is_empty() && !text.contains(['\r', '\n']) && text.chars().count() <= 256)
         .then(|| text.to_owned())
@@ -1520,6 +1586,16 @@ pub fn TerminalView(
     /// callback, SelectAll would only copy the visible rows, not the entire
     /// session history.
     on_copy_all: EventHandler<()>,
+    /// Copy a cell range of the FULL session (absolute coordinates into
+    /// scrollback + grid, i.e. `Terminal::render_all` row space) to the
+    /// clipboard. Called when a mouse selection extends beyond the visible
+    /// viewport — e.g. the user dragged past the top edge and the view
+    /// auto-scrolled into history, or scrolled mid-drag. `render_output.rows`
+    /// only holds the on-screen window, so the component cannot extract such
+    /// a selection locally; the handler in `app.rs` renders the whole session
+    /// via `render_all` and extracts the range, guaranteeing the copy is
+    /// complete rather than clipped to the viewport.
+    on_copy_range: EventHandler<((usize, usize), (usize, usize))>,
     /// Copy the full encrypted session log (every PTY byte — prompts, user
     /// input, output) as a readable transcript. Called by Cmd+Shift+L /
     /// Ctrl+Shift+L. Unlike `on_copy_all`, this captures interactive
@@ -1603,6 +1679,11 @@ pub fn TerminalView(
     // Ctrl+Shift+C / Cmd+C can re-copy it without re-hit-testing).
     let mut selection_text: Signal<String> = use_signal(String::new);
     let mut selecting = use_signal(|| false);
+    // Signed auto-scroll velocity (rows per tick) while a drag-selection
+    // sits beyond the viewport's top/bottom edge; None inside the band.
+    // Written by mousemove, consumed by the `_drag_autoscroll_future` poll,
+    // cleared on mouseup. Negative = up (into history), positive = down.
+    let mut drag_autoscroll: Signal<Option<i32>> = use_signal(|| None);
     let mut mouse_button_down: Signal<Option<u8>> = use_signal(|| None);
     let mut last_motion_cell: Signal<Option<(usize, usize)>> = use_signal(|| None);
     // Timestamp of the last double-click, used to detect a triple-click
@@ -1613,6 +1694,58 @@ pub fn TerminalView(
     // the cell metrics only change with a font (re)load. NONE until the first
     // successful poll — mouse/wheel hit-testing ignores events before that.
     let mut content_geo: Signal<Option<(f64, f64, f64, f64)>> = use_signal(|| None);
+
+    // ── Drag-selection edge auto-scroll ──
+    // While the mouse button is down and the pointer sits past the top or
+    // bottom edge of the grid, keep scrolling (into history at the top,
+    // toward live output at the bottom) and extend the selection head in
+    // lock-step — mousemove alone can't do this because no events fire while
+    // the pointer holds still. The velocity is armed/updated by mousemove
+    // (`drag_autoscroll_velocity`) and cleared on mouseup. Extending the
+    // head by exactly the scrolled row count keeps it glued to the viewport
+    // edge without needing the (stale-in-this-closure) render_output: the
+    // head already rides the edge row, and the edge moves N absolute rows
+    // per N-row scroll. Any drift from a clamped scroll (hitting the top of
+    // history) is corrected by the mouseup hit-test.
+    let autoscroll_up = on_scroll_up;
+    let autoscroll_down = on_scroll_down;
+    let _drag_autoscroll_future = use_future(move || async move {
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(60)).await;
+            if !selecting() {
+                continue;
+            }
+            let Some(velocity) = drag_autoscroll() else {
+                continue;
+            };
+            let rows = velocity.unsigned_abs() as usize;
+            if rows == 0 {
+                continue;
+            }
+            if velocity < 0 {
+                autoscroll_up.call(rows);
+            } else {
+                autoscroll_down.call(rows);
+            }
+            let ts = *selection.peek();
+            if let Some(ts) = ts {
+                let head_row = if velocity < 0 {
+                    ts.head.0.saturating_sub(rows)
+                } else {
+                    // May briefly overshoot past the last session row when the
+                    // scroll clamps at the live view; extraction clamps and
+                    // mouseup re-hit-tests, so no harm.
+                    ts.head.0 + rows
+                };
+                if head_row != ts.head.0 {
+                    selection.set(Some(TextSelection {
+                        head: (head_row, ts.head.1),
+                        ..ts
+                    }));
+                }
+            }
+        }
+    });
 
     // True while the user is dragging a popup by its grip. While set, the
     // 100ms resize future pauses its `--suggestion-popup-*` writes so it
@@ -1657,6 +1790,14 @@ pub fn TerminalView(
     let search_input_id = format!("terminal-search-{session_id}");
     let search_input_id_for_keydown = search_input_id.clone();
     let copy_rows = render_output.rows.clone();
+    // Viewport origin in absolute (scrollback + grid) row space, captured for
+    // the keydown/copy closures. Selections are stored in absolute
+    // coordinates; this converts them back to viewport rows for local
+    // extraction and highlight mapping.
+    let copy_base = viewport_base(
+        render_output.scrollback_total,
+        render_output.scrollback_offset,
+    );
     let handle_keydown = move |e: KeyboardEvent| {
         let key = e.key();
         let code = e.code();
@@ -1709,10 +1850,17 @@ pub fn TerminalView(
             TerminalOverlayKeyAction::Copy(CopyShortcut::Command) => {
                 // Mouseup can occur outside this pane. Recompute from the
                 // terminal-owned cell range when its mouseup cache is empty.
-                let text = terminal_selection_text(&selection_text(), selection(), &copy_rows);
+                let text =
+                    terminal_selection_text(&selection_text(), selection(), &copy_rows, copy_base);
                 if !text.is_empty() {
                     e.prevent_default();
                     copy_text_to_clipboard(text);
+                } else if let Some(ts) = selection().filter(|ts| ts.anchor != ts.head) {
+                    // Selection extends beyond the visible viewport (the drag
+                    // auto-scrolled into history, or the user scrolled after
+                    // selecting): extract from the FULL session in app.rs.
+                    e.prevent_default();
+                    on_copy_range.call((ts.anchor, ts.head));
                 }
                 // With no terminal-owned selection, preserve the browser's
                 // native copy behavior for popup/input DOM selections.
@@ -1722,11 +1870,18 @@ pub fn TerminalView(
             TerminalOverlayKeyAction::Copy(CopyShortcut::CtrlShift) => {
                 e.prevent_default();
                 e.stop_propagation();
-                let text = terminal_selection_text(&selection_text(), selection(), &copy_rows);
+                let text =
+                    terminal_selection_text(&selection_text(), selection(), &copy_rows, copy_base);
                 if !text.is_empty() {
                     if let ClipboardCopyOutcome::Copied(n) = copy_text_to_clipboard(text) {
                         tracing::info!("[COPY] Ctrl+Shift+C copied {n} chars (terminal selection)");
                     }
+                    return;
+                }
+                if let Some(ts) = selection().filter(|ts| ts.anchor != ts.head) {
+                    // Selection spans rows outside the viewport: delegate to
+                    // app.rs, which extracts from the full session history.
+                    on_copy_range.call((ts.anchor, ts.head));
                     return;
                 }
                 // No terminal-owned selection — fall back to the DOM selection
@@ -1800,7 +1955,7 @@ pub fn TerminalView(
             e.prevent_default();
             e.stop_propagation();
             if let Some(selected) =
-                search_query_from_selection(&selection_text(), selection(), &copy_rows)
+                search_query_from_selection(&selection_text(), selection(), &copy_rows, copy_base)
             {
                 if search_query() != selected {
                     search_query.set(selected);
@@ -1826,9 +1981,12 @@ pub fn TerminalView(
             e.prevent_default();
             e.stop_propagation();
             if meta {
-                if let Some(selected) =
-                    search_query_from_selection(&selection_text(), selection(), &copy_rows)
-                {
+                if let Some(selected) = search_query_from_selection(
+                    &selection_text(),
+                    selection(),
+                    &copy_rows,
+                    copy_base,
+                ) {
                     let found = find_search_matches(&copy_rows, &selected);
                     search_query.set(selected);
                     search_matches.set(found.clone());
@@ -2509,6 +2667,12 @@ pub fn TerminalView(
     let down_reporting = render_output.mode_mouse_reporting && render_output.scrollback_offset == 0;
     let down_sgr = render_output.mode_mouse_sgr;
     let down_rows = render_output.rows.clone();
+    // Viewport → absolute row conversion base for the mouse closures. The
+    // closures are recreated on every render, so this tracks scrolling.
+    let sel_base = viewport_base(
+        render_output.scrollback_total,
+        render_output.scrollback_offset,
+    );
     let on_mouse_down = move |e: MouseEvent| {
         if current_disconnected {
             return;
@@ -2568,13 +2732,15 @@ pub fn TerminalView(
                     .map(|r| r.cells.len())
                     .unwrap_or(0)
                     .saturating_sub(1);
+                // Stored in absolute rows; extraction below stays viewport-
+                // local (the clicked row is on screen by definition).
                 let ts = TextSelection {
-                    anchor: (row, 0),
-                    head: (row, last_col),
+                    anchor: (sel_base + row, 0),
+                    head: (sel_base + row, last_col),
                 };
                 selection.set(Some(ts));
                 selecting.set(false);
-                let text = extract_selection(&down_rows, ts.anchor, ts.head);
+                let text = extract_selection(&down_rows, (row, 0), (row, last_col));
                 if !text.is_empty() {
                     selection_text.set(text.clone());
                     copy_text_to_clipboard(text);
@@ -2582,12 +2748,14 @@ pub fn TerminalView(
                 return;
             }
 
+            let anchor = (sel_base + cell.0, cell.1);
             selection.set(Some(TextSelection {
-                anchor: cell,
-                head: cell,
+                anchor,
+                head: anchor,
             }));
             selection_text.set(String::new());
             selecting.set(true);
+            drag_autoscroll.set(None);
         } else if button == 1 {
             // Middle-click paste (xterm convention; consistent with
             // copy-on-select, the OS clipboard carries the selection).
@@ -2605,8 +2773,22 @@ pub fn TerminalView(
         if selecting() {
             if let Some(ts) = selection() {
                 let Some(cell) = event_cell(&e) else { return };
-                if cell != ts.head {
-                    selection.set(Some(TextSelection { head: cell, ..ts }));
+                let head = (sel_base + cell.0, cell.1);
+                if head != ts.head {
+                    selection.set(Some(TextSelection { head, ..ts }));
+                }
+                // Dragging past the top/bottom edge arms the auto-scroll
+                // poll: the view keeps scrolling (into history at the top,
+                // toward live at the bottom) while the button stays down,
+                // dynamically extending the selection so the eventual copy
+                // captures everything — not just the visible window.
+                if let Some((_, top, _, ch)) = content_geo() {
+                    let bottom = top + rows_len_cached as f64 * ch;
+                    let velocity =
+                        drag_autoscroll_velocity(e.client_coordinates().y, top, bottom, ch);
+                    if drag_autoscroll() != velocity {
+                        drag_autoscroll.set(velocity);
+                    }
                 }
             }
             return;
@@ -2673,8 +2855,10 @@ pub fn TerminalView(
             return;
         }
         selecting.set(false);
+        drag_autoscroll.set(None);
         let Some(ts) = selection() else { return };
-        let ts = finalize_selection_on_mouse_up(ts, event_cell(&e));
+        let release_cell = event_cell(&e).map(|(row, col)| (sel_base + row, col));
+        let ts = finalize_selection_on_mouse_up(ts, release_cell);
         selection.set(Some(ts));
         if ts.anchor == ts.head {
             // Plain click, no drag → clear any prior selection.
@@ -2682,12 +2866,22 @@ pub fn TerminalView(
             selection_text.set(String::new());
             return;
         }
-        let text = extract_selection(&up_rows, ts.anchor, ts.head);
-        if !text.is_empty() {
-            selection_text.set(text.clone());
-            // Copy-on-select (WindTerm default): the selection text is in
-            // the clipboard the moment the button is released.
-            copy_text_to_clipboard(text);
+        if let Some((start, end)) = selection_in_viewport(ts, sel_base, up_rows.len()) {
+            let text = extract_selection(&up_rows, start, end);
+            if !text.is_empty() {
+                selection_text.set(text.clone());
+                // Copy-on-select (WindTerm default): the selection text is in
+                // the clipboard the moment the button is released.
+                copy_text_to_clipboard(text);
+            }
+        } else {
+            // The drag auto-scrolled beyond the visible window (or the user
+            // scrolled mid-drag): the viewport rows alone cannot produce the
+            // full text. Delegate to app.rs, which extracts the absolute
+            // range from the complete session (`render_all`) so the copy is
+            // never clipped to the on-screen window.
+            selection_text.set(String::new());
+            on_copy_range.call((ts.anchor, ts.head));
         }
     };
 
@@ -2725,13 +2919,17 @@ pub fn TerminalView(
         // An empty/whitespace run or a single cell is still a valid selection:
         // WindTerm selects the whitespace run too. But a degenerate range on an
         // empty row isn't worth copying.
-        let anchor = (row, start_col);
-        let head = (row, end_col);
-        selection.set(Some(TextSelection { anchor, head }));
+        // Stored in absolute rows (scrollback + grid) so the highlight
+        // survives scrolling; extraction stays viewport-local (the clicked
+        // row is visible by definition).
+        selection.set(Some(TextSelection {
+            anchor: (sel_base + row, start_col),
+            head: (sel_base + row, end_col),
+        }));
         selecting.set(false); // no drag follows unless a fresh mousedown starts
         // Record the timestamp so the next mousedown can detect a triple-click.
         last_dblclick.set(Some(std::time::Instant::now()));
-        let text = extract_selection(&dbl_rows, anchor, head);
+        let text = extract_selection(&dbl_rows, (row, start_col), (row, end_col));
         if !text.is_empty() {
             selection_text.set(text.clone());
             copy_text_to_clipboard(text);
@@ -2838,18 +3036,27 @@ pub fn TerminalView(
         .join("");
 
     // Per-row selection ranges for the mouse-drag highlight. `usize::MAX`
-    // means "to end of row" (extraction clamps per-row anyway).
+    // means "to end of row" (extraction clamps per-row anyway). The stored
+    // selection is in absolute (scrollback + grid) rows; each viewport row
+    // maps to absolute `hl_base + row_idx`, so the highlight stays glued to
+    // its content while the user scrolls and rows fully inside the range
+    // (e.g. scrolled-into history mid-drag) render fully selected.
+    let hl_base = viewport_base(
+        render_output.scrollback_total,
+        render_output.scrollback_offset,
+    );
     let selection_read = selection();
     let sel_range = selection_read
         .as_ref()
         .map(|ts| rusterm_core::terminal::normalize_selection(ts.anchor, ts.head));
     let sel_for_row = |row_idx: usize| -> Option<(usize, usize)> {
         let ((sr, sc), (er, ec)) = sel_range?;
-        if row_idx < sr || row_idx > er {
+        let abs_row = hl_base + row_idx;
+        if abs_row < sr || abs_row > er {
             None
         } else {
-            let a = if row_idx == sr { sc } else { 0 };
-            let b = if row_idx == er { ec } else { usize::MAX };
+            let a = if abs_row == sr { sc } else { 0 };
+            let b = if abs_row == er { ec } else { usize::MAX };
             Some((a, b))
         }
     };
@@ -3042,6 +3249,7 @@ pub fn TerminalView(
                         &selection_text(),
                         selection(),
                         &render_output.rows,
+                        hl_base,
                     );
                     let selected_for_find = selected_text.clone().unwrap_or_default();
                     let selected_for_online = selected_text.clone().unwrap_or_default();
@@ -3316,18 +3524,18 @@ pub fn TerminalView(
 #[cfg(test)]
 mod tests {
     use super::{
-        ClipboardCopyOutcome, CopyShortcut, OneKeyKeyAction, PopupDirection, PopupDragPoll,
-        SEARCH_CURRENT_BG, SEARCH_MATCH_BG, TerminalOverlayKeyAction, TextSelection,
-        accepts_history_completion, accepts_inline_suggestion, app_owns_mouse,
-        build_install_popup_drag_script, build_manual_popup_layout_script,
-        build_terminal_measure_script, cell_style, color_to_css, copy_text_to_clipboard,
-        cursor_key_seq, event_cell_from_coords, finalize_selection_on_mouse_up,
-        find_search_matches, is_find_shortcut, is_history_completion_shortcut,
-        onekey_popup_key_action, online_search_url, parse_popup_drag_poll_response,
-        popup_anchor_col, popup_anchor_row, popup_fallback_left_px, popup_fallback_top_px,
-        popup_layout, scroll_thumb_geometry, search_query_from_selection,
-        suggestion_navigation_index, terminal_key_bytes, terminal_overlay_key_action,
-        terminal_selection_text, word_range_in_row,
+        ClipboardCopyOutcome, CopyShortcut, DRAG_AUTOSCROLL_MAX_ROWS_PER_TICK, OneKeyKeyAction,
+        PopupDirection, PopupDragPoll, SEARCH_CURRENT_BG, SEARCH_MATCH_BG,
+        TerminalOverlayKeyAction, TextSelection, accepts_history_completion,
+        accepts_inline_suggestion, app_owns_mouse, build_install_popup_drag_script,
+        build_manual_popup_layout_script, build_terminal_measure_script, cell_style, color_to_css,
+        copy_text_to_clipboard, cursor_key_seq, drag_autoscroll_velocity, event_cell_from_coords,
+        finalize_selection_on_mouse_up, find_search_matches, is_find_shortcut,
+        is_history_completion_shortcut, onekey_popup_key_action, online_search_url,
+        parse_popup_drag_poll_response, popup_anchor_col, popup_anchor_row, popup_fallback_left_px,
+        popup_fallback_top_px, popup_layout, scroll_thumb_geometry, search_query_from_selection,
+        selection_in_viewport, suggestion_navigation_index, terminal_key_bytes,
+        terminal_overlay_key_action, terminal_selection_text, viewport_base, word_range_in_row,
     };
     use dioxus::prelude::{Code, Key};
     use rusterm_core::terminal::{CellColor, RenderCell, RenderRow};
@@ -3847,8 +4055,92 @@ mod tests {
         let finalized = finalize_selection_on_mouse_up(stale_selection, Some((3, 3)));
 
         assert_eq!(
-            terminal_selection_text("", Some(finalized), &rows),
+            terminal_selection_text("", Some(finalized), &rows, 0),
             "first\n\nsoft-错误"
+        );
+    }
+
+    #[test]
+    fn viewport_base_maps_scroll_offset_into_absolute_rows() {
+        // At the live view (offset 0) the first visible absolute row is the
+        // first grid row (= scrollback_total). Scrolling up by N shifts the
+        // window N rows into history; the offset clamps at the top.
+        assert_eq!(viewport_base(100, 0), 100);
+        assert_eq!(viewport_base(100, 30), 70);
+        assert_eq!(viewport_base(100, 100), 0);
+        assert_eq!(viewport_base(100, 500), 0);
+        assert_eq!(viewport_base(0, 0), 0);
+    }
+
+    #[test]
+    fn selection_in_viewport_converts_only_fully_visible_ranges() {
+        // Viewport shows absolute rows 70..=93 (base 70, 24 rows).
+        let visible = TextSelection {
+            anchor: (72, 3),
+            head: (75, 1),
+        };
+        assert_eq!(
+            selection_in_viewport(visible, 70, 24),
+            Some(((2, 3), (5, 1)))
+        );
+        // Reversed drag normalizes before the visibility check.
+        let reversed = TextSelection {
+            anchor: (75, 1),
+            head: (72, 3),
+        };
+        assert_eq!(
+            selection_in_viewport(reversed, 70, 24),
+            Some(((2, 3), (5, 1)))
+        );
+        // Extends above the viewport (drag auto-scrolled into history and
+        // back down): the visible rows alone can't produce the text.
+        let above = TextSelection {
+            anchor: (60, 0),
+            head: (75, 1),
+        };
+        assert_eq!(selection_in_viewport(above, 70, 24), None);
+        // Extends below the viewport.
+        let below = TextSelection {
+            anchor: (72, 0),
+            head: (99, 1),
+        };
+        assert_eq!(selection_in_viewport(below, 70, 24), None);
+    }
+
+    #[test]
+    fn selection_spanning_beyond_viewport_yields_no_local_text() {
+        // A selection reaching into scrolled-away history must NOT be
+        // extracted from the viewport rows — that would silently clip the
+        // copy to the visible window (the bug in issue screenshot #125).
+        // The empty result routes the caller to `on_copy_range`, which
+        // extracts from the full session.
+        let rows = vec![row_from("visible tail")];
+        let spanning = TextSelection {
+            anchor: (0, 0), // absolute row 0: deep in scrollback
+            head: (500, 5), // viewport shows only absolute row 500
+        };
+        assert_eq!(terminal_selection_text("", Some(spanning), &rows, 500), "");
+    }
+
+    #[test]
+    fn drag_autoscroll_velocity_scales_with_edge_overshoot() {
+        // Inside the content band: no auto-scroll.
+        assert_eq!(drag_autoscroll_velocity(50.0, 10.0, 400.0, 20.0), None);
+        assert_eq!(drag_autoscroll_velocity(10.0, 10.0, 400.0, 20.0), None);
+        // Just past the top edge: gentle 1 row/tick into history.
+        assert_eq!(drag_autoscroll_velocity(5.0, 10.0, 400.0, 20.0), Some(-1));
+        // Deeper overshoot scrolls faster (one extra row per cell height)…
+        assert_eq!(drag_autoscroll_velocity(-35.0, 10.0, 400.0, 20.0), Some(-3));
+        // …capped so it stays controllable.
+        assert_eq!(
+            drag_autoscroll_velocity(-1000.0, 10.0, 400.0, 20.0),
+            Some(-DRAG_AUTOSCROLL_MAX_ROWS_PER_TICK)
+        );
+        // Below the bottom edge scrolls down (toward the live view).
+        assert_eq!(drag_autoscroll_velocity(405.0, 10.0, 400.0, 20.0), Some(1));
+        assert_eq!(
+            drag_autoscroll_velocity(2000.0, 10.0, 400.0, 20.0),
+            Some(DRAG_AUTOSCROLL_MAX_ROWS_PER_TICK)
         );
     }
 
@@ -3864,7 +4156,7 @@ mod tests {
         };
 
         assert_eq!(
-            terminal_selection_text("", Some(selection), &rows),
+            terminal_selection_text("", Some(selection), &rows, 0),
             "error: permission denied\ncaused by: 无权限"
         );
     }
@@ -3885,7 +4177,10 @@ mod tests {
             head: (0, 3),
         };
 
-        assert_eq!(terminal_selection_text("", Some(selection), &rows), "错误");
+        assert_eq!(
+            terminal_selection_text("", Some(selection), &rows, 0),
+            "错误"
+        );
     }
 
     #[test]
@@ -3906,16 +4201,17 @@ mod tests {
             terminal_selection_text(
                 "captured before output shifted",
                 Some(first_selection),
-                &old_rows
+                &old_rows,
+                0
             ),
             "captured before output shifted"
         );
         assert_eq!(
-            terminal_selection_text("", Some(first_selection), &first_rows),
+            terminal_selection_text("", Some(first_selection), &first_rows, 0),
             "pane one error"
         );
         assert_eq!(
-            terminal_selection_text("", Some(second_selection), &second_rows),
+            terminal_selection_text("", Some(second_selection), &second_rows, 0),
             "pane two warning"
         );
     }
@@ -3939,7 +4235,7 @@ mod tests {
             head: (0, rows[0].cells.len() - 1),
         };
         assert_eq!(
-            terminal_selection_text("", Some(selection), &rows),
+            terminal_selection_text("", Some(selection), &rows, 0),
             "permission denied"
         );
     }
@@ -4405,7 +4701,7 @@ mod tests {
             head: (0, 9),
         };
         assert_eq!(
-            search_query_from_selection("", Some(one_line), &rows).as_deref(),
+            search_query_from_selection("", Some(one_line), &rows, 0).as_deref(),
             Some("beta")
         );
 
@@ -4414,7 +4710,7 @@ mod tests {
             head: (1, 4),
         };
         assert_eq!(
-            search_query_from_selection("", Some(multiline), &rows),
+            search_query_from_selection("", Some(multiline), &rows, 0),
             None
         );
     }

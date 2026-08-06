@@ -2591,6 +2591,7 @@ fn render_terminal_pane(
             let sid_for_scroll_down = tab.id.clone();
             let sid_for_scroll_bottom = tab.id.clone();
             let sid_for_copy_all = tab.id.clone();
+            let sid_for_copy_range = tab.id.clone();
             let sid_for_copy_session_log = tab.id.clone();
             let sid_for_sug_nav = tab.id.clone();
             let sid_for_history_completion = tab.id.clone();
@@ -3283,6 +3284,35 @@ fn render_terminal_pane(
                                         }
                                         _ => {}
                                     }
+                                }
+                            }
+                        }
+                    },
+                    on_copy_range: move |(anchor, head): ((usize, usize), (usize, usize))| {
+                        // A mouse selection extended beyond the visible viewport
+                        // (edge auto-scroll into history, or scrolling mid-drag).
+                        // The endpoints are absolute cells into the full session
+                        // (scrollback + grid = `render_all` row space), so extract
+                        // from the complete history — the viewport rows alone
+                        // would clip the copy to the on-screen window.
+                        let terminals = state_for_cmd.read().terminals.clone();
+                        if let Some(handle) = terminals.get(&sid_for_copy_range) {
+                            let entry = handle.lock();
+                            let all_rows = entry.terminal.render_all();
+                            drop(entry);
+                            let text = rusterm_core::terminal::extract_selection(
+                                &all_rows, anchor, head,
+                            );
+                            if !text.is_empty() {
+                                if let crate::components::terminal_view::ClipboardCopyOutcome::Copied(n) =
+                                    crate::components::terminal_view::copy_text_to_clipboard(text)
+                                {
+                                    tracing::info!(
+                                        "[COPY] range {:?}..{:?} (full session) copied {n} chars for session {:?}",
+                                        anchor,
+                                        head,
+                                        &sid_for_copy_range[..sid_for_copy_range.len().min(8)]
+                                    );
                                 }
                             }
                         }

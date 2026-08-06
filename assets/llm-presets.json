@@ -1,0 +1,135 @@
+{
+  "version": 1,
+  "presets": [
+    {
+      "id": "openai",
+      "name": "OpenAI (GPT)",
+      "protocol": "openai",
+      "base_url": "https://api.openai.com/v1",
+      "model": "gpt-4o-mini",
+      "requires_key": true,
+      "open_source": false,
+      "key_url": "https://platform.openai.com/api-keys"
+    },
+    {
+      "id": "anthropic",
+      "name": "Anthropic (Claude)",
+      "protocol": "anthropic",
+      "base_url": "https://api.anthropic.com",
+      "model": "claude-sonnet-4-20250514",
+      "requires_key": true,
+      "open_source": false,
+      "key_url": "https://console.anthropic.com/settings/keys"
+    },
+    {
+      "id": "gemini",
+      "name": "Google Gemini",
+      "protocol": "openai",
+      "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+      "model": "gemini-2.0-flash",
+      "requires_key": true,
+      "open_source": false,
+      "key_url": "https://aistudio.google.com/apikey"
+    },
+    {
+      "id": "kimi",
+      "name": "Moonshot Kimi",
+      "protocol": "openai",
+      "base_url": "https://api.moonshot.cn/v1",
+      "model": "moonshot-v1-8k",
+      "requires_key": true,
+      "open_source": false,
+      "key_url": "https://platform.moonshot.cn/console/api-keys"
+    },
+    {
+      "id": "xai",
+      "name": "xAI (Grok)",
+      "protocol": "openai",
+      "base_url": "https://api.x.ai/v1",
+      "model": "grok-3-mini",
+      "requires_key": true,
+      "open_source": false,
+      "key_url": "https://console.x.ai"
+    },
+    {
+      "id": "deepseek",
+      "name": "DeepSeek",
+      "protocol": "openai",
+      "base_url": "https://api.deepseek.com/v1",
+      "model": "deepseek-chat",
+      "requires_key": true,
+      "open_source": true,
+      "key_url": "https://platform.deepseek.com/api_keys"
+    },
+    {
+      "id": "qwen",
+      "name": "Qwen (阿里云百炼)",
+      "protocol": "openai",
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "model": "qwen-plus",
+      "requires_key": true,
+      "open_source": true,
+      "key_url": "https://bailian.console.aliyun.com/?apiKey=1"
+    },
+    {
+      "id": "glm",
+      "name": "Zhipu GLM (智谱)",
+      "protocol": "openai",
+      "base_url": "https://open.bigmodel.cn/api/paas/v4",
+      "model": "glm-4-flash",
+      "requires_key": true,
+      "open_source": true,
+      "key_url": "https://open.bigmodel.cn/usercenter/apikeys"
+    },
+    {
+      "id": "siliconflow",
+      "name": "SiliconFlow (硅基流动)",
+      "protocol": "openai",
+      "base_url": "https://api.siliconflow.cn/v1",
+      "model": "deepseek-ai/DeepSeek-V3",
+      "requires_key": true,
+      "open_source": true,
+      "key_url": "https://cloud.siliconflow.cn/account/ak"
+    },
+    {
+      "id": "groq",
+      "name": "Groq",
+      "protocol": "openai",
+      "base_url": "https://api.groq.com/openai/v1",
+      "model": "llama-3.3-70b-versatile",
+      "requires_key": true,
+      "open_source": true,
+      "key_url": "https://console.groq.com/keys"
+    },
+    {
+      "id": "openrouter",
+      "name": "OpenRouter (聚合)",
+      "protocol": "openai",
+      "base_url": "https://openrouter.ai/api/v1",
+      "model": "openrouter/auto",
+      "requires_key": true,
+      "open_source": true,
+      "key_url": "https://openrouter.ai/settings/keys"
+    },
+    {
+      "id": "ollama",
+      "name": "Ollama (本地)",
+      "protocol": "openai",
+      "base_url": "http://127.0.0.1:11434/v1",
+      "model": "qwen2.5-coder:7b",
+      "requires_key": false,
+      "open_source": true,
+      "key_url": "https://ollama.com/download"
+    },
+    {
+      "id": "lmstudio",
+      "name": "LM Studio (本地)",
+      "protocol": "openai",
+      "base_url": "http://127.0.0.1:1234/v1",
+      "model": "local-model",
+      "requires_key": false,
+      "open_source": true,
+      "key_url": "https://lmstudio.ai"
+    }
+  ]
+}

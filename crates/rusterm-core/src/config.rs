@@ -1465,6 +1465,24 @@ impl ChatDock {
     }
 }
 
+/// How the chat panel's outbound AI/preset requests reach the network
+/// (issue #126). Persisted (non-secret) so the choice survives restarts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum ChatProxyMode {
+    /// Honor `HTTP_PROXY`/`HTTPS_PROXY`/`ALL_PROXY` environment variables
+    /// (reqwest's default behavior).
+    #[default]
+    System,
+    /// Force a direct connection, ignoring environment proxies.
+    Off,
+    /// Auto-detect a local Clash-style client (probes 7890/7897/7891 on
+    /// loopback) and route through it. Falls back to direct if none found.
+    Clash,
+    /// Use the explicit `proxy_url` (http://…, https://…, or socks5://…).
+    Custom,
+}
+
 /// Persisted settings for the agent chat box (issue #122). Stored under
 /// `PersistedConfig::chat`. All fields `#[serde(default)]` so legacy
 /// settings files load cleanly (chat box just starts hidden with the
@@ -1495,6 +1513,17 @@ pub struct ChatSettings {
     /// this field and get the floating overlay.
     #[serde(default)]
     pub dock: ChatDock,
+    /// Explicit user consent for RusTerm to fetch the official provider
+    /// preset catalog from the network (issue #126). Default `false` — no
+    /// remote fetch ever happens until the user opts in.
+    #[serde(default)]
+    pub allow_remote_presets: bool,
+    /// Proxy routing for chat/preset requests. Default `System` (env vars).
+    #[serde(default)]
+    pub proxy_mode: ChatProxyMode,
+    /// Proxy URL used when `proxy_mode == Custom`.
+    #[serde(default)]
+    pub proxy_url: String,
 }
 
 fn default_chat_agents() -> Vec<AgentConfig> {
@@ -1511,6 +1540,9 @@ impl Default for ChatSettings {
             width: 0.0,
             height: 0.0,
             dock: ChatDock::Floating,
+            allow_remote_presets: false,
+            proxy_mode: ChatProxyMode::System,
+            proxy_url: String::new(),
         }
     }
 }
@@ -3059,6 +3091,9 @@ mod tests {
             width: 0.0,
             height: 0.0,
             dock: ChatDock::Floating,
+            allow_remote_presets: false,
+            proxy_mode: ChatProxyMode::System,
+            proxy_url: String::new(),
         };
         let n = s.normalized();
         // The default OpenAI agent is restored.
@@ -3093,6 +3128,9 @@ mod tests {
             width: 420.0,
             height: 400.0,
             dock: ChatDock::Right,
+            allow_remote_presets: true,
+            proxy_mode: ChatProxyMode::Clash,
+            proxy_url: String::new(),
         }
         .normalized();
         let json = serde_json::to_string(&s).unwrap();
@@ -3106,6 +3144,9 @@ mod tests {
         assert_eq!(parsed.position, ChatPosition { x: 120.0, y: 300.0 });
         // The dock mode survives the roundtrip too.
         assert_eq!(parsed.dock, ChatDock::Right);
+        // Issue #126: network consent + proxy settings survive the roundtrip.
+        assert!(parsed.allow_remote_presets);
+        assert_eq!(parsed.proxy_mode, ChatProxyMode::Clash);
     }
 
     #[test]

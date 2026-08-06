@@ -1,5 +1,7 @@
 pub mod anthropic;
+pub mod chat;
 pub mod openai;
+pub mod presets;
 pub mod shadow_sandbox;
 pub mod suggestion;
 
@@ -9,7 +11,15 @@ pub mod qwen_local;
 pub mod template_gen;
 
 pub use anthropic::AnthropicClient;
+pub use chat::{
+    ChatProtocol, ChatRequest, ChatTurn, ChatTurnRole, ProxySelection, complete_chat,
+    detect_clash_proxy,
+};
 pub use openai::OpenAIClient;
+pub use presets::{
+    PresetCatalog, ProviderPreset, REMOTE_PRESETS_URL, builtin_presets, fetch_remote_presets,
+    merge_presets,
+};
 pub use shadow_sandbox::{
     ApprovedExecution, ShadowExecutionRequest, ShadowExecutionResult, ShadowSandbox,
     ShadowSandboxError, ShadowSandboxPhase,

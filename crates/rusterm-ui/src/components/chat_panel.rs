@@ -33,8 +33,11 @@
 
 use dioxus::prelude::*;
 
+use rusterm_ai::chat::{ChatProtocol, ChatRequest, ChatTurn, ChatTurnRole, ProxySelection};
+use rusterm_ai::presets::ProviderPreset;
 use rusterm_core::config::{
-    AgentConfig, ChatAgentProvider, ChatDock, ChatPosition, ChatSettings, SkinSettings,
+    AgentConfig, ChatAgentProvider, ChatDock, ChatPosition, ChatProxyMode, ChatSettings,
+    SkinSettings,
 };
 
 use crate::state::{AppState, ChatCommandEntry, ChatCommandSource, ChatMessage, ChatRole};
@@ -95,6 +98,15 @@ pub fn ChatPanel(
     let mut draft_model = use_signal(String::new);
     let mut draft_base_url = use_signal(String::new);
     let mut draft_prompt = use_signal(String::new);
+    // Provider protocol for the draft. Not directly editable — set when the
+    // user applies an official preset (issue #126) or seeded from the agent.
+    let draft_provider = use_signal(ChatAgentProvider::default);
+    // Official provider presets: built-in catalog, optionally refreshed from
+    // the network once the user grants consent (chat.network_consent).
+    let presets = use_signal(rusterm_ai::presets::builtin_presets);
+    // Id of the preset currently highlighted in the popover's picker ("" —
+    // none). Drives the key-acquisition hint line.
+    let preset_selected = use_signal(String::new);
 
     // ── Drag polling loop ────────────────────────────────────────────────
     // Installs document-level capture listeners on mousedown and polls the
@@ -476,6 +488,8 @@ pub fn ChatPanel(
                                     draft_model.set(a.model);
                                     draft_base_url.set(a.base_url);
                                     draft_prompt.set(a.system_prompt);
+                                    let mut dp = draft_provider;
+                                    dp.set(a.provider);
                                 }
                                 draft_api_key.set(String::new());
                             }
@@ -528,7 +542,7 @@ pub fn ChatPanel(
             if *show_agent_config.peek() {
                 div {
                     style: "position:absolute;top:{CHAT_TITLE_HEIGHT}px;left:0;right:0;bottom:0;z-index:20;background:var(--skin-surface);overflow-y:auto;",
-                    { render_agent_config(state.clone(), active_agent.clone(), draft_name, draft_model, draft_base_url, draft_prompt, draft_api_key, show_agent_config, on_save_chat.clone()) }
+                    { render_agent_config(state.clone(), active_agent.clone(), draft_name, draft_model, draft_base_url, draft_prompt, draft_api_key, draft_provider, presets, preset_selected, show_agent_config, on_save_chat.clone()) }
                 }
             }
 
@@ -646,10 +660,13 @@ fn render_message(msg: &ChatMessage) -> Element {
 
 /// Inline agent configuration popover. Lets the user edit the active agent's
 /// model / base URL / system prompt and paste an API key (held in memory
-/// only — see module docs on the secret policy).
+/// only — see module docs on the secret policy). Issue #126 adds a picker of
+/// official provider presets (open- and closed-source), a consent-gated
+/// online refresh of that catalog, and proxy settings (Clash-compatible).
 ///
 /// The draft signals are lifted into the parent `ChatPanel` (Dioxus hooks
 /// can't run inside a plain helper fn) and passed in here.
+#[allow(clippy::too_many_arguments)]
 fn render_agent_config(
     mut state: Signal<AppState>,
     agent: Option<AgentConfig>,
@@ -658,6 +675,9 @@ fn render_agent_config(
     mut draft_base_url: Signal<String>,
     mut draft_prompt: Signal<String>,
     mut draft_api_key: Signal<String>,
+    mut draft_provider: Signal<ChatAgentProvider>,
+    presets: Signal<Vec<ProviderPreset>>,
+    mut preset_selected: Signal<String>,
     mut show_agent_config: Signal<bool>,
     on_save_chat: EventHandler<ChatSettings>,
 ) -> Element {
@@ -673,9 +693,152 @@ fn render_agent_config(
     };
     let agent_id = agent.id.clone();
 
+    let settings_snapshot = state.read().chat_settings.clone();
+    let allow_remote = settings_snapshot.allow_remote_presets;
+    let proxy_mode = settings_snapshot.proxy_mode;
+    let proxy_url = settings_snapshot.proxy_url.clone();
+    let preset_list = presets.read().clone();
+    // Hint line for the currently highlighted preset (key acquisition URL,
+    // open/closed-source tag, keyless marker).
+    let selected_preset = preset_list
+        .iter()
+        .find(|p| p.id == *preset_selected.read())
+        .cloned();
+
+    let mut on_apply_preset = move |preset: ProviderPreset| {
+        draft_name.set(preset.name.clone());
+        draft_model.set(preset.model.clone());
+        draft_base_url.set(preset.base_url.clone());
+        draft_provider.set(if preset.protocol == "anthropic" {
+            ChatAgentProvider::Anthropic
+        } else {
+            ChatAgentProvider::OpenAI
+        });
+        let mut s = state.write();
+        s.chat_status = Some(format!(
+            "{} · {}",
+            crate::i18n::t("chat.preset_applied"),
+            preset.name
+        ));
+    };
+
+    let on_refresh_presets = move |_| {
+        // Explicit user-consent gate: the checkbox below must be ON before
+        // any network fetch happens. (Belt and braces — the button is also
+        // disabled in the UI when consent is off.)
+        if !state.read().chat_settings.allow_remote_presets {
+            return;
+        }
+        state.write().chat_status = Some(crate::i18n::t("chat.preset_refreshing").to_string());
+        let mut presets_sig = presets;
+        spawn(async move {
+            let proxy = resolve_proxy_selection(&state.read().chat_settings).await;
+            match rusterm_ai::presets::fetch_remote_presets(
+                rusterm_ai::presets::REMOTE_PRESETS_URL,
+                &proxy,
+            )
+            .await
+            {
+                Ok(remote) => {
+                    let merged = rusterm_ai::presets::merge_presets(
+                        rusterm_ai::presets::builtin_presets(),
+                        remote,
+                    );
+                    let count = merged.len();
+                    presets_sig.set(merged);
+                    state.write().chat_status = Some(format!(
+                        "{} ({count})",
+                        crate::i18n::t("chat.preset_refreshed")
+                    ));
+                }
+                Err(e) => {
+                    tracing::warn!("[CHAT] preset refresh failed: {e:#}");
+                    state.write().chat_status = Some(format!(
+                        "{}: {e}",
+                        crate::i18n::t("chat.preset_refresh_failed")
+                    ));
+                }
+            }
+        });
+    };
+
     rsx! {
         div {
             style: "padding:8px;display:flex;flex-direction:column;gap:6px;background:var(--skin-surface);",
+
+            // ── Official provider presets (issue #126) ─────────────────────
+            label { style: label_style(), { crate::i18n::t("chat.preset_label") }
+                div { style: "display:flex;gap:6px;align-items:center;",
+                    select {
+                        style: "flex:1;{input_style()}",
+                        value: "{preset_selected}",
+                        onchange: move |e| {
+                            let id = e.value();
+                            preset_selected.set(id.clone());
+                            if let Some(p) = presets.read().iter().find(|p| p.id == id).cloned() {
+                                on_apply_preset(p);
+                            }
+                        },
+                        option { value: "", { crate::i18n::t("chat.preset_pick") } }
+                        for preset in preset_list.iter() {
+                            option {
+                                value: "{preset.id}",
+                                selected: *preset_selected.read() == preset.id,
+                                { format!(
+                                    "{} · {}{}",
+                                    preset.name,
+                                    crate::i18n::t(if preset.open_source {
+                                        "chat.preset_open_source"
+                                    } else {
+                                        "chat.preset_closed_source"
+                                    }),
+                                    if preset.requires_key { "" } else { " · 🔓" },
+                                ) }
+                            }
+                        }
+                    }
+                    button {
+                        style: format!(
+                            "background:none;border:1px solid var(--skin-border);border-radius:3px;padding:3px 8px;font-size:10px;color:var(--skin-text-muted);{}",
+                            if allow_remote { "cursor:pointer;" } else { "opacity:0.45;cursor:not-allowed;" }
+                        ),
+                        disabled: !allow_remote,
+                        title: crate::i18n::t("chat.network_consent"),
+                        onclick: on_refresh_presets,
+                        { crate::i18n::t("chat.preset_refresh") }
+                    }
+                }
+            }
+            if let Some(p) = selected_preset {
+                div { style: "font-size:10px;color:var(--skin-text-muted);line-height:1.5;",
+                    if p.requires_key && !p.key_url.is_empty() {
+                        { format!("{} {}", crate::i18n::t("chat.preset_key_hint"), p.key_url) }
+                    } else if !p.requires_key {
+                        { crate::i18n::t("chat.preset_no_key_needed") }
+                    }
+                }
+            }
+            // Consent checkbox: the ONLY switch that authorizes RusTerm to
+            // reach the network for preset metadata. Persisted so the choice
+            // survives restarts; default OFF.
+            label {
+                style: "display:flex;align-items:flex-start;gap:6px;font-size:10px;color:var(--skin-text-muted);cursor:pointer;line-height:1.5;",
+                input {
+                    r#type: "checkbox",
+                    checked: allow_remote,
+                    onchange: move |e| {
+                        let granted = e.checked();
+                        let mut s = state.write();
+                        s.chat_settings.allow_remote_presets = granted;
+                        let updated = s.chat_settings.clone();
+                        drop(s);
+                        on_save_chat.call(updated);
+                    },
+                }
+                span { { crate::i18n::t("chat.network_consent") } }
+            }
+
+            // ── Agent fields ──────────────────────────────────────────────
             label { style: label_style(), { crate::i18n::t("chat.agent_name") }
                 input {
                     style: input_style(),
@@ -714,6 +877,61 @@ fn render_agent_config(
                     oninput: move |e| draft_prompt.set(e.value()),
                 }
             }
+
+            // ── Network proxy (Clash-compatible, issue #126) ───────────────
+            label { style: label_style(), { crate::i18n::t("chat.proxy_label") }
+                select {
+                    style: input_style(),
+                    value: "{proxy_mode_value(proxy_mode)}",
+                    onchange: move |e| {
+                        let mode = proxy_mode_from_value(&e.value());
+                        let mut s = state.write();
+                        s.chat_settings.proxy_mode = mode;
+                        let updated = s.chat_settings.clone();
+                        drop(s);
+                        on_save_chat.call(updated);
+                        // Give immediate feedback for Clash auto-detect so
+                        // the user knows whether a local client was found.
+                        if mode == ChatProxyMode::Clash {
+                            spawn(async move {
+                                let found = rusterm_ai::chat::detect_clash_proxy().await;
+                                let msg = match found {
+                                    Some(url) => format!(
+                                        "{} {url}",
+                                        crate::i18n::t("chat.proxy_clash_found")
+                                    ),
+                                    None => crate::i18n::t("chat.proxy_clash_missing")
+                                        .to_string(),
+                                };
+                                state.write().chat_status = Some(msg);
+                            });
+                        }
+                    },
+                    option { value: "system", selected: proxy_mode == ChatProxyMode::System,
+                        { crate::i18n::t("chat.proxy_system") } }
+                    option { value: "off", selected: proxy_mode == ChatProxyMode::Off,
+                        { crate::i18n::t("chat.proxy_off") } }
+                    option { value: "clash", selected: proxy_mode == ChatProxyMode::Clash,
+                        { crate::i18n::t("chat.proxy_clash") } }
+                    option { value: "custom", selected: proxy_mode == ChatProxyMode::Custom,
+                        { crate::i18n::t("chat.proxy_custom") } }
+                }
+            }
+            if proxy_mode == ChatProxyMode::Custom {
+                input {
+                    style: input_style(),
+                    placeholder: crate::i18n::t("chat.proxy_custom_placeholder"),
+                    value: "{proxy_url}",
+                    onchange: move |e| {
+                        let mut s = state.write();
+                        s.chat_settings.proxy_url = e.value();
+                        let updated = s.chat_settings.clone();
+                        drop(s);
+                        on_save_chat.call(updated);
+                    },
+                }
+            }
+
             div { style: "display:flex;gap:6px;justify-content:flex-end;",
                 button {
                     style: "background:var(--skin-accent);color:var(--skin-bg);border:0;border-radius:4px;padding:4px 12px;font-size:11px;cursor:pointer;",
@@ -731,12 +949,18 @@ fn render_agent_config(
                             a.model = draft_model();
                             a.base_url = draft_base_url();
                             a.system_prompt = draft_prompt();
+                            a.provider = draft_provider();
                             saved_name = a.name.clone();
                         }
                         let mut feedback = format!("{} · {}", crate::i18n::t("chat.saved"), saved_name);
-                        // API key held in memory only (TODO: keychain).
-                        if !draft_api_key().is_empty() {
-                            feedback.push_str(&format!(" ({})", crate::i18n::t("chat.api_key_in_memory")));
+                        // API key held in memory only (never persisted). This
+                        // is THE fix for issue #126's "configured a key but
+                        // chat still says no LLM": the key is now actually
+                        // stored (keyed by agent id) and used by send_message.
+                        if !draft_api_key().trim().is_empty() {
+                            s.chat_api_keys
+                                .insert(agent_id.clone(), draft_api_key().trim().to_string());
+                            feedback.push_str(&format!(" ({})", crate::i18n::t("chat.api_key_saved")));
                         }
                         s.chat_status = Some(feedback);
                         let updated = s.chat_settings.clone();
@@ -749,6 +973,54 @@ fn render_agent_config(
                 }
             }
         }
+    }
+}
+
+/// Serialize a proxy mode for the `<select>` value round-trip.
+fn proxy_mode_value(mode: ChatProxyMode) -> &'static str {
+    match mode {
+        ChatProxyMode::System => "system",
+        ChatProxyMode::Off => "off",
+        ChatProxyMode::Clash => "clash",
+        ChatProxyMode::Custom => "custom",
+    }
+}
+
+fn proxy_mode_from_value(value: &str) -> ChatProxyMode {
+    match value {
+        "off" => ChatProxyMode::Off,
+        "clash" => ChatProxyMode::Clash,
+        "custom" => ChatProxyMode::Custom,
+        _ => ChatProxyMode::System,
+    }
+}
+
+/// Resolve the persisted proxy settings into a concrete [`ProxySelection`]
+/// for one request. Clash mode probes the well-known local ports at call
+/// time (a Clash client may start/stop between requests) and falls back to
+/// a direct connection when nothing is listening.
+async fn resolve_proxy_selection(settings: &ChatSettings) -> ProxySelection {
+    match settings.proxy_mode {
+        ChatProxyMode::System => ProxySelection::System,
+        ChatProxyMode::Off => ProxySelection::Disabled,
+        ChatProxyMode::Custom => {
+            let url = settings.proxy_url.trim().to_string();
+            if url.is_empty() {
+                ProxySelection::System
+            } else {
+                ProxySelection::Url(url)
+            }
+        }
+        ChatProxyMode::Clash => match rusterm_ai::chat::detect_clash_proxy().await {
+            Some(url) => {
+                tracing::info!("[CHAT] using detected Clash proxy: {url}");
+                ProxySelection::Url(url)
+            }
+            None => {
+                tracing::info!("[CHAT] Clash mode set but no local client found; going direct");
+                ProxySelection::Disabled
+            }
+        },
     }
 }
 
@@ -834,17 +1106,66 @@ async fn query_history(query: &str) -> Option<Vec<rusterm_db::history::HistoryEn
     db.search_history(q, 30).await.ok()
 }
 
-/// Send the current input as a user message to the active agent. The v1
-/// implementation appends the user turn to the log and records a placeholder
-/// assistant acknowledgement — a real LLM round-trip is wired in once the
-/// agent's API key is resolved from the secret store. This keeps the UI fully
-/// functional for the command-palette flow (which doesn't need an LLM) while
-/// making the chat surface visibly responsive.
+/// Send the current input as a user message to the active agent and run a
+/// real LLM round-trip through `rusterm_ai::chat` (issue #126). The active
+/// agent's provider/model/base URL come from `chat_settings`; the API key is
+/// looked up in the in-memory `chat_api_keys` store (populated by the ⚙
+/// popover's Save button — never persisted to disk). Missing prerequisites
+/// surface as System messages instead of silently stubbing out.
 fn send_message(mut state: Signal<AppState>) {
     let text = state.read().chat_input.trim().to_string();
     if text.is_empty() {
         return;
     }
+    if state.read().chat_request_in_flight {
+        state.write().chat_status = Some(crate::i18n::t("chat.request_in_flight").to_string());
+        return;
+    }
+
+    // Snapshot everything the request needs BEFORE mutating the log.
+    let (agent, api_key, settings) = {
+        let s = state.read();
+        let agent = s.chat_settings.active_agent().cloned();
+        let api_key = agent
+            .as_ref()
+            .and_then(|a| s.chat_api_keys.get(&a.id).cloned())
+            .unwrap_or_default();
+        (agent, api_key, s.chat_settings.clone())
+    };
+    let Some(agent) = agent else {
+        state.write().chat_status = Some(crate::i18n::t("chat.no_agent").to_string());
+        return;
+    };
+
+    // Pre-flight checks with actionable feedback (the old stub always
+    // replied "尚未接入 LLM" even when everything was configured).
+    let protocol = match agent.provider {
+        ChatAgentProvider::Anthropic => ChatProtocol::Anthropic,
+        // `Local` routes through the OpenAI-compatible protocol too — it
+        // covers Ollama / LM Studio / vLLM etc., which don't need a key.
+        ChatAgentProvider::OpenAI | ChatAgentProvider::Local => ChatProtocol::OpenAiCompatible,
+    };
+    let key_required =
+        agent.provider != ChatAgentProvider::Local && !is_loopback_base_url(&agent.base_url);
+    if key_required && api_key.is_empty() {
+        let mut s = state.write();
+        s.chat_messages.push(ChatMessage {
+            role: ChatRole::System,
+            content: crate::i18n::t("chat.need_api_key").to_string(),
+        });
+        s.chat_status = None;
+        return;
+    }
+    if agent.model.trim().is_empty() {
+        let mut s = state.write();
+        s.chat_messages.push(ChatMessage {
+            role: ChatRole::System,
+            content: crate::i18n::t("chat.need_model").to_string(),
+        });
+        s.chat_status = None;
+        return;
+    }
+
     let mut s = state.write();
     s.chat_messages.push(ChatMessage {
         role: ChatRole::User,
@@ -852,22 +1173,77 @@ fn send_message(mut state: Signal<AppState>) {
     });
     s.chat_input.clear();
     s.chat_status = Some(crate::i18n::t("chat.thinking").to_string());
+    s.chat_request_in_flight = true;
+    // Full conversation history (User/Assistant turns only — System bubbles
+    // are local UI notices, not model context).
+    let turns: Vec<ChatTurn> = s
+        .chat_messages
+        .iter()
+        .filter_map(|m| match m.role {
+            ChatRole::User => Some(ChatTurn {
+                role: ChatTurnRole::User,
+                content: m.content.clone(),
+            }),
+            ChatRole::Assistant => Some(ChatTurn {
+                role: ChatTurnRole::Assistant,
+                content: m.content.clone(),
+            }),
+            ChatRole::System => None,
+        })
+        .collect();
     drop(s);
 
-    // Kick off the (currently stubbed) agent turn. We spawn so the UI stays
-    // responsive; the future pushes the assistant message when it completes.
     spawn(async move {
-        // TODO(issue #122 follow-up): route through rusterm_ai::SuggestionEngine
-        // or a new chat-completions client, keyed off the active agent's
-        // provider/model and the in-memory API key.
-        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let proxy = resolve_proxy_selection(&settings).await;
+        let request = ChatRequest {
+            protocol,
+            base_url: agent.base_url.clone(),
+            api_key,
+            model: agent.model.clone(),
+            system_prompt: agent.system_prompt.clone(),
+            turns,
+            proxy,
+        };
+        tracing::info!(
+            target: "rusterm.chat",
+            "chat request: provider={:?} model={} base_url={}",
+            agent.provider,
+            agent.model,
+            if agent.base_url.is_empty() { "(default)" } else { &agent.base_url },
+        );
+        let result = rusterm_ai::chat::complete_chat(&request).await;
         let mut s = state.write();
-        s.chat_messages.push(ChatMessage {
-            role: ChatRole::Assistant,
-            content: crate::i18n::t("chat.stub_reply").to_string(),
-        });
-        s.chat_status = None;
+        s.chat_request_in_flight = false;
+        match result {
+            Ok(reply) => {
+                s.chat_messages.push(ChatMessage {
+                    role: ChatRole::Assistant,
+                    content: if reply.trim().is_empty() {
+                        "(empty response)".to_string()
+                    } else {
+                        reply
+                    },
+                });
+                s.chat_status = None;
+            }
+            Err(e) => {
+                tracing::warn!(target: "rusterm.chat", "chat request failed: {e:#}");
+                s.chat_messages.push(ChatMessage {
+                    role: ChatRole::System,
+                    content: format!("{}: {e}", crate::i18n::t("chat.request_failed")),
+                });
+                s.chat_status = None;
+            }
+        }
     });
+}
+
+/// `true` when the base URL points at localhost — keyless local runtimes
+/// (Ollama, LM Studio) shouldn't be blocked by the API-key pre-flight even
+/// when the agent's provider is OpenAI(-compatible).
+fn is_loopback_base_url(base_url: &str) -> bool {
+    let lower = base_url.trim().to_ascii_lowercase();
+    lower.contains("://127.0.0.1") || lower.contains("://localhost") || lower.contains("://[::1]")
 }
 
 /// Insert a command into the active terminal's input (NOT auto-run — the user
@@ -953,4 +1329,97 @@ fn label_style() -> &'static str {
 
 fn input_style() -> &'static str {
     "background:var(--skin-bg);color:var(--skin-text);border:1px solid var(--skin-border);border-radius:3px;padding:3px 6px;font-size:11px;font-family:inherit;box-sizing:border-box;"
+}
+
+#[cfg(test)]
+mod chat_config_tests {
+    use super::*;
+
+    #[test]
+    fn proxy_mode_select_values_round_trip() {
+        for mode in [
+            ChatProxyMode::System,
+            ChatProxyMode::Off,
+            ChatProxyMode::Clash,
+            ChatProxyMode::Custom,
+        ] {
+            assert_eq!(proxy_mode_from_value(proxy_mode_value(mode)), mode);
+        }
+        // Unknown values fall back to the safe default (System).
+        assert_eq!(proxy_mode_from_value("garbage"), ChatProxyMode::System);
+    }
+
+    #[test]
+    fn loopback_base_urls_skip_the_api_key_preflight() {
+        assert!(is_loopback_base_url("http://127.0.0.1:11434/v1"));
+        assert!(is_loopback_base_url("http://localhost:1234/v1"));
+        assert!(is_loopback_base_url(" HTTP://LOCALHOST:8080 "));
+        assert!(is_loopback_base_url("http://[::1]:11434/v1"));
+        assert!(!is_loopback_base_url("https://api.openai.com/v1"));
+        assert!(!is_loopback_base_url(""));
+    }
+
+    #[tokio::test]
+    async fn resolve_proxy_selection_maps_persisted_modes() {
+        let mut settings = ChatSettings::default();
+
+        settings.proxy_mode = ChatProxyMode::System;
+        assert_eq!(
+            resolve_proxy_selection(&settings).await,
+            ProxySelection::System
+        );
+
+        settings.proxy_mode = ChatProxyMode::Off;
+        assert_eq!(
+            resolve_proxy_selection(&settings).await,
+            ProxySelection::Disabled
+        );
+
+        settings.proxy_mode = ChatProxyMode::Custom;
+        settings.proxy_url = "http://127.0.0.1:7890".to_string();
+        assert_eq!(
+            resolve_proxy_selection(&settings).await,
+            ProxySelection::Url("http://127.0.0.1:7890".to_string())
+        );
+
+        // Custom mode with an empty URL degrades to System (nothing to use).
+        settings.proxy_url = "  ".to_string();
+        assert_eq!(
+            resolve_proxy_selection(&settings).await,
+            ProxySelection::System
+        );
+
+        // Clash mode always resolves (either a detected URL or Disabled) —
+        // it must never hang or panic when no client is running.
+        settings.proxy_mode = ChatProxyMode::Clash;
+        let resolved = resolve_proxy_selection(&settings).await;
+        match resolved {
+            ProxySelection::Url(url) => {
+                assert!(url.contains("127.0.0.1"));
+            }
+            ProxySelection::Disabled => {}
+            other => panic!("unexpected clash resolution: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn api_key_saved_into_in_memory_store_is_readable_by_send_path() {
+        // Pins the issue #126 root-cause fix at the state level: a key
+        // stored under the agent id must be what the send path looks up.
+        let mut app = AppState::default();
+        let agent_id = app
+            .chat_settings
+            .active_agent()
+            .expect("default agent")
+            .id
+            .clone();
+        app.chat_api_keys
+            .insert(agent_id.clone(), "sk-test-123".to_string());
+        let looked_up = app
+            .chat_settings
+            .active_agent()
+            .and_then(|a| app.chat_api_keys.get(&a.id))
+            .cloned();
+        assert_eq!(looked_up.as_deref(), Some("sk-test-123"));
+    }
 }

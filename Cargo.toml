@@ -67,7 +67,7 @@ bincode = "1"
 
 # AI
 async-openai = "0.40"
-reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls"], default-features = false }
+reqwest = { version = "0.12", features = ["json", "stream", "rustls-tls", "socks"], default-features = false }
 
 # Local AI inference (candle) — feature-gated under rusterm-ai/qwen-local.
 # candle-core 0.11.0 ships quantized_qwen2 + gguf_file::write + QTensor::quantize.

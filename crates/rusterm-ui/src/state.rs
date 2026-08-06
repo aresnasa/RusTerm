@@ -605,6 +605,14 @@ pub struct AppState {
     /// "no API key configured", error text). Cleared on next send.
     #[serde(skip)]
     pub chat_status: Option<String>,
+    /// In-memory API keys keyed by agent id (issue #126). NEVER serialized —
+    /// matches the project's "never persist secrets in settings.json" policy.
+    /// Entered in the agent-config popover and held for the app's lifetime.
+    #[serde(skip)]
+    pub chat_api_keys: std::collections::HashMap<String, String>,
+    /// `true` while an LLM request is in flight — blocks double-sends.
+    #[serde(skip)]
+    pub chat_request_in_flight: bool,
 }
 
 /// One turn in the chat log. `role` mirrors OpenAI's convention so the same
@@ -1098,6 +1106,8 @@ impl Default for AppState {
             chat_command_selected: 0,
             chat_drag_offset: None,
             chat_status: None,
+            chat_api_keys: std::collections::HashMap::new(),
+            chat_request_in_flight: false,
         }
     }
 }
@@ -2150,6 +2160,71 @@ pub fn reorder_tab(
         return false;
     }
     state.tabs.insert(insert_at, src_tab);
+    true
+}
+
+/// Place a freshly copied session next to its source instead of at the
+/// far right of the tab bar (Task 127: 副本支持就近复制).
+///
+/// `open_connection` appends the copy's workspace tab at the end of
+/// `state.tabs` (and its session tab at the end of `state.sessions`).
+/// This helper moves both so the copy sits immediately AFTER the source:
+///   - the workspace tab, via `reorder_tab` (which also preserves the
+///     active tab — the copy stays active after the move);
+///   - the session tab, so the persisted snapshot (`build_session_state`
+///     iterates `state.sessions` in order) restores the copy adjacent to
+///     its source on the next launch as well.
+///
+/// No-op (returns `false`) when either id is unknown, when source ==
+/// copy, or when the source has no workspace tab (pane-only session) —
+/// in that case the copy simply stays where `open_connection` put it.
+///
+/// Takes `&mut AppState` so it's unit-testable without a dioxus runtime.
+pub fn place_copied_session_next_to_source(
+    state: &mut AppState,
+    source_session_id: &str,
+    copy_session_id: &str,
+) -> bool {
+    if source_session_id == copy_session_id {
+        return false;
+    }
+    let source_tab_id = state
+        .tabs
+        .iter()
+        .find(|t| t.anchor_session_id.as_deref() == Some(source_session_id))
+        .map(|t| t.id.clone());
+    let Some(source_tab_id) = source_tab_id else {
+        return false;
+    };
+    // Move the copy's workspace tab immediately after the source's tab.
+    // `reorder_tab` returns `false` for the already-adjacent case (copying
+    // the rightmost tab) — that's still a success for our purposes, so
+    // only treat "copy tab not found" as a failure.
+    if !state
+        .tabs
+        .iter()
+        .any(|t| t.anchor_session_id.as_deref() == Some(copy_session_id))
+    {
+        return false;
+    }
+    reorder_tab(state, copy_session_id, &source_tab_id, false);
+    // Mirror the adjacency in `state.sessions` so the persisted snapshot
+    // (and thus the restored tab order) keeps the copy next to its source.
+    let copy_pos = state.sessions.iter().position(|s| s.id == copy_session_id);
+    let src_pos = state
+        .sessions
+        .iter()
+        .position(|s| s.id == source_session_id);
+    if let (Some(copy_pos), Some(src_pos)) = (copy_pos, src_pos) {
+        let copy_tab = state.sessions.remove(copy_pos);
+        // Removing the copy may shift the source left by one.
+        let src_pos_after = if copy_pos < src_pos {
+            src_pos - 1
+        } else {
+            src_pos
+        };
+        state.sessions.insert(src_pos_after + 1, copy_tab);
+    }
     true
 }
 
@@ -4262,6 +4337,102 @@ mod tests {
         // Active tab + session unchanged.
         assert_eq!(state.active_tab.as_deref(), Some("beta"));
         assert_eq!(state.active_session.as_deref(), Some("beta"));
+    }
+
+    /// Helper for the place_copied_session_next_to_source tests: simulate
+    /// what `open_connection` does for a session copy — append the copy's
+    /// SessionTab and WorkspaceTab at the END and make it active.
+    fn append_copy(state: &mut AppState, copy_id: &str) {
+        state.sessions.push(SessionTab {
+            id: copy_id.to_string(),
+            name: format!("{copy_id} 副本"),
+            kind: SessionType::Ssh,
+            render_output: Default::default(),
+            version: 0,
+            suggestion: None,
+            suggestions: Vec::new(),
+            suggestion_corrections: HashSet::new(),
+            suggestion_selected: 0,
+            suggestion_visible: false,
+            command_history: Vec::new(),
+            hostname: Some(copy_id.to_string()),
+            cwd: None,
+            last_command_status: CommandStatus::default(),
+        });
+        push_workspace_tab(state, copy_id);
+    }
+
+    /// Task 127 (副本支持就近复制): a copied session's tab moves from the
+    /// far right to immediately after its source tab, and the session list
+    /// mirrors the adjacency (so the persisted snapshot restores the copy
+    /// next to its source too).
+    #[test]
+    fn copied_session_is_placed_immediately_after_its_source() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma"]);
+        // Copy `alpha` — open_connection appends at the far right.
+        append_copy(&mut state, "alpha-copy");
+        assert_eq!(
+            tab_anchors(&state),
+            vec!["alpha", "beta", "gamma", "alpha-copy"]
+        );
+
+        let placed = place_copied_session_next_to_source(&mut state, "alpha", "alpha-copy");
+        assert!(placed);
+        // Workspace tab order: copy sits right after the source.
+        assert_eq!(
+            tab_anchors(&state),
+            vec!["alpha", "alpha-copy", "beta", "gamma"]
+        );
+        // Session list mirrors the adjacency (restore order).
+        let session_ids: Vec<&str> = state.sessions.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(session_ids, vec!["alpha", "alpha-copy", "beta", "gamma"]);
+        // The copy stays the active tab (push_workspace_tab activated it;
+        // the move must not steal focus back).
+        let copy_tab_id = state
+            .tabs
+            .iter()
+            .find(|t| t.anchor_session_id.as_deref() == Some("alpha-copy"))
+            .map(|t| t.id.clone())
+            .unwrap();
+        assert_eq!(state.active_tab.as_deref(), Some(copy_tab_id.as_str()));
+        assert_eq!(state.active_session.as_deref(), Some("alpha-copy"));
+    }
+
+    /// Copying the RIGHTMOST tab: the freshly appended copy is already
+    /// adjacent to its source. The helper still succeeds (the inner
+    /// `reorder_tab` no-ops) and the order is unchanged.
+    #[test]
+    fn copy_of_rightmost_tab_is_already_adjacent() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        append_copy(&mut state, "beta-copy");
+
+        let placed = place_copied_session_next_to_source(&mut state, "beta", "beta-copy");
+        assert!(placed);
+        assert_eq!(tab_anchors(&state), vec!["alpha", "beta", "beta-copy"]);
+        let session_ids: Vec<&str> = state.sessions.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(session_ids, vec!["alpha", "beta", "beta-copy"]);
+    }
+
+    /// Unknown source session (e.g. a pane-only session with no workspace
+    /// tab) → no-op: the copy stays where `open_connection` appended it.
+    #[test]
+    fn place_copied_session_with_unknown_source_is_noop() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+        append_copy(&mut state, "orphan-copy");
+
+        let placed = place_copied_session_next_to_source(&mut state, "nonexistent", "orphan-copy");
+        assert!(!placed);
+        assert_eq!(tab_anchors(&state), vec!["alpha", "beta", "orphan-copy"]);
+    }
+
+    /// Unknown copy session id → no-op, no mutation.
+    #[test]
+    fn place_copied_session_with_unknown_copy_is_noop() {
+        let mut state = state_with_active_session(&["alpha", "beta"]);
+
+        let placed = place_copied_session_next_to_source(&mut state, "alpha", "nonexistent");
+        assert!(!placed);
+        assert_eq!(tab_anchors(&state), vec!["alpha", "beta"]);
     }
 
     /// Verifies the timing-window guard for failed-command suggestions.
