@@ -2202,4 +2202,20 @@ mod tests {
         let matches = settings_search_matches("Example/Ops-Coder", &[model]);
         assert!(matches.iter().any(|item| item.title == "Ops Coder"));
     }
+
+    #[test]
+    fn settings_search_includes_otp_webhook_in_both_languages() {
+        let english = settings_search_matches("otp feishu", &[]);
+        assert!(
+            english
+                .iter()
+                .any(|item| item.target == "settings-otp-webhook")
+        );
+        let chinese = settings_search_matches("二次认证 飞书", &[]);
+        assert!(
+            chinese
+                .iter()
+                .any(|item| item.target == "settings-otp-webhook")
+        );
+    }
 }

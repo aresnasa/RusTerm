@@ -609,10 +609,16 @@ fn looks_like_otp_prompt(prompt: &str) -> bool {
         "2fa",
         "two-factor",
         "two factor",
+        "2nd password",
+        "second password",
+        "2nd pwd",
+        "second pwd",
         "二次验证",
         "动态密码",
         "验证码",
         "认证码",
+        "第二密码",
+        "二次密码",
     ];
     OTP_MARKERS.iter().any(|m| lower.contains(m))
 }
@@ -1311,5 +1317,19 @@ mod otp_prompt_tests {
         assert!(looks_like_otp_prompt("OTP:"));
         assert!(looks_like_otp_prompt("mfa code:"));
         assert!(looks_like_otp_prompt("MFA Code:"));
+    }
+
+    #[test]
+    fn detects_jumpserver_2nd_password_prompt() {
+        // JumpServer MFA commonly shows a second-stage "2nd Password:" prompt
+        // after the primary password. This must be detected as OTP.
+        assert!(looks_like_otp_prompt("2nd Password: "));
+        assert!(looks_like_otp_prompt("2nd password:"));
+        assert!(looks_like_otp_prompt("Second Password: "));
+        assert!(looks_like_otp_prompt("second password:"));
+        assert!(looks_like_otp_prompt("2nd pwd: "));
+        assert!(looks_like_otp_prompt("second pwd: "));
+        assert!(looks_like_otp_prompt("第二密码: "));
+        assert!(looks_like_otp_prompt("二次密码: "));
     }
 }
