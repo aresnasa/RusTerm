@@ -1149,9 +1149,33 @@ impl AppState {
     /// `theme_name` is the name of the current theme so it can be restored
     /// on next launch without a flicker.
     pub fn build_session_state(&self, theme_name: &str) -> rusterm_core::SessionState {
-        let sessions: Vec<_> = self
-            .sessions
-            .iter()
+        // Emit sessions in tab-bar order so a restore reopens them in the
+        // exact order the user last arranged (drag-reorders included) —
+        // `restore_sessions` appends workspace tabs in snapshot order, so the
+        // snapshot's vec order IS the restored tab order. Anchor sessions
+        // come first following `self.tabs`; sessions living only inside a
+        // split layout (no tab of their own) follow in `self.sessions`
+        // order.
+        let mut ordered: Vec<&SessionTab> = Vec::with_capacity(self.sessions.len());
+        let mut seen: HashSet<&str> = HashSet::with_capacity(self.sessions.len());
+        for tab in &self.tabs {
+            let Some(anchor_id) = tab.anchor_session_id.as_deref() else {
+                continue;
+            };
+            if let Some(session) = self.sessions.iter().find(|s| s.id == anchor_id)
+                && seen.insert(anchor_id)
+            {
+                ordered.push(session);
+            }
+        }
+        for session in &self.sessions {
+            if !seen.contains(session.id.as_str()) {
+                ordered.push(session);
+            }
+        }
+
+        let sessions: Vec<_> = ordered
+            .into_iter()
             .filter(|tab| self.bottom_shell_session_id.as_deref() != Some(tab.id.as_str()))
             // Presence in the encrypted snapshot is the durable record that
             // this terminal was logged in when the app last exited. Tabs that
