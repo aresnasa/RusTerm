@@ -101,6 +101,29 @@ Expected flow per user directive: settings button → embedded browser visits op
 creates session + chat permission → token persisted → later OTP prompts plan Fetch directly.
 Note: origin/main caught up (earlier 3 commits pushed); e38e99c is the only unpushed commit.
 
+## Session 6: proactive sign-in at connect (commit ff363a7)
+User directive: the Feishu window must pop up BEFORE the JumpServer terminal login reaches
+`2nd Password:` — scan first, then auto-fill the converted OTP at the prompt.
+**Implemented:**
+- New `feishu_auth_pending_for(state, session, now)` in feishu_oauth_flow.rs: true when a
+  pending auth for that session exists and is younger than `FEISHU_QR_TIMEOUT` (abandoned scans
+  age out so the prompt path can re-auth). Test: `pending_auth_lookup_is_session_scoped_and_ages_out`.
+- New `maybe_preauth_feishu_at_connect(state, session_id)` in app.rs (below
+  `start_feishu_auth_session`): gates = provider active → cfg complete (incomplete = warn+skip,
+  no error popup on every connect) → no pending auth for session → `feishu_tty_fill_plan` is
+  `Reauth`. Then `start_feishu_auth_session(Some(session))` opens the embedded window at connect.
+  Valid token (plan Fetch) ⇒ nothing at connect; prompt-triggered fetch fills as before.
+- Hooked into BOTH SSH connect paths (component scope, so `feishu_browser` works):
+  `open_connection` SSH arm (after `start_ssh_connection`) and `reconnect_session` SSH arm
+  (uses `&wd_tab_id` since `tab_id` moves into the connect fn). Non-SSH kinds not hooked.
+- Anti-double-open: `trigger_feishu_otp_fetch`'s `Reauth` arm now returns early (logged
+  "OTP prompt while sign-in pending — waiting for scan") when `feishu_auth_pending_for` is true —
+  never rotates the nonce mid-scan; the OAuth-success handler chains `trigger_feishu_otp_fetch`
+  for the session itself. The prompt's `feishu_tty_fill_begin` InFlight marker goes stale after
+  45s which is fine (re-begin is attempt-capped; no begin gate on the OAuth-success chain).
+`cargo check --workspace` ✅, `cargo test -p rusterm-ui` 815 pass ✅. Unpushed commits on main:
+e38e99c + ff363a7 (ff363a7 also swept in previously-staged .claude/Claude.md + this memory file).
+
 ## Still unverified end-to-end (needs live JumpServer + Feishu)
 QR scan → exchange → 动态口令 → bot reply parse → tty fill. Next user retest should capture
 `RUST_LOG=info` logs (~/Library/Application Support/rusterm/logs/) and grep `[OTP-FEISHU]`,
