@@ -100,7 +100,19 @@ impl OAuthSink for FeishuOAuthChannelSink {
 /// Builds+registers the pending auth, then pops the QR dialog.
 fn start_feishu_auth_session(state: &mut Signal<AppState>, session: Option<String>) {
     let Some(cfg) = feishu_user_cfg(&state.read()) else {
+        // Not silent: without feedback a mis-saved provider makes the
+        // settings button (and the OTP-prompt path) look dead (issue #130).
         tracing::warn!("[OTP-FEISHU] cannot start auth — provider not configured");
+        state.write().feishu_qr_popup = Some(FeishuQrPopup {
+            session,
+            authorize_url: String::new(),
+            state_nonce: String::new(),
+            port: 8878,
+            status: FeishuQrPopupStatus::Failed {
+                reason: crate::i18n::t("feishu.qr_status_cfg_missing_fields"),
+                failed_at: std::time::Instant::now(),
+            },
+        });
         return;
     };
     if feishu_cfg_incomplete(&cfg) {

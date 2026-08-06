@@ -815,7 +815,10 @@ fn otp_default_http() -> OtpWebhookConfig {
 
 const OTP_INPUT_STYLE: &str = "width: 100%; box-sizing: border-box; padding: 6px 8px; border: 1px solid var(--settings-border); border-radius: 4px; background: var(--settings-bg); color: var(--settings-text); font-size: 12px;";
 
-fn render_otp_webhook_settings(mut setting: Signal<Option<OtpWebhookConfig>>) -> Element {
+fn render_otp_webhook_settings(
+    mut setting: Signal<Option<OtpWebhookConfig>>,
+    on_save: EventHandler<Option<OtpWebhookConfig>>,
+) -> Element {
     let current = setting();
     let kind = match current {
         Some(OtpWebhookConfig::Feishubot { .. }) => "feishubot",
@@ -1117,6 +1120,13 @@ fn render_otp_webhook_settings(mut setting: Signal<Option<OtpWebhookConfig>>) ->
                         r#type: "button",
                         style: "background: var(--settings-accent, #7aa2f7); color: #1a1b26; border: none; border-radius: 4px; padding: 6px 12px; font-size: 12px; font-weight: 600; cursor: pointer;",
                         onclick: move |_| {
+                            // Persist the CURRENT provider draft first — the auth
+                            // starter reads the saved config, so an unsaved
+                            // FeishuUser selection would otherwise make this
+                            // button (and the OTP-prompt auto-fill) silently do
+                            // nothing until the dialog's Save button is hit
+                            // (issue #130).
+                            on_save.call(setting());
                             // Signal-only: app.rs polls and resets this.
                             *crate::FEISHU_AUTH_REQUESTED.write() = true;
                         },
@@ -1831,7 +1841,7 @@ pub fn SettingsDialog(
                 }
 
                 // ── OTP / MFA webhook (JumpServer 二次认证) ──────────────
-                { render_otp_webhook_settings(otp_webhook_setting) }
+                { render_otp_webhook_settings(otp_webhook_setting, on_save_otp_webhook) }
 
                 // ── Local AI template generation ───────────────────────
                 h3 {
