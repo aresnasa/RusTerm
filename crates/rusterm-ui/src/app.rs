@@ -9122,7 +9122,12 @@ fn longest_suffix_matching_prefix(data: &[u8], expected: &[u8]) -> usize {
 const LOCAL_SHELL_INTEGRATION_ENV: &str = "RUSTERM_SI";
 
 fn shell_integration_script() -> &'static str {
-    r#"__rusterm_precmd() { printf '\e]133;D;%s\e\\' "$?"; printf '\e]133;A\e\\'; printf '\e]7;file://%s%s\e\\' "${HOSTNAME:-localhost}" "$PWD"; }; if [ -n "$ZSH_VERSION" ]; then precmd_functions+=(__rusterm_precmd); elif [ -n "$BASH_VERSION" ]; then PROMPT_COMMAND="__rusterm_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"; fi"#
+    // Guarded PROMPT_COMMAND assignment: only set the hook when the
+    // function actually defined. If the function definition was corrupted
+    // (e.g. by residual input in the remote shell's line buffer), bash
+    // would otherwise point PROMPT_COMMAND at a non-existent function and
+    // print `__rusterm_precmd: command not found` after every prompt.
+    r#"__rusterm_precmd() { printf '\e]133;D;%s\e\\' "$?"; printf '\e]133;A\e\\'; printf '\e]7;file://%s%s\e\\' "${HOSTNAME:-localhost}" "$PWD"; }; if [ -n "$ZSH_VERSION" ]; then precmd_functions+=(__rusterm_precmd); elif [ -n "$BASH_VERSION" ] && declare -F __rusterm_precmd >/dev/null 2>&1; then PROMPT_COMMAND="__rusterm_precmd${PROMPT_COMMAND:+;$PROMPT_COMMAND}"; fi"#
 }
 
 /// The local shell receives only this short bootstrap through its interactive
@@ -9133,7 +9138,15 @@ fn shell_integration_setup() -> Vec<u8> {
 }
 
 fn ssh_shell_integration_setup() -> Vec<u8> {
-    let mut setup = shell_integration_script().as_bytes().to_vec();
+    // Prepend Ctrl+U (unix-line-discard) to kill anything already sitting
+    // in the remote shell's line buffer before the script arrives. Session
+    // replay may have just sent commands (e.g. `cd '{cwd}'`) and any
+    // residual text would otherwise concatenate with the script, corrupt
+    // the function definition, and leave a broken PROMPT_COMMAND behind.
+    // Ctrl+U is a no-op when the line is already empty.
+    let mut setup = Vec::with_capacity(1 + shell_integration_script().len() + 1);
+    setup.push(b'\x15');
+    setup.extend_from_slice(shell_integration_script().as_bytes());
     setup.push(b'\n');
     setup
 }
@@ -9179,7 +9192,14 @@ async fn inject_shell_integration_when_quiet(
     }
 
     let setup = ssh_shell_integration_setup();
-    echo_filter.lock().arm(&setup);
+    // The setup begins with Ctrl+U to clear any residual line content, but
+    // bash does not echo that control byte, so the echo filter must arm
+    // only with the visible script text that follows it.
+    let echo_start = setup
+        .iter()
+        .position(|b| *b != b'\x15')
+        .unwrap_or(setup.len());
+    echo_filter.lock().arm(&setup[echo_start..]);
     if integration_tx.send(setup).is_ok() {
         tracing::info!(
             "[SSH] injected shell integration after initial-output quiet period for {}",
@@ -9458,6 +9478,40 @@ mod session_startup_tests {
 
         let unrelated = b"__rusterm_not_the_injected_command\r\n";
         assert_eq!(filter.filter(unrelated), unrelated);
+    }
+
+    #[test]
+    fn ssh_shell_integration_setup_prepends_ctrl_u_and_guards_hook() {
+        let setup = ssh_shell_integration_setup();
+        assert_eq!(setup[0], b'\x15', "first byte must be Ctrl+U");
+        let text = String::from_utf8_lossy(&setup[1..]);
+        assert!(
+            text.contains("declare -F __rusterm_precmd"),
+            "script must guard PROMPT_COMMAND behind function existence"
+        );
+        assert!(text.ends_with('\n'), "script must end with a newline");
+    }
+
+    #[test]
+    fn echo_filter_skips_leading_ctrl_u_prefix() {
+        let setup = ssh_shell_integration_setup();
+        // Ctrl+U is not echoed by the shell, so the filter arms only with
+        // the visible script text that follows it.
+        let echo_start = setup
+            .iter()
+            .position(|b| *b != b'\x15')
+            .unwrap_or(setup.len());
+        let echoed_command = &setup[echo_start..setup.len() - 1]; // strip trailing newline
+        let mut filter = ShellIntegrationEchoFilter::default();
+        filter.arm(&setup[echo_start..]);
+
+        let mut output = echoed_command.to_vec();
+        output.extend_from_slice(b"\r\n\x1b]133;A\x1b\\ecs-user@host:~$ ");
+
+        assert_eq!(
+            filter.filter(&output),
+            b"\r\x1b[2K\x1b]133;A\x1b\\ecs-user@host:~$ "
+        );
     }
 
     #[test]

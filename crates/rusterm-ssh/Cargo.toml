@@ -27,6 +27,8 @@ webpki-roots.workspace = true
 reqwest.workspace = true
 async-trait.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
+getrandom = "0.2"
 
 rusterm-core.workspace = true
 

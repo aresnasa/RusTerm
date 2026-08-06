@@ -9,11 +9,11 @@ use rand::RngCore;
 
 use crate::config::{
     ChatSettings, ConnectionConfig, ConnectionKind, CustomApiTemplate,
-    DEFAULT_ONEKEY_PASSWORD_EXPECT, EncryptedValue, FocusedTabAppearance, Keybindings, Language,
-    OneKey, OneKeyPreference, OneKeyStep, OtpWebhookConfig, PersistedConfig, PersistedConnection,
-    PersistedConnectionKind, PersistedOneKey, PersistedOneKeyStep, PersistedProxyConfig,
-    PersistedSshAuth, PersistedSshConfig, ProxyConfig, QwenLocalSettings, SidebarPreferences,
-    SkinSettings, SshAuth, SshConfig, WorkspacePreferences,
+    DEFAULT_ONEKEY_PASSWORD_EXPECT, EncryptedValue, FeishuUserToken, FocusedTabAppearance,
+    Keybindings, Language, OneKey, OneKeyPreference, OneKeyStep, OtpWebhookConfig, PersistedConfig,
+    PersistedConnection, PersistedConnectionKind, PersistedOneKey, PersistedOneKeyStep,
+    PersistedProxyConfig, PersistedSshAuth, PersistedSshConfig, ProxyConfig, QwenLocalSettings,
+    SidebarPreferences, SkinSettings, SshAuth, SshConfig, WorkspacePreferences,
 };
 use rusterm_crypto::{KeyringStore, decrypt_data, encrypt_data};
 
@@ -276,6 +276,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            feishu_user_token: existing.feishu_user_token.clone(),
             chat: existing.chat.clone(),
         };
 
@@ -316,6 +317,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            feishu_user_token: existing.feishu_user_token.clone(),
             chat: existing.chat.clone(),
         };
 
@@ -364,6 +366,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            feishu_user_token: existing.feishu_user_token.clone(),
             chat: existing.chat.clone(),
         };
 
@@ -409,6 +412,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            feishu_user_token: existing.feishu_user_token.clone(),
             chat: existing.chat.clone(),
         };
 
@@ -451,6 +455,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            feishu_user_token: existing.feishu_user_token.clone(),
             chat: existing.chat.clone(),
         };
         let json =
@@ -493,6 +498,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            feishu_user_token: existing.feishu_user_token.clone(),
             chat: existing.chat.clone(),
         };
         let json =
@@ -543,6 +549,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            feishu_user_token: existing.feishu_user_token.clone(),
             chat: existing.chat.clone(),
         };
 
@@ -591,6 +598,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            feishu_user_token: existing.feishu_user_token.clone(),
             chat: existing.chat.clone(),
         };
 
@@ -636,6 +644,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            feishu_user_token: existing.feishu_user_token.clone(),
             chat: existing.chat.clone(),
         };
 
@@ -680,6 +689,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            feishu_user_token: existing.feishu_user_token.clone(),
             chat: existing.chat.clone(),
         };
 
@@ -724,6 +734,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            feishu_user_token: existing.feishu_user_token.clone(),
             chat: existing.chat.clone(),
         };
 
@@ -766,6 +777,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            feishu_user_token: existing.feishu_user_token.clone(),
             chat: existing.chat.clone(),
         };
 
@@ -850,6 +862,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            feishu_user_token: existing.feishu_user_token.clone(),
             chat: existing.chat.clone(),
         };
 
@@ -888,6 +901,7 @@ impl ConfigManager {
             suggestion_popup_offset_y: 0.0,
             otp_webhook: None,
             chat: ChatSettings::default().normalized(),
+            feishu_user_token: None,
         };
 
         let mut persisted = if self.config_path.exists() {
@@ -946,6 +960,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            feishu_user_token: existing.feishu_user_token.clone(),
             chat: existing.chat.clone(),
         };
 
@@ -1075,6 +1090,54 @@ impl ConfigManager {
         persisted.version = CONFIG_VERSION;
         persisted.master_password_hash = self.master_password_hash.clone();
         persisted.otp_webhook = cfg.cloned();
+        let json =
+            serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
+        let temp_path = self.config_path.with_extension("json.tmp");
+        fs::write(&temp_path, &json).context("Failed to write config file")?;
+        fs::rename(&temp_path, &self.config_path).context("Failed to rename temp config file")?;
+        Ok(())
+    }
+
+    /// Load the cached Feishu user token for the
+    /// [`OtpWebhookConfig::FeishuUser`] OTP flow. The JSON-serialized token
+    /// pair is decrypted with the app master key. Returns `None` when the
+    /// user has not yet signed in (or the cached entry does not decrypt),
+    /// which tells the caller to surface the QR sign-in flow.
+    pub fn load_feishu_user_token(&self) -> Option<FeishuUserToken> {
+        let ev = self.read_persisted().feishu_user_token?;
+        match self.decrypt_value(&ev) {
+            Ok(json) => match serde_json::from_str::<FeishuUserToken>(&json) {
+                Ok(token) => Some(token),
+                Err(e) => {
+                    tracing::warn!("[OTP-FEISHU] cached token JSON malformed (clearing): {e}");
+                    let _ = self.save_feishu_user_token(None);
+                    None
+                }
+            },
+            Err(e) => {
+                // A decrypt failure usually means the master password changed
+                // since the token was stored; drop it so the user re-scans.
+                tracing::warn!("[OTP-FEISHU] cached token failed to decrypt (clearing): {e}");
+                let _ = self.save_feishu_user_token(None);
+                None
+            }
+        }
+    }
+
+    /// Persist (or clear, with `None`) the cached Feishu user token. The
+    /// token is encrypted with the app master key before being written. Only
+    /// the token field is touched — every other setting is preserved.
+    pub fn save_feishu_user_token(&self, token: Option<&FeishuUserToken>) -> Result<()> {
+        let encrypted = token
+            .map(|t| {
+                let json = serde_json::to_string(t).context("Failed to serialize Feishu token")?;
+                self.encrypt_string(&json)
+            })
+            .transpose()?;
+        let mut persisted = self.read_persisted_for_update()?;
+        persisted.version = CONFIG_VERSION;
+        persisted.master_password_hash = self.master_password_hash.clone();
+        persisted.feishu_user_token = encrypted;
         let json =
             serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
         let temp_path = self.config_path.with_extension("json.tmp");

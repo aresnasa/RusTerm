@@ -62,7 +62,14 @@ impl OtpProvider {
     /// value.
     pub fn from_config(cfg: Option<&OtpWebhookConfig>) -> Self {
         match cfg {
-            None | Some(OtpWebhookConfig::Manual) => OtpProvider::Manual,
+            // `FeishuUser` is an interactive, UI-driven flow (QR sign-in +
+            // cached user token) that cannot run inside the SSH auth loop.
+            // Map it to `Manual` here so a keyboard-interactive OTP prompt
+            // still surfaces to the user; the UI layer drives the tty
+            // auto-fill separately via `crate::feishu_otp`.
+            None | Some(OtpWebhookConfig::Manual) | Some(OtpWebhookConfig::FeishuUser { .. }) => {
+                OtpProvider::Manual
+            }
             Some(OtpWebhookConfig::Http {
                 url,
                 method,
@@ -114,7 +121,10 @@ impl OtpProvider {
 
     /// Returns `true` if this provider can fetch a code automatically.
     pub fn is_automatic(&self) -> bool {
-        matches!(self, OtpProvider::Http { .. } | OtpProvider::Feishubot { .. })
+        matches!(
+            self,
+            OtpProvider::Http { .. } | OtpProvider::Feishubot { .. }
+        )
     }
 
     /// Fetch the current OTP code. Returns `Ok(None)` when no code could be
@@ -131,9 +141,16 @@ impl OtpProvider {
                 headers,
                 code_re,
                 timeout,
-            } => fetch_http(url, method.clone(), body.as_deref(), headers, code_re, *timeout)
-                .await
-                .map(Some),
+            } => fetch_http(
+                url,
+                method.clone(),
+                body.as_deref(),
+                headers,
+                code_re,
+                *timeout,
+            )
+            .await
+            .map(Some),
             OtpProvider::Feishubot {
                 base_url,
                 app_id,
@@ -190,7 +207,10 @@ async fn fetch_http(
     }
     let resp = req.send().await.context("OTP webhook request failed")?;
     let status = resp.status();
-    let text = resp.text().await.context("OTP webhook response decode failed")?;
+    let text = resp
+        .text()
+        .await
+        .context("OTP webhook response decode failed")?;
     if !status.is_success() {
         tracing::warn!(
             "[OTP] webhook {} returned status {} body_len={}",
@@ -272,7 +292,10 @@ struct FeishuMessageListData {
 async fn feishu_tenant_token(base_url: &str, app_id: &str, app_secret: &str) -> Result<String> {
     let client = http_client(Duration::from_secs(10))?;
     let resp: FeishuTokenResp = client
-        .post(format!("{}/open-apis/auth/v3/tenant_access_token/internal", base_url))
+        .post(format!(
+            "{}/open-apis/auth/v3/tenant_access_token/internal",
+            base_url
+        ))
         .json(&serde_json::json!({
             "app_id": app_id,
             "app_secret": app_secret,
@@ -290,7 +313,8 @@ async fn feishu_tenant_token(base_url: &str, app_id: &str, app_secret: &str) -> 
             resp.msg
         ));
     }
-    resp.tenant_access_token.ok_or_else(|| anyhow!("Feishu token API returned no token"))
+    resp.tenant_access_token
+        .ok_or_else(|| anyhow!("Feishu token API returned no token"))
 }
 
 /// Read the latest messages from `chat_id`, returning the most recent one
@@ -379,13 +403,19 @@ mod tests {
     #[test]
     fn extract_code_with_no_group_uses_whole_match() {
         let re = Regex::new(r"\b\d{6}\b").unwrap();
-        assert_eq!(extract_code("Your code: 123456 expires soon", &re).as_deref(), Some("123456"));
+        assert_eq!(
+            extract_code("Your code: 123456 expires soon", &re).as_deref(),
+            Some("123456")
+        );
     }
 
     #[test]
     fn extract_code_with_capture_group_uses_group_1() {
         let re = Regex::new(r"code[:\s]+(\d{6})").unwrap();
-        assert_eq!(extract_code("MFA code: 654321 ok", &re).as_deref(), Some("654321"));
+        assert_eq!(
+            extract_code("MFA code: 654321 ok", &re).as_deref(),
+            Some("654321")
+        );
     }
 
     #[test]
@@ -396,7 +426,10 @@ mod tests {
 
     #[test]
     fn provider_from_config_manual_returns_manual() {
-        assert!(matches!(OtpProvider::from_config(None), OtpProvider::Manual));
+        assert!(matches!(
+            OtpProvider::from_config(None),
+            OtpProvider::Manual
+        ));
         assert!(matches!(
             OtpProvider::from_config(Some(&OtpWebhookConfig::Manual)),
             OtpProvider::Manual
@@ -414,7 +447,9 @@ mod tests {
             timeout_secs: 5,
         };
         match OtpProvider::from_config(Some(&cfg)) {
-            OtpProvider::Http { method, timeout, .. } => {
+            OtpProvider::Http {
+                method, timeout, ..
+            } => {
                 assert_eq!(method, reqwest::Method::POST);
                 assert_eq!(timeout, Duration::from_secs(5));
             }

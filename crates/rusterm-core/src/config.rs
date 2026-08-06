@@ -1708,6 +1708,25 @@ pub struct PersistedConfig {
     /// API keys are NOT stored here — see `AgentConfig::api_key_id`.
     #[serde(default)]
     pub chat: ChatSettings,
+
+    /// Cached Feishu user token (access + refresh tokens) for the
+    /// [`OtpWebhookConfig::FeishuUser`] OTP flow. The JSON-serialized token
+    /// pair is encrypted with the app master key before it lands here.
+    /// Legacy settings files omit this field and get `None`.
+    #[serde(default)]
+    pub feishu_user_token: Option<EncryptedValue>,
+}
+
+/// An encrypted string at rest in `settings.json`. The `_encrypted` marker in
+/// the JSON makes plain-text mistakes obvious during audits.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct FeishuUserToken {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub access_expires_at: i64,
+    pub refresh_expires_at: i64,
+    #[serde(default)]
+    pub user_open_id: Option<String>,
 }
 
 // ── OTP / MFA webhook provider ────────────────────────────────────────
@@ -1797,6 +1816,43 @@ pub enum OtpWebhookConfig {
         #[serde(default = "default_http_timeout_secs")]
         timeout_secs: u64,
     },
+    /// Feishu *user-token* flow for JumpServer tty second-factor prompts.
+    ///
+    /// Crucially different from [`Feishubot`](OtpWebhookConfig::Feishubot):
+    /// that variant reads a group/bot chat with a `tenant_access_token`,
+    /// whereas this one signs the *user* in via Feishu OAuth (QR scan,
+    /// PKCE), then sends a message **as the user** to a designated ops bot
+    /// (e.g. 智小安) which issues the one-time code. RusTerm reads the bot's
+    /// reply from the direct-message conversation and auto-fills the OTP
+    /// prompt inside the interactive terminal.
+    ///
+    /// Guard rail: messages may only be sent to `bot_open_id` — the send
+    /// path hard-enforces the recipient and cannot address any other user,
+    /// chat, or app.
+    FeishuUser {
+        /// App id of the Feishu custom app (`cli_...`). Needs user-token
+        /// message-send + message-read scopes and a redirect allowlist entry
+        /// pointing at `http://127.0.0.1:8877/oauth/feishu/callback`.
+        app_id: String,
+        /// App secret. Stored encrypted-at-rest via the master key (the
+        /// whole `PersistedConfig` blob is encrypted on disk).
+        app_secret: String,
+        /// The ONLY allowed message recipient: the open id (`ou_...`) of the
+        /// ops bot that issues OTP codes (e.g. 智小安).
+        bot_open_id: String,
+        /// Regex used to extract the numeric code from the bot's reply.
+        /// Default `"\\b\\d{4,8}\\b"`.
+        #[serde(default = "default_otp_code_pattern")]
+        code_pattern: String,
+        /// Text RusTerm sends to the bot to request a code. Default
+        /// `"申请临时密码"`.
+        #[serde(default = "default_feishu_otp_request_text")]
+        request_text: String,
+        /// Optional Feishu base URL override (`https://open.larksuite.com`
+        /// for the international Lark variant).
+        #[serde(default = "default_feishu_base_url")]
+        base_url: String,
+    },
     /// No automatic fetch. OTP prompts are surfaced to the user through the
     /// existing OneKey credential popup for manual entry. This is also the
     /// implicit behaviour when `otp_webhook` is `None`.
@@ -1828,6 +1884,10 @@ pub fn default_otp_max_age_secs() -> u64 {
 
 pub fn default_feishu_base_url() -> String {
     "https://open.feishu.cn".to_string()
+}
+
+pub fn default_feishu_otp_request_text() -> String {
+    "申请临时密码".to_string()
 }
 
 pub fn default_http_method() -> String {
@@ -2854,6 +2914,7 @@ mod tests {
             suggestion_popup_offset_y: -38.5,
             otp_webhook: None,
             chat: ChatSettings::default(),
+            feishu_user_token: None,
         };
         let json = serde_json::to_string(&config).unwrap();
         let parsed: PersistedConfig = serde_json::from_str(&json).unwrap();

@@ -24,6 +24,8 @@ rfd.workspace = true
 zeroize.workspace = true
 sha2.workspace = true
 base64.workspace = true
+axum.workspace = true
+qrcode.workspace = true
 
 rusterm-core.workspace = true
 rusterm-ssh.workspace = true

@@ -1,6 +1,7 @@
 pub mod channel;
 pub mod client;
 pub mod direct;
+pub mod feishu_otp;
 pub mod host_spec;
 pub mod known_hosts;
 pub mod otp;

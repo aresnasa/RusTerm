@@ -89,8 +89,10 @@ rfd = "0.15"
 wasmtime = { version = "45", default-features = false, features = ["cranelift", "pooling-allocator"] }
 wasmtime-wasi = "45.0.3"
 
-# HTTP server (REST relay)
+# HTTP server (REST relay + Feishu OAuth callback listener)
 axum = "0.8"
+# QR-code rendering for the Feishu OAuth sign-in popup (issue #129).
+qrcode = "0.14"
 
 # Logging
 tracing = "0.1"
