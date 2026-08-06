@@ -11256,6 +11256,156 @@ send hi\n"
             assert!(new_conn.name.contains("copy") || new_conn.name.contains("副本"));
         }
     }
+
+    #[test]
+    fn copy_session_seeds_replay_recorder_and_schedules_login_replay() {
+        // Pins the "复制会话要重新执行登录逻辑" contract: the duplicated
+        // session inherits the source session's recorded interactive
+        // establishment ops (jumpserver menu navigation + context commands
+        // like `sudo -i`) so it replays the full login sequence after it
+        // connects — exactly like a reconnect of the source would.
+        let mut state = AppState::default();
+        connected_session(
+            &mut state,
+            "src-sess",
+            "jumpserver",
+            ConnectionKind::Ssh(SshConfig {
+                host: "jump.example.com".to_string(),
+                port: 22,
+                username: "ops".to_string(),
+                auth: rusterm_core::config::SshAuth::Agent,
+                terminal_type: "xterm-256color".to_string(),
+                proxy: None,
+                proxy_jump: None,
+                keepalive_interval: None,
+                host_key_policy: "accept-new".to_string(),
+            }),
+        );
+        // The source session navigated the bastion menu to a target machine
+        // and elevated — the establishment sequence a copy must reproduce.
+        state.session_replays.insert(
+            "src-sess".to_string(),
+            crate::state::SessionReplayRecorder {
+                ops: vec![
+                    "p".to_string(),
+                    "k8s-master-0001".to_string(),
+                    "sudo -i".to_string(),
+                ],
+                shell_integrated: true,
+            },
+        );
+
+        let ops = seed_copied_session_replay(&mut state, "src-sess", "copy-sess");
+        assert_eq!(
+            ops,
+            vec![
+                "p".to_string(),
+                "k8s-master-0001".to_string(),
+                "sudo -i".to_string()
+            ],
+            "the copy must inherit the source's full establishment sequence"
+        );
+        // The copy's own recorder is seeded so *its* future reconnects also
+        // replay the sequence (mirrors the startup-restore path).
+        assert_eq!(
+            crate::state::replayable_ops(&state, "copy-sess"),
+            ops,
+            "copied session's recorder must be seeded with the inherited ops"
+        );
+        // The source's recorder is untouched.
+        assert_eq!(crate::state::replayable_ops(&state, "src-sess").len(), 3);
+        // With no login script (or a pure-navigation one), the handler
+        // schedules the replay.
+        assert!(should_schedule_replay(None, &ops));
+        assert!(should_schedule_replay(
+            Some("expect Opt>\nsend k8s-master-0001"),
+            &ops
+        ));
+        // A credential-bearing script still owns the establishment flow.
+        assert!(!should_schedule_replay(
+            Some("expect Password:\nsend_onekey prod-root"),
+            &ops
+        ));
+    }
+
+    #[test]
+    fn copy_session_without_recorded_ops_seeds_nothing() {
+        // A plain SSH session (no bastion navigation recorded) copies as
+        // before: transport login only, no replay scheduled, no recorder
+        // entry invented for the copy.
+        let mut state = AppState::default();
+        let ops = seed_copied_session_replay(&mut state, "src-sess", "copy-sess");
+        assert!(ops.is_empty());
+        assert!(!state.session_replays.contains_key("copy-sess"));
+        assert!(!should_schedule_replay(None, &ops));
+    }
+
+    /// Pins the "会话副本也能正确恢复" contract: a copied session persists
+    /// with the source's saved-connection id and a "副本" display name that
+    /// matches no saved connection. Restore must resolve the transport
+    /// config through the id and keep the persisted title.
+    #[test]
+    fn restore_resolves_copied_sessions_by_connection_id_and_keeps_title() {
+        let saved = ConnectionConfig {
+            id: "saved-conn".to_string(),
+            name: "jumpserver".to_string(),
+            kind: ConnectionKind::Ssh(SshConfig {
+                host: "jump.example.com".to_string(),
+                port: 22,
+                username: "ops".to_string(),
+                auth: rusterm_core::config::SshAuth::Agent,
+                terminal_type: "xterm-256color".to_string(),
+                proxy: None,
+                proxy_jump: None,
+                keepalive_interval: None,
+                host_key_policy: "accept-new".to_string(),
+            }),
+            group: None,
+            tags: Vec::new(),
+            onekey: true,
+            login_script: Some("expect Opt>\nsend p".to_string()),
+        };
+        let connections = vec![saved.clone()];
+        let ps = |name: &str, connection_id: Option<&str>| rusterm_core::PersistedSession {
+            id: "tab-uuid".to_string(),
+            name: name.to_string(),
+            kind: SessionType::Ssh,
+            hostname: Some("jump.example.com".to_string()),
+            connection_id: connection_id.map(str::to_string),
+            cwd: None,
+            command_history_tail: Vec::new(),
+            terminal_size: None,
+            replay_ops: Vec::new(),
+        };
+
+        // The copy: id matches, name doesn't. Resolves via the id and keeps
+        // the copy title (so it doesn't collide with the original's tab).
+        let copy =
+            find_restore_connection(&connections, &ps("jumpserver 副本", Some("saved-conn")))
+                .expect("copy must resolve through its saved-connection id");
+        assert_eq!(copy.id, "saved-conn");
+        assert_eq!(copy.name, "jumpserver 副本", "persisted title is kept");
+        assert_eq!(copy.onekey, saved.onekey);
+        assert_eq!(copy.login_script, saved.login_script);
+
+        // The original: same id, original name.
+        let original = find_restore_connection(&connections, &ps("jumpserver", Some("saved-conn")))
+            .expect("original resolves too");
+        assert_eq!(original.name, "jumpserver");
+
+        // Legacy snapshot (pre-fix): connection_id held a tab UUID that
+        // matches nothing — the name fallback still resolves it.
+        let legacy = find_restore_connection(&connections, &ps("jumpserver", Some("stale-uuid")))
+            .expect("legacy snapshots resolve via the name fallback");
+        assert_eq!(legacy.id, "saved-conn");
+
+        // A copy from a legacy snapshot is unresolvable (id stale, name
+        // matches nothing) — restore skips it rather than guessing.
+        assert!(
+            find_restore_connection(&connections, &ps("jumpserver 副本", Some("stale-uuid")))
+                .is_none()
+        );
+    }
 }
 
 fn start_ssh_connection(
@@ -14275,6 +14425,37 @@ fn restore_prompt_items(snapshot: &rusterm_core::SessionState) -> Vec<RestoreSes
 /// After all sessions are restored, we set `active_session` to the saved
 /// active session (if it exists) so the user lands on the tab they last
 /// had focused.
+/// Resolves the saved `ConnectionConfig` a persisted SSH/Telnet/Tcp session
+/// should be restored with.
+///
+/// Matching order:
+/// 1. `ConnectionConfig::id == ps.connection_id` — the durable
+///    saved-connection identity written by `build_session_state`. This is
+///    the only match that works for **copied sessions** ("X 副本"): they
+///    share the source's connection id but their display name matches no
+///    saved connection.
+/// 2. `ConnectionConfig::name == ps.name` — legacy fallback for snapshots
+///    written before the connection id was persisted correctly (they stored
+///    a tab UUID that matches nothing).
+///
+/// The returned config keeps the *persisted* display name, so a restored
+/// copy is still titled "X 副本" instead of colliding with the original —
+/// distinct titles also keep the duplicate-name guard in layout restore
+/// from disabling pane-layout reattachment.
+fn find_restore_connection(
+    connections: &[ConnectionConfig],
+    ps: &rusterm_core::PersistedSession,
+) -> Option<ConnectionConfig> {
+    let mut conn = connections
+        .iter()
+        .find(|c| c.id == ps.connection_id.as_deref().unwrap_or("") || c.name == ps.name)
+        .cloned()?;
+    if !ps.name.is_empty() {
+        conn.name = ps.name.clone();
+    }
+    Some(conn)
+}
+
 fn restore_sessions(
     mut state: Signal<AppState>,
     input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
@@ -14359,14 +14540,11 @@ fn restore_sessions(
                 }
             }
             SessionType::Ssh | SessionType::Telnet | SessionType::Tcp => {
-                // Look up the connection config by id (fall back to matching
-                // by name, then by hostname).
-                let conn = connections
-                    .iter()
-                    .find(|c| {
-                        c.id == ps.connection_id.as_deref().unwrap_or("") || c.name == ps.name
-                    })
-                    .cloned();
+                // Look up the connection config by saved-connection id (fall
+                // back to matching by name for legacy snapshots), keeping the
+                // persisted display name — a copied session ("X 副本") shares
+                // the original's connection id but must keep its own title.
+                let conn = find_restore_connection(&connections, ps);
                 if let Some(conn) = conn {
                     let conn_for_replay = conn.clone();
                     open_connection(state.clone(), input_senders.clone(), conn, None);
@@ -15468,6 +15646,35 @@ fn suppress_login_script(state: &mut AppState, session_id: &str) {
     );
 }
 
+/// State-level half of "copy session" (复制会话): seed the duplicated
+/// session's replay recorder with the source session's recorded
+/// establishment ops so the copy replays the same interactive login
+/// sequence (jumpserver menu navigation, `sudo -i`, …) after it connects.
+/// Without this, the copy only re-runs the transport login and lands on the
+/// bastion menu instead of the machine the source session had navigated to.
+///
+/// Seeding the recorder (rather than only scheduling a one-shot replay)
+/// also makes future reconnects of the copy replay the same sequence,
+/// mirroring what `restore_sessions` does for restored tabs.
+///
+/// Returns the ops the caller should feed to `should_schedule_replay` /
+/// `schedule_replay_after_reconnect`; empty when the source recorded
+/// nothing.
+fn seed_copied_session_replay(state: &mut AppState, source_id: &str, new_id: &str) -> Vec<String> {
+    let ops = replayable_ops(state, source_id);
+    if ops.is_empty() {
+        return Vec::new();
+    }
+    state.session_replays.insert(
+        new_id.to_string(),
+        crate::state::SessionReplayRecorder {
+            ops: ops.clone(),
+            shell_integrated: false,
+        },
+    );
+    ops
+}
+
 /// In-process monotonic tiebreaker for replay-event ordering. The DuckDB
 /// fold orders by `(ts_micros, seq)`: the timestamp separates app runs, the
 /// seq separates events captured within the same microsecond (e.g. a
@@ -15518,6 +15725,12 @@ fn persist_replay_event(app: &AppState, session_id: &str, event: &'static str, o
 /// DB log across restarts — if the app dies again before the next snapshot
 /// save, the next restore still finds the ops under the id the new snapshot
 /// will reference — and stops orphaned streams from accumulating.
+///
+/// When `old_session_id == new_session_id` this degenerates to *seeding*:
+/// the ops are appended as fresh events and nothing is cleared. The
+/// copy-session path uses this to give a duplicated tab a stream consistent
+/// with its seeded in-memory recorder — the source session's stream must
+/// stay untouched (it is still live).
 fn migrate_replay_stream(
     analytics: crate::analytics::AnalyticsHandle,
     old_session_id: String,
@@ -17797,7 +18010,13 @@ pub fn App() -> Element {
                     // `open_connection`. Works for all connection kinds that
                     // `open_connection` supports (SSH / Shell / Telnet /
                     // Serial); the new session gets a fresh id and a
-                    // "{name} 副本" display name.
+                    // "{name} 副本" display name. Beyond the transport
+                    // config, the copy also inherits the source session's
+                    // recorded interactive establishment ops (jumpserver
+                    // menu navigation, `sudo -i`, …) and replays them after
+                    // it connects — mirroring the reconnect path — so the
+                    // duplicate actually lands on the same machine in the
+                    // same context, not just on the bastion menu.
                     on_copy_session: move |sid: String| {
                         let conn = state.read().session_configs.get(&sid).cloned();
                         if let Some(conn) = conn {
@@ -17806,7 +18025,64 @@ pub fn App() -> Element {
                                 "connection.copy_name",
                                 &[("name", &conn.name)],
                             );
-                            open_connection(state, input_senders, new_conn, None);
+                            // Source tab's last known cwd — restored after
+                            // the replayed establishment ops, exactly like a
+                            // reconnect.
+                            let follow_up_cwd = state
+                                .read()
+                                .sessions
+                                .iter()
+                                .find(|t| t.id == sid)
+                                .and_then(|t| t.cwd.clone());
+                            let opened = open_connection(state, input_senders, new_conn, None);
+                            let new_sid = opened.session_id;
+                            let replay_ops =
+                                seed_copied_session_replay(&mut state.write(), &sid, &new_sid);
+                            if !replay_ops.is_empty() {
+                                // Seed the copy's per-session replay-event
+                                // stream (old == new → nothing cleared, the
+                                // source stream stays live). Without this the
+                                // copy's DB stream starts EMPTY while its
+                                // in-memory recorder holds the inherited
+                                // prefix: the first context command typed in
+                                // the copy (`sudo -i`, …) would land in the
+                                // empty stream, and a later restore — where
+                                // the stream wins over the snapshot — would
+                                // replay only that suffix, missing the
+                                // bastion navigation entirely.
+                                migrate_replay_stream(
+                                    state.read().analytics.clone(),
+                                    new_sid.clone(),
+                                    new_sid.clone(),
+                                    replay_ops.clone(),
+                                );
+                            }
+                            if should_schedule_replay(conn.login_script.as_deref(), &replay_ops) {
+                                if conn
+                                    .login_script
+                                    .as_deref()
+                                    .is_some_and(|s| !s.trim().is_empty())
+                                {
+                                    // Recorded ops hold the user's *last*
+                                    // selection — suppress the (pure
+                                    // navigation) login script so the menu
+                                    // isn't driven twice.
+                                    suppress_login_script(&mut state.write(), &new_sid);
+                                }
+                                tracing::info!(
+                                    "[COPY-SESSION] copy {} of {} scheduling {} recorded op(s) for post-connect replay",
+                                    &new_sid[..new_sid.len().min(8)],
+                                    &sid[..sid.len().min(8)],
+                                    replay_ops.len()
+                                );
+                                schedule_replay_after_reconnect(
+                                    state,
+                                    input_senders,
+                                    new_sid,
+                                    replay_ops,
+                                    follow_up_cwd,
+                                );
+                            }
                         } else {
                             tracing::warn!(
                                 "[COPY-SESSION] no stored config for session {}; cannot copy",

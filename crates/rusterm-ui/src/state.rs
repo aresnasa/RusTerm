@@ -1162,15 +1162,20 @@ impl AppState {
                 };
 
                 // Look up connection_id for SSH/Telnet/Tcp sessions so we can
-                // find the matching `ConnectionConfig` on restore.
+                // find the matching `ConnectionConfig` on restore. The
+                // session's own stored config (keyed by tab id) carries the
+                // saved-connection identity in `ConnectionConfig::id` — that
+                // is what `restore_sessions` matches against the saved
+                // connections list. Copied sessions ("X 副本") keep the
+                // source's connection id, so a duplicate stays restorable
+                // even though its display name matches no saved connection.
                 let connection_id = match tab.kind {
                     rusterm_core::session::SessionType::Ssh
                     | rusterm_core::session::SessionType::Telnet
                     | rusterm_core::session::SessionType::Tcp => self
                         .session_configs
-                        .iter()
-                        .find(|(_, c)| c.name == tab.name)
-                        .map(|(id, _)| id.clone())
+                        .get(&tab.id)
+                        .map(|c| c.id.clone())
                         .or_else(|| Some(tab.id.clone())),
                     _ => None,
                 };
@@ -8877,6 +8882,60 @@ mod session_replay_tests {
         assert_eq!(
             snapshot.sessions[0].replay_ops,
             vec!["web-server-01".to_string()]
+        );
+    }
+
+    /// The persisted `connection_id` must be the *saved-connection identity*
+    /// (`ConnectionConfig::id`), not the session/tab id and not a name-based
+    /// guess. This is what makes a **copied session** ("X 副本") restorable:
+    /// its display name matches no saved connection, so restore can only
+    /// find the transport config through this id.
+    #[test]
+    fn build_session_state_persists_saved_connection_id_for_copies() {
+        let mut state = AppState::default();
+        // A copied session: fresh tab UUID, display name with the copy
+        // suffix, but the stored config carries the source's connection id.
+        let mut copy_config = config_of(ssh_kind());
+        copy_config.name = "conn 副本".to_string();
+        state
+            .session_configs
+            .insert("copy-tab".to_string(), copy_config);
+        state.sessions.push(SessionTab {
+            id: "copy-tab".to_string(),
+            name: "conn 副本".to_string(),
+            kind: SessionType::Ssh,
+            render_output: Default::default(),
+            version: 1,
+            suggestion: None,
+            suggestions: Vec::new(),
+            suggestion_corrections: std::collections::HashSet::new(),
+            suggestion_selected: 0,
+            suggestion_visible: false,
+            command_history: Vec::new(),
+            hostname: Some("jump.example.com".to_string()),
+            cwd: None,
+            last_command_status: CommandStatus::default(),
+        });
+        state
+            .session_connection_states
+            .insert("copy-tab".to_string(), SessionConnectionState::Connected);
+
+        let snapshot = state.build_session_state("Dark");
+        assert_eq!(snapshot.sessions.len(), 1);
+        assert_eq!(
+            snapshot.sessions[0].connection_id.as_deref(),
+            Some("conn-1"),
+            "copy persists the saved-connection id, not the tab id"
+        );
+        assert_eq!(snapshot.sessions[0].name, "conn 副本");
+
+        // A session without a stored config still falls back to its tab id
+        // (never a bare None for remote kinds).
+        state.session_configs.remove("copy-tab");
+        let snapshot = state.build_session_state("Dark");
+        assert_eq!(
+            snapshot.sessions[0].connection_id.as_deref(),
+            Some("copy-tab")
         );
     }
 }

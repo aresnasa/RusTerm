@@ -33,6 +33,13 @@
 - `on_reconnect` → `reconnect_session(state, input_senders, sid)`
 - `on_copy_session` → 读 `session_configs[sid]` 克隆，`new_conn.name=tf("connection.copy_name",...)`，`open_connection(state, input_senders, new_conn, None)`（新会话得新 session id，保留原 saved-connection id 使 OneKey/sudo 一致）。无 config 时 warn。
 
+### 复制会话回放登录逻辑 (2026-08-06 补充)
+用户反馈"复制会话只克隆了 UI/传输配置，没有真正重放登录进机器"。修复：`on_copy_session` 现在镜像 reconnect 的回放路径——
+- 新纯函数 `seed_copied_session_replay(&mut AppState, source_id, new_id) -> Vec<String>`（app.rs，紧跟 `suppress_login_script` 之后）：读 `replayable_ops(source)`，非空则把 `SessionReplayRecorder { ops, shell_integrated:false }` 种到新会话 id 下（副本自己的后续 reconnect 也能回放，镜像 restore_sessions 的 re-seed），返回 ops。
+- handler 流程：捕获源 tab 的 `cwd`（follow_up）→ `open_connection` 返回 `OpenConnectionResult.session_id` → `seed_copied_session_replay` → `should_schedule_replay(login_script, ops)` 为真时：非空脚本先 `suppress_login_script(new_sid)`（防双驱菜单），然后 `schedule_replay_after_reconnect(state, input_senders, new_sid, ops, follow_up_cwd)`。该函数等待 Connecting→Connected（对全新连接同样适用），安全过滤 + 回显节奏 + 凭据守卫全部沿用。
+- 日志：`[COPY-SESSION] copy <new> of <src> scheduling N recorded op(s) for post-connect replay`。
+- 测试（session_startup_tests，2 新）：`copy_session_seeds_replay_recorder_and_schedules_login_replay`（继承 jumpserver 导航+sudo -i 序列、副本 recorder 被种、源不受影响、纯导航脚本被 ops 压制、凭据脚本仍赢）、`copy_session_without_recorded_ops_seeds_nothing`（普通 SSH 复制行为不变）。ui lib 772 全绿。
+
 ## 测试 (`session_startup_tests`，6 新，全绿)
 - `disconnect_sets_state_to_disconnected_and_preserves_config_and_tab`：断开后状态=Disconnected、config 保留、tab 保留、badge=Disconnected。
 - `disconnect_is_idempotent_for_already_disconnected_session`：重复断开 no-op。

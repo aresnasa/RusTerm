@@ -361,7 +361,28 @@ fn suggestion_navigation_index(
     selected: usize,
     suggestion_count: usize,
 ) -> Option<usize> {
-    if suggestion_count == 0 || !ctrl || alt || meta || shift {
+    if suggestion_count == 0 {
+        return None;
+    }
+
+    // Unmodified ArrowUp/ArrowDown navigate the suggestion list. They are
+    // consumed here (the caller returns early) so the shell never sees them:
+    // ArrowUp would otherwise swap the edited line for the previous history
+    // entry and the suggestion being browsed would be lost.
+    if !ctrl && !alt && !meta && !shift {
+        return match key {
+            Key::ArrowDown => Some((selected + 1) % suggestion_count),
+            Key::ArrowUp => Some(
+                selected
+                    .checked_sub(1)
+                    .unwrap_or(suggestion_count.saturating_sub(1)),
+            ),
+            _ => None,
+        };
+    }
+
+    // Ctrl+N / Ctrl+P remain available as readline-style navigation.
+    if !ctrl || alt || meta || shift {
         return None;
     }
 
@@ -1940,19 +1961,13 @@ pub fn TerminalView(
 
         // ── Suggestion panel ──
         //
-        // Arrow keys are intentionally NOT intercepted by the suggestion
-        // panel. In a terminal, arrow keys are the primary cursor-movement
-        // and history-navigation mechanism (Left/Right move within the line,
-        // Up/Down traverse command history). If the suggestion panel hijacked
-        // them for list navigation, the user would lose the ability to move
-        // the cursor or browse history whenever a suggestion happened to be
-        // visible — which is almost always, because the suggestion query
-        // fires on every keystroke.
-        //
-        // Instead, when an arrow key is pressed while the panel is visible,
-        // we dismiss the panel and let the key fall through to the PTY (so
-        // the shell moves the cursor / changes history as expected). The
-        // panel can still be driven via Tab (accept), Escape (dismiss), and
+        // ArrowUp/ArrowDown navigate the suggestion list while the panel is
+        // visible (consumed above by `suggestion_navigation_index` — the key
+        // never reaches the PTY, so the shell cannot swap away the line being
+        // completed). ArrowLeft/ArrowRight stay with the terminal: they
+        // dismiss the panel and fall through to the PTY so the user keeps
+        // in-line cursor movement. The panel can also be driven via
+        // Ctrl+N/Ctrl+P (navigate), Tab (accept), Escape (dismiss), and
         // Shift+Delete (purge entry).
         if current_suggestion_visible && !closure_suggestions.is_empty() {
             if let Some(next) = suggestion_navigation_index(
@@ -1976,9 +1991,10 @@ pub fn TerminalView(
                     }
                     return;
                 }
-                // Arrow keys dismiss the panel and fall through to the PTY
-                // so the shell handles cursor movement / history navigation.
-                Key::ArrowDown | Key::ArrowUp | Key::ArrowLeft | Key::ArrowRight => {
+                // Left/Right dismiss the panel and fall through to the PTY
+                // so the shell can move the cursor within the line. Up/Down
+                // are handled above by `suggestion_navigation_index`.
+                Key::ArrowLeft | Key::ArrowRight => {
                     on_suggestion_dismiss.call(false);
                     // Don't return — let the key continue to the PTY.
                 }
@@ -4168,6 +4184,71 @@ mod tests {
         );
         assert_eq!(
             suggestion_navigation_index(&ctrl_p, true, false, false, true, 0, 3),
+            None
+        );
+    }
+
+    #[test]
+    fn plain_arrow_up_down_navigate_visible_suggestions() {
+        // Unmodified Up/Down move the selection with wrap-around.
+        assert_eq!(
+            suggestion_navigation_index(&Key::ArrowDown, false, false, false, false, 0, 3),
+            Some(1)
+        );
+        assert_eq!(
+            suggestion_navigation_index(&Key::ArrowDown, false, false, false, false, 2, 3),
+            Some(0)
+        );
+        assert_eq!(
+            suggestion_navigation_index(&Key::ArrowUp, false, false, false, false, 0, 3),
+            Some(2)
+        );
+        assert_eq!(
+            suggestion_navigation_index(&Key::ArrowUp, false, false, false, false, 2, 3),
+            Some(1)
+        );
+        // No suggestions → no navigation (the key falls through to the PTY).
+        assert_eq!(
+            suggestion_navigation_index(&Key::ArrowDown, false, false, false, false, 0, 0),
+            None
+        );
+        // Left/Right stay with the terminal even with the panel open.
+        assert_eq!(
+            suggestion_navigation_index(&Key::ArrowLeft, false, false, false, false, 0, 3),
+            None
+        );
+        assert_eq!(
+            suggestion_navigation_index(&Key::ArrowRight, false, false, false, false, 0, 3),
+            None
+        );
+        // Modified arrows are never suggestion navigation.
+        assert_eq!(
+            suggestion_navigation_index(&Key::ArrowUp, true, false, false, false, 0, 3),
+            None
+        );
+        assert_eq!(
+            suggestion_navigation_index(&Key::ArrowDown, false, true, false, false, 0, 3),
+            None
+        );
+        assert_eq!(
+            suggestion_navigation_index(&Key::ArrowUp, false, false, false, true, 0, 3),
+            None
+        );
+        assert_eq!(
+            suggestion_navigation_index(&Key::ArrowDown, false, false, true, false, 0, 3),
+            None
+        );
+        // Unmodified typing keys are not navigation either.
+        assert_eq!(
+            suggestion_navigation_index(
+                &Key::Character("j".into()),
+                false,
+                false,
+                false,
+                false,
+                0,
+                3
+            ),
             None
         );
     }

@@ -19,11 +19,13 @@ use dioxus::prelude::*;
 ///   - Tab                     : accept selected (parent)
 ///   - Escape                  : dismiss (parent)
 ///   - Shift+Delete            : delete selected from history (parent)
-///   - Arrow keys              : dismiss panel + forward to PTY (parent)
-///                                — arrows always move the cursor / browse
-///                                history, never navigate the suggestion
-///                                list, so the user retains full terminal
-///                                cursor control even while the panel is up.
+///   - ArrowUp / ArrowDown     : move the selection within the list
+///                                (consumed by the parent — never reach the
+///                                PTY, so the shell cannot swap away the
+///                                line being completed)
+///   - ArrowLeft / ArrowRight  : dismiss panel + forward to PTY (parent)
+///                                — left/right always move the cursor
+///                                within the edited line.
 ///
 /// The × button is the discoverable affordance for deletion — it's always
 /// visible on the selected item and on hover for the others. The

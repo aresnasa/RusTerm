@@ -5,6 +5,14 @@
 
 提交链：`d1b4648`（阶段1）→ `51e8089`（阶段2 启动恢复弹框）→ `1bb56de`（阶段3 Cmd+Q 弹框）→ `ded0d49`（阶段4 三根因）→ `61a55f3`（阶段5 最后一次选择语义）→ `68bcd55` + `3669e34`（阶段6+7：上下文命令录制、回显驱动回放节奏、DuckDB 时序事件日志）→ **`e79ba4f`（阶段8：每会话独立时序流，修多 jumpserver 窗口恢复错乱，本文以此为准）**。
 
+## 阶段 9：副本会话可恢复 + 副本流种子（2026-08-06）
+用户要求"某个会话的副本也需要能正确的恢复，回放逻辑需要检查"。审查发现三缺陷，均已修复：
+1. **`build_session_state` 的 connection_id 是错的（致命）**：原实现按 `c.name == tab.name` 在 session_configs 里找并返回 **map key（tab UUID）** 而非 `ConnectionConfig::id`。原会话全靠 restore 的 name-fallback 侥幸恢复；副本（"X 副本"）名字不匹配任何保存连接 → restore 直接 skip，副本+其 replay ops 全丢。**修复**：`session_configs.get(&tab.id).map(|c| c.id.clone())`（保存连接的真实身份），fallback tab id 保留。测试 `build_session_state_persists_saved_connection_id_for_copies`（state.rs）。
+2. **restore 连接解析提取为纯函数 `find_restore_connection(connections, ps)`**（app.rs，restore_sessions 之前）：先按 `c.id == ps.connection_id` 匹配（副本唯一可行路径），再按 name 兜底（legacy 快照）；返回的 config **保留 ps.name 作为显示名**（副本恢复后仍叫 "X 副本"，与原会话不重名 → 不触发布局恢复的重名跳过守卫）。测试 `restore_resolves_copied_sessions_by_connection_id_and_keeps_title`（含 legacy 快照正/负例）。
+3. **副本 DuckDB 流种子**：`seed_copied_session_replay` 只 seed 内存 recorder，DB 流为空；副本里后续敲 `sudo -i` 会 persist 到空流，重启恢复时 `latest_replay_ops` 非空即胜 → 只回放 suffix、丢导航前缀。**修复**：on_copy_session 里 seed 后调 `migrate_replay_stream(analytics, new_sid, new_sid, ops)` —— old==new 退化为"只种不删"（migrate 的 old!=new 守卫天然保护源流），doc 已注明该语义。
+- 验证：rusterm-ui 774 passed（默认）/ 773（analytics feature），rustfmt clean。
+- 已知残留：legacy 快照里的副本（connection_id 是旧 tab UUID、名字带副本后缀）无法解析 → skip（不猜测）；serial 副本仍不参与 restore（原有语义）。
+
 ## 阶段 8：每会话独立时序流（2026-08-04, `e79ba4f`）
 **根因**：DuckDB `replay_events` 按 connection_id 键 → 同一保存连接开多个 jumpserver 窗口（各自导航到不同目标机）时事件交织进同一条流，restore 时所有窗口 fold 出同一份（最后写入者的）导航 → 恢复错乱。
 1. **新表 `session_replay_events (session_id, ts_micros, seq, event, op)`** + 索引 `(session_id, ts_micros, seq)`；旧 `replay_events` 表在 init_schema 里 `DROP TABLE IF EXISTS`（数据无法归因到会话，不迁移；restore 一次性回退到快照 ops）。事件语法/fold 不变。
