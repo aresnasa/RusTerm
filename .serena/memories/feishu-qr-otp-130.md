@@ -79,7 +79,9 @@ and scanning it moves BOTH login and OAuth redirect onto the phone — the phone
 - All feishu_browser fns require Dioxus runtime scope (all call sites are component handlers/futures).
 
 ## Verified
-`cargo check --workspace` clean; `cargo test -p rusterm-ui` 814 pass. All work still uncommitted on main.
+`cargo check --workspace` clean; `cargo test -p rusterm-ui` 814 pass; clippy warnings only (pre-existing).
+Committed on main (3 commits ahead of origin, NOT pushed): 9bf697b (QR OAuth + OTP autofill),
+3f4a549 (app.rs), a4515e2 (embedded browser replaces self-rendered QR, #130).
 
 ## Still unverified end-to-end (needs live JumpServer + Feishu)
 QR scan → exchange → 动态口令 → bot reply parse → tty fill. Next user retest should capture
