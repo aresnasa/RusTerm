@@ -150,11 +150,14 @@ async fn handle_feishu_oauth_event(state: &mut Signal<AppState>, event: FeishuOA
     let step = {
         let mut s = state.write();
         match feishu_oauth_event_plan(&mut s, &event) {
-            OAuthPlan::Ignore => Step::Done,
+            OAuthPlan::Ignore => return,
             OAuthPlan::Failed(_) => Step::Done,
             OAuthPlan::Exchange(plan) => Step::RunExchange(*plan),
         }
     };
+    // A recognized callback landed in the embedded browser window — its job
+    // is done either way; the main-window popup reports the outcome.
+    crate::feishu_browser::close_feishu_login_window();
     let Step::RunExchange(exchange) = step else {
         return;
     };
@@ -20103,6 +20106,8 @@ pub fn App() -> Element {
                     let session = popup_session_for_close.clone();
                     let mut s = state.write();
                     cancel_feishu_auth(&mut s, session.as_deref());
+                    drop(s);
+                    crate::feishu_browser::close_feishu_login_window();
                 },
                 on_browser: move |_| {
                     let url = popup_url.clone();
