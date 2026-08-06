@@ -50,9 +50,10 @@ use crate::components::dock::{
 use crate::components::{BottomToolPanel, RemoteFilesPanel, RightToolPanel};
 use crate::feishu_oauth_flow::{
     AuthStart, ExchangePlan, OAuthPlan, TtyFillPlan, apply_feishu_oauth_result, cancel_feishu_auth,
-    feishu_cfg_incomplete, feishu_oauth_event_plan, feishu_otp_session_closed, feishu_owns_prompt,
-    feishu_tty_fill_begin, feishu_tty_fill_end, feishu_tty_fill_plan, feishu_user_cfg,
-    insert_pending_auth, looks_like_feishu_otp_prompt, oauth_extra_from_plan, prepare_auth_start,
+    feishu_auth_pending_for, feishu_cfg_incomplete, feishu_oauth_event_plan,
+    feishu_otp_session_closed, feishu_owns_prompt, feishu_tty_fill_begin, feishu_tty_fill_end,
+    feishu_tty_fill_plan, feishu_user_cfg, insert_pending_auth, looks_like_feishu_otp_prompt,
+    oauth_extra_from_plan, prepare_auth_start,
 };
 use crate::feishu_oauth_listener::{FeishuOAuthCallback, ListenerHandle, OAuthSink, bind_listener};
 use crate::keybindings::action_for_event;
@@ -149,6 +150,44 @@ fn start_feishu_auth_session(state: &mut Signal<AppState>, session: Option<Strin
     // (a QR carrying the authorize URL itself would move the redirect onto
     // the phone, where no listener exists — issue #130).
     crate::feishu_browser::open_feishu_login_window(authorize_url);
+}
+
+/// Proactive sign-in at connect time (issue #130): the embedded Feishu
+/// window must pop up WHILE the JumpServer connection is being established
+/// — before the login reaches `2nd Password:` — whenever the FeishuUser
+/// provider is active but no usable token is persisted. The scan then runs
+/// in parallel with the login; by the time the OTP prompt appears the code
+/// exchange has usually finished and the prompt-triggered fill plans
+/// `Fetch` directly. If the prompt lands mid-scan, the `Reauth` arm in
+/// [`trigger_feishu_otp_fetch`] waits on the pending auth instead of
+/// rotating the QR page under the user's phone.
+fn maybe_preauth_feishu_at_connect(mut state: Signal<AppState>, session_id: &str) {
+    let start = {
+        let s = state.read();
+        let Some(cfg) = feishu_user_cfg(&s) else {
+            return; // provider inactive — nothing proactive to do
+        };
+        if feishu_cfg_incomplete(&cfg) {
+            // Don't pop an error dialog on EVERY connect — the OTP-prompt
+            // path surfaces the "config missing" popup when it matters.
+            tracing::warn!(
+                "[OTP-FEISHU] session={} provider config incomplete — skipping connect-time sign-in",
+                &session_id[..session_id.len().min(8)]
+            );
+            false
+        } else if feishu_auth_pending_for(&s, session_id, std::time::Instant::now()) {
+            false // a scan for this session is already under way
+        } else {
+            matches!(feishu_tty_fill_plan(&s), TtyFillPlan::Reauth)
+        }
+    };
+    if start {
+        tracing::info!(
+            "[OTP-FEISHU] session={} no usable token at connect — opening Feishu sign-in ahead of login",
+            &session_id[..session_id.len().min(8)]
+        );
+        start_feishu_auth_session(&mut state, Some(session_id.to_string()));
+    }
 }
 
 /// Drain one OAuth delivery. Exchange tasks run as `spawn`s so the drain
@@ -326,6 +365,18 @@ async fn trigger_feishu_otp_fetch(state: &mut Signal<AppState>, session: &str) {
             });
         }
         TtyFillPlan::Reauth => {
+            // A sign-in for this session may already be under way (opened
+            // proactively at connect). Starting a fresh one here would
+            // rotate the nonce and replace the QR page mid-scan — wait for
+            // the OAuth callback instead; on success it chains straight
+            // into a new fetch for this session (issue #130).
+            if feishu_auth_pending_for(&state.read(), session, std::time::Instant::now()) {
+                tracing::info!(
+                    "[OTP-FEISHU] session={} OTP prompt while sign-in pending — waiting for scan",
+                    &session[..session.len().min(8)]
+                );
+                return;
+            }
             start_feishu_auth_session(state, Some(session.to_string()));
         }
         TtyFillPlan::Skip => {}
@@ -15862,6 +15913,7 @@ fn open_connection(
             });
             let assigned = assign_opened_session(&mut state.write(), target.as_ref(), &tab_id);
             start_ssh_connection(state, input_senders, tab_id.clone(), ssh_config.clone());
+            maybe_preauth_feishu_at_connect(state, &tab_id);
             assigned
         }
         ConnectionKind::Shell(shell_config) => {
@@ -17053,6 +17105,7 @@ fn reconnect_session(
     match conn.kind {
         ConnectionKind::Ssh(ssh_config) => {
             start_ssh_connection(state, input_senders, tab_id, ssh_config);
+            maybe_preauth_feishu_at_connect(state, &wd_tab_id);
         }
         ConnectionKind::Shell(shell_config) => {
             start_shell_connection(state, input_senders, tab_id, shell_config);

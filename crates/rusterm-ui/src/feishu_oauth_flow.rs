@@ -201,6 +201,22 @@ fn is_owned_by(popup: &Option<FeishuQrPopup>, session: Option<&str>) -> bool {
         .is_some_and(|p| p.session.as_deref() == session)
 }
 
+/// `true` when a QR sign-in for `session` is still awaiting its OAuth
+/// callback and is young enough to plausibly complete. Two callers rely on
+/// this to WAIT instead of starting a fresh sign-in (issue #130):
+/// - the connect-time proactive open must not fire twice for one session;
+/// - the `2nd Password:` prompt path must not rotate the nonce while the
+///   user is mid-scan on the window that was opened at connect — the OAuth
+///   success handler chains the OTP fetch for this session by itself.
+/// Attempts older than [`FEISHU_QR_TIMEOUT`] are treated as abandoned so a
+/// walked-away scan does not block the prompt-triggered re-auth forever.
+pub fn feishu_auth_pending_for(state: &AppState, session: &str, now: Instant) -> bool {
+    state.feishu_pending_auths.values().any(|pending| {
+        pending.session.as_deref() == Some(session)
+            && now.duration_since(pending.created) <= FEISHU_QR_TIMEOUT
+    })
+}
+
 /// Close the popup + cancel any pending auths tied to `session`. The
 /// settings-initiated (`None`-session) flow is intentionally NOT cancelled
 /// by a session-specific cancel — the user may close a terminal tab while
@@ -766,6 +782,44 @@ mod tests {
         cancel_feishu_auth(&mut state, Some("other"));
         assert!(state.feishu_qr_popup.is_some());
         assert_eq!(state.feishu_pending_auths.len(), 1);
+    }
+
+    #[test]
+    fn pending_auth_lookup_is_session_scoped_and_ages_out() {
+        let mut state = state_without_cm();
+        let now = Instant::now();
+        assert!(
+            !feishu_auth_pending_for(&state, "sess-1", now),
+            "no pending auths at all"
+        );
+        insert_pending_auth(
+            &mut state,
+            None,
+            prepare_auth_start(),
+            "cli_x",
+            "http://127.0.0.1:8878/callback",
+            FIRST_PORT,
+        );
+        assert!(
+            !feishu_auth_pending_for(&state, "sess-1", now),
+            "a settings-owned (sessionless) auth does not count for a session"
+        );
+        insert_pending_auth(
+            &mut state,
+            Some("sess-1".into()),
+            prepare_auth_start(),
+            "cli_x",
+            "http://127.0.0.1:8878/callback",
+            FIRST_PORT,
+        );
+        assert!(feishu_auth_pending_for(&state, "sess-1", Instant::now()));
+        assert!(
+            !feishu_auth_pending_for(&state, "sess-2", Instant::now()),
+            "another session's auth does not count"
+        );
+        // Abandoned scans age out so the prompt path can re-auth again.
+        let later = Instant::now() + FEISHU_QR_TIMEOUT + Duration::from_secs(1);
+        assert!(!feishu_auth_pending_for(&state, "sess-1", later));
     }
 
     // ── event → plan ────────────────────────────────────────────────────

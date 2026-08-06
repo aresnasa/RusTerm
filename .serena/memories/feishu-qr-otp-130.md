@@ -83,6 +83,24 @@ and scanning it moves BOTH login and OAuth redirect onto the phone — the phone
 Committed on main (3 commits ahead of origin, NOT pushed): 9bf697b (QR OAuth + OTP autofill),
 3f4a549 (app.rs), a4515e2 (embedded browser replaces self-rendered QR, #130).
 
+## Session 5: browser window still not opening — unsaved provider draft (commit e38e99c)
+User screenshot: reconnect → `2nd Password:` → OneKey popup ("sudo 密码") instead of embedded
+browser. Gate analysis: OneKey winning ⇒ `feishu_owns_prompt` false ⇒ `feishu_user_cfg` None
+(prompt text matches "2nd password" marker; attempts reset was already wired).
+**Root cause:** the settings 扫码登录/授权 button only set `FEISHU_AUTH_REQUESTED`; the poll loop's
+`start_feishu_auth_session` reads the PERSISTED config (`load_otp_webhook`), but the FeishuUser
+draft is only persisted when the dialog's 保存 button fires `on_save_otp_webhook`. Unsaved draft ⇒
+button silently no-ops (warn only) AND the tty gates see provider inactive ⇒ OneKey popup wins.
+**Fix:**
+- `render_otp_webhook_settings` now takes `on_save: EventHandler<Option<OtpWebhookConfig>>`; the
+  auth button calls `on_save.call(setting())` (synchronous persist) BEFORE raising
+  `FEISHU_AUTH_REQUESTED` (150ms poll ⇒ persist wins the race).
+- `start_feishu_auth_session` provider-missing branch now shows the `FeishuQrPopup` Failed state
+  (`feishu.qr_status_cfg_missing_fields`) instead of silently returning.
+Expected flow per user directive: settings button → embedded browser visits open.feishu.cn,
+creates session + chat permission → token persisted → later OTP prompts plan Fetch directly.
+Note: origin/main caught up (earlier 3 commits pushed); e38e99c is the only unpushed commit.
+
 ## Still unverified end-to-end (needs live JumpServer + Feishu)
 QR scan → exchange → 动态口令 → bot reply parse → tty fill. Next user retest should capture
 `RUST_LOG=info` logs (~/Library/Application Support/rusterm/logs/) and grep `[OTP-FEISHU]`,
