@@ -63,3 +63,4 @@ qwen-local-cuda = ["qwen-local", "rusterm-ai/qwen-local-cuda"]
 
 [dev-dependencies]
 tempfile = "3"
+reqwest.workspace = true

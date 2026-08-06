@@ -17,8 +17,10 @@
 //!    `user_access_token` and `refresh_token`.
 //! 3. [`feishu_otp::ensure_fresh_token`] refreshes the token when stale, so
 //!    the user only scans once until the refresh window lapses.
-//! 4. [`request_otp_from_bot`] sends a request **only to the configured bot**
-//!    (hard-enforced) and polls the DM for the matching OTP reply.
+//! 4. [`FeishuOtpClient::request_otp`] sends a request **only to the configured bot**
+//!    (hard-enforced) and polls the DM for the matching OTP reply, also
+//!    parsing the bot-reported validity window (`有效期剩余：NN秒`) and
+//!    re-requesting once when the code is about to lapse.
 //!
 //! # Guard rails (user requirement)
 //!
@@ -54,6 +56,28 @@ const OTP_POLL_INTERVAL: Duration = Duration::from_millis(800);
 
 /// How long to keep polling the DM for the OTP reply before giving up.
 const OTP_REPLY_WINDOW: Duration = Duration::from_secs(25);
+
+/// A code whose reported remaining validity is below this many seconds is
+/// too risky to type (network + tty round-trip may outlive it); request a
+/// fresh one instead (issue #130).
+const MIN_OTP_VALID_SECS: u64 = 5;
+
+/// Typed marker error: the persisted Feishu user session is unusable (both
+/// tokens expired, or the refresh endpoint rejected the refresh token) and
+/// only a fresh QR sign-in can recover. Callers detect it with
+/// `err.downcast_ref::<ReauthRequired>()` — anyhow searches the whole
+/// context chain — and pop the QR popup instead of surfacing a dead-end
+/// failure (issue #130).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReauthRequired;
+
+impl std::fmt::Display for ReauthRequired {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Feishu user session expired; QR re-auth required")
+    }
+}
+
+impl std::error::Error for ReauthRequired {}
 
 // ── PKCE ──────────────────────────────────────────────────────────────
 
@@ -272,11 +296,13 @@ async fn refresh_user_token(
         .await
         .context("Feishu token refresh response decode failed")?;
     if resp.code != 0 {
-        return Err(anyhow!(
+        // A rejected refresh token (revoked, rotated away, app secret
+        // changed…) is not transient — only a fresh QR sign-in recovers.
+        // Tag the error so the UI can fall back to the QR popup.
+        return Err(anyhow::Error::new(ReauthRequired).context(format!(
             "Feishu token refresh error {}: {}",
-            resp.code,
-            resp.error_description
-        ));
+            resp.code, resp.error_description
+        )));
     }
     let now = token_now();
     token.access_token = resp.access_token.clone();
@@ -289,6 +315,27 @@ async fn refresh_user_token(
 
 // ── OTP relay client ───────────────────────────────────────────────────
 
+/// An OTP code extracted from the bot's reply, together with the validity
+/// window the bot reported (issue #130: replies look like
+/// `otp：313786，有效期剩余：36秒`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedOtp {
+    pub code: String,
+    /// Remaining validity in seconds, when the bot's reply stated one.
+    pub valid_secs: Option<u64>,
+}
+
+/// Parse the remaining-validity window from a bot reply, e.g.
+/// `有效期剩余：36秒` / `有效期剩余: 36 秒`. Returns `None` when the reply
+/// carries no recognizable window (callers then assume it is fresh).
+pub fn parse_validity_secs(text: &str) -> Option<u64> {
+    static VALIDITY_RE: std::sync::OnceLock<Regex> = std::sync::OnceLock::new();
+    let re = VALIDITY_RE.get_or_init(|| {
+        Regex::new(r"有效期(?:剩余)?\s*[：:]?\s*(\d+)\s*秒").expect("validity regex is valid")
+    });
+    re.captures(text)?.get(1)?.as_str().parse().ok()
+}
+
 /// Client that relays a one-time code request to the designated ops bot via
 /// the signed-in user's Feishu identity. The destination bot is fixed at
 /// construction and cannot be changed on the send path.
@@ -299,7 +346,7 @@ pub struct FeishuOtpClient {
     app_secret: String,
     /// The ONLY allowed recipient (`ou_...` open id of the ops bot).
     bot_open_id: String,
-    /// Message text sent to trigger the bot (e.g. "申请临时密码").
+    /// Message text sent to trigger the bot (e.g. "动态口令").
     request_text: String,
     code_re: Regex,
 }
@@ -332,10 +379,30 @@ impl FeishuOtpClient {
 
     /// Send an OTP request to the bot and poll the DM for the matching code.
     /// `token` is refreshed in place when stale.
-    pub async fn request_otp(&self, token: &mut FeishuUserToken) -> Result<Option<String>> {
+    ///
+    /// When the bot reports a validity window (`有效期剩余：NN秒`) that is
+    /// already nearly exhausted, one fresh request is made automatically so
+    /// the caller never types a code that dies mid-flight (issue #130).
+    pub async fn request_otp(&self, token: &mut FeishuUserToken) -> Result<Option<FetchedOtp>> {
+        let first = self.request_otp_once(token).await?;
+        match first {
+            Some(otp) if otp.valid_secs.is_some_and(|s| s < MIN_OTP_VALID_SECS) => {
+                tracing::info!(
+                    "[OTP-FEISHU] code expires in {}s (< {}s); requesting a fresh one",
+                    otp.valid_secs.unwrap_or(0),
+                    MIN_OTP_VALID_SECS
+                );
+                self.request_otp_once(token).await
+            }
+            other => Ok(other),
+        }
+    }
+
+    /// One request/poll cycle: message the bot, poll the DM for a reply.
+    async fn request_otp_once(&self, token: &mut FeishuUserToken) -> Result<Option<FetchedOtp>> {
         let access = ensure_fresh_token(token, &self.base_url, &self.app_id, &self.app_secret)
             .await?
-            .ok_or_else(|| anyhow!("Feishu user session expired; QR re-auth required"))?;
+            .ok_or(anyhow::Error::new(ReauthRequired))?;
 
         tracing::info!("[OTP-FEISHU] requesting OTP from bot {}", self.bot_open_id);
 
@@ -414,16 +481,16 @@ impl FeishuOtpClient {
 
     /// Poll the direct-message conversation for a message matching the OTP
     /// pattern, sent (by the bot) after `since` ms-epoch.
-    async fn poll_for_code(&self, access_token: &str, chat_id: &str) -> Result<Option<String>> {
+    async fn poll_for_code(&self, access_token: &str, chat_id: &str) -> Result<Option<FetchedOtp>> {
         let client = http_client(OTP_FETCH_TIMEOUT)?;
         let start = std::time::Instant::now();
         let since_ms = chrono::Utc::now().timestamp_millis();
         loop {
-            if let Some(code) = self
+            if let Some(otp) = self
                 .scan_recent_messages(&client, access_token, chat_id, since_ms)
                 .await?
             {
-                return Ok(Some(code));
+                return Ok(Some(otp));
             }
             if start.elapsed() >= OTP_REPLY_WINDOW {
                 tracing::warn!("[OTP-FEISHU] timed out waiting for bot OTP reply");
@@ -440,7 +507,7 @@ impl FeishuOtpClient {
         access_token: &str,
         chat_id: &str,
         since_ms: i64,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<FetchedOtp>> {
         if chat_id.is_empty() {
             return Ok(None);
         }
@@ -491,11 +558,13 @@ impl FeishuOtpClient {
             }
             let content = item.body.map(|b| b.content).unwrap_or_default();
             if let Some(code) = extract_first_match(&content, &self.code_re) {
+                let valid_secs = parse_validity_secs(&content);
                 tracing::info!(
-                    "[OTP-FEISHU] matched OTP in bot reply (content len={})",
-                    content.len()
+                    "[OTP-FEISHU] matched OTP in bot reply (content len={}, valid_secs={:?})",
+                    content.len(),
+                    valid_secs
                 );
-                return Ok(Some(code));
+                return Ok(Some(FetchedOtp { code, valid_secs }));
             }
         }
         Ok(None)
@@ -566,7 +635,7 @@ mod tests {
             "cli_x".into(),
             "secret".into(),
             "ou_bot".into(),
-            "申请临时密码".into(),
+            "动态口令".into(),
             r"\d{6}",
         );
         assert_eq!(client.bot_open_id(), "ou_bot");
@@ -595,5 +664,41 @@ mod tests {
             extract_first_match("code 123456 ok", &re).as_deref(),
             Some("123456")
         );
+    }
+
+    #[test]
+    fn parses_validity_window_from_bot_reply() {
+        // Exact format from issue #130.
+        assert_eq!(
+            parse_validity_secs("otp：313786，有效期剩余：36秒"),
+            Some(36)
+        );
+        // ASCII colon + spaces variant.
+        assert_eq!(parse_validity_secs("有效期剩余: 5 秒"), Some(5));
+        // "剩余" omitted.
+        assert_eq!(parse_validity_secs("有效期 90 秒"), Some(90));
+        // JSON-wrapped text content, as delivered by the message list API.
+        assert_eq!(
+            parse_validity_secs(r#"{"text":"otp：313786，有效期剩余：36秒"}"#),
+            Some(36)
+        );
+        // No window stated → None (treated as fresh).
+        assert_eq!(parse_validity_secs("您的验证码是 123456"), None);
+    }
+
+    #[test]
+    fn reauth_required_downcasts_through_context_chain() {
+        // The UI decides "pop the QR" via downcast_ref, so the marker must
+        // stay reachable even when wrapped by `.context(...)` layers.
+        let plain = anyhow::Error::new(ReauthRequired);
+        assert!(plain.downcast_ref::<ReauthRequired>().is_some());
+
+        let wrapped = anyhow::Error::new(ReauthRequired)
+            .context("Feishu token refresh error 20037: invalid refresh_token")
+            .context("outer retry layer");
+        assert!(wrapped.downcast_ref::<ReauthRequired>().is_some());
+
+        let unrelated = anyhow!("network unreachable").context("send failed");
+        assert!(unrelated.downcast_ref::<ReauthRequired>().is_none());
     }
 }

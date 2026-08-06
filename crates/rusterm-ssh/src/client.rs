@@ -596,7 +596,11 @@ async fn auth_keyboard_interactive(
 /// the common keywords. A `false` result means "treat it as a password
 /// prompt" (the safe default — sending the password to an OTP prompt is
 /// harmless because the server will reject it).
-fn looks_like_otp_prompt(prompt: &str) -> bool {
+/// Must stay in sync with the ssh auth-path gate at `SshClient::connect`:
+/// OTP markers short-circuit to the provider; anything else falls through
+/// to the normal Password flow. `pub` so the UI tty watcher (issue #129)
+/// reuses the exact same marker list instead of drifting copies.
+pub fn looks_like_otp_prompt(prompt: &str) -> bool {
     let lower = prompt.to_ascii_lowercase();
     // Strong OTP markers — a prompt containing any of these is an OTP prompt.
     const OTP_MARKERS: &[&str] = &[

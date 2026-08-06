@@ -163,6 +163,34 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         "settings.otp_provider_manual" => ("Manual (prompt only)", "手动（仅提示）"),
         "settings.otp_provider_feishubot" => ("Feishu bot chat", "飞书机器人聊天"),
         "settings.otp_provider_http" => ("Generic HTTP webhook", "通用 HTTP webhook"),
+        "settings.otp_provider_feishuuser" => (
+            "Feishu QR sign-in (JumpServer OTP)",
+            "飞书扫码登录（JumpServer 二次认证）",
+        ),
+        "settings.otp_feishu_bot_open_id" => {
+            ("Ops bot open id (智小安)", "运维机器人 open id（智小安）")
+        }
+        "settings.otp_feishu_request_text" => ("OTP request message", "取码消息文本"),
+        "settings.otp_feishu_token_connected" => (
+            "Feishu signed in, expires {ts}",
+            "飞书已登录，token 至 {ts}",
+        ),
+        "settings.otp_feishu_token_missing" => (
+            "Not signed in — scan the QR to connect",
+            "未连接 — 点击下方按钮扫码登录",
+        ),
+        "settings.otp_feishu_token_failed" => {
+            ("Last sign-in failed: {reason}", "上次连接失败：{reason}")
+        }
+        "settings.otp_feishu_reauth" => ("Scan / re-scan to sign in", "扫码登录 / 重新授权"),
+        "settings.otp_feishu_permissions_hint" => (
+            "Required Feishu app scopes: im:message send as user + im:message readonly; redirect allowlist: http://127.0.0.1:8878/oauth/feishu/callback",
+            "需要的飞书应用权限：以用户身份发消息 im:message:send im:message 只读；重定向白名单：http://127.0.0.1:8878/oauth/feishu/callback",
+        ),
+        "settings.otp_feishuuser_help" => (
+            "Scan the Feishu QR once; RusTerm inherits your Feishu login and can only send ONE fixed message to the configured ops bot (智小安). No other recipients or actions are possible.",
+            "首次需扫码完成飞书登录授权；之后 RusTerm 只会以你的身份向配置的运维机器人发送固定的取码消息并读取回复。不会产生其他收件人或动作。",
+        ),
         "settings.otp_feishu_app_id" => ("Feishu App ID", "飞书 App ID"),
         "settings.otp_feishu_app_secret" => ("Feishu App Secret", "飞书 App Secret"),
         "settings.otp_feishu_chat_id" => ("Feishu Chat ID", "飞书聊天 ID"),
@@ -175,6 +203,29 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         "settings.otp_code_pattern" => ("Code extraction regex", "验证码提取正则"),
         "settings.otp_max_age_secs" => ("Max code age (seconds)", "验证码最大时效（秒）"),
         "settings.otp_timeout_secs" => ("Timeout (seconds)", "超时（秒）"),
+        "feishu.qr_title" => ("Feishu sign-in", "飞书扫码登录"),
+        "feishu.qr_subtitle_session" => (
+            "Scan with Feishu to auto-fill the JumpServer OTP",
+            "使用飞书扫码授权，自动填入 JumpServer 二次验证码",
+        ),
+        "feishu.qr_subtitle_settings" => (
+            "Scan with Feishu to connect RusTerm",
+            "使用飞书扫码完成授权",
+        ),
+        "feishu.qr_open" => ("Open in browser", "在浏览器打开"),
+        "feishu.qr_rescan" => ("Rescan / reauthorize", "重新扫码"),
+        "feishu.qr_expired" => ("QR expired — rescan to retry", "二维码已过期 — 请重新扫码"),
+        "feishu.qr_fetching" => ("Fetching OTP from 智小安…", "正在向智小安获取临时密码…"),
+        "feishu.qr_delivered" => ("OTP auto-filled", "已自动填入验证码"),
+        "feishu.qr_failed" => ("Sign-in failed: {reason}", "授权失败：{reason}"),
+        "feishu.qr_status_cfg_missing_fields" => (
+            "Complete the Feishu fields in Settings → OTP webhook first",
+            "请先在 设置 → OTP 二次认证 webhook 中补全飞书字段",
+        ),
+        "feishu.qr_scan_help" => (
+            "1. Scan with the Feishu mobile app → confirm login\n2. RusTerm only messages the configured ops bot (智小安)\n3. This popup closes automatically after sign-in",
+            "1. 用飞书扫码并确认登录\n2. RusTerm 只会向配置的智小安机器人发取码消息\n3. 授权完成后本弹窗自动关闭",
+        ),
         "settings.keybindings" => ("Keyboard shortcuts", "键盘快捷键"),
         "settings.skin" => ("Skin", "皮肤"),
         "settings.usage_habits" => ("Usage habits & privacy", "使用习惯与隐私"),

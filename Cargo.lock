@@ -8175,6 +8175,7 @@ dependencies = [
  "parking_lot",
  "qrcode",
  "regex",
+ "reqwest",
  "rfd 0.15.4",
  "rusterm-ai",
  "rusterm-analytics",

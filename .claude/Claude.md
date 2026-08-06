@@ -249,3 +249,14 @@ Linux gpu-muxi-001.x86.test.brainpp.dev 5.15.0-119-generic #1，将API 脚本放
 127. ![](image_9.png)副本支持就近复制，不需要放到最右边，同时检查恢复逻辑，支持恢复回放带有副本字样的会话及登录状态。
 128. 继续优化回放逻辑，这里需要完整的记录当前 rusterm 的会话状态（包括窗口的分布的 id 号）和用户挪动 id 号的习惯，再下次恢复回放时保持上次的排序顺序。
 129. ![](image_10.png)这里需要一个 webhook，访问飞书聊天工具，基于https://open.feishu.cn/community/articles/7271149634339422210工具来发送 OTP 二次认证。这里需要复用已有的
+130. ![](image_11.png)登录 jumpserver 需要用如下逻辑：
+  0. 访问飞书的扫码登录（获取 session信息），这里需要继承 rust 生成二维码的工具到本项目
+  0.1 [@Image](zed:///agent/pasted-image?name=Image) 还是没有正确的先生成二维码扫码，需要修复终端的逻辑，需要支持生成二维码，继续修复。
+  0.2 ![](image_12.png)还是没法正确的生成二维码，可以参考https://github.com/h4ckf0r0day/obscura，这里需要集成一个极简的浏览器访问飞书，并获取 session 信息，继续改造，支持手机扫码登录
+
+  1. 首先尝试触发飞书扫码，获取登录态的 session
+  2. 使用这个 session 往智小安发送消息：动态口令
+  3. 基于 2 发送的消息恢复的消息，计算otp：313786，有效期剩余：36秒，otp 和时间
+  4. 自动填入 otp 到 jumpserver
+  5. 继续其他逻辑。
+  6. 如果已经登录了飞书可以复用相关 session

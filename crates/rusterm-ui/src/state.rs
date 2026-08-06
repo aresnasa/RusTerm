@@ -613,6 +613,150 @@ pub struct AppState {
     /// `true` while an LLM request is in flight — blocks double-sends.
     #[serde(skip)]
     pub chat_request_in_flight: bool,
+
+    // ── Feishu OAuth OTP auto-fill (issue #129) ──────────────────────────
+    //
+    // Feishu *user-token* OTP flow: the user scans a Feishu QR code once,
+    // RusTerm inherits the Feishu login state as a user_access_token, sends
+    // `request_text` to the ops bot (智小安) — the ONLY allowed recipient —
+    // and auto-fills the bot's reply into tty OTP prompts. The local OAuth
+    // callback listener lives in `crate::feishu_oauth_listener` (loopback
+    // 127.0.0.1:8878); its deliveries land in `feishu_oauth_events` and are
+    // processed one event loop tick later.
+    /// In flight OAuth sign-ins keyed by the `state` nonce. The matching
+    /// `code_verifier` is needed to exchange the authorization code after
+    /// the user's scan completes.
+    #[serde(skip)]
+    pub feishu_pending_auths: std::collections::HashMap<String, PendingFeishuAuth>,
+    /// The visible "scan to sign in" QR popup, if any. `session` names the
+    /// tty session whose OTP prompt triggered the flow (`None` when started
+    /// from the settings dialog).
+    #[serde(skip)]
+    pub feishu_qr_popup: Option<FeishuQrPopup>,
+    /// The loopback port the OAuth listener actually bound (8878 preferred,
+    /// 8879+ fallback). `None` until the listener starts — authorize URLs
+    /// built before that fall back to the preferred port.
+    #[serde(skip)]
+    pub feishu_oauth_port: Option<u16>,
+    /// OAuth callbacks delivered by the loopback listener — every successful
+    /// exchange attempt. Processed (and drained) by the app event loop.
+    #[serde(skip)]
+    pub feishu_oauth_events: Vec<FeishuOAuthEvent>,
+    /// Result of the most recent sign-in attempt, surfaced on the QR popup
+    /// and in settings. NOT persisted — the encrypted token pair persisted
+    /// by `ConfigManager::save_feishu_user_token` is the source of truth.
+    #[serde(skip)]
+    pub feishu_token_status: Option<FeishuTokenStatus>,
+    /// Per-session OTP fetch status, used for UI feedback and debouncing
+    /// (a session never starts a second fetch while one is in flight).
+    #[serde(skip)]
+    pub feishu_otp_status: std::collections::HashMap<String, FeishuOtpFetch>,
+    /// Feishu OTP auto-fill attempts per session. After
+    /// [`FEISHU_OTP_MAX_ATTEMPTS`] failures/exhaustions the session falls
+    /// back to the manual OneKey popup so the user is never locked out.
+    /// Reset whenever an OTP is actually delivered.
+    #[serde(skip)]
+    pub feishu_otp_attempts: std::collections::HashMap<String, u8>,
+    /// One-shot: the Feishu QR popup was just (re)armed and settings must
+    /// become visible. Written by the settings "扫码授权" button (which
+    /// can't see the settings-visibility signal), consumed by app.rs.
+    #[serde(skip)]
+    pub feishu_auth_reveal_settings: bool,
+}
+
+/// In-flight Feishu OAuth authorization (issue #129). Created when RusTerm
+/// builds the QR authorize URL; consumed when the loopback listener reports
+/// the callback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingFeishuAuth {
+    /// PKCE verifier matching the challenge embedded in the authorize URL.
+    pub code_verifier: String,
+    /// Session whose OTP prompt initiated the flow, if any.
+    pub session: Option<String>,
+    pub created: std::time::Instant,
+}
+
+/// The Feishu QR sign-in popup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeishuQrPopup {
+    /// Waiting session (OTP auto-fill target), or `None` for a settings-
+    /// initiated authorization.
+    pub session: Option<String>,
+    /// Full authorize URL rendered as the QR code.
+    pub authorize_url: String,
+    /// `state` nonce — index into `feishu_pending_auths`.
+    pub state_nonce: String,
+    /// Loopback port the OAuth listener accepted the request on (used to pin
+    /// the redirect URI when re-arming a cancelled flow).
+    pub port: u16,
+    /// Lifecycle the popup renders: scanning, delivered, or failed.
+    pub status: FeishuQrPopupStatus,
+}
+
+/// Lifecycle of one QR sign-in attempt, rendered by the popup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeishuQrPopupStatus {
+    /// Waiting for the user to scan and authorize.
+    Scanning { started: std::time::Instant },
+    /// Tokens exchanged, the cached OTP was filled into the waiting session.
+    Delivered { delivered_at: std::time::Instant },
+    /// The flow died with a user-readable, secret-free reason.
+    Failed {
+        reason: String,
+        failed_at: std::time::Instant,
+    },
+}
+
+impl FeishuQrPopupStatus {
+    pub fn failed_at(&self) -> Option<std::time::Instant> {
+        match self {
+            FeishuQrPopupStatus::Failed { failed_at, .. } => Some(*failed_at),
+            _ => None,
+        }
+    }
+
+    pub fn delivered_at(&self) -> Option<std::time::Instant> {
+        match self {
+            FeishuQrPopupStatus::Delivered { delivered_at } => Some(*delivered_at),
+            _ => None,
+        }
+    }
+}
+
+/// A Feishu OAuth callback outcome as delivered by the loopback listener
+/// (values only, no UI types so the listener crate layer stays lean).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeishuOAuthEvent {
+    pub state: String,
+    /// Authorization `code` on success; `Err` carries the user-readable
+    /// OAuth error description from Feishu.
+    pub result: Result<String, String>,
+}
+
+/// Non-secret summary of the latest Feishu sign-in attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeishuTokenStatus {
+    /// Tokens obtained and persisted. Value: access-token expiry (unix secs).
+    Connected { expires_at: i64 },
+    /// The authorization code exchange failed.
+    Failed {
+        reason: String,
+        at: std::time::Instant,
+    },
+}
+
+/// Per-session state of the Feishu OTP bot round-trip.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeishuOtpFetch {
+    /// A request to the bot is in flight (message sent, reply polled).
+    InFlight { started: std::time::Instant },
+    /// The bot's reply fetched and auto-filled.
+    Delivered { at: std::time::Instant },
+    /// Fetch failed or timed out (`reason` is log/UI-safe, no secrets).
+    Failed {
+        reason: String,
+        at: std::time::Instant,
+    },
 }
 
 /// One turn in the chat log. `role` mirrors OpenAI's convention so the same
@@ -1108,6 +1252,14 @@ impl Default for AppState {
             chat_status: None,
             chat_api_keys: std::collections::HashMap::new(),
             chat_request_in_flight: false,
+            feishu_pending_auths: std::collections::HashMap::new(),
+            feishu_qr_popup: None,
+            feishu_oauth_port: None,
+            feishu_oauth_events: Vec::new(),
+            feishu_token_status: None,
+            feishu_otp_status: std::collections::HashMap::new(),
+            feishu_otp_attempts: std::collections::HashMap::new(),
+            feishu_auth_reveal_settings: false,
         }
     }
 }
@@ -3305,6 +3457,18 @@ pub fn close_session(
     }
     state.ssh_sessions.remove(id);
     state.sftp_clients.remove(id);
+    state.feishu_otp_status.remove(id);
+    state.feishu_otp_attempts.remove(id);
+    if state
+        .feishu_qr_popup
+        .as_ref()
+        .is_some_and(|popup| popup.session.as_deref() == Some(id))
+    {
+        state.feishu_qr_popup = None;
+    }
+    state
+        .feishu_pending_auths
+        .retain(|_, pending| pending.session.as_deref() != Some(id));
     state.transfers.cancel_for_session(id);
     for job_id in state
         .transfers

@@ -1845,7 +1845,8 @@ pub enum OtpWebhookConfig {
         #[serde(default = "default_otp_code_pattern")]
         code_pattern: String,
         /// Text RusTerm sends to the bot to request a code. Default
-        /// `"申请临时密码"`.
+        /// `"动态口令"` (issue #130 — 智小安 replies with
+        /// `otp：NNNNNN，有效期剩余：NN秒`).
         #[serde(default = "default_feishu_otp_request_text")]
         request_text: String,
         /// Optional Feishu base URL override (`https://open.larksuite.com`
@@ -1887,7 +1888,7 @@ pub fn default_feishu_base_url() -> String {
 }
 
 pub fn default_feishu_otp_request_text() -> String {
-    "申请临时密码".to_string()
+    "动态口令".to_string()
 }
 
 pub fn default_http_method() -> String {

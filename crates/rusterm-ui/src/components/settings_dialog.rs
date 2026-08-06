@@ -787,6 +787,19 @@ fn otp_default_feishubot() -> OtpWebhookConfig {
     }
 }
 
+/// Default Feishu *user-token* provider used when the selector switches to
+/// `feishuuser` and no prior config exists.
+fn otp_default_feishuuser() -> OtpWebhookConfig {
+    OtpWebhookConfig::FeishuUser {
+        app_id: String::new(),
+        app_secret: String::new(),
+        bot_open_id: String::new(),
+        code_pattern: rusterm_core::config::default_otp_code_pattern(),
+        request_text: rusterm_core::config::default_feishu_otp_request_text(),
+        base_url: rusterm_core::config::default_feishu_base_url(),
+    }
+}
+
 /// Default generic HTTP OTP webhook used when the user switches the provider
 /// selector to `http` and no prior config exists.
 fn otp_default_http() -> OtpWebhookConfig {
@@ -807,6 +820,7 @@ fn render_otp_webhook_settings(mut setting: Signal<Option<OtpWebhookConfig>>) ->
     let kind = match current {
         Some(OtpWebhookConfig::Feishubot { .. }) => "feishubot",
         Some(OtpWebhookConfig::Http { .. }) => "http",
+        Some(OtpWebhookConfig::FeishuUser { .. }) => "feishuuser",
         Some(OtpWebhookConfig::Manual) | None => "manual",
     };
 
@@ -826,6 +840,24 @@ fn render_otp_webhook_settings(mut setting: Signal<Option<OtpWebhookConfig>>) ->
             code_pattern.clone(),
             sender_open_id.clone().unwrap_or_default(),
             max_age_secs,
+        )),
+        _ => None,
+    };
+
+    let feishuuser_fields = match current {
+        Some(OtpWebhookConfig::FeishuUser {
+            ref app_id,
+            ref app_secret,
+            ref bot_open_id,
+            ref code_pattern,
+            ref request_text,
+            ..
+        }) => Some((
+            app_id.clone(),
+            app_secret.clone(),
+            bot_open_id.clone(),
+            code_pattern.clone(),
+            request_text.clone(),
         )),
         _ => None,
     };
@@ -874,12 +906,14 @@ fn render_otp_webhook_settings(mut setting: Signal<Option<OtpWebhookConfig>>) ->
                     match e.value().as_str() {
                         "feishubot" => setting.set(Some(otp_default_feishubot())),
                         "http" => setting.set(Some(otp_default_http())),
+                        "feishuuser" => setting.set(Some(otp_default_feishuuser())),
                         _ => setting.set(None),
                     }
                 },
                 option { value: "manual", selected: kind == "manual", { crate::i18n::t("settings.otp_provider_manual") } }
                 option { value: "feishubot", selected: kind == "feishubot", { crate::i18n::t("settings.otp_provider_feishubot") } }
                 option { value: "http", selected: kind == "http", { crate::i18n::t("settings.otp_provider_http") } }
+                option { value: "feishuuser", selected: kind == "feishuuser", { crate::i18n::t("settings.otp_provider_feishuuser") } }
             }
         }
 
@@ -982,6 +1016,129 @@ fn render_otp_webhook_settings(mut setting: Signal<Option<OtpWebhookConfig>>) ->
                                 }
                             }
                         },
+                    }
+                }
+            }
+        }
+
+        if let Some((app_id, app_secret, bot_open_id, code_pattern, request_text)) = feishuuser_fields {
+            div {
+                style: "display: flex; flex-direction: column; gap: 10px; margin-top: 12px; background: var(--settings-bg); border: 1px solid var(--settings-border); border-radius: 6px; padding: 12px;",
+                p {
+                    style: "margin: 0; color: var(--settings-text-muted); font-size: 12px; line-height: 1.5;",
+                    { crate::i18n::t("settings.otp_feishuuser_help") }
+                }
+                div {
+                    label { style: "font-size: 11px; color: var(--settings-text-muted); display: block; margin-bottom: 2px;", { crate::i18n::t("settings.otp_feishu_app_id") } }
+                    input {
+                        r#type: "text",
+                        value: "{app_id}",
+                        placeholder: "cli_xxxx",
+                        style: OTP_INPUT_STYLE,
+                        oninput: move |e| {
+                            let mut cur = setting();
+                            if let Some(OtpWebhookConfig::FeishuUser { app_id, .. }) = cur.as_mut() {
+                                *app_id = e.value();
+                                setting.set(cur);
+                            }
+                        },
+                    }
+                }
+                div {
+                    label { style: "font-size: 11px; color: var(--settings-text-muted); display: block; margin-bottom: 2px;", { crate::i18n::t("settings.otp_feishu_app_secret") } }
+                    input {
+                        r#type: "password",
+                        value: "{app_secret}",
+                        style: OTP_INPUT_STYLE,
+                        oninput: move |e| {
+                            let mut cur = setting();
+                            if let Some(OtpWebhookConfig::FeishuUser { app_secret, .. }) = cur.as_mut() {
+                                *app_secret = e.value();
+                                setting.set(cur);
+                            }
+                        },
+                    }
+                }
+                div {
+                    label { style: "font-size: 11px; color: var(--settings-text-muted); display: block; margin-bottom: 2px;", { crate::i18n::t("settings.otp_feishu_bot_open_id") } }
+                    input {
+                        r#type: "text",
+                        value: "{bot_open_id}",
+                        placeholder: "ou_xxxx",
+                        style: OTP_INPUT_STYLE,
+                        oninput: move |e| {
+                            let mut cur = setting();
+                            if let Some(OtpWebhookConfig::FeishuUser { bot_open_id, .. }) = cur.as_mut() {
+                                *bot_open_id = e.value();
+                                setting.set(cur);
+                            }
+                        },
+                    }
+                }
+                div {
+                    label { style: "font-size: 11px; color: var(--settings-text-muted); display: block; margin-bottom: 2px;", { crate::i18n::t("settings.otp_code_pattern") } }
+                    input {
+                        r#type: "text",
+                        value: "{code_pattern}",
+                        placeholder: "\\b\\d{{4,8}}\\b",
+                        style: OTP_INPUT_STYLE,
+                        oninput: move |e| {
+                            let mut cur = setting();
+                            if let Some(OtpWebhookConfig::FeishuUser { code_pattern, .. }) = cur.as_mut() {
+                                *code_pattern = e.value();
+                                setting.set(cur);
+                            }
+                        },
+                    }
+                }
+                div {
+                    label { style: "font-size: 11px; color: var(--settings-text-muted); display: block; margin-bottom: 2px;", { crate::i18n::t("settings.otp_feishu_request_text") } }
+                    input {
+                        r#type: "text",
+                        value: "{request_text}",
+                        placeholder: "动态口令",
+                        style: OTP_INPUT_STYLE,
+                        oninput: move |e| {
+                            let mut cur = setting();
+                            if let Some(OtpWebhookConfig::FeishuUser { request_text, .. }) = cur.as_mut() {
+                                *request_text = e.value();
+                                setting.set(cur);
+                            }
+                        },
+                    }
+                }
+                p {
+                    style: "margin: 2px 0 0; color: var(--settings-text-muted); font-size: 11px; line-height: 1.5;",
+                    { crate::i18n::t("settings.otp_feishu_permissions_hint") }
+                }
+                div {
+                    style: "display: flex; align-items: center; gap: 12px; margin-top: 4px;",
+                    button {
+                        r#type: "button",
+                        style: "background: var(--settings-accent, #7aa2f7); color: #1a1b26; border: none; border-radius: 4px; padding: 6px 12px; font-size: 12px; font-weight: 600; cursor: pointer;",
+                        onclick: move |_| {
+                            // Signal-only: app.rs polls and resets this.
+                            *crate::FEISHU_AUTH_REQUESTED.write() = true;
+                        },
+                        { crate::i18n::t("settings.otp_feishu_reauth") }
+                    }
+                    span {
+                        style: "font-size: 11px; color: var(--settings-text-muted);",
+                        {
+                            let status = crate::APP_STATE.read().feishu_token_status.clone();
+                            match status {
+                                Some(crate::state::FeishuTokenStatus::Connected { expires_at }) => {
+                                    let ts = chrono::DateTime::from_timestamp(expires_at, 0)
+                                        .map(|dt| dt.format("%H:%M").to_string())
+                                        .unwrap_or_default();
+                                    crate::i18n::tf("settings.otp_feishu_token_connected", &[("ts", &ts)])
+                                }
+                                Some(crate::state::FeishuTokenStatus::Failed { reason, .. }) => {
+                                    crate::i18n::tf("settings.otp_feishu_token_failed", &[("reason", &reason)])
+                                }
+                                None => crate::i18n::t("settings.otp_feishu_token_missing"),
+                            }
+                        }
                     }
                 }
             }

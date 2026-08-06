@@ -48,6 +48,13 @@ use crate::components::dock::{
     start_dock_drag,
 };
 use crate::components::{BottomToolPanel, RemoteFilesPanel, RightToolPanel};
+use crate::feishu_oauth_flow::{
+    AuthStart, ExchangePlan, OAuthPlan, TtyFillPlan, apply_feishu_oauth_result, cancel_feishu_auth,
+    feishu_cfg_incomplete, feishu_oauth_event_plan, feishu_otp_session_closed, feishu_owns_prompt,
+    feishu_tty_fill_begin, feishu_tty_fill_end, feishu_tty_fill_plan, feishu_user_cfg,
+    insert_pending_auth, looks_like_feishu_otp_prompt, oauth_extra_from_plan, prepare_auth_start,
+};
+use crate::feishu_oauth_listener::{FeishuOAuthCallback, ListenerHandle, OAuthSink, bind_listener};
 use crate::keybindings::action_for_event;
 use crate::layout::{PaneLayout, SplitAxis, SplitDirection};
 use crate::skin::css_variables;
@@ -71,7 +78,244 @@ use crate::state::{
     toggle_comparison_mode, toggle_pane_zoom, toggle_split_mode, track_terminal_input,
     tracked_terminal_command,
 };
+use crate::state::{
+    FeishuOAuthEvent, FeishuOtpFetch, FeishuQrPopup, FeishuQrPopupStatus, FeishuTokenStatus,
+};
 use crate::transfers::{FileEndpoint, TransferJob, TransferRequest};
+
+// ── Feishu OAuth bridge (issue #129) ────────────────────────────────
+
+/// [`OAuthSink`] that pushes deliveries onto a bounded mpsc channel — the
+/// listener is a plain axum task, so Dioxus signals (not `Sync`) cannot be
+/// inside it. The component task drains the channel.
+struct FeishuOAuthChannelSink(tokio::sync::mpsc::UnboundedSender<FeishuOAuthCallback>);
+
+impl OAuthSink for FeishuOAuthChannelSink {
+    fn deliver(&self, cb: FeishuOAuthCallback) {
+        let _ = self.0.send(cb);
+    }
+}
+
+/// Start a fresh QR sign-in (either session-driven or settings-driven).
+/// Builds+registers the pending auth, then pops the QR dialog.
+fn start_feishu_auth_session(state: &mut Signal<AppState>, session: Option<String>) {
+    let Some(cfg) = feishu_user_cfg(&state.read()) else {
+        tracing::warn!("[OTP-FEISHU] cannot start auth — provider not configured");
+        return;
+    };
+    if feishu_cfg_incomplete(&cfg) {
+        // Keep the popup around so the user sees the hint; simply don't fire.
+        state.write().feishu_qr_popup = Some(FeishuQrPopup {
+            session,
+            authorize_url: String::new(),
+            state_nonce: String::new(),
+            port: 8878,
+            status: FeishuQrPopupStatus::Failed {
+                reason: crate::i18n::t("feishu.qr_status_cfg_missing_fields"),
+                failed_at: std::time::Instant::now(),
+            },
+        });
+        return;
+    }
+    let redirect_port = state
+        .read()
+        .feishu_oauth_port
+        .unwrap_or(crate::feishu_oauth_listener::FIRST_PORT);
+    let redirect = crate::feishu_oauth_listener::redirect_uri(redirect_port);
+    let start: AuthStart = prepare_auth_start();
+    let authorize_url = insert_pending_auth(
+        &mut state.write(),
+        session,
+        start,
+        &cfg.app_id,
+        &redirect,
+        redirect_port,
+    );
+    // Open the embedded browser window on the Feishu authorize page. Feishu
+    // renders its official sign-in QR there; a phone scan authorizes THIS
+    // desktop webview, so the OAuth redirect reaches the loopback listener
+    // (a QR carrying the authorize URL itself would move the redirect onto
+    // the phone, where no listener exists — issue #130).
+    crate::feishu_browser::open_feishu_login_window(authorize_url);
+}
+
+/// Drain one OAuth delivery. Exchange tasks run as `spawn`s so the drain
+/// loop never blocks on network — only the tiny state-mutation parts execute
+/// on this task.
+async fn handle_feishu_oauth_event(state: &mut Signal<AppState>, event: FeishuOAuthEvent) {
+    enum Step {
+        Done,
+        RunExchange(ExchangePlan),
+    }
+    let step = {
+        let mut s = state.write();
+        match feishu_oauth_event_plan(&mut s, &event) {
+            OAuthPlan::Ignore => Step::Done,
+            OAuthPlan::Failed(_) => Step::Done,
+            OAuthPlan::Exchange(plan) => Step::RunExchange(*plan),
+        }
+    };
+    let Step::RunExchange(exchange) = step else {
+        return;
+    };
+
+    let nonce = exchange.nonce.clone();
+    let session = exchange.session.clone();
+    let exchange_code = exchange.code.clone();
+    let extra = oauth_extra_from_plan(&exchange);
+    let mut state_clone = *state;
+    spawn(async move {
+        let result = rusterm_ssh::feishu_otp::exchange_code(
+            &extra.app_id,
+            &extra.app_secret,
+            &exchange_code,
+            &extra.redirect_uri,
+            &extra.verifier,
+        )
+        .await
+        .map_err(|e| format!("{e:#}"));
+        let mut s = state_clone.write();
+        apply_feishu_oauth_result(&mut s, &nonce, &result);
+        match result {
+            Ok(_token) => {
+                let session_for_next = session.clone();
+                drop(s);
+                if let Some(sess) = session_for_next {
+                    trigger_feishu_otp_fetch(&mut state_clone, &sess).await;
+                }
+            }
+            Err(reason) => {
+                let _ = reason;
+            }
+        }
+    });
+}
+
+/// Fetch the OTP from 智小安 using the persisted user token and type it
+/// into `session`'s tty. Runs as a `spawn` so UI never blocks. Quietly
+/// retries the whole cycle once when the reply poll times out — a second
+/// failed attempt falls back to the OneKey popup (attempts are capped).
+async fn trigger_feishu_otp_fetch(state: &mut Signal<AppState>, session: &str) {
+    let plan = {
+        let s = state.read();
+        feishu_tty_fill_plan(&s)
+    };
+    match plan {
+        TtyFillPlan::Fetch { token: fresh_token } => {
+            let Some(cfg) = feishu_user_cfg(&state.read()) else {
+                return;
+            };
+            let mut token = fresh_token;
+            let client = rusterm_ssh::feishu_otp::FeishuOtpClient::new(
+                cfg.base_url.clone(),
+                cfg.app_id.clone(),
+                cfg.app_secret.clone(),
+                cfg.bot_open_id.clone(),
+                cfg.request_text.clone(),
+                &cfg.code_pattern,
+            );
+            let mut state_owned = *state;
+            let session_owned = session.to_string();
+            spawn(async move {
+                let initial_refresh_token = token.refresh_token.clone();
+                let outcome = client.request_otp(&mut token).await;
+                // Feishu ROTATES the refresh token on every refresh — persist
+                // the updated pair immediately or the stored refresh token
+                // goes stale and the next app run is forced into a QR re-scan
+                // (issue #130: "reuse the signed-in session").
+                if token.refresh_token != initial_refresh_token {
+                    let cm = state_owned.read().config_manager.clone();
+                    if let Some(cm) = cm {
+                        if let Err(e) = cm.save_feishu_user_token(Some(&token)) {
+                            tracing::error!("[OTP-FEISHU] failed to persist refreshed token: {e}");
+                        } else {
+                            state_owned.write().feishu_token_status =
+                                Some(FeishuTokenStatus::Connected {
+                                    expires_at: token.access_expires_at,
+                                });
+                        }
+                    }
+                }
+                match outcome {
+                    Ok(Some(otp)) => {
+                        if let Some(secs) = otp.valid_secs {
+                            tracing::info!("[OTP-FEISHU] bot reports {}s validity left", secs);
+                        }
+                        let sender = crate::INPUT_SENDERS.read().get(&session_owned).cloned();
+                        if let Some(sender) = sender {
+                            let mut payload = otp.code.into_bytes();
+                            payload.push(b'\r');
+                            if sender.send(payload).is_ok() {
+                                let mut s = state_owned.write();
+                                feishu_tty_fill_end(&mut s, &session_owned, true, None);
+                                tracing::info!(
+                                    "[OTP-FEISHU] OTP queued for {}",
+                                    &session_owned[..session_owned.len().min(8)]
+                                );
+                            } else {
+                                let mut s = state_owned.write();
+                                feishu_tty_fill_end(
+                                    &mut s,
+                                    &session_owned,
+                                    false,
+                                    Some("sender closed".into()),
+                                );
+                            }
+                        } else {
+                            let mut s = state_owned.write();
+                            feishu_tty_fill_end(
+                                &mut s,
+                                &session_owned,
+                                false,
+                                Some("no tty sender".into()),
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        let mut s = state_owned.write();
+                        feishu_tty_fill_end(
+                            &mut s,
+                            &session_owned,
+                            false,
+                            Some("reply timeout".into()),
+                        );
+                    }
+                    Err(e) => {
+                        // A dead user session (expired/revoked refresh token)
+                        // is recoverable — fall through to a fresh QR sign-in
+                        // instead of surfacing a dead-end failure (issue #130).
+                        let reauth = e
+                            .downcast_ref::<rusterm_ssh::feishu_otp::ReauthRequired>()
+                            .is_some();
+                        let mut s = state_owned.write();
+                        feishu_tty_fill_end(&mut s, &session_owned, false, Some(format!("{e:#}")));
+                        if reauth {
+                            // Drop the dead token so the next prompt plans
+                            // Reauth directly rather than retrying the fetch.
+                            if let Some(cm) = s.config_manager.clone() {
+                                let _ = cm.save_feishu_user_token(None);
+                            }
+                            s.feishu_token_status = None;
+                            drop(s);
+                            tracing::info!(
+                                "[OTP-FEISHU] token unusable — opening QR sign-in for {}",
+                                &session_owned[..session_owned.len().min(8)]
+                            );
+                            start_feishu_auth_session(
+                                &mut state_owned,
+                                Some(session_owned.clone()),
+                            );
+                        }
+                    }
+                }
+            });
+        }
+        TtyFillPlan::Reauth => {
+            start_feishu_auth_session(state, Some(session.to_string()));
+        }
+        TtyFillPlan::Skip => {}
+    }
+}
 
 fn save_config(state: &Signal<AppState>) {
     let s = state.read();
@@ -1392,6 +1636,31 @@ fn drive_login_script(
     }
 
     let tail = login_script_output_tail(data);
+
+    // Feishu OTP ownership gate (issue #130): a login-script step with a
+    // broad `password`-style expect would match `2nd Password:` and type a
+    // menu selection or stored credential into the OTP field. While the
+    // FeishuUser provider owns the prompt, hold the script where it is — the
+    // OTP auto-fill (or QR sign-in) resolves the prompt, then the script
+    // resumes on the next output chunk. The prompt check runs first so the
+    // config read only happens for OTP prompts.
+    if looks_like_feishu_otp_prompt(&tail) {
+        let (provider_active, attempts) = {
+            let s = state.read();
+            (
+                feishu_user_cfg(&s).is_some(),
+                s.feishu_otp_attempts.get(session_id).copied().unwrap_or(0),
+            )
+        };
+        if feishu_owns_prompt(provider_active, &tail, attempts) {
+            tracing::info!(
+                "[LOGIN-SCRIPT] {} paused at OTP prompt — Feishu auto-fill owns it",
+                session_id
+            );
+            return;
+        }
+    }
+
     let onekeys = state.read().onekeys.clone();
     let now = std::time::Instant::now();
 
@@ -8085,6 +8354,8 @@ const ONEKEY_SKIP_ALT_SCREEN: OneKeySkip =
     "alt_screen_active (a full-screen app like vim/less owns the terminal)";
 const ONEKEY_SKIP_NO_MATCH: OneKeySkip = "no_match";
 const ONEKEY_SKIP_COOLDOWN: OneKeySkip = "submission_cooldown";
+const ONEKEY_SKIP_FEISHU_OTP: OneKeySkip =
+    "feishu_otp_prompt (Feishu OTP auto-fill owns this prompt)";
 
 fn note_onekey_output_after_submission(state: &mut AppState, session_id: &str, data: &[u8]) {
     if !state.onekey_submission_cooldown.contains_key(session_id) {
@@ -8178,6 +8449,24 @@ fn onekey_popup_for_output(
         .rev()
         .find(|line| !line.trim().is_empty())
         .unwrap_or("");
+    // Feishu OTP ownership gate (issue #130): when the active OTP provider
+    // is FeishuUser and this looks like a tty OTP prompt (`2nd Password:`,
+    // `OTP:` …), OneKey must stand down — a broad `password` expect would
+    // auto-type a stored login password into the OTP field. The Feishu
+    // pipeline (token fetch or QR sign-in) fills the prompt instead; OneKey
+    // becomes the manual fallback once the Feishu attempt cap is exhausted.
+    // The prompt check runs first so the config read only happens for OTP
+    // prompts, not on every output chunk.
+    if looks_like_feishu_otp_prompt(last_line) {
+        let attempts = state
+            .feishu_otp_attempts
+            .get(session_id)
+            .copied()
+            .unwrap_or(0);
+        if feishu_owns_prompt(feishu_user_cfg(state).is_some(), last_line, attempts) {
+            return Err(ONEKEY_SKIP_FEISHU_OTP);
+        }
+    }
     let mut matches = Vec::new();
     let mut matched_expect = None;
     for onekey in &onekeys {
@@ -8949,6 +9238,61 @@ fn check_onekey_match(
             }
         }
     }
+
+    // ── Feishu OTP auto-fill (issue #129) ─────────────────────────────
+    // After the OneKey gate ran, look for a tty OTP prompt (JumpServer's
+    // `2nd Password:` / `OTP:` / `二次验证码:` etc.) on the current line —
+    // JumpServer's OTP prompt arrives as plain tty bytes post-auth, not via the SSH
+    // keyboard-interactive provider. When the active OTP provider is
+    // `FeishuUser` and this session isn't already in a fetch cycle, kick
+    // off the QR/sign-in → bot-message → auto-fill pipeline.
+    maybe_trigger_feishu_otp(state, session_id, data);
+}
+
+fn maybe_trigger_feishu_otp(mut state: Signal<AppState>, session_id: &str, data: &[u8]) {
+    let may_start = {
+        let mut s = state.write();
+        // Prompt gate first — cheap, in-memory — so the provider check (a
+        // config read) only runs for chunks that actually show an OTP prompt.
+        let line = onekey_prompt_text(&s, session_id, data);
+        if !looks_like_feishu_otp_prompt(&line) {
+            false
+        } else if feishu_user_cfg(&s).is_none() {
+            // OTP prompt on screen but the FeishuUser provider is not active
+            // (another provider selected, none configured, or the config
+            // store is still locked). Logged so a missing QR popup is
+            // diagnosable from the session log.
+            tracing::info!(
+                "[OTP-FEISHU] session={} OTP prompt detected but FeishuUser provider inactive — skipping",
+                &session_id[..session_id.len().min(8)]
+            );
+            false
+        } else {
+            let attempts_before = s.feishu_otp_attempts.get(session_id).copied().unwrap_or(0);
+            let status_before = match s.feishu_otp_status.get(session_id) {
+                Some(FeishuOtpFetch::InFlight { .. }) => "in_flight",
+                Some(FeishuOtpFetch::Delivered { .. }) => "delivered",
+                Some(FeishuOtpFetch::Failed { .. }) => "failed",
+                None => "none",
+            };
+            let begin = feishu_tty_fill_begin(&mut s, session_id);
+            tracing::info!(
+                "[OTP-FEISHU] session={} OTP prompt detected begin={} attempts_before={} status_before={}",
+                &session_id[..session_id.len().min(8)],
+                begin,
+                attempts_before,
+                status_before
+            );
+            begin
+        }
+    };
+    if may_start {
+        let mut state_owned = state;
+        let session_owned = session_id.to_string();
+        spawn(async move {
+            trigger_feishu_otp_fetch(&mut state_owned, &session_owned).await;
+        });
+    }
 }
 
 const SHELL_INTEGRATION_QUIET_PERIOD: std::time::Duration = std::time::Duration::from_millis(1_200);
@@ -9151,6 +9495,37 @@ fn ssh_shell_integration_setup() -> Vec<u8> {
     setup
 }
 
+/// `true` when the tty's current line is a credential prompt (password,
+/// passphrase, OTP/MFA…) — automatic input like the shell-integration
+/// bootstrap must NEVER be typed there. A JumpServer asset connect with MFA
+/// sits quietly at `2nd Password:`, which otherwise looks exactly like the
+/// "login finished, shell idle" state the injector waits for (issue #130:
+/// the ~400-byte script was submitted as a masked secret and rejected).
+fn shell_integration_blocked_by_prompt(line: &str) -> bool {
+    if rusterm_ssh::client::looks_like_otp_prompt(line) {
+        return true;
+    }
+    let lower = line.to_lowercase();
+    // Password-style prompts that the OTP matcher deliberately does NOT
+    // flag (it must not hijack plain password auth), plus common login
+    // identity prompts. Suffix-anchored markers ("login:") avoid matching
+    // hostnames like `root@loginhost:~$`.
+    const SECRET_MARKERS: &[&str] = &["password", "passphrase", "passcode", "密码", "口令"];
+    if SECRET_MARKERS.iter().any(|m| lower.contains(m)) {
+        return true;
+    }
+    let trimmed = lower.trim_end();
+    const PROMPT_SUFFIXES: &[&str] = &[
+        "login:",
+        "username:",
+        "user name:",
+        "pin:",
+        "用户名:",
+        "用户名：",
+    ];
+    PROMPT_SUFFIXES.iter().any(|s| trimmed.ends_with(s))
+}
+
 fn prepare_local_shell_integration(shell_config: &mut ShellConfig) -> Vec<u8> {
     shell_config
         .env
@@ -9169,6 +9544,7 @@ async fn inject_shell_integration_when_quiet(
     mut output_activity: mpsc::UnboundedReceiver<()>,
     integration_tx: mpsc::UnboundedSender<Vec<u8>>,
     echo_filter: Arc<Mutex<ShellIntegrationEchoFilter>>,
+    state: Signal<AppState>,
     session_id: String,
 ) {
     // Require actual remote output (normally banner/MOTD/prompt) before any
@@ -9181,13 +9557,34 @@ async fn inject_shell_integration_when_quiet(
     gate.observe_output(std::time::Instant::now());
 
     loop {
-        let remaining = gate
-            .remaining(std::time::Instant::now(), SHELL_INTEGRATION_QUIET_PERIOD)
-            .expect("initial output was observed");
-        match tokio::time::timeout(remaining, output_activity.recv()).await {
-            Ok(Some(())) => gate.observe_output(std::time::Instant::now()),
-            Ok(None) => return,
-            Err(_) => break,
+        // Wait for the quiet period to elapse without further output.
+        loop {
+            let remaining = gate
+                .remaining(std::time::Instant::now(), SHELL_INTEGRATION_QUIET_PERIOD)
+                .expect("initial output was observed");
+            match tokio::time::timeout(remaining, output_activity.recv()).await {
+                Ok(Some(())) => gate.observe_output(std::time::Instant::now()),
+                Ok(None) => return,
+                Err(_) => break,
+            }
+        }
+        // Quiet reached — but never type the ~400-byte setup script into a
+        // credential prompt. A JumpServer/bastion session waiting at
+        // `Password:` / `2nd Password:` / OTP is exactly a "quiet tty":
+        // the script would be submitted as a (masked) secret and rejected.
+        // Hold off until further output arrives (the prompt was answered)
+        // and re-evaluate after the next quiet window.
+        let line = onekey_prompt_text(&state.read(), &session_id, b"");
+        if !shell_integration_blocked_by_prompt(&line) {
+            break;
+        }
+        tracing::info!(
+            "[SSH] shell integration deferred — tty sits at a credential prompt ({})",
+            session_id
+        );
+        match output_activity.recv().await {
+            Some(()) => gate.observe_output(std::time::Instant::now()),
+            None => return,
         }
     }
 
@@ -9363,6 +9760,40 @@ mod session_startup_tests {
         assert_eq!(items[1].name, "Local");
         assert_eq!(items[1].detail, "Shell");
         assert!(!items[1].has_replay);
+    }
+
+    #[test]
+    fn credential_prompts_block_shell_integration_injection() {
+        // Issue #130: a JumpServer asset connect with MFA sits quietly at
+        // `2nd Password:` — the injector must NOT type the setup script there
+        // (it was echoed as hundreds of masked chars and submitted as a
+        // wrong OTP).
+        assert!(shell_integration_blocked_by_prompt("2nd Password: "));
+        assert!(shell_integration_blocked_by_prompt("OTP: "));
+        assert!(shell_integration_blocked_by_prompt("请输入MFA认证码: "));
+        assert!(shell_integration_blocked_by_prompt("Password: "));
+        assert!(shell_integration_blocked_by_prompt(
+            "[sudo] password for infra: "
+        ));
+        assert!(shell_integration_blocked_by_prompt("Enter passphrase: "));
+        assert!(shell_integration_blocked_by_prompt("请输入密码："));
+        assert!(shell_integration_blocked_by_prompt("动态口令: "));
+        assert!(shell_integration_blocked_by_prompt("login: "));
+        assert!(shell_integration_blocked_by_prompt("Username: "));
+    }
+
+    #[test]
+    fn shell_prompts_do_not_block_shell_integration_injection() {
+        // Ordinary shell / bastion-menu prompts must keep injecting.
+        assert!(!shell_integration_blocked_by_prompt("root@host:~# "));
+        assert!(!shell_integration_blocked_by_prompt("infra@web-01:~$ "));
+        // Hostname containing "login" must not trip the suffix markers.
+        assert!(!shell_integration_blocked_by_prompt("root@loginhost:~$ "));
+        assert!(!shell_integration_blocked_by_prompt("Opt> "));
+        assert!(!shell_integration_blocked_by_prompt(""));
+        assert!(!shell_integration_blocked_by_prompt(
+            "Last login: Wed Aug  5 21:08:12 2026 from 10.10.192.57"
+        ));
     }
 
     #[test]
@@ -11751,6 +12182,7 @@ fn start_ssh_connection(
                     initial_output_activity_rx,
                     session.input_tx.clone(),
                     shell_integration_echo_filter.clone(),
+                    state,
                     tab_id.clone(),
                 ));
 
@@ -12512,6 +12944,10 @@ fn start_ssh_connection(
                             s.onekey_submission_cooldown.remove(&id);
                             s.onekey_output_since_submission.remove(&id);
                             s.onekey_preference_attempts.remove(&id);
+                            // Feishu OTP runtime is per-connection: reset the
+                            // attempt cap/debounce so a reconnect's OTP prompt
+                            // can start a fresh fill cycle (issue #130).
+                            feishu_otp_session_closed(&mut s, &id);
                             if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
                                 // Keep disconnect feedback exclusively in session
                                 // chrome. TerminalView already maps Enter/right-click
@@ -13515,6 +13951,10 @@ fn start_shell_connection(
                             s.onekey_submission_cooldown.remove(&id);
                             s.onekey_output_since_submission.remove(&id);
                             s.onekey_preference_attempts.remove(&id);
+                            // Feishu OTP runtime is per-connection: reset the
+                            // attempt cap/debounce so a reconnect's OTP prompt
+                            // can start a fresh fill cycle (issue #130).
+                            feishu_otp_session_closed(&mut s, &id);
                             if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == id) {
                                 // Keep disconnect feedback exclusively in session
                                 // chrome. TerminalView already maps Enter/right-click
@@ -13748,6 +14188,7 @@ fn start_serial_connection(
                                 crate::i18n::tf("session.disconnected", &[("reason", &reason)]),
                             );
                             clear_onekey_session_runtime(&mut state.write(), &id);
+                            feishu_otp_session_closed(&mut state.write(), &id);
                             let failed = crate::i18n::t("session.disconnected_short");
                             let reconnect = crate::i18n::t("session.reconnect_hint");
                             let msg = format!("\r\n{failed}\r\n{reconnect}\r\n");
@@ -13866,6 +14307,7 @@ fn start_telnet_connection(
                     initial_output_activity_rx,
                     session.input_tx.clone(),
                     shell_integration_echo_filter.clone(),
+                    state,
                     tab_id.clone(),
                 ));
 
@@ -13991,6 +14433,7 @@ fn start_telnet_connection(
                                 crate::i18n::tf("session.disconnected", &[("reason", &reason)]),
                             );
                             clear_onekey_session_runtime(&mut state.write(), &id);
+                            feishu_otp_session_closed(&mut state.write(), &id);
                             let failed = crate::i18n::t("session.disconnected_short");
                             let reconnect = crate::i18n::t("session.reconnect_hint");
                             let msg = format!("\r\n{failed}\r\n{reconnect}\r\n");
@@ -15572,6 +16015,9 @@ fn disconnect_session_state(
     state.onekey_submission_cooldown.remove(tab_id);
     state.onekey_output_since_submission.remove(tab_id);
     state.onekey_preference_attempts.remove(tab_id);
+    // Same rationale as the transport-level disconnect handlers: the Feishu
+    // OTP attempt cap/debounce is per-connection state (issue #130).
+    feishu_otp_session_closed(state, tab_id);
     state.login_scripts.remove(tab_id);
     if let Some(tab) = state.sessions.iter_mut().find(|t| t.id == tab_id) {
         tab.last_command_status = CommandStatus::Disconnected(reason);
@@ -15656,6 +16102,12 @@ const REPLAY_OP_TIMEOUT_SECS: u64 = 20;
 /// (the remaining ops are not silently abandoned — they resume once the
 /// prompt clears, e.g. after the user types the password).
 const REPLAY_CREDENTIAL_WAIT_SECS: u64 = 30;
+/// Best-effort wait for the remote's FIRST output after a reconnect before
+/// the first replay op is sent. Bounded: a remote that stays silent until
+/// prodded proceeds after this grace (the per-op quiescence wait and the
+/// credential guard still apply). Keeps the first op from being typed into a
+/// prompt that is still on the wire (e.g. JumpServer's `2nd Password:`).
+const REPLAY_FIRST_OUTPUT_GRACE_SECS: u64 = 5;
 
 /// Splits recorded replay ops into (safe-to-replay, skipped) using the same
 /// safety checker that gates live command submission. Only `Safe` verdicts
@@ -15970,6 +16422,12 @@ mod session_replay_engine_tests {
         // A replayed `sudo -i` triggers the sudo password prompt.
         let sudo_prompt = "[sudo] password for ecs-user: ";
         assert!(credential_kind(sudo_prompt).is_some());
+        // JumpServer's MFA prompt (`2nd Password:`) must also pause the
+        // replay — a replayed asset selection typed into it would submit
+        // garbage as an OTP (issue #130). koko masks the echo, so the
+        // masked-tail variant must match too.
+        assert!(credential_kind("2nd Password: ").is_some());
+        assert!(credential_kind("2nd Password: ******").is_some());
         // After OneKey auto-submits (or the user types the password), sudo
         // accepts it and drops to a root shell prompt — no longer a
         // credential prompt, so the wait-for-resolution loop returns and the
@@ -16209,6 +16667,54 @@ fn schedule_replay_after_reconnect(
                     tab.render_output = render_result;
                     tab.version += 1;
                 }
+            }
+        }
+
+        // 3.5 Bounded grace for the remote's FIRST post-reconnect output.
+        // The per-op pacing below is echo-driven, but the first op has no
+        // previous echo to wait for — a mere quiescence window can elapse in
+        // the gap between "transport connected" and the remote's first byte
+        // (JumpServer's MFA prompt in particular arrives only after koko has
+        // asked the core API). The first op was then typed blindly into the
+        // just-appearing `2nd Password:` prompt before the credential guard
+        // ever saw it. Waiting (best-effort) for output after our own notice
+        // lets that prompt land first, so the guard below pauses the replay
+        // and the Feishu OTP auto-fill (or the user) resolves it.
+        {
+            let baseline = state
+                .read()
+                .sessions
+                .iter()
+                .find(|t| t.id == tab_id)
+                .map(|t| t.version);
+            let Some(baseline) = baseline else {
+                return;
+            };
+            let deadline = std::time::Instant::now()
+                + std::time::Duration::from_secs(REPLAY_FIRST_OUTPUT_GRACE_SECS);
+            loop {
+                let version = state
+                    .read()
+                    .sessions
+                    .iter()
+                    .find(|t| t.id == tab_id)
+                    .map(|t| t.version);
+                match version {
+                    None => return,
+                    Some(version) if version != baseline => break,
+                    Some(_) => {}
+                }
+                if std::time::Instant::now() >= deadline {
+                    // Some remotes stay silent until prodded — proceed; the
+                    // quiescence wait + credential guard still run per op.
+                    tracing::info!(
+                        "[REPLAY] session {} no output within {}s after reconnect — proceeding",
+                        &tab_id[..tab_id.len().min(8)],
+                        REPLAY_FIRST_OUTPUT_GRACE_SECS
+                    );
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(REPLAY_POLL_MS)).await;
             }
         }
 
@@ -16456,6 +16962,12 @@ fn reconnect_session(
         s.onekey_output_since_submission.remove(&tab_id);
         s.onekey_preference_attempts.remove(&tab_id);
         s.pending_exit_check.remove(&tab_id);
+        // Reset the Feishu OTP auto-fill runtime: the attempt counter and
+        // debounce belong to the DEAD connection's prompts. Without this, a
+        // few failed cycles before the disconnect would permanently gate
+        // `feishu_tty_fill_begin` and the fresh connection's `2nd Password:`
+        // prompt would never trigger the fetch/QR flow again (issue #130).
+        feishu_otp_session_closed(&mut s, &tab_id);
         // Drop the stale login-script runtime so the fresh connection
         // re-runs the script from step 0 (`drive_login_script` initializes
         // at most once per connection lifetime).
@@ -16683,6 +17195,110 @@ pub fn App() -> Element {
     // WebView2). Document-level capture-phase listeners are the only
     // mechanism that works reliably.
     let split_drag: Signal<Option<SplitDragState>> = use_signal(|| None);
+    let mut oauth_channel_rx =
+        use_signal(|| None::<tokio::sync::mpsc::UnboundedReceiver<FeishuOAuthCallback>>);
+
+    // ── Feishu OAuth (issue #129) ──────────────────────────────────────────
+    // 1. Mirror `state` into the global so settings_dialog's reauth button
+    //    can read it without prop-drilling.
+    // 2. Bind the loopback listener once (idempotent — the handle is stored
+    //    in a Signal so re-runs don't double-bind).
+    // 3. Poll the delivery queue every 500 ms and turn each OAuth event into
+    //    either an exchange task or a popup-state mutation.
+    let mut oauth_listener_handle: Signal<Option<ListenerHandle>> = use_signal(|| None);
+    {
+        let mut state = state;
+        let input_senders_for_feishu = input_senders;
+        use_effect(move || {
+            // (1) state + senders mirror
+            *crate::APP_STATE.write() = state();
+            *crate::INPUT_SENDERS.write() = input_senders_for_feishu();
+            // Mirror the token expiry so the settings dialog's badge stays
+            // accurate even when the dialog is rendered BEFORE any Feishu
+            // flow ran.
+            if state().unlock_state == UnlockState::Unlocked
+                && state().feishu_token_status.is_none()
+            {
+                if let Some(cm) = state().config_manager.as_ref() {
+                    if let Some(token) = cm.load_feishu_user_token() {
+                        let mut s = state.write();
+                        s.feishu_token_status = Some(FeishuTokenStatus::Connected {
+                            expires_at: token.access_expires_at,
+                        });
+                        drop(s);
+                    }
+                }
+            }
+        });
+        use_effect(move || {
+            // (2) listener — only once
+            if oauth_listener_handle.read().is_some() {
+                return;
+            }
+            let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<FeishuOAuthCallback>();
+            let sink: std::sync::Arc<dyn crate::feishu_oauth_listener::OAuthSink> =
+                std::sync::Arc::new(FeishuOAuthChannelSink(tx));
+            match bind_listener(sink, &crate::relay_tunnel::runtime_handle()) {
+                Ok(handle) => {
+                    tracing::info!("[OTP-FEISHU] listener ready on port {}", handle.port());
+                    state.write().feishu_oauth_port = Some(handle.port());
+                    oauth_listener_handle.set(Some(handle));
+                    oauth_channel_rx.set(Some(rx));
+                }
+                Err(e) => {
+                    tracing::warn!("[OTP-FEISHU] listener failed to bind: {e}");
+                }
+            }
+        });
+    }
+    // (3) drain OAuth callbacks / settings reauth requests
+    {
+        let mut state = state;
+        use_future(move || async move {
+            loop {
+                let reauth = {
+                    let mut flag = crate::FEISHU_AUTH_REQUESTED.write();
+                    if *flag {
+                        *flag = false;
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if reauth {
+                    start_feishu_auth_session(&mut state, None);
+                }
+                // Drain callbacks from the axum listener (queued via the
+                // channel — not from AppState so Dioxus's unsync storage
+                // never crosses the runtime/thread boundary).
+                {
+                    let mut drain = Vec::new();
+                    {
+                        let mut sig = oauth_channel_rx.write();
+                        if let Some(rx) = sig.as_mut() {
+                            while let Ok(cb) = rx.try_recv() {
+                                drain.push(cb);
+                            }
+                        }
+                    }
+                    for cb in drain {
+                        state.write().feishu_oauth_events.push(FeishuOAuthEvent {
+                            state: cb.state,
+                            result: cb.result,
+                        });
+                    }
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                let deliveries = {
+                    let mut s = state.write();
+                    std::mem::take(&mut s.feishu_oauth_events)
+                };
+                for ev in deliveries {
+                    handle_feishu_oauth_event(&mut state, ev).await;
+                }
+            }
+        });
+    }
 
     // Active tab/pane drag (Task 22). Set by the tab bar's `onmousedown`
     // (via `on_drag_start` → `start_tab_drag`) or by a pane title bar's
@@ -19469,6 +20085,41 @@ pub fn App() -> Element {
                             },
                             { crate::i18n::t("layout.keep_showing") }
                         }
+                    }
+                }
+            }
+        }
+
+        // ── Feishu QR sign-in popup (issue #129) ────────────────────────
+        if let Some(popup) = state.read().feishu_qr_popup.clone() {
+            {
+                let popup_session_for_close = popup.session.clone();
+                let popup_session_for_rescan = popup.session.clone();
+                let popup_url = popup.authorize_url.clone();
+                rsx! {
+                    crate::components::FeishuQrPopupView {
+                popup: popup.clone(),
+                on_close: move |_| {
+                    let session = popup_session_for_close.clone();
+                    let mut s = state.write();
+                    cancel_feishu_auth(&mut s, session.as_deref());
+                },
+                on_browser: move |_| {
+                    let url = popup_url.clone();
+                    if !url.is_empty() {
+                        match std::process::Command::new("open").arg(&url).spawn() {
+                            Ok(_) => tracing::info!("[OTP-FEISHU] opened authorize URL in browser"),
+                            Err(e) => tracing::warn!("[OTP-FEISHU] browser open failed: {e}"),
+                        }
+                    }
+                },
+                        on_rescan: move |_| {
+                            let session = popup_session_for_rescan.clone();
+                            let mut s = state.write();
+                            cancel_feishu_auth(&mut s, session.as_deref());
+                            drop(s);
+                            start_feishu_auth_session(&mut state, session);
+                        },
                     }
                 }
             }
