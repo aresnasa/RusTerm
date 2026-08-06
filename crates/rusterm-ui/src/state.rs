@@ -4019,6 +4019,78 @@ mod tests {
         assert_eq!(snapshot.active_session, None);
     }
 
+    /// The snapshot records sessions in tab-bar order (after any drag
+    /// reorders), not in `state.sessions` creation order. Restore opens
+    /// sessions in snapshot order, so this is what preserves the user's
+    /// last tab arrangement across restarts.
+    #[test]
+    fn session_snapshot_orders_sessions_by_tab_bar_order() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma"]);
+        for id in ["alpha", "beta", "gamma"] {
+            state
+                .session_connection_states
+                .insert(id.to_string(), SessionConnectionState::Connected);
+        }
+        // Drag "gamma" before "alpha": tab bar becomes [gamma, alpha, beta]
+        // while state.sessions stays [alpha, beta, gamma].
+        assert!(reorder_tab(&mut state, "gamma", "alpha", true));
+        assert_eq!(tab_anchors(&state), vec!["gamma", "alpha", "beta"]);
+
+        let snapshot = state.build_session_state("Default Dark");
+
+        let ids: Vec<&str> = snapshot.sessions.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["gamma", "alpha", "beta"]);
+        // The reorder must not disturb which session is active.
+        assert_eq!(snapshot.active_session.as_deref(), Some("alpha"));
+    }
+
+    /// Sessions that live only inside a split-pane layout (no workspace tab
+    /// of their own) still make it into the snapshot — appended after the
+    /// tab anchors, in their original `state.sessions` order.
+    #[test]
+    fn session_snapshot_appends_pane_only_sessions_after_tab_anchors() {
+        let mut state = state_with_tabs(&["alpha", "beta", "pane-only"]);
+        // Tab bar deliberately reversed vs. creation order; "pane-only" has
+        // no tab (it's somebody's split pane).
+        for name in ["beta", "alpha"] {
+            state.tabs.push(WorkspaceTab {
+                id: name.to_string(),
+                anchor_session_id: Some(name.to_string()),
+            });
+        }
+        for id in ["alpha", "beta", "pane-only"] {
+            state
+                .session_connection_states
+                .insert(id.to_string(), SessionConnectionState::Connected);
+        }
+
+        let snapshot = state.build_session_state("Default Dark");
+
+        let ids: Vec<&str> = snapshot.sessions.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["beta", "alpha", "pane-only"]);
+    }
+
+    /// Tab-bar ordering must not weaken the Connected-only filter: a
+    /// disconnected tab in the middle of the bar is still omitted.
+    #[test]
+    fn session_snapshot_tab_order_still_skips_disconnected_sessions() {
+        let mut state = state_with_active_session(&["alpha", "beta", "gamma"]);
+        for id in ["alpha", "gamma"] {
+            state
+                .session_connection_states
+                .insert(id.to_string(), SessionConnectionState::Connected);
+        }
+        state
+            .session_connection_states
+            .insert("beta".to_string(), SessionConnectionState::Disconnected);
+        assert!(reorder_tab(&mut state, "gamma", "alpha", true));
+
+        let snapshot = state.build_session_state("Default Dark");
+
+        let ids: Vec<&str> = snapshot.sessions.iter().map(|s| s.id.as_str()).collect();
+        assert_eq!(ids, vec!["gamma", "alpha"]);
+    }
+
     #[test]
     fn session_snapshot_roundtrip_restores_only_terminals_logged_in_at_exit() {
         let mut state = state_with_tabs(&["connected", "disconnected"]);
