@@ -254,6 +254,7 @@ Linux gpu-muxi-001.x86.test.brainpp.dev 5.15.0-119-generic #1，将API 脚本放
   0.1 [@Image](zed:///agent/pasted-image?name=Image) 还是没有正确的先生成二维码扫码，需要修复终端的逻辑，需要支持生成二维码，继续修复。
   0.2 ![](image_12.png)还是没法正确的生成二维码，可以参考https://github.com/h4ckf0r0day/obscura，这里需要集成一个极简的浏览器访问飞书，并获取 session 信息，继续改造，支持手机扫码登录
   0.3 ![](image_13.png)没有先使用obscura访问飞书的接口生成二维码获取 session，检查继承逻辑
+  0.4 [@Image](zed:///agent/pasted-image?name=Image) 还是没有弹出飞书扫码页，不符合预期。，需要使用obscura访问open.feishu.cn 创建相关会话并获取飞书聊天的权限，再进行后续步骤
 
   1. 首先尝试触发飞书扫码，获取登录态的 session
   2. 使用这个 session 往智小安发送消息：动态口令
