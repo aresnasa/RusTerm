@@ -61,14 +61,15 @@ use crate::state::{
     execute_tab_drop_on_pane, execute_tab_drop_on_pane_at, focus_pane_for_layout,
     focused_pane_session, invert_send_targets, move_floating_pane_for_active,
     move_session_to_leftmost, note_exit_code_evidence, note_shell_integration_evidence,
-    note_shell_prompt_evidence, pop_context_command, prepare_split_for_sidebar_drop,
-    prepare_split_for_sidebar_drop_at, prompt_looks_like_shell, prompt_return_completion_target,
-    push_workspace_tab, record_context_command, record_onekey_behavior, record_replay_op,
-    reorder_tab, replayable_ops, resize_layout_split, rollback_pending_exit, scroll_sync_targets,
-    seed_onekey_habit_event, select_all_send_targets, selected_send_target_ids, set_active_tab,
-    set_pane_session_for_layout, set_send_target_selected, source_pane_for_copy,
-    suppress_comparison_diff_warning, toggle_comparison_mode, toggle_pane_zoom, toggle_split_mode,
-    track_terminal_input, tracked_terminal_command,
+    note_shell_prompt_evidence, place_copied_session_next_to_source, pop_context_command,
+    prepare_split_for_sidebar_drop, prepare_split_for_sidebar_drop_at, prompt_looks_like_shell,
+    prompt_return_completion_target, push_workspace_tab, record_context_command,
+    record_onekey_behavior, record_replay_op, reorder_tab, replayable_ops, resize_layout_split,
+    rollback_pending_exit, scroll_sync_targets, seed_onekey_habit_event, select_all_send_targets,
+    selected_send_target_ids, set_active_tab, set_pane_session_for_layout,
+    set_send_target_selected, source_pane_for_copy, suppress_comparison_diff_warning,
+    toggle_comparison_mode, toggle_pane_zoom, toggle_split_mode, track_terminal_input,
+    tracked_terminal_command,
 };
 use crate::transfers::{FileEndpoint, TransferJob, TransferRequest};
 
@@ -18066,6 +18067,16 @@ pub fn App() -> Element {
                                 .and_then(|t| t.cwd.clone());
                             let opened = open_connection(state, input_senders, new_conn, None);
                             let new_sid = opened.session_id;
+                            // Task 127: 副本支持就近复制 — open_connection
+                            // appends the copy at the far right; move its tab
+                            // (and its session-list slot, so the persisted
+                            // restore order matches) to sit immediately after
+                            // the source tab.
+                            place_copied_session_next_to_source(
+                                &mut state.write(),
+                                &sid,
+                                &new_sid,
+                            );
                             let replay_ops =
                                 seed_copied_session_replay(&mut state.write(), &sid, &new_sid);
                             if !replay_ops.is_empty() {

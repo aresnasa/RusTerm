@@ -40,6 +40,14 @@
 - 日志：`[COPY-SESSION] copy <new> of <src> scheduling N recorded op(s) for post-connect replay`。
 - 测试（session_startup_tests，2 新）：`copy_session_seeds_replay_recorder_and_schedules_login_replay`（继承 jumpserver 导航+sudo -i 序列、副本 recorder 被种、源不受影响、纯导航脚本被 ops 压制、凭据脚本仍赢）、`copy_session_without_recorded_ops_seeds_nothing`（普通 SSH 复制行为不变）。ui lib 772 全绿。
 
+### 副本就近放置（任务 127，2026-08-06）
+用户要求"副本支持就近复制，不需要放到最右边"。`open_connection` 天然 append 到最右。修复：
+- 新纯函数 `place_copied_session_next_to_source(&mut AppState, source_sid, copy_sid) -> bool`（state.rs，紧跟 `reorder_tab` 之后）：① 找源 session 的 workspace tab，复用 `reorder_tab(copy_sid, source_tab_id, before=false)` 把副本 tab 移到源 tab 右侧（reorder_tab 保 active tab —— 副本保持激活）；② 同步把 `state.sessions` 里的副本条目移到源条目之后 —— `build_session_state` 按 sessions 顺序落快照，因此**重启恢复后副本也仍然紧邻源会话**。No-op：源/副本 id 未知、source==copy、源无 tab（pane-only）。复制最右 tab 时内部 reorder_tab 返回 false（已相邻）但函数仍返回 true。
+- app.rs `on_copy_session`：`open_connection` 返回后立刻调 `place_copied_session_next_to_source(&mut state.write(), &sid, &new_sid)`，再走 seed/replay 流程（顺序无耦合）。
+- 恢复逻辑复查：阶段 9（见 `mem:RusTerm/session-replay-recovery`）的 connection_id 匹配 + 副本流种子 + 名字保留仍完好，`restore_resolves_copied_sessions_by_connection_id_and_keeps_title` 等测试全绿，无需再改。
+- 测试（state.rs tests，4 新 + `append_copy` helper）：`copied_session_is_placed_immediately_after_its_source`（tabs+sessions 双重顺序 + active 保持）、`copy_of_rightmost_tab_is_already_adjacent`、`place_copied_session_with_unknown_source_is_noop`、`place_copied_session_with_unknown_copy_is_noop`。ui lib 782 全绿。
+- 注意：`move_session_to_leftmost`（SSH 首次登录 per-host autoconfig）只在 host 从未配置过时移动 —— 副本的 host 必然已配置，不会打架。
+
 ## 测试 (`session_startup_tests`，6 新，全绿)
 - `disconnect_sets_state_to_disconnected_and_preserves_config_and_tab`：断开后状态=Disconnected、config 保留、tab 保留、badge=Disconnected。
 - `disconnect_is_idempotent_for_already_disconnected_session`：重复断开 no-op。
