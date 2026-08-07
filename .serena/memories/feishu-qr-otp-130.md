@@ -168,3 +168,36 @@ User retest showed no Feishu window and OneKey `sudo 密码` at `2nd Password:`.
 - Fixed proactive OAuth ordering: OAuth success only fetches/sends OTP when the session has an InFlight OTP cycle AND the current rendered terminal line still matches an OTP prompt. A fast QR scan before `2nd Password:` now persists the token and waits for the later prompt instead of typing OTP into an earlier login/menu stage.
 - Added regressions: `jumpserver_otp_prompt_never_creates_a_password_popup`, `oauth_success_fetches_only_for_an_already_visible_otp_prompt`, and strengthened prompt gate tests.
 Validation: `cargo test -p rusterm-ui` 817 tests + 2 doctests passed; `cargo check --workspace` passed; rust-analyzer diagnostics clean. Live Feishu/JumpServer E2E still requires user credentials and was not run. No commit/push made.
+
+## Session 10: live CDP HTTP bug + stuck popup fixes (uncommitted)
+User ran a build from HEAD at 03:07/04:00 CST and hit: browser spawned OK, but popup showed
+"浏览器已启动，但无法连接本地 CDP 调试端口" then stayed stuck on "正在向智小安获取临时密码…".
+
+Root causes found + fixed:
+1. cdp_http_request (crates/rusterm-ui/src/feishu_browser.rs) read the DevTools HTTP response
+   with `stream.take(MAX).read_to_end()`. Chrome's DevTools server is HTTP/1.1 keep-alive: it
+   sets Content-Length and does NOT close the connection → read_to_end blocked until the 2 s
+   read timeout → every `working_devtools_port` / `fetch_cdp_targets` / `activate_cdp_target`
+   failed at runtime. curl worked because it reads exactly Content-Length bytes. Fixed by
+   `read_http_response` + `parse_http_head`: read headers to `\r\n\r\n`, honour Content-Length,
+   bounded fallback only when no length; dropped the bogus `Content-Length: 0` on GET. Added
+   `--remote-allow-origins=*` to the launch plan. Tests assert the new reader completes
+   without ever polling past the declared body.
+2. Popup lifecycle had no failure/timeout arm for the OTP fetch phase: OtpFailed/OtpReply-error
+   only updated `feishu_otp_status[session]` but left `FeishuQrPopupStatus::Scanning`, so the
+   banner kept saying "正在向智小安获取临时密码…". Fixed in app.rs: OtpFailed and OtpReply
+   parse-failure now mark the session popup Failed; successful queue marks it Delivered; a
+   FEISHU_OTP_CYCLE_WATCHDOG (180 s) fails any cycle whose browser thread never reported back;
+   new i18n `feishu.qr_otp_timeout` ("获取临时密码超时，请重试").
+3. OtpSendReady approval was a single-shot strict current-line check — if the rendered `2nd
+   Password:` line beat the drain tick, approval denied within 3 s and 智小安 never got the
+   message (user's exact complaint). Now a grace loop retries the check for 2.4 s
+   (FEISHU_OTP_SEND_APPROVAL_GRACE) before denying, well within the backend's 3 s window.
+
+Validation: `cargo fmt -p rusterm-ui`; `cargo test -p rusterm-ui` 841 passed/0 failed;
+`cargo build -p rusterm-ui` clean; clippy shows no NEW warnings in the touched lines
+(pre-existing collapsible-if warnings elsewhere, ignored).
+
+Still pending: real retest on the user's Mac against the live Chrome instance (DevTools port
+alive) + real Feishu/JumpServer to confirm: scan → auto 智小安 message → OTP auto-filled,
+and that the popup never sticks on the fetching banner when automation fails.
