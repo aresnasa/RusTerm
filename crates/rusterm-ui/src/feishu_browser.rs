@@ -603,14 +603,14 @@ fn working_devtools_port(profile_dir: &Path) -> Option<u16> {
 
 fn wait_for_devtools_port(profile_dir: &Path) -> Result<u16, String> {
     let deadline = Instant::now() + DEVTOOLS_CONNECT_TIMEOUT;
-    let mut last_error = String::from("DevTools port never appeared");
     loop {
         match probe_devtools_port(profile_dir) {
             Ok(port) => return Ok(port),
-            Err(error) => last_error = error,
-        }
-        if Instant::now() >= deadline {
-            return Err(last_error);
+            Err(error) => {
+                if Instant::now() >= deadline {
+                    return Err(error);
+                }
+            }
         }
         thread::sleep(DEVTOOLS_POLL_INTERVAL);
     }
@@ -1572,25 +1572,27 @@ mod tests {
         assert!(parse_http_head("HTTP/1.1 not-a-number\r\n\r\n").is_err());
     }
 
-    /// Yields `payload` in one read, then fails if polled again: the response
-    /// must complete at exactly `Content-Length` bytes, never awaiting EOF.
-    struct ReadOnceThenFail {
-        payload: Option<Vec<u8>>,
+    /// Yields `payload` in chunk-sized reads; once drained, either errors
+    /// (`past_end_error`) or reports a clean EOF. The erroring variant proves
+    /// a Content-Length response completes without ever awaiting EOF.
+    struct ChunkedReader {
+        payload: std::io::Cursor<Vec<u8>>,
+        chunk: usize,
+        error_past_end: bool,
     }
 
-    impl Read for ReadOnceThenFail {
+    impl Read for ChunkedReader {
         fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            let Some(payload) = self.payload.take() else {
-                return Err(std::io::Error::other(
-                    "response reader must not be polled past Content-Length",
-                ));
-            };
-            let length = payload.len().min(buffer.len());
-            if length < payload.len() {
-                self.payload = Some(payload.split_off(length));
+            if self.payload.position() == self.payload.get_ref().len() as u64 {
+                if self.error_past_end {
+                    return Err(std::io::Error::other(
+                        "response reader must not be polled past Content-Length",
+                    ));
+                }
+                return Ok(0);
             }
-            buffer[..length].copy_from_slice(&payload[..length]);
-            Ok(length)
+            let limit = buffer.len().min(self.chunk);
+            self.payload.read(&mut buffer[..limit])
         }
     }
 
@@ -1602,9 +1604,11 @@ mod tests {
             body.len()
         );
         let mut payload = head.into_bytes();
-        payload.extend(body.iter().chain(std::iter::empty()));
-        let mut reader = ReadOnceThenFail {
-            payload: Some(payload),
+        payload.extend_from_slice(body);
+        let mut reader = ChunkedReader {
+            payload: std::io::Cursor::new(payload),
+            chunk: usize::MAX,
+            error_past_end: true,
         };
         let (status, received) = read_http_response(&mut reader).unwrap();
         assert_eq!(status, 200);
@@ -1617,8 +1621,10 @@ mod tests {
         let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
         let mut payload = head.into_bytes();
         payload.extend_from_slice(body);
-        let mut reader = ReadOnceThenFail {
-            payload: Some(payload),
+        let mut reader = ChunkedReader {
+            payload: std::io::Cursor::new(payload),
+            chunk: 3,
+            error_past_end: true,
         };
         let (status, received) = read_http_response(&mut reader).unwrap();
         assert_eq!(status, 200);
@@ -1628,27 +1634,13 @@ mod tests {
     #[test]
     fn cdp_http_reports_unexpected_eof_mid_body() {
         let payload = b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\n\r\nshort".to_vec();
-        let mut reader = ReadOnceThenFail_eof(payload);
+        let mut reader = ChunkedReader {
+            payload: std::io::Cursor::new(payload),
+            chunk: usize::MAX,
+            error_past_end: false,
+        };
         let error = read_http_response(&mut reader).unwrap_err();
         assert!(error.contains("unexpected EOF"));
-    }
-
-    /// Yields `payload` then EOF (read returns 0), unlike `ReadOnceThenFail`.
-    struct ReadOnceThenFail_eof(Vec<u8>);
-
-    impl Read for ReadOnceThenFail_eof {
-        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            if self.0.is_empty() {
-                return Ok(0);
-            }
-            let payload = std::mem::take(&mut self.0);
-            let length = payload.len().min(buffer.len());
-            if length < payload.len() {
-                self.0 = payload[length..].to_vec();
-            }
-            buffer[..length].copy_from_slice(&payload[..length]);
-            Ok(length)
-        }
     }
 
     #[test]
