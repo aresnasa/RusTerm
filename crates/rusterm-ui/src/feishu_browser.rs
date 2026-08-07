@@ -1400,8 +1400,7 @@ mod tests {
         );
         assert!(!plan.arguments().contains(&OsString::from("--new-window")));
         assert!(
-            !plan
-                .arguments()
+            plan.arguments()
                 .contains(&OsString::from("--remote-allow-origins=*"))
         );
         assert!(!plan.arguments().contains(&OsString::from(&plan.url)));
@@ -1545,5 +1544,119 @@ mod tests {
         assert!(!looks_like_logged_in_feishu_url(
             "https://evil.example@tenant.feishu.cn/next/messenger/"
         ));
+    }
+
+    #[test]
+    fn parse_http_head_extracts_status_and_length() {
+        let (status, length) = parse_http_head(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=UTF-8\r\nContent-Length: 110\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(length, Some(110));
+
+        let (status, length) =
+            parse_http_head("HTTP/1.1 200 OK\r\ncOnTeNt-LeNgTh: 42\r\n\r\n").unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(length, Some(42));
+
+        let (status, length) = parse_http_head("HTTP/1.1 404 Not Found\r\n\r\n").unwrap();
+        assert_eq!(status, 404);
+        assert_eq!(length, None);
+    }
+
+    #[test]
+    fn parse_http_head_rejects_missing_status() {
+        assert!(parse_http_head("this is not HTTP\r\n\r\n").is_err());
+        assert!(parse_http_head("").is_err());
+        assert!(parse_http_head("HTTP/1.1 not-a-number\r\n\r\n").is_err());
+    }
+
+    /// Yields `payload` in one read, then fails if polled again: the response
+    /// must complete at exactly `Content-Length` bytes, never awaiting EOF.
+    struct ReadOnceThenFail {
+        payload: Option<Vec<u8>>,
+    }
+
+    impl Read for ReadOnceThenFail {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let Some(payload) = self.payload.take() else {
+                return Err(std::io::Error::other(
+                    "response reader must not be polled past Content-Length",
+                ));
+            };
+            let length = payload.len().min(buffer.len());
+            if length < payload.len() {
+                self.payload = Some(payload.split_off(length));
+            }
+            buffer[..length].copy_from_slice(&payload[..length]);
+            Ok(length)
+        }
+    }
+
+    #[test]
+    fn cdp_http_reads_content_length_body_without_eof() {
+        let body = br#"[{"id":"1","type":"page"}]"#;
+        let head = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json; charset=UTF-8\r\nContent-Length: {}\r\n\r\n",
+            body.len()
+        );
+        let mut payload = head.into_bytes();
+        payload.extend(body.iter().chain(std::iter::empty()));
+        let mut reader = ReadOnceThenFail {
+            payload: Some(payload),
+        };
+        let (status, received) = read_http_response(&mut reader).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(received, body);
+    }
+
+    #[test]
+    fn cdp_http_reads_head_and_body_across_small_reads() {
+        let body = b"{\"result\":[]}";
+        let head = format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n", body.len());
+        let mut payload = head.into_bytes();
+        payload.extend_from_slice(body);
+        let mut reader = ReadOnceThenFail {
+            payload: Some(payload),
+        };
+        let (status, received) = read_http_response(&mut reader).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(received, body);
+    }
+
+    #[test]
+    fn cdp_http_reports_unexpected_eof_mid_body() {
+        let payload = b"HTTP/1.1 200 OK\r\nContent-Length: 16\r\n\r\nshort".to_vec();
+        let mut reader = ReadOnceThenFail_eof(payload);
+        let error = read_http_response(&mut reader).unwrap_err();
+        assert!(error.contains("unexpected EOF"));
+    }
+
+    /// Yields `payload` then EOF (read returns 0), unlike `ReadOnceThenFail`.
+    struct ReadOnceThenFail_eof(Vec<u8>);
+
+    impl Read for ReadOnceThenFail_eof {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            if self.0.is_empty() {
+                return Ok(0);
+            }
+            let payload = std::mem::take(&mut self.0);
+            let length = payload.len().min(buffer.len());
+            if length < payload.len() {
+                self.0 = payload[length..].to_vec();
+            }
+            buffer[..length].copy_from_slice(&payload[..length]);
+            Ok(length)
+        }
+    }
+
+    #[test]
+    fn cdp_http_falls_back_to_eof_without_content_length() {
+        let payload = b"HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\n\r\nTarget closed".to_vec();
+        let mut reader = std::io::Cursor::new(payload);
+        let (status, body) = read_http_response(&mut reader).unwrap();
+        assert_eq!(status, 200);
+        assert_eq!(body, b"Target closed");
     }
 }
