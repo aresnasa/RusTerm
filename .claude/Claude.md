@@ -262,7 +262,7 @@ Linux gpu-muxi-001.x86.test.brainpp.dev 5.15.0-119-generic #1，将API 脚本放
   0.9 ![](image_14.png)修复开启多个 chrome 的页面，同时修复扫码成功后，没有发送消息到“智小安”，需要修复
   0.10 ![](image_15.png)需要调用 chrome 登录飞书，检查并修复相关问题
   0.11 登录成功后的这个 chrome 或者 edge 可以在后台挂着，每次新复制会话直接调用智小安消息中的 OTP 内容即可，可以发送 2fa 或者动态口令给智小安，复用飞书登录态的信息。
-
+  0.12 [@Image](zed:///agent/pasted-image?name=Image) 卡在搜索智小安了，没有触发搜索智小安，然后发消息 2fa 或者动态口令，继续修复
 
   1. 首先尝试触发飞书扫码，获取登录态的 session
   2. 使用这个 session 往智小安发送消息：动态口令

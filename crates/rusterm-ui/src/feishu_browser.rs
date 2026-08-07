@@ -95,6 +95,10 @@ impl BrowserLaunchPlan {
             OsString::from("--no-first-run"),
             OsString::from("--no-default-browser-check"),
             OsString::from("--no-startup-window"),
+            // Chrome 111+ rejects DevTools websocket handshakes whose Origin
+            // is not allow-listed; RusTerm's client sends none, but keep this
+            // as insurance for any client that does.
+            OsString::from("--remote-allow-origins=*"),
         ]
     }
 }
@@ -456,12 +460,16 @@ fn open_browser_session(plan: BrowserLaunchPlan, generation: u64) {
             }
             tracing::info!("[OTP-FEISHU] started dedicated {browser_name} session");
 
-            let Some(port) = wait_for_devtools_port(&plan.profile_dir) else {
-                finish_with_failure(
-                    generation,
-                    "浏览器已启动，但无法连接本地 CDP 调试端口。请关闭该 RusTerm 专用浏览器窗口后重试。",
-                );
-                return;
+            let port = match wait_for_devtools_port(&plan.profile_dir) {
+                Ok(port) => port,
+                Err(last_error) => {
+                    tracing::warn!(error = %last_error, "[OTP-FEISHU] browser started but CDP port unreachable");
+                    finish_with_failure(
+                        generation,
+                        "浏览器已启动，但无法连接本地 CDP 调试端口。请关闭该 RusTerm 专用浏览器窗口后重试。",
+                    );
+                    return;
+                }
             };
             port
         }
@@ -581,20 +589,28 @@ pub fn request_feishu_otp(
     });
 }
 
-fn working_devtools_port(profile_dir: &Path) -> Option<u16> {
-    let contents = fs::read_to_string(profile_dir.join(DEVTOOLS_ACTIVE_PORT)).ok()?;
-    let port = parse_devtools_port(&contents)?;
-    fetch_cdp_targets(port).ok().map(|_| port)
+fn probe_devtools_port(profile_dir: &Path) -> Result<u16, String> {
+    let contents = fs::read_to_string(profile_dir.join(DEVTOOLS_ACTIVE_PORT))
+        .map_err(|error| format!("DevToolsActivePort unreadable: {error}"))?;
+    let port = parse_devtools_port(&contents)
+        .ok_or_else(|| "DevToolsActivePort has no valid port".to_string())?;
+    fetch_cdp_targets(port).map(|_| port)
 }
 
-fn wait_for_devtools_port(profile_dir: &Path) -> Option<u16> {
+fn working_devtools_port(profile_dir: &Path) -> Option<u16> {
+    probe_devtools_port(profile_dir).ok()
+}
+
+fn wait_for_devtools_port(profile_dir: &Path) -> Result<u16, String> {
     let deadline = Instant::now() + DEVTOOLS_CONNECT_TIMEOUT;
+    let mut last_error = String::from("DevTools port never appeared");
     loop {
-        if let Some(port) = working_devtools_port(profile_dir) {
-            return Some(port);
+        match probe_devtools_port(profile_dir) {
+            Ok(port) => return Ok(port),
+            Err(error) => last_error = error,
         }
         if Instant::now() >= deadline {
-            return None;
+            return Err(last_error);
         }
         thread::sleep(DEVTOOLS_POLL_INTERVAL);
     }
