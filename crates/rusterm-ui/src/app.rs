@@ -15548,7 +15548,6 @@ fn restore_sessions(
                 }
             }
             SessionType::Serial => {
-            SessionType::Serial => {
                 // Serial sessions don't have a cwd to restore (no shell
                 // integration), and reconnecting to a serial port requires
                 // the port config which we don't persist here. Skip silently.
