@@ -201,3 +201,38 @@ Validation: `cargo fmt -p rusterm-ui`; `cargo test -p rusterm-ui` 841 passed/0 f
 Still pending: real retest on the user's Mac against the live Chrome instance (DevTools port
 alive) + real Feishu/JumpServer to confirm: scan → auto 智小安 message → OTP auto-filled,
 and that the popup never sticks on the fetching banner when automation fails.
+
+## Session 11 (2026-08-07 late)
+
+User retest: CDP works, browser logs in, but bot never searched. Read logs and live CDP.
+
+Findings from live CDP (python websocket-client to port 60226):
+- s1-s2: messenger page has ZERO `<input>` in steady state; only `.appNavbar-search-input` DIV opens
+   the ⌘+K palette. Hidden decoys exist: `ud__select__selector__search__input` (negative-Y,
+   inside folded alert cards) does match `input[class*=search]`.
+- s5: palette editor = `div[contenteditable="true"].zone-container:not(.innerdocbody)`, ancestor
+   id `search_bar_editor` exists (s6 chain). Bot cards: `.bot-result-card`, name in
+   `.bot-chatter-info-name`, robot label `.bot-tag`="机器人". Both 智小安 and OTP-智小安 appear.
+- s7-s8: composer `innerdocbody` `innerText` tail = `…。​\n​\n​` (ZWSP+newlines); JS `.trim()`
+   does NOT strip ZWSP → old strict `editor_text != request_text` always failed
+   (`发送框内容校验失败` at 05:24:13). Confirmed len 24 vs expected 19.
+- s9: `.chatWindow_chatName` = "智小安" ✓, `.messageItem-wrapper[data-id]` count 11 ✓.
+- s11: `is_self` via `wrapper.querySelector('.message-self')` works (own message has that class).
+
+Root causes fixed in commit `bd64bdc` (fix 飞书扫码：机器人搜索与消息发送; on
+`fix/feishu-cdp-http`, pushed to origin):
+- New `type_into_editor`: 6 retries alternating execCommand('insertText') (DOM-driven,
+  self-verifying) and CDP `Input.insertText` (with focus priming), each preceded by
+  re-clear; read-back strips U+200B then trims before equality.
+- `search_editor_finder`/`composer_finder`: layered selectors with dialog-exclusion fallback.
+- Bot candidates: primary `.bot-chatter-info-name` within `.bot-result-card` (robot label
+  checked); fallback finds bare 「机器人」 badge in span/div/p/li and walks up to the small
+  card, EXCLUDING anything under history/recent containers (stale chips must not match).
+
+Codegraph caveat: codegraph index only walks committed HEAD, so it showed hundreds-of-lines
+STALE automate_feishu_otp. The real working tree had a newer staged (never committed) rewrite
+from earlier session (already includes `type_into_editor`, candidates fallback, etc.) which is
+what user-log analysis relied on. Always `git status -s` + `git diff --cached` first.
+
+Branch state at session end: `fix/feishu-cdp-http` @ bd64bdc (pushed matches origin).
+User still needs to restart RusTerm (running binary was built at b6df836) and retest.

@@ -525,11 +525,17 @@ pub fn approve_feishu_otp_send(request_id: u64, approved: bool) {
 }
 
 /// Ask the named Feishu bot for an OTP-related reply in the current authenticated
-/// Messenger target. The request runs away from the UI thread and retains the
-/// originating tty cycle so stale replies cannot affect a later prompt.
+/// Messenger target. `search_keys` are tried in order against the palette search
+/// box (a short pinyin key ranks the bot better than its full name in tenants
+/// where pinyin lookup is enabled, while the full name works everywhere); the
+/// first key that produces a unique exact-name robot candidate wins. Candidate
+/// selection always requires an exact `bot_name` match. The request runs away
+/// from the UI thread and retains the originating tty cycle so stale replies
+/// cannot affect a later prompt.
 pub fn request_feishu_otp(
     session: String,
     bot_name: String,
+    search_keys: Vec<String>,
     request_text: String,
     code_pattern: String,
     cycle_started: Instant,
@@ -566,7 +572,13 @@ pub fn request_feishu_otp(
             }
         };
         let result = match OTP_LOCK.lock() {
-            Ok(_guard) => automate_feishu_otp(&bot_name, &request_text, &code_pattern, approval),
+            Ok(_guard) => automate_feishu_otp(
+                &bot_name,
+                &search_keys,
+                &request_text,
+                &code_pattern,
+                approval,
+            ),
             Err(_) => Err(AutomationFailure::dom("飞书自动化会话锁不可用，请重试。")),
         };
         match result {
@@ -1170,14 +1182,41 @@ fn text_insert_script(finders_expr: &str, text: &str) -> String {
             el.dispatchEvent(new Event('change', { bubbles: true }));\
             return el.value === __TEXT__ ? 'ok' : 'mismatch';\
         }\
+        // Contenteditable path: fully clear any stale text first (automation\
+        // retries and Feishu's own state can leave ghost content which would\
+        // otherwise be silently appended to), then place the DOM selection on\
+        // the editor so execCommand's beforeinput lands at a known location.\
         if (el.isContentEditable) {\
             const selection = window.getSelection();\
             const range = document.createRange();\
             range.selectNodeContents(el);\
             selection.removeAllRanges();\
             selection.addRange(range);\
+            document.execCommand('delete', false);\
+            selection.removeAllRanges();\
+            const caret = document.createRange();\
+            caret.selectNodeContents(el);\
+            caret.collapse(false);\
+            selection.addRange(caret);\
         }\
-        document.execCommand('insertText', false, __TEXT__);\
+        // Feishu's Slate editor caches its internal state across palette\
+        // open/close cycles, and plain execCommand('insertText') then leaves\
+        // the DOM updated but the Slate state stale — no onChange fires, so\
+        // the search never runs. Wrapping the insert in synthetic\
+        // compositionstart/end events forces Slate down its IME code path,\
+        // which always propagates the change. Harmless when Slate was already\
+        // in sync (fresh mount).\
+        el.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true, cancelable: true, data: '' }));\
+        el.dispatchEvent(new CompositionEvent('compositionupdate', { bubbles: true, cancelable: true, data: __TEXT__ }));\
+        const inserted = document.execCommand('insertText', false, __TEXT__);\
+        el.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, cancelable: true, data: __TEXT__ }));\
+        if (!inserted) {\
+            // Some editors reject execCommand; fall back to a direct DOM\
+            // mutation plus synthetic input events, which Feishu's Slate\
+            // instance still observes.\
+            el.textContent = __TEXT__;\
+            el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: __TEXT__ }));\
+        }\
         const current = (el.innerText || el.textContent || '').replace(/\\u200B/g, '').trim();\
         return current === __EXPECTED__ ? 'ok' : 'mismatch';\
     })()"
@@ -1223,6 +1262,12 @@ fn type_into_editor(
         }
         let state: String = client.evaluate(&exec_script)?;
         last_state = state.clone();
+        tracing::info!(
+            "[OTP-FEISHU] text entry attempt {} -> {} (text len={})",
+            attempt,
+            state,
+            text.chars().count()
+        );
         if state == "ok" {
             return Ok(());
         }
@@ -1261,8 +1306,44 @@ fn message_snapshots(client: &mut CdpClient) -> Result<Vec<MessageSnapshot>, Aut
     )
 }
 
+/// Build the ordered list of palette search keys: each trimmed, deduplicated,
+/// and falling back to the bot's own name when the caller gave no usable key.
+///
+/// The palette treats every entry as an alternative lookup key. A short pinyin
+/// key (e.g. "zxa") ranks the target bot ahead of look-alike entries such as
+/// `OTP-智小安` in tenants where Feishu indexes pinyin aliases, but that
+/// tenant-level index is not always enabled, so the full bot name is kept as
+/// a fallback that always resolves. Selection of the actual candidate still
+/// requires an exact `bot_name` match, so a fuzzy search can never divert the
+/// flow to the wrong bot.
+fn build_search_keys(bot_name: &str, search_keys: &[String]) -> Vec<String> {
+    let mut keys: Vec<String> = Vec::new();
+    for key in search_keys {
+        let trimmed = key.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if keys.iter().any(|seen| seen == trimmed) {
+            continue;
+        }
+        keys.push(trimmed.to_string());
+    }
+    if keys.is_empty() {
+        keys.push(bot_name.trim().to_string());
+    }
+    keys
+}
+
+/// Per-key budget while polling for palette candidates. Feishu renders a
+/// skeleton for ~400 ms before results land, and 3 s comfortably covers the
+/// search round-trip; keeping the per-key budget short lets a failing alias
+/// (e.g. "zxa" in a tenant without pinyin index) yield quickly to the next
+/// key instead of burning the whole budget on the first attempt.
+const SEARCH_KEY_CANDIDATES_TIMEOUT: Duration = Duration::from_secs(3);
+
 fn automate_feishu_otp(
     bot_name: &str,
+    search_keys: &[String],
     request_text: &str,
     code_pattern: &str,
     approve_send: impl FnOnce() -> Result<(), AutomationFailure>,
@@ -1304,29 +1385,6 @@ fn automate_feishu_otp(
         "未找到飞书搜索入口。",
     )?;
     client.click(search_entry)?;
-
-    let search_editor = wait_for_point(
-        &mut client,
-        r#"(() => {
-            const element = document.querySelector('#search_bar_editor [contenteditable=true]');
-            if (!element) return null;
-            const rect = element.getBoundingClientRect();
-            if (rect.width <= 0 || rect.height <= 0) return null;
-            return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
-        })()"#,
-        "未找到飞书搜索输入框。",
-    )?;
-    client.click(search_editor)?;
-    type_into_editor(
-        &mut client,
-        &search_editor_finder(),
-        bot_name,
-        "未能在飞书搜索框中输入机器人名称。",
-    )?;
-    tracing::info!(
-        "[OTP-FEISHU] search editor filled (bot name len={})",
-        bot_name.chars().count()
-    );
 
     // Primary strategy uses the known Lark result-card classes. The fallback
     // locates a bare "机器人" badge, walks up to its small surrounding result
@@ -1392,26 +1450,120 @@ fn automate_feishu_otp(
         return out;
     })()"#
     .replace("__BOT__", &json_string(bot_name));
-    let candidates_deadline = Instant::now() + DOM_WAIT_TIMEOUT;
-    loop {
-        let candidates: Vec<BotCandidate> = client.evaluate(&candidates_expression)?;
-        if candidates
-            .iter()
-            .any(|candidate| candidate.name == bot_name && candidate.has_robot_label)
-        {
+
+    // Search-key fallback chain: try each alias in order. For every key the
+    // palette editor is re-located and re-typed (palette re-renders stale the
+    // DOM references), then candidates are polled for a short per-key budget.
+    // The first key that yields a usable exact bot match wins.
+    let keys = build_search_keys(bot_name, search_keys);
+    let mut bot_point: Option<Point> = None;
+    for (key_index, key) in keys.iter().enumerate() {
+        let search_editor = wait_for_point(
+            &mut client,
+            r#"(() => {
+                const element = document.querySelector('#search_bar_editor [contenteditable=true]');
+                if (!element) return null;
+                const rect = element.getBoundingClientRect();
+                if (rect.width <= 0 || rect.height <= 0) return null;
+                return { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 };
+            })()"#,
+            "未找到飞书搜索输入框。",
+        )?;
+        client.click(search_editor)?;
+        type_into_editor(
+            &mut client,
+            &search_editor_finder(),
+            key,
+            "未能在飞书搜索框中输入机器人名称。",
+        )?;
+        tracing::info!(
+            "[OTP-FEISHU][SEARCH] key '{}' ({}/{}) typed, polling candidates",
+            key,
+            key_index + 1,
+            keys.len()
+        );
+
+        let key_deadline = Instant::now() + SEARCH_KEY_CANDIDATES_TIMEOUT;
+        loop {
+            let candidates: Vec<BotCandidate> = client.evaluate(&candidates_expression)?;
+            if candidates
+                .iter()
+                .any(|candidate| candidate.name == bot_name && candidate.has_robot_label)
+            {
+                // Settle briefly so the click center is stable, then enforce
+                // exact name + robot label + uniqueness before clicking.
+                thread::sleep(Duration::from_millis(300));
+                let settled: Vec<BotCandidate> = client.evaluate(&candidates_expression)?;
+                match unique_exact_bot_candidate(&settled, bot_name) {
+                    Ok(point) => {
+                        bot_point = Some(point);
+                        tracing::info!(
+                            "[OTP-FEISHU][SEARCH] key '{}' hit exact bot candidate",
+                            key
+                        );
+                    }
+                    Err(reason) => {
+                        tracing::warn!(
+                            "[OTP-FEISHU][SEARCH] key '{}' candidate rejected: {}",
+                            key,
+                            reason
+                        );
+                    }
+                }
+                break;
+            }
+            if Instant::now() >= key_deadline {
+                tracing::info!(
+                    "[OTP-FEISHU][SEARCH] key '{}' ({}/{}) miss, trying next key",
+                    key,
+                    key_index + 1,
+                    keys.len()
+                );
+                break;
+            }
+            thread::sleep(AUTOMATION_POLL_INTERVAL);
+        }
+
+        if bot_point.is_some() {
             break;
         }
-        if Instant::now() >= candidates_deadline {
-            return Err(AutomationFailure::dom(
-                "未找到名称完全匹配且标记为机器人的飞书联系人。",
-            ));
+
+        // Key missed. Feishu keeps recent searches under a history list; an
+        // entry exactly matching this key is a cheap way to reach the result
+        // list without relying on the flaky editor insert path.
+        let history_click_script = r#"(() => {
+            const key = __KEY__;
+            const entry = Array.from(document.querySelectorAll(
+                '.search-history-list-item .history-item-content'
+            )).find((el) => (el.textContent || '').trim() === key);
+            if (!entry) return false;
+            const rect = entry.getBoundingClientRect();
+            if (rect.width <= 0 || rect.height <= 0) return false;
+            entry.click();
+            return true;
+        })()"#
+        .replace("__KEY__", &json_string(key));
+        let clicked: bool = client.evaluate(&history_click_script).unwrap_or(false);
+        if clicked {
+            tracing::info!(
+                "[OTP-FEISHU][SEARCH] clicked search-history entry for key '{}'",
+                key
+            );
+            thread::sleep(Duration::from_millis(500));
+            let candidates: Vec<BotCandidate> = client.evaluate(&candidates_expression)?;
+            if let Ok(point) = unique_exact_bot_candidate(&candidates, bot_name) {
+                bot_point = Some(point);
+                tracing::info!(
+                    "[OTP-FEISHU][SEARCH] history entry for key '{}' reached exact bot candidate",
+                    key
+                );
+            }
         }
-        thread::sleep(AUTOMATION_POLL_INTERVAL);
     }
-    thread::sleep(Duration::from_millis(300));
-    let candidates: Vec<BotCandidate> = client.evaluate(&candidates_expression)?;
-    let bot_point =
-        unique_exact_bot_candidate(&candidates, bot_name).map_err(AutomationFailure::dom)?;
+
+    let bot_point = bot_point.ok_or_else(|| {
+        AutomationFailure::dom("未找到名称完全匹配且标记为机器人的飞书联系人。")
+    })?;
     client.click(bot_point)?;
     tracing::info!("[OTP-FEISHU] bot result card clicked");
 
@@ -1514,7 +1666,6 @@ fn automate_feishu_otp(
         thread::sleep(AUTOMATION_POLL_INTERVAL);
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1660,6 +1811,43 @@ mod tests {
             "https%3A%2F%2Fwww.feishu.cn%2Fmessenger%2F%3Fa%3D1%26name%3D%E6%99%BA%E5%B0%8F%E5%AE%89"
         );
         assert_eq!(percent_encode_url("AZaz09-._~"), "AZaz09-._~");
+    }
+
+    #[test]
+    fn search_keys_trim_dedupe_and_fall_back_to_bot_name() {
+        let keys = vec!["zxa".to_string(), "智小安".to_string()];
+        assert_eq!(
+            build_search_keys("智小安", &keys),
+            vec!["zxa".to_string(), "智小安".to_string()]
+        );
+
+        // Whitespace is trimmed; duplicates are dropped; empties are skipped.
+        let keys = vec![
+            "  zxa  ".to_string(),
+            "zxa".to_string(),
+            "".to_string(),
+            "   ".to_string(),
+            "智小安".to_string(),
+        ];
+        assert_eq!(
+            build_search_keys("智小安", &keys),
+            vec!["zxa".to_string(), "智小安".to_string()]
+        );
+
+        // An empty list falls back to the bot name so the bot can still be
+        // found by its literal name.
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(
+            build_search_keys("智小安", &empty),
+            vec!["智小安".to_string()]
+        );
+
+        // All-empty entries also fall back.
+        let keys = vec!["  ".to_string(), "".to_string()];
+        assert_eq!(
+            build_search_keys("智小安", &keys),
+            vec!["智小安".to_string()]
+        );
     }
 
     #[test]

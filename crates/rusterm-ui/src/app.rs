@@ -242,6 +242,13 @@ async fn handle_feishu_oauth_event(state: &mut Signal<AppState>, event: FeishuOA
 /// failed attempt falls back to the OneKey popup (attempts are capped).
 const FEISHU_WEB_OTP_BOT_NAME: &str = "智小安";
 
+/// Palette search keys for the OTP bot, tried in order. The short pinyin key
+/// ranks 智小安 ahead of look-alikes such as `OTP-智小安` in tenants where
+/// Feishu indexes pinyin aliases; the full name is kept as a last-resort
+/// fallback that always resolves, regardless of the tenant's pinyin index.
+/// The exact `FEISHU_WEB_OTP_BOT_NAME` match still gates candidate selection.
+const FEISHU_WEB_OTP_BOT_SEARCH_KEYS: &[&str] = &["zxa", "智小安"];
+
 /// Grace window for the tty OTP prompt to (re)appear after the browser
 /// automation says it is ready to send: the backend only waits 3 s, so the UI
 /// retries the strict current-line check for ~2.4 s before denying.
@@ -355,6 +362,10 @@ async fn trigger_feishu_otp_fetch(state: &mut Signal<AppState>, session: &str) {
         crate::feishu_browser::request_feishu_otp(
             session.to_string(),
             FEISHU_WEB_OTP_BOT_NAME.to_string(),
+            FEISHU_WEB_OTP_BOT_SEARCH_KEYS
+                .iter()
+                .map(|key| key.to_string())
+                .collect(),
             request_text,
             code_pattern,
             cycle_started,
