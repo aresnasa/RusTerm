@@ -155,14 +155,39 @@ impl SshClient {
         let config = Arc::new(interactive_client_config());
 
         let handle = connect_authenticated(&self.config, config, self.otp_provider.clone()).await?;
-        let handle = Arc::new(handle);
 
+        spawn_interactive_channel(
+            Arc::new(handle),
+            self.config.terminal_type.as_str(),
+            self.config.host.clone(),
+            self.event_tx.clone(),
+            session_id,
+            size,
+        )
+        .await
+    }
+}
+
+/// Open an interactive shell channel (PTY + shell + IO forwarder tasks) on an
+/// already-authenticated transport. Shared by [`SshClient::connect`] (fresh
+/// transport + auth) and [`SshSession::clone_channel`] (a new terminal tab on
+/// the same transport — used to duplicate JumpServer/koko sessions without a
+/// second login or OTP round-trip).
+async fn spawn_interactive_channel(
+    handle: Arc<Handle>,
+    terminal_type: &str,
+    host: String,
+    event_tx: mpsc::UnboundedSender<SessionEvent>,
+    session_id: SessionId,
+    size: TerminalSize,
+) -> anyhow::Result<(Session, SshSession)> {
+    {
         let channel = handle.channel_open_session().await?;
 
         channel
             .request_pty(
                 false,
-                self.config.terminal_type.as_str(),
+                terminal_type,
                 size.cols as u32,
                 size.rows as u32,
                 0,
@@ -184,7 +209,7 @@ impl SshClient {
 
         let session = Session::with_id(
             session_id.clone(),
-            self.config.host.clone(),
+            host.clone(),
             SessionType::Ssh,
             input_tx,
             resize_tx,
@@ -203,7 +228,7 @@ impl SshClient {
 
         // Output reader: forward data from SSH channel to event channel
         let sid_read = session_id.clone();
-        let evt_read = self.event_tx.clone();
+        let evt_read = event_tx.clone();
         let disconnected_read = disconnected.clone();
         let tap_read = output_tap.clone();
         tokio::spawn(async move {
@@ -276,7 +301,7 @@ impl SshClient {
 
         // Input/resize/close writer
         let sid_write = session_id.clone();
-        let evt_write = self.event_tx.clone();
+        let evt_write = event_tx.clone();
         let disconnected_write = disconnected.clone();
         tokio::spawn(async move {
             let mut disconnect_reason = "Session closed".to_string();
@@ -338,16 +363,15 @@ impl SshClient {
             }
         });
 
-        let _ = self
-            .event_tx
-            .send(SessionEvent::Connected(session_id.clone()));
+        let _ = event_tx.send(SessionEvent::Connected(session_id.clone()));
 
         Ok((
             session,
             SshSession {
                 handle,
                 session_id,
-                event_tx: self.event_tx.clone(),
+                host,
+                event_tx,
                 disconnected,
                 output_tap,
                 output_tap_lock,
@@ -678,6 +702,8 @@ impl Drop for OutputTapGuard {
 pub struct SshSession {
     handle: Arc<Handle>,
     session_id: String,
+    /// Remote host name (used to label duplicated terminal sessions).
+    host: String,
     event_tx: mpsc::UnboundedSender<SessionEvent>,
     disconnected: Arc<std::sync::atomic::AtomicBool>,
     /// Optional output tap installed by the relay executor to capture
@@ -765,6 +791,47 @@ impl SshSession {
     /// The session/tab id used as the key in `ssh_sessions`.
     pub fn session_id(&self) -> &str {
         &self.session_id
+    }
+
+    /// True once this session's interactive channel has ended (closed by the
+    /// peer, a write failure, or an explicit disconnect). A disconnected
+    /// session cannot serve as the source of a channel clone.
+    pub fn is_disconnected(&self) -> bool {
+        self.disconnected
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Duplicate this session onto a fresh interactive channel of the SAME
+    /// authenticated transport — no new TCP connection, handshake, login or
+    /// OTP is performed. This is the fast path behind "copy session" for
+    /// interactive-bastion (JumpServer/koko) tabs: the bastion sees a second
+    /// shell channel on the already-logged-in connection and drops the user
+    /// back at its main menu, from which RusTerm replays the recorded
+    /// establishment ops to land on the same target host.
+    ///
+    /// The clone gets its own `Session` (input/resize/close senders) and its
+    /// own `SessionEvent` stream (the caller's `event_tx`), fully independent
+    /// of the source tab's channel: closing either tab only closes its own
+    /// channel; the shared transport dies with the last `SshSession` handle.
+    pub async fn clone_channel(
+        &self,
+        event_tx: mpsc::UnboundedSender<SessionEvent>,
+        new_session_id: SessionId,
+        size: TerminalSize,
+        terminal_type: &str,
+    ) -> anyhow::Result<(Session, SshSession)> {
+        if self.is_disconnected() {
+            anyhow::bail!("cannot clone a channel from a disconnected SSH session");
+        }
+        spawn_interactive_channel(
+            self.handle.clone(),
+            terminal_type,
+            self.host.clone(),
+            event_tx,
+            new_session_id,
+            size,
+        )
+        .await
     }
 
     /// Begin one exclusive relay transaction on this interactive PTY.
@@ -1190,6 +1257,7 @@ l3IjZ0yTc0Xx9bC6dF8gAAAAG2FyZXNuYXNhQEZyYW5rcy1NNU1heC5sb2NhbAEC
         let ssh_session = SshSession {
             handle: Arc::new(handle),
             session_id: "history-test".to_string(),
+            host: "127.0.0.1".to_string(),
             event_tx,
             disconnected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             output_tap: Arc::new(parking_lot::RwLock::new(None)),
@@ -1232,6 +1300,183 @@ l3IjZ0yTc0Xx9bC6dF8gAAAAG2FyZXNuYXNhQEZyYW5rcy1NNU1heC5sb2NhbAEC
         assert!(!ssh_session.relay_exec_active());
 
         ssh_session
+            .handle
+            .disconnect(russh::Disconnect::ByApplication, "", "en")
+            .await
+            .unwrap();
+        server_task.await.unwrap();
+    }
+
+    /// Channel cloning: a second interactive shell channel opens on the same
+    /// authenticated transport — no new TCP connect, no auth — and the clone
+    /// reports its own session id while the source stays connected.
+    #[tokio::test]
+    async fn clone_channel_reuses_authenticated_transport_for_new_interactive_shell() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let server_handler = PtyRequiredHistoryServer {
+            events: events.clone(),
+            pty_requested: false,
+        };
+
+        let mut server_config = server::Config::default();
+        server_config.auth_rejection_time = std::time::Duration::ZERO;
+        server_config
+            .keys
+            .push(russh::keys::ssh_key::PrivateKey::from_openssh(TEST_SERVER_KEY).unwrap());
+        let server_config = Arc::new(server_config);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server_task = tokio::spawn(async move {
+            let (socket, _) = listener.accept().await.unwrap();
+            server::run_stream(server_config, socket, server_handler)
+                .await
+                .unwrap();
+        });
+
+        let client_handler = Handler::new(address.ip().to_string(), HostKeyPolicy::Disabled);
+        let mut handle =
+            client::connect(Arc::new(client::Config::default()), address, client_handler)
+                .await
+                .unwrap();
+        assert!(
+            handle
+                .authenticate_none("test-user")
+                .await
+                .unwrap()
+                .success()
+        );
+
+        let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+        let source = SshSession {
+            handle: Arc::new(handle),
+            session_id: "source-tab".to_string(),
+            host: "jump.example.com".to_string(),
+            event_tx,
+            disconnected: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            output_tap: Arc::new(parking_lot::RwLock::new(None)),
+            output_tap_lock: Arc::new(tokio::sync::Mutex::new(())),
+            relay_exec_active: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            relay_exec_reusable: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        assert!(!source.is_disconnected());
+
+        // Clone a fresh interactive channel. Its events must flow into the
+        // CALLER's event channel (the source's event_tx here) and carry the
+        // NEW session id.
+        let (clone_event_tx, mut clone_event_rx) = mpsc::unbounded_channel();
+        let size = TerminalSize {
+            cols: 120,
+            rows: 32,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let (clone_session, clone_ssh_session) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            source.clone_channel(
+                clone_event_tx,
+                "clone-tab".to_string(),
+                size,
+                "xterm-256color",
+            ),
+        )
+        .await
+        .expect("clone_channel timed out")
+        .expect("clone_channel failed");
+
+        assert_eq!(clone_session.id, "clone-tab");
+        assert_eq!(clone_ssh_session.session_id(), "clone-tab");
+        assert!(!clone_ssh_session.is_disconnected());
+        assert!(
+            !source.is_disconnected(),
+            "cloning must not disturb the source channel"
+        );
+
+        // The server saw exactly one channel open + pty + shell — on the
+        // SAME connection (the mock accepts only one TCP stream; a second
+        // TCP connect would hang forever). Poll briefly: the server records
+        // the request before replying, but the reply may reach the client
+        // before the recorder's push is observable from this task.
+        let events_deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            {
+                let recorded = events.lock().unwrap();
+                if recorded.as_slice() == ["open", "pty", "shell"] {
+                    break;
+                }
+            }
+            assert!(
+                std::time::Instant::now() < events_deadline,
+                "expected [open, pty, shell], got {:?}",
+                events.lock().unwrap()
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+
+        // The Connected event for the clone lands on the clone's stream,
+        // not the source's.
+        match clone_event_rx.recv().await {
+            Some(SessionEvent::Connected(id)) => assert_eq!(id, "clone-tab"),
+            other => panic!("expected Connected(clone-tab), got {other:?}"),
+        }
+        assert!(event_rx.try_recv().is_err(), "source stream stays silent");
+
+        // Closing the clone only tears down ITS channel (input writer task
+        // exits and emits Disconnected for the clone id); the source
+        // transport stays usable.
+        clone_session.close().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        loop {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                clone_event_rx.recv(),
+            )
+            .await
+            {
+                Ok(Some(SessionEvent::Disconnected(id, _))) => {
+                    assert_eq!(id, "clone-tab");
+                    break;
+                }
+                _ if std::time::Instant::now() < deadline => continue,
+                _ => panic!("clone channel did not report its own Disconnected"),
+            }
+        }
+        assert!(clone_ssh_session.is_disconnected());
+        assert!(
+            !source.is_disconnected(),
+            "closing the clone must not disconnect the source"
+        );
+
+        // The shared transport still serves the source (another clone).
+        let (second_clone_tx, mut second_clone_rx) = mpsc::unbounded_channel();
+        let (_s2, second) = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            source.clone_channel(
+                second_clone_tx,
+                "second-clone".to_string(),
+                size,
+                "xterm-256color",
+            ),
+        )
+        .await
+        .expect("second clone timed out")
+        .expect("transport must survive clone close");
+        assert!(matches!(
+            second_clone_rx.recv().await,
+            Some(SessionEvent::Connected(id)) if id == "second-clone"
+        ));
+
+        // A DISCONNECTED source must refuse to clone.
+        source
+            .disconnected
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (third_tx, _third_rx) = mpsc::unbounded_channel();
+        let err = source
+            .clone_channel(third_tx, "doomed".to_string(), size, "xterm-256color")
+            .await
+            .expect_err("disconnected source must not clone");
+        assert!(err.to_string().contains("disconnected"));
+
+        second
             .handle
             .disconnect(russh::Disconnect::ByApplication, "", "en")
             .await

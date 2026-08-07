@@ -159,6 +159,10 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
             ("Warn before highlighting large diffs", "高亮大量差异前警告")
         }
         "settings.otp_webhook" => ("OTP 二次认证 webhook", "OTP 二次认证 webhook"),
+        "settings.otp_webhook_enabled" => (
+            "Enable automatic OTP fetch (browser / Feishu / webhook)",
+            "启用自动获取 OTP（浏览器 / 飞书 / webhook）",
+        ),
         "settings.otp_provider" => ("Provider", "提供方式"),
         "settings.otp_provider_manual" => ("Manual (prompt only)", "手动（仅提示）"),
         "settings.otp_provider_feishubot" => ("Feishu bot chat", "飞书机器人聊天"),

@@ -8946,6 +8946,31 @@ pub fn note_shell_integration_evidence(state: &mut AppState, session_id: &str) {
     rec.shell_integrated = true;
 }
 
+/// Replay-time skip predicate: is this recorded op already satisfied by the
+/// terminal state (cursor line) in front of us — i.e. can we avoid retyping
+/// it? Used by `schedule_replay_after_reconnect` before each send so a copy/
+/// clone (or a reconnect on a bastion that remembers its target) does not
+/// re-drive menu steps the server already performed.
+///
+/// The check is deliberately asymmetric:
+/// - CONTEXT commands (`sudo -i`, nested `ssh`, `kubectl exec`, …) are never
+///   skipped — a shell prompt in front of us says nothing about which
+///   privilege/container context it carries, so they must still be replayed.
+/// - MENU-navigation ops are skipped when the cursor line already looks like
+///   a shell prompt: a bastion menu (JumpServer `Opt>`, custom `> ` menus)
+///   is explicitly NOT shell-looking per [`prompt_looks_like_shell`], while
+///   landing directly on the target host's shell makes the whole recorded
+///   navigation prefix moot. The loop-level `continue` then re-evaluates the
+///   (unchanged) prompt for each subsequent menu op, so once the shell is
+///   reached — however that happened — the menu prefix drains away and only
+///   the context suffix still sends.
+pub fn replay_op_already_satisfied(current_line: &str, op: &str) -> bool {
+    if is_context_command(op) {
+        return false;
+    }
+    prompt_looks_like_shell(current_line)
+}
+
 /// The operations a reconnect should replay for this session, in order —
 /// the recorded establishment prefix. Shell-integration evidence freezes
 /// the recorder but keeps this prefix (see
@@ -8999,6 +9024,29 @@ mod session_replay_tests {
             .session_configs
             .insert(session_id.to_string(), config_of(kind));
         state
+    }
+
+    /// Clone/reconnect skip predicate: a menu-navigation op is redundant when
+    /// the terminal already sits at a shell prompt (the bastion delivered the
+    /// session straight to the target), but context commands must still
+    /// replay regardless, and a bastion menu prompt (`Opt>`) must never be
+    /// mistaken for a finished login.
+    #[test]
+    fn replay_skip_predicate_skips_menu_ops_only_at_shell_prompt() {
+        // Already on the target host's shell → the recorded menu ops are moot.
+        assert!(replay_op_already_satisfied("[ops@web-01 ~]$ ", "2"));
+        assert!(replay_op_already_satisfied("[ops@web-01 ~]$ ", "web-01"));
+        assert!(replay_op_already_satisfied("root@db:~# ", "/q"));
+        // Bastion menu prompt → ops still needed (classic JumpServer clone).
+        assert!(!replay_op_already_satisfied("Opt> ", "2"));
+        assert!(!replay_op_already_satisfied("Opt> 2", "web-01"));
+        // No prompt content at all → replay as before.
+        assert!(!replay_op_already_satisfied("", "2"));
+        // Context commands are never skipped — a shell prompt says nothing
+        // about the privilege/container context we must re-establish.
+        assert!(!replay_op_already_satisfied("[ops@web-01 ~]$ ", "sudo -i"));
+        assert!(!replay_op_already_satisfied("root@db:~# ", "kubectl exec -it pod -- sh"));
+        assert!(!replay_op_already_satisfied("[ops@web-01 ~]$ ", "ssh internal-02"));
     }
 
     /// The core jumpserver flow: menu-navigation inputs are recorded in order

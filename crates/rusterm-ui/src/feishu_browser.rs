@@ -1020,32 +1020,42 @@ impl CdpClient {
         Ok(())
     }
 
-    fn clear_focused_editor(&mut self) -> Result<(), AutomationFailure> {
-        self.command(
-            "Input.dispatchKeyEvent",
-            json!({ "type": "keyDown", "commands": ["selectAll"] }),
-        )?;
-        self.command("Input.dispatchKeyEvent", json!({ "type": "keyUp" }))?;
-        self.command(
-            "Input.dispatchKeyEvent",
-            json!({
-                "type": "keyDown",
-                "key": "Backspace",
-                "code": "Backspace",
-                "windowsVirtualKeyCode": 8,
-                "nativeVirtualKeyCode": 8,
-            }),
-        )?;
-        self.command(
-            "Input.dispatchKeyEvent",
-            json!({
-                "type": "keyUp",
-                "key": "Backspace",
-                "code": "Backspace",
-                "windowsVirtualKeyCode": 8,
-                "nativeVirtualKeyCode": 8,
-            }),
-        )?;
+    /// Reliable select-all + delete. The old `commands: ["selectAll"]` payload
+    /// was silently ignored by the Slate palette, so a single Backspace removed
+    /// only one char and retries appended onto residue. Here we drive a real
+    /// Cmd (or Ctrl) + A through discrete key events, then Backspace. Callers
+    /// repeat this until a DOM read-back confirms the editor is empty.
+    fn select_all_and_backspace(&mut self) -> Result<(), AutomationFailure> {
+        for (event_type, modifiers, vk, key) in [
+            ("rawKeyDown", 4, 91, "Meta"),
+            ("keyDown", 4, 65, "a"),
+            ("keyUp", 4, 65, "a"),
+            ("keyUp", 0, 91, "Meta"),
+        ] {
+            self.command(
+                "Input.dispatchKeyEvent",
+                json!({
+                    "type": event_type,
+                    "modifiers": modifiers,
+                    "windowsVirtualKeyCode": vk,
+                    "nativeVirtualKeyCode": vk,
+                    "key": key,
+                    "code": if key == "a" { "KeyA" } else { "MetaLeft" },
+                }),
+            )?;
+        }
+        for event_type in ["keyDown", "keyUp"] {
+            self.command(
+                "Input.dispatchKeyEvent",
+                json!({
+                    "type": event_type,
+                    "key": "Backspace",
+                    "code": "Backspace",
+                    "windowsVirtualKeyCode": 8,
+                    "nativeVirtualKeyCode": 8,
+                }),
+            )?;
+        }
         Ok(())
     }
 
@@ -1154,114 +1164,111 @@ fn element_focus_script(finders_expr: &str) -> String {
         .replace("__FINDERS__", finders_expr)
 }
 
+/// Read the editor's user-entered text only. `innerText` of the editor also
+/// exposes the Slate placeholder node (`.editor__custom--placeholder-content`
+/// lives in a `data-void` / `contenteditable=false` subtree, but innerText
+/// reports it regardless), which broke the composer's "cleared" read-back:
+/// after Backspace the text still read as `发送给 智小安`, so typing was
+/// rejected as `clear-failed`. Strip every placeholder/void subtree first.
 fn element_text_script(finders_expr: &str) -> String {
     "(() => { const el = __FINDERS__; if (!el) return null; \
-        return (el.innerText || el.textContent || '').replace(/\\u200B/g, '').trim(); })()"
+        let text = el.innerText || el.textContent || ''; \
+        el.querySelectorAll('[data-void], .editor__custom--placeholder') \
+            .forEach((node) => { \
+                const placeholder = node.innerText || node.textContent || ''; \
+                if (placeholder) text = text.split(placeholder).join(''); \
+            }); \
+        return text.replace(/\\u200B/g, '').trim(); })()"
         .replace("__FINDERS__", finders_expr)
 }
 
-/// Script that focuses the located editor, selects its contents, and inserts
-/// `text` via `document.execCommand('insertText')`. Unlike the raw CDP
-/// `Input.insertText`, this runs the browser's real editing pipeline, which
-/// fires the beforeinput/input events Feishu's custom editor listens to — the
-/// raw CDP call was observed to silently drop text in the live app. Handles
-/// plain INPUT/TEXTAREA controls via the native value setter. Returns
-/// 'ok' | 'mismatch' | 'missing' after a read-back verification.
-fn text_insert_script(finders_expr: &str, text: &str) -> String {
-    "(() => {\
-        const el = __FINDERS__;\
-        if (!el) return 'missing';\
-        const tag = (el.tagName || '').toUpperCase();\
-        el.focus();\
-        if (tag === 'INPUT' || tag === 'TEXTAREA') {\
-            const proto = tag === 'INPUT' ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;\
-            const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');\
-            if (descriptor && descriptor.set) descriptor.set.call(el, __TEXT__);\
-            else el.value = __TEXT__;\
-            el.dispatchEvent(new Event('input', { bubbles: true }));\
-            el.dispatchEvent(new Event('change', { bubbles: true }));\
-            return el.value === __TEXT__ ? 'ok' : 'mismatch';\
-        }\
-        // Contenteditable path: fully clear any stale text first (automation\
-        // retries and Feishu's own state can leave ghost content which would\
-        // otherwise be silently appended to), then place the DOM selection on\
-        // the editor so execCommand's beforeinput lands at a known location.\
-        if (el.isContentEditable) {\
-            const selection = window.getSelection();\
-            const range = document.createRange();\
-            range.selectNodeContents(el);\
-            selection.removeAllRanges();\
-            selection.addRange(range);\
-            document.execCommand('delete', false);\
-            selection.removeAllRanges();\
-            const caret = document.createRange();\
-            caret.selectNodeContents(el);\
-            caret.collapse(false);\
-            selection.addRange(caret);\
-        }\
-        // Feishu's Slate editor caches its internal state across palette\
-        // open/close cycles, and plain execCommand('insertText') then leaves\
-        // the DOM updated but the Slate state stale — no onChange fires, so\
-        // the search never runs. Wrapping the insert in synthetic\
-        // compositionstart/end events forces Slate down its IME code path,\
-        // which always propagates the change. Harmless when Slate was already\
-        // in sync (fresh mount).\
-        el.dispatchEvent(new CompositionEvent('compositionstart', { bubbles: true, cancelable: true, data: '' }));\
-        el.dispatchEvent(new CompositionEvent('compositionupdate', { bubbles: true, cancelable: true, data: __TEXT__ }));\
-        const inserted = document.execCommand('insertText', false, __TEXT__);\
-        el.dispatchEvent(new CompositionEvent('compositionend', { bubbles: true, cancelable: true, data: __TEXT__ }));\
-        if (!inserted) {\
-            // Some editors reject execCommand; fall back to a direct DOM\
-            // mutation plus synthetic input events, which Feishu's Slate\
-            // instance still observes.\
-            el.textContent = __TEXT__;\
-            el.dispatchEvent(new InputEvent('input', { bubbles: true, cancelable: true, inputType: 'insertText', data: __TEXT__ }));\
-        }\
-        const current = (el.innerText || el.textContent || '').replace(/\\u200B/g, '').trim();\
-        return current === __EXPECTED__ ? 'ok' : 'mismatch';\
-    })()"
-    .replace("__FINDERS__", finders_expr)
-    .replace("__TEXT__", &json_string(text))
-    .replace("__EXPECTED__", &json_string(text.trim()))
-}
-
-/// Verified, retrying text entry. Live runs showed the bare CDP
-/// `Input.insertText` intermittently landing nowhere (empty search box / wrong
-/// composer content) depending on which element held focus at that instant, so
-/// every write is now followed by a DOM read-back and retried, alternating
-/// between the in-page execCommand pipeline and the CDP input pipeline (each
-/// attempt re-clears the editor first, so retries cannot duplicate text).
+/// Verified, retrying text entry. Live debugging against the real Feishu web
+/// app showed the in-page pipelines (`document.execCommand('insertText')`
+/// wrapped in synthetic composition events, or synthetic beforeinput/input
+/// dispatch) DO update the editor DOM — so read-back sees the text — but
+/// Slate's search trigger never fires, so no candidates ever render. Only
+/// trusted input lands in Slate's model: focus the editor via JS so the
+/// `searchEditorHasFocus` gate passes, then drive the native CDP
+/// `Input.insertText` pipeline. Every attempt clears the editor first (native
+/// select-all + Backspace), so retries cannot duplicate text, and each write
+/// is followed by a DOM read-back.
 fn type_into_editor(
     client: &mut CdpClient,
     finders_expr: &str,
     text: &str,
     failure_reason: &str,
 ) -> Result<(), AutomationFailure> {
-    let exec_script = text_insert_script(finders_expr, text);
     let focus_script = element_focus_script(finders_expr);
     let text_script = element_text_script(finders_expr);
+    // Active-element leak guard: the page keeps a background conversation
+    // composer mounted alongside the palette (two contentediables). Trusted
+    // `Input.insertText` lands on `document.activeElement`; if that is the
+    // composer instead of the palette editor, characters leak into the wrong
+    // editor and corrupt the send. Only authorize typing when the focused
+    // element is exactly the target editor.
+    let active_ok_script = "(() => { const target = __FINDERS__;         const active = document.activeElement;         return !!target && !!active && (active === target || target.contains(active)); })()"
+        .replace("__FINDERS__", finders_expr);
+    let expected = text.trim();
     let mut last_state = "missing".to_string();
-    for attempt in 0..6 {
+    for attempt in 0..2 {
         if attempt > 0 {
-            thread::sleep(AUTOMATION_POLL_INTERVAL);
+            thread::sleep(Duration::from_millis(400));
         }
-        if attempt % 3 == 2 {
-            // Fallback: focus via DOM, then drive the native CDP input pipeline.
-            let focused: bool = client.evaluate(&focus_script)?;
-            if focused {
-                client.clear_focused_editor()?;
-                client.insert_text(text)?;
-                thread::sleep(AUTOMATION_POLL_INTERVAL);
-                let current: Option<String> = client.evaluate(&text_script)?;
-                if current.as_deref() == Some(text.trim()) {
-                    return Ok(());
+        let focused: bool = client.evaluate(&focus_script)?;
+        if !focused {
+            last_state = "missing".to_string();
+            tracing::warn!(
+                "[OTP-FEISHU] text entry attempt {} -> editor not found (text len={})",
+                attempt,
+                text.chars().count()
+            );
+            continue;
+        }
+        // Settle so Slate finishes its focus handling before we inspect
+        // activeElement / dispatch trusted input. Prevents stale focus reads.
+        thread::sleep(Duration::from_millis(250));
+        // Reliable clear: Cmd/Ctrl+A then Backspace, repeated until empty
+        // (read-back verified). The old CDP `commands:["selectAll"]` path was
+        // unreliable on Slate and left residue that retries appended to —
+        // the root cause of the accumulated `zx智小智小智小智小安` text.
+        let mut cleared = false;
+        for _ in 0..8 {
+            client.select_all_and_backspace()?;
+            thread::sleep(Duration::from_millis(120));
+            let now: Option<String> = client.evaluate(&text_script)?;
+            match now.as_deref() {
+                Some(current) if current.trim().is_empty() => {
+                    cleared = true;
+                    break;
                 }
-                last_state = "cdp-mismatch".to_string();
-                continue;
+                _ => {}
             }
         }
-        let state: String = client.evaluate(&exec_script)?;
-        last_state = state.clone();
+        if !cleared {
+            last_state = "clear-failed".to_string();
+            tracing::warn!("[OTP-FEISHU] text entry attempt {} -> could not clear editor", attempt);
+            continue;
+        }
+        let active_ok: bool = client.evaluate(&active_ok_script).unwrap_or(false);
+        if !active_ok {
+            last_state = "focus-leak".to_string();
+            tracing::warn!(
+                "[OTP-FEISHU] text entry attempt {} -> activeElement not target editor; suppress typing",
+                attempt
+            );
+            continue;
+        }
+        for ch in text.chars() {
+            client.insert_text(&ch.to_string())?;
+            thread::sleep(Duration::from_millis(50));
+        }
+        thread::sleep(AUTOMATION_POLL_INTERVAL);
+        let current: Option<String> = client.evaluate(&text_script)?;
+        let state = match current.as_deref() {
+            Some(current) if current == expected => "ok",
+            Some(_) => "cdp-mismatch",
+            None => "missing",
+        };
         tracing::info!(
             "[OTP-FEISHU] text entry attempt {} -> {} (text len={})",
             attempt,
@@ -1271,6 +1278,7 @@ fn type_into_editor(
         if state == "ok" {
             return Ok(());
         }
+        last_state = state.to_string();
     }
     tracing::warn!(
         "[OTP-FEISHU] editor text entry failed after retries (state={last_state}, text len={})",
@@ -1278,7 +1286,6 @@ fn type_into_editor(
     );
     Err(AutomationFailure::dom(failure_reason))
 }
-
 fn unique_exact_bot_candidate(
     candidates: &[BotCandidate],
     bot_name: &str,
@@ -1297,48 +1304,49 @@ fn unique_exact_bot_candidate(
 }
 
 fn message_snapshots(client: &mut CdpClient) -> Result<Vec<MessageSnapshot>, AutomationFailure> {
+    // Bot replies render inside universal cards whose text does NOT appear
+    // under `.message-content` (verified against the live page: those wrappers
+    // read as empty strings, so replies were never matched). Fall back to the
+    // universal-card root, then the wrapper itself.
     client.evaluate(
         r#"(() => Array.from(document.querySelectorAll('.messageItem-wrapper[data-id]')).map(wrapper => ({
             id: wrapper.getAttribute('data-id') || '',
             is_self: !!wrapper.querySelector('.message-self'),
-            body: (wrapper.querySelector('.message-content')?.innerText || '').trim()
+            body: (() => {
+                const nodes = [
+                    wrapper.querySelector('.message-content'),
+                    wrapper.querySelector('.universal-card'),
+                    wrapper
+                ];
+                for (const node of nodes) {
+                    if (!node) continue;
+                    const text = (node.innerText || '').replace(/​/g, ' ').trim();
+                    if (text) return text;
+                }
+                return '';
+            })()
         })).filter(message => message.id))()"#,
     )
 }
 
-/// Build the ordered list of palette search keys: each trimmed, deduplicated,
-/// and falling back to the bot's own name when the caller gave no usable key.
-///
-/// The palette treats every entry as an alternative lookup key. A short pinyin
-/// key (e.g. "zxa") ranks the target bot ahead of look-alike entries such as
-/// `OTP-智小安` in tenants where Feishu indexes pinyin aliases, but that
-/// tenant-level index is not always enabled, so the full bot name is kept as
-/// a fallback that always resolves. Selection of the actual candidate still
-/// requires an exact `bot_name` match, so a fuzzy search can never divert the
-/// flow to the wrong bot.
+/// Build the palette search keys. Intentionally a single key: the bot's own
+/// name (智小安). Alias/pinyin keys such as "zxa" used to head a fallback
+/// chain, but the retried multi-key typing left residue in the Slate palette
+/// editor (`zx智小智小智小智小安`), so the chain was removed. Selection of the
+/// actual candidate still requires an exact `bot_name` match plus the robot
+/// badge, so the single-key search can never divert the flow to a wrong bot.
 fn build_search_keys(bot_name: &str, search_keys: &[String]) -> Vec<String> {
-    let mut keys: Vec<String> = Vec::new();
-    for key in search_keys {
-        let trimmed = key.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if keys.iter().any(|seen| seen == trimmed) {
-            continue;
-        }
-        keys.push(trimmed.to_string());
-    }
-    if keys.is_empty() {
-        keys.push(bot_name.trim().to_string());
-    }
-    keys
+    // Only ever search by the bot's own name (智小安). Alias keys such as "zxa"
+    // caused a degraded first attempt whose residue accumulated into the
+    // palette editor (zx智小智小智小智小安) across retries. The `search_keys`
+    // argument is kept for API compatibility but intentionally ignored.
+    let _ = search_keys;
+    vec![bot_name.trim().to_string()]
 }
 
-/// Per-key budget while polling for palette candidates. Feishu renders a
-/// skeleton for ~400 ms before results land, and 3 s comfortably covers the
-/// search round-trip; keeping the per-key budget short lets a failing alias
-/// (e.g. "zxa" in a tenant without pinyin index) yield quickly to the next
-/// key instead of burning the whole budget on the first attempt.
+/// Budget while polling for palette candidates after typing the single search
+/// key. Feishu renders a skeleton for ~400 ms before results land, and 3 s
+/// comfortably covers the search round-trip.
 const SEARCH_KEY_CANDIDATES_TIMEOUT: Duration = Duration::from_secs(3);
 
 fn automate_feishu_otp(
@@ -1470,6 +1478,9 @@ fn automate_feishu_otp(
             "未找到飞书搜索输入框。",
         )?;
         client.click(search_editor)?;
+        // Let the palette settle after the click so the editor actually owns
+        // focus before trusted text is dispatched.
+        thread::sleep(Duration::from_millis(300));
         type_into_editor(
             &mut client,
             &search_editor_finder(),
@@ -1542,7 +1553,7 @@ fn automate_feishu_otp(
             entry.click();
             return true;
         })()"#
-        .replace("__KEY__", &json_string(key));
+            .replace("__KEY__", &json_string(key));
         let clicked: bool = client.evaluate(&history_click_script).unwrap_or(false);
         if clicked {
             tracing::info!(
@@ -1561,11 +1572,16 @@ fn automate_feishu_otp(
         }
     }
 
-    let bot_point = bot_point.ok_or_else(|| {
-        AutomationFailure::dom("未找到名称完全匹配且标记为机器人的飞书联系人。")
-    })?;
-    client.click(bot_point)?;
-    tracing::info!("[OTP-FEISHU] bot result card clicked");
+    // The exact-match gate above has already validated this candidate (exact
+    // name + 机器人 badge + uniqueness, settled read-back). Open the
+    // conversation with Enter instead of clicking the card: live debugging
+    // showed the click only raises the bot's profile panel (the composer
+    // check then timed out with 未能确认名称和发送框均匹配目标机器人), while
+    // Enter on the highlighted candidate opens the chat directly.
+    let _bot_point = bot_point
+        .ok_or_else(|| AutomationFailure::dom("未找到名称完全匹配且标记为机器人的飞书联系人。"))?;
+    client.press_enter()?;
+    tracing::info!("[OTP-FEISHU] exact bot candidate confirmed; Enter pressed to open conversation");
 
     let expected_placeholder = format!("发送给 {bot_name}");
     let composer_deadline = Instant::now() + DOM_WAIT_TIMEOUT;
@@ -1814,35 +1830,22 @@ mod tests {
     }
 
     #[test]
-    fn search_keys_trim_dedupe_and_fall_back_to_bot_name() {
+    fn search_keys_always_resolve_to_only_the_bot_name() {
+        // Alias keys are intentionally ignored: the palette is searched only
+        // by the bot's own name, so multi-key retry can never accumulate
+        // residue like "zx智小智小智小智小安" in the editor.
         let keys = vec!["zxa".to_string(), "智小安".to_string()];
         assert_eq!(
             build_search_keys("智小安", &keys),
-            vec!["zxa".to_string(), "智小安".to_string()]
+            vec!["智小安".to_string()]
         );
 
-        // Whitespace is trimmed; duplicates are dropped; empties are skipped.
-        let keys = vec![
-            "  zxa  ".to_string(),
-            "zxa".to_string(),
-            "".to_string(),
-            "   ".to_string(),
-            "智小安".to_string(),
-        ];
-        assert_eq!(
-            build_search_keys("智小安", &keys),
-            vec!["zxa".to_string(), "智小安".to_string()]
-        );
-
-        // An empty list falls back to the bot name so the bot can still be
-        // found by its literal name.
         let empty: Vec<String> = Vec::new();
         assert_eq!(
             build_search_keys("智小安", &empty),
             vec!["智小安".to_string()]
         );
 
-        // All-empty entries also fall back.
         let keys = vec!["  ".to_string(), "".to_string()];
         assert_eq!(
             build_search_keys("智小安", &keys),

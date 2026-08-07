@@ -817,7 +817,9 @@ const OTP_INPUT_STYLE: &str = "width: 100%; box-sizing: border-box; padding: 6px
 
 fn render_otp_webhook_settings(
     mut setting: Signal<Option<OtpWebhookConfig>>,
+    mut enabled: Signal<bool>,
     on_save: EventHandler<Option<OtpWebhookConfig>>,
+    on_save_enabled: EventHandler<bool>,
 ) -> Element {
     let current = setting();
     let kind = match current {
@@ -892,6 +894,25 @@ fn render_otp_webhook_settings(
         p {
             style: "margin: 0 0 12px; color: var(--settings-text-muted); font-size: 12px; line-height: 1.5;",
             { crate::i18n::t("settings.otp_webhook_help") }
+        }
+
+        // Master switch — turns the whole automatic OTP pipeline on/off
+        // without touching the saved provider configuration.
+        div {
+            style: "display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 12px;",
+            label {
+                style: "font-size: 12px; color: var(--settings-text);",
+                { crate::i18n::t("settings.otp_webhook_enabled") }
+            }
+            input {
+                r#type: "checkbox",
+                checked: "{enabled()}",
+                style: "cursor: pointer;",
+                onchange: move |e| {
+                    enabled.set(e.checked());
+                    on_save_enabled.call(e.checked());
+                },
+            }
         }
 
         // Provider selector — `manual` maps to `None` on disk (the safe
@@ -1289,6 +1310,12 @@ pub fn SettingsDialog(
     /// Fires with the new OTP webhook config when the user clicks Save.
     #[props(default)]
     on_save_otp_webhook: EventHandler<Option<OtpWebhookConfig>>,
+    /// Current OTP auto-fetch master switch (from settings.json).
+    #[props(default = true)]
+    otp_webhook_enabled: bool,
+    /// Fires with the new master-switch state when the user clicks Save.
+    #[props(default)]
+    on_save_otp_webhook_enabled: EventHandler<bool>,
     /// Hardware warning text for the local AI toggle (empty if OK).
     #[props(default)]
     qwen_local_warning: String,
@@ -1320,6 +1347,7 @@ pub fn SettingsDialog(
     let mut qwen_local = use_signal(|| qwen_local_settings.clone());
     // OTP webhook draft — edited locally, committed on Save.
     let mut otp_webhook_setting = use_signal(|| otp_webhook.clone());
+    let otp_webhook_enabled_setting = use_signal(|| otp_webhook_enabled);
     let mut model_download_state = use_signal(|| initial_model_download_state);
     let model_download_task = use_signal(|| None::<(String, String)>);
     // Custom-model form state (collapsible "Add custom model" section).
@@ -1841,7 +1869,7 @@ pub fn SettingsDialog(
                 }
 
                 // ── OTP / MFA webhook (JumpServer 二次认证) ──────────────
-                { render_otp_webhook_settings(otp_webhook_setting, on_save_otp_webhook) }
+                { render_otp_webhook_settings(otp_webhook_setting, otp_webhook_enabled_setting, on_save_otp_webhook, on_save_otp_webhook_enabled) }
 
                 // ── Local AI template generation ───────────────────────
                 h3 {
@@ -2269,6 +2297,7 @@ pub fn SettingsDialog(
                                 on_save_usage_habits.call(usage_habits());
                                 on_save_qwen_local.call(qwen_local());
                                 on_save_otp_webhook.call(otp_webhook_setting());
+                                on_save_otp_webhook_enabled.call(otp_webhook_enabled_setting());
                             },
                             { crate::i18n::t("common.save") }
                         }

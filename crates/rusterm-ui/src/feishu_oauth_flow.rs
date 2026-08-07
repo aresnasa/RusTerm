@@ -83,7 +83,10 @@ pub fn otp_prompt_blocks_password_automation(line: &str) -> bool {
 /// The FeishuUser OTP configuration, if that provider is active. Everything
 /// needed to start the OAuth flow or the bot round-trip (never logged).
 pub fn feishu_user_cfg(state: &AppState) -> Option<FeishuUserCfgView> {
-    let cfg = state.config_manager.as_ref()?.load_otp_webhook()?;
+    // Master switch: when OTP auto-fetch is disabled, every Feishu path
+    // (pre-auth, browser round-trip, prompt detection) stands down — the
+    // OTP prompt falls back to manual entry via the OneKey popup.
+    let cfg = state.config_manager.as_ref()?.load_active_otp_webhook()?;
     match cfg {
         OtpWebhookConfig::FeishuUser {
             app_id,

@@ -276,6 +276,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            otp_webhook_enabled: existing.otp_webhook_enabled,
             feishu_user_token: existing.feishu_user_token.clone(),
             chat: existing.chat.clone(),
         };
@@ -317,6 +318,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            otp_webhook_enabled: existing.otp_webhook_enabled,
             feishu_user_token: existing.feishu_user_token.clone(),
             chat: existing.chat.clone(),
         };
@@ -366,6 +368,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            otp_webhook_enabled: existing.otp_webhook_enabled,
             feishu_user_token: existing.feishu_user_token.clone(),
             chat: existing.chat.clone(),
         };
@@ -412,6 +415,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            otp_webhook_enabled: existing.otp_webhook_enabled,
             feishu_user_token: existing.feishu_user_token.clone(),
             chat: existing.chat.clone(),
         };
@@ -455,6 +459,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            otp_webhook_enabled: existing.otp_webhook_enabled,
             feishu_user_token: existing.feishu_user_token.clone(),
             chat: existing.chat.clone(),
         };
@@ -498,6 +503,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            otp_webhook_enabled: existing.otp_webhook_enabled,
             feishu_user_token: existing.feishu_user_token.clone(),
             chat: existing.chat.clone(),
         };
@@ -549,6 +555,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            otp_webhook_enabled: existing.otp_webhook_enabled,
             feishu_user_token: existing.feishu_user_token.clone(),
             chat: existing.chat.clone(),
         };
@@ -598,6 +605,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            otp_webhook_enabled: existing.otp_webhook_enabled,
             feishu_user_token: existing.feishu_user_token.clone(),
             chat: existing.chat.clone(),
         };
@@ -644,6 +652,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            otp_webhook_enabled: existing.otp_webhook_enabled,
             feishu_user_token: existing.feishu_user_token.clone(),
             chat: existing.chat.clone(),
         };
@@ -689,6 +698,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            otp_webhook_enabled: existing.otp_webhook_enabled,
             feishu_user_token: existing.feishu_user_token.clone(),
             chat: existing.chat.clone(),
         };
@@ -734,6 +744,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            otp_webhook_enabled: existing.otp_webhook_enabled,
             feishu_user_token: existing.feishu_user_token.clone(),
             chat: existing.chat.clone(),
         };
@@ -777,6 +788,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            otp_webhook_enabled: existing.otp_webhook_enabled,
             feishu_user_token: existing.feishu_user_token.clone(),
             chat: existing.chat.clone(),
         };
@@ -862,6 +874,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            otp_webhook_enabled: existing.otp_webhook_enabled,
             feishu_user_token: existing.feishu_user_token.clone(),
             chat: existing.chat.clone(),
         };
@@ -900,6 +913,7 @@ impl ConfigManager {
             qwen_local: Default::default(),
             suggestion_popup_offset_y: 0.0,
             otp_webhook: None,
+            otp_webhook_enabled: true,
             chat: ChatSettings::default().normalized(),
             feishu_user_token: None,
         };
@@ -960,6 +974,7 @@ impl ConfigManager {
             qwen_local: existing.qwen_local.clone(),
             suggestion_popup_offset_y: existing.suggestion_popup_offset_y,
             otp_webhook: existing.otp_webhook.clone(),
+            otp_webhook_enabled: existing.otp_webhook_enabled,
             feishu_user_token: existing.feishu_user_token.clone(),
             chat: existing.chat.clone(),
         };
@@ -1096,6 +1111,42 @@ impl ConfigManager {
         fs::write(&temp_path, &json).context("Failed to write config file")?;
         fs::rename(&temp_path, &self.config_path).context("Failed to rename temp config file")?;
         Ok(())
+    }
+
+    /// Load the OTP auto-fetch master switch. `true` (the default, also
+    /// for legacy settings files) means the configured provider is active;
+    /// `false` means every automatic OTP path stands down.
+    pub fn load_otp_webhook_enabled(&self) -> bool {
+        self.read_persisted().otp_webhook_enabled
+    }
+
+    /// Persist the OTP auto-fetch master switch without touching the
+    /// provider configuration.
+    pub fn save_otp_webhook_enabled(&self, enabled: bool) -> Result<()> {
+        let mut persisted = self.read_persisted_for_update()?;
+        persisted.version = CONFIG_VERSION;
+        persisted.master_password_hash = self.master_password_hash.clone();
+        persisted.otp_webhook_enabled = enabled;
+        let json =
+            serde_json::to_string_pretty(&persisted).context("Failed to serialize config")?;
+        let temp_path = self.config_path.with_extension("json.tmp");
+        fs::write(&temp_path, &json).context("Failed to write config file")?;
+        fs::rename(&temp_path, &self.config_path).context("Failed to rename temp config file")?;
+        Ok(())
+    }
+
+    /// Load the OTP webhook provider only when the master switch is ON.
+    /// This is the accessor every runtime path (SSH auth, Feishu browser
+    /// OTP round-trip) must use; [`Self::load_otp_webhook`] stays raw so
+    /// the settings dialog can still display/edit the saved provider
+    /// while the feature is switched off.
+    pub fn load_active_otp_webhook(&self) -> Option<OtpWebhookConfig> {
+        let persisted = self.read_persisted();
+        if persisted.otp_webhook_enabled {
+            persisted.otp_webhook
+        } else {
+            None
+        }
     }
 
     /// Load the cached Feishu user token for the

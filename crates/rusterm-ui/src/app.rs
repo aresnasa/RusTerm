@@ -105,6 +105,14 @@ impl OAuthSink for FeishuOAuthChannelSink {
 /// a supported local browser and reuse its dedicated profile on later
 /// connections.
 fn start_feishu_auth_session(state: &mut Signal<AppState>, session: Option<String>) {
+    // TODO(feishu-otp-shield): 临时屏蔽飞书 OTP/登录自动化入口。等 macOS "关于本机"
+    // 弹窗根因查清、并且 `otp_webhook_enabled` 开关在 release binary 中确认生效后,
+    // 再按一个干净的、显式的开关把这层 logic 放回来。目前任何路径都不应进入飞书侧。
+    let _ = (state, session);
+    tracing::warn!("[OTP-FEISHU][shielded] start_feishu_auth_session blocked (feishu-otp-shield)");
+    return;
+
+    #[allow(unreachable_code)]
     let cfg = {
         let snapshot = state.read();
         feishu_user_cfg(&snapshot)
@@ -153,6 +161,15 @@ fn start_feishu_auth_session(state: &mut Signal<AppState>, session: Option<Strin
 /// the browser-session flow opens Feishu Web once; an authenticated dedicated
 /// Chrome/Edge profile is reused without another QR scan.
 fn maybe_preauth_feishu_at_connect(mut state: Signal<AppState>, session_id: &str) {
+    // TODO(feishu-otp-shield): 临时屏蔽 SSH 连接前的飞书预认证。与
+    // start_feishu_auth_session 同一 shield,等根因查清再放回。
+    let _ = (&mut state, session_id);
+    tracing::warn!(
+        "[OTP-FEISHU][shielded] maybe_preauth_feishu_at_connect blocked (feishu-otp-shield)"
+    );
+    return;
+
+    #[allow(unreachable_code)]
     let cfg = {
         let snapshot = state.read();
         feishu_user_cfg(&snapshot)
@@ -242,12 +259,11 @@ async fn handle_feishu_oauth_event(state: &mut Signal<AppState>, event: FeishuOA
 /// failed attempt falls back to the OneKey popup (attempts are capped).
 const FEISHU_WEB_OTP_BOT_NAME: &str = "智小安";
 
-/// Palette search keys for the OTP bot, tried in order. The short pinyin key
-/// ranks 智小安 ahead of look-alikes such as `OTP-智小安` in tenants where
-/// Feishu indexes pinyin aliases; the full name is kept as a last-resort
-/// fallback that always resolves, regardless of the tenant's pinyin index.
+/// Palette search key for the OTP bot. Only the bot's own name is ever typed:
+/// the old pinyin alias ("zxa") head-of-chain caused retried typing to
+/// accumulate residue in the Slate palette editor (`zx智小智小智小智小安`).
 /// The exact `FEISHU_WEB_OTP_BOT_NAME` match still gates candidate selection.
-const FEISHU_WEB_OTP_BOT_SEARCH_KEYS: &[&str] = &["zxa", "智小安"];
+const FEISHU_WEB_OTP_BOT_SEARCH_KEYS: &[&str] = &["智小安"];
 
 /// Grace window for the tty OTP prompt to (re)appear after the browser
 /// automation says it is ready to send: the backend only waits 3 s, so the UI
@@ -344,6 +360,13 @@ fn queue_feishu_otp_if_prompt_visible(
 }
 
 async fn trigger_feishu_otp_fetch(state: &mut Signal<AppState>, session: &str) {
+    // TODO(feishu-otp-shield): 临时屏蔽「从智小安/飞书 web 抓 OTP」全流程。
+    // 根因排查期间任何路径都不能再触发 request_feishu_otp / TtyFillPlan::Fetch。
+    let _ = (state, session);
+    tracing::warn!("[OTP-FEISHU][shielded] trigger_feishu_otp_fetch blocked (feishu-otp-shield)");
+    return;
+
+    #[allow(unreachable_code)]
     let browser_plan = {
         let snapshot = state.read();
         let cfg = feishu_user_cfg(&snapshot);
@@ -2015,7 +2038,7 @@ fn render_workspace_dock_panel(
                         .find(|connection| connection.id == id)
                         .cloned();
                     if let Some(connection) = connection {
-                        open_connection(state, input_senders, connection, None);
+                        open_connection(state, input_senders, connection, None, None);
                     }
                 },
                 on_new: move |_| {
@@ -4863,7 +4886,7 @@ fn single_pane_with_drop(
                     });
                     // Use the same preserve-and-grow plan as the primary manual
                     // drag path. At MAX_PANES, `None` opens a separate tab.
-                    open_connection(state, input_senders, conn, target);
+                    open_connection(state, input_senders, conn, target, None);
                     return;
                 }
                 tracing::debug!("[DROP-SINGLE] received drop with no recognized MIME type");
@@ -6144,6 +6167,7 @@ fn clone_session_into_pane(
             layout_owner_tab_id: layout_owner_tab_id.to_string(),
             pane_idx: target_pane_idx,
         }),
+        None,
     );
     let assignment_verified = result.assigned_to_target
         && result.session_id != source_session_id
@@ -6601,7 +6625,7 @@ pub(crate) fn finish_tab_drag(
                     replaced_session,
                     target_idx
                 );
-                let result = open_connection(state, input_senders, conn, target);
+                let result = open_connection(state, input_senders, conn, target, None);
                 if result.assigned_to_target {
                     tracing::info!(
                         "[TAB-DRAG] connection {} assigned to pane {}",
@@ -7643,7 +7667,7 @@ fn multi_pane_container(
                                 layout_owner_tab_id: plan.layout_owner_tab_id,
                                 pane_idx: plan.pane_idx,
                             });
-                            open_connection(state, input_senders, conn, target);
+                            open_connection(state, input_senders, conn, target, None);
                             return;
                         }
                         // Unknown MIME type — log and ignore.
@@ -12259,11 +12283,22 @@ fn start_ssh_connection(
     mut input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
     tab_id: String,
     ssh_config: SshConfig,
+    // `Some(source)` turns this session into a CHANNEL CLONE of an
+    // already-authenticated transport (`source.clone_channel`): no new TCP
+    // connection, SSH handshake, login, or OTP prompt. Used by the
+    // copy-session fast path so duplicating a JumpServer/koko tab does not
+    // demand a second verification code. `None` keeps the classic fresh
+    // connect.
+    channel_clone_source: Option<rusterm_ssh::SshSession>,
 ) {
     // This is the single entry point for every SSH session (saved connection,
     // reconnect/restore, and newly-created connection). Start Feishu auth here,
     // before the SSH coroutine can reach JumpServer's `2nd Password:` prompt.
-    maybe_preauth_feishu_at_connect(state, &tab_id);
+    // A channel clone performs NO authentication at all, so it must skip the
+    // Feishu pre-auth/browser round-trip entirely.
+    if channel_clone_source.is_none() {
+        maybe_preauth_feishu_at_connect(state, &tab_id);
+    }
 
     spawn(async move {
         // Try to get measured container size, but don't block too long
@@ -12314,24 +12349,55 @@ fn start_ssh_connection(
         // When no provider is configured (or it's `Manual`), this falls back
         // to `OtpProvider::Manual` and OTP prompts are surfaced to the user
         // through the existing OneKey credential popup for manual entry.
-        let otp_provider = {
-            let cfg = state
-                .read()
-                .config_manager
-                .as_ref()
-                .and_then(|cm| cm.load_otp_webhook());
-            rusterm_ssh::OtpProvider::from_config(cfg.as_ref())
-        };
-        let client = rusterm_ssh::SshClient::new(ssh_config, event_tx.clone())
-            .with_otp_provider(otp_provider);
-
         // Cap the entire connect attempt (TCP + SSH handshake + auth + PTY
         // request) so a server that accepts TCP but never completes the
         // handshake/auth can't hang the session in `Reconnecting` forever.
         // See [`SSH_CONNECT_TIMEOUT_SECS`] for the rationale.
+        //
+        // Channel clones skip TCP/handshake/auth (and thus any OTP or
+        // webhook work) — they only open a new shell channel on the source
+        // session's live transport, so the timeout mostly guards against a
+        // wedged bastion.
+        let terminal_type = ssh_config.terminal_type.clone();
+        // Dedicated clones for the connect closure so `tab_id`/`event_tx`
+        // stay usable by the post-connect handler below.
+        let tab_id_conn = tab_id.clone();
+        let event_tx_conn = event_tx.clone();
         let connect_result = tokio::time::timeout(
             std::time::Duration::from_secs(SSH_CONNECT_TIMEOUT_SECS),
-            client.connect(tab_id.clone(), initial_size),
+            async move {
+                match channel_clone_source {
+                    Some(source) => {
+                        tracing::info!(
+                            "[COPY-SESSION] cloning SSH channel from session {} for {}",
+                            &source.session_id()[..source.session_id().len().min(8)],
+                            &tab_id_conn[..tab_id_conn.len().min(8)]
+                        );
+                        source
+                            .clone_channel(
+                                event_tx_conn,
+                                tab_id_conn,
+                                initial_size,
+                                terminal_type.as_str(),
+                            )
+                            .await
+                    }
+                    None => {
+                        let otp_provider = {
+                            let cfg = state
+                                .read()
+                                .config_manager
+                                .as_ref()
+                                .and_then(|cm| cm.load_active_otp_webhook());
+                            rusterm_ssh::OtpProvider::from_config(cfg.as_ref())
+                        };
+                        rusterm_ssh::SshClient::new(ssh_config, event_tx_conn)
+                            .with_otp_provider(otp_provider)
+                            .connect(tab_id_conn, initial_size)
+                            .await
+                    }
+                }
+            },
         )
         .await;
         let connect_result = match connect_result {
@@ -15326,6 +15392,12 @@ fn restore_sessions(
 ) {
     let saved_active = to_restore.active_session.clone();
     let connections: Vec<ConnectionConfig> = state.read().connections.clone();
+    // 0.17 OTP-reuse grouping: resolved-connection id → tab id of the FIRST
+    // restored SSH session of that connection. Later restores of the same
+    // connection clone a channel from that session's authenticated transport
+    // instead of demanding a second JumpServer OTP. See
+    // `decide_restore_open` / `wait_for_restore_clone_source`.
+    let mut restore_first_ssh_tabs: HashMap<String, String> = HashMap::new();
 
     for ps in &to_restore.sessions {
         match ps.kind {
@@ -15410,143 +15482,61 @@ fn restore_sessions(
                 let conn = find_restore_connection(&connections, ps);
                 if let Some(conn) = conn {
                     let conn_for_replay = conn.clone();
-                    open_connection(state.clone(), input_senders.clone(), conn, None);
-                    // Find the tab we just created (it's the last one pushed).
-                    let tab_id = state
-                        .read()
-                        .sessions
-                        .last()
-                        .map(|t| t.id.clone())
-                        .unwrap_or_default();
-                    if !tab_id.is_empty() {
-                        // Apply the persisted terminal size so the SSH session
-                        // opens with the correct PTY winsize from the start.
-                        if let Some(ts) = ps.terminal_size.as_ref() {
-                            let terminals = state.read().terminals.clone();
-                            if let Some(handle) = terminals.get(&tab_id) {
-                                let mut entry = handle.lock();
-                                entry.terminal.resize(
-                                    ts.cols,
-                                    ts.rows,
-                                    ts.pixel_width,
-                                    ts.pixel_height,
+                    // 0.17 OTP-reuse: several restored sessions against the
+                    // same saved SSH connection share ONE authentication. The
+                    // first opens fresh (its OTP covers the group); later
+                    // ones defer via a channel clone from its live transport.
+                    match decide_restore_open(&restore_first_ssh_tabs, &conn) {
+                        RestoreOpenDecision::CloneFrom { first_tab_id } => {
+                            let mut st = state;
+                            let senders = input_senders;
+                            let conn_clone = conn.clone();
+                            let conn_name = conn.name.clone();
+                            let ps_name = ps.name.clone();
+                            let ps_for_restore = ps.clone();
+                            tracing::info!(
+                                "[RESTORE-CLONE] session {:?} defers to the first {:?} session — waiting for its authentication before cloning a channel",
+                                ps_name,
+                                conn_name
+                            );
+                            spawn(async move {
+                                let clone_source = wait_for_restore_clone_source(
+                                    st,
+                                    &first_tab_id,
+                                    &conn_name,
+                                )
+                                .await;
+                                let opened = open_connection(
+                                    st,
+                                    senders,
+                                    conn_clone.clone(),
+                                    None,
+                                    clone_source,
                                 );
-                            }
-                        }
-                    }
-                    // Establishment ops to replay: the session's OWN DuckDB
-                    // replay-event stream (keyed by the persisted tab id)
-                    // wins over the bincode snapshot when it has data — each
-                    // event row is written as the input happens, so the fold
-                    // can't lose the final ops to the snapshot's save
-                    // debounce (and it survives crashes for the same
-                    // reason). Streams are strictly per-session: several
-                    // jumpserver windows restored from the same saved
-                    // connection each fold only their own navigation, so
-                    // concurrent restores can't cross-contaminate. Without
-                    // the `analytics` feature the fold is always empty and
-                    // the snapshot ops are used as before.
-                    let restore_replay_ops = {
-                        let analytics = state.read().analytics.clone();
-                        match analytics.latest_replay_ops(&ps.id) {
-                            Ok(ops) if !ops.is_empty() => {
-                                tracing::info!(
-                                    "[REPLAY] restored session {} using {} op(s) from its per-session replay stream (was {})",
-                                    &tab_id[..tab_id.len().min(8)],
-                                    ops.len(),
-                                    &ps.id[..ps.id.len().min(8)],
+                                finish_restored_session(
+                                    st,
+                                    senders,
+                                    &ps_for_restore,
+                                    &conn_for_replay,
+                                    opened.session_id,
                                 );
-                                ops
-                            }
-                            Ok(_) => ps.replay_ops.clone(),
-                            Err(e) => {
-                                tracing::warn!(
-                                    "[REPLAY] failed to read replay-event log — falling back to snapshot ops: {e}"
-                                );
-                                ps.replay_ops.clone()
-                            }
+                            });
                         }
-                    };
-                    // Re-home the stream onto the freshly minted tab id so
-                    // the next snapshot/restart finds it, and drop the old
-                    // stream (its id is now unreferenced).
-                    if !restore_replay_ops.is_empty() && !tab_id.is_empty() {
-                        migrate_replay_stream(
-                            state.read().analytics.clone(),
-                            ps.id.clone(),
-                            tab_id.clone(),
-                            restore_replay_ops.clone(),
-                        );
-                    }
-                    if !tab_id.is_empty() {
-                        // Pre-seed command history tail so suggestions work.
-                        let mut s = state.write();
-                        if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == tab_id) {
-                            tab.command_history = ps.command_history_tail.clone();
-                        }
-                        // Re-seed the interactive-replay recorder so future
-                        // reconnects of the restored session replay the same
-                        // establishment ops.
-                        if !restore_replay_ops.is_empty() {
-                            s.session_replays.insert(
-                                tab_id.clone(),
-                                crate::state::SessionReplayRecorder {
-                                    ops: restore_replay_ops.clone(),
-                                    shell_integrated: false,
-                                },
+                        RestoreOpenDecision::Fresh => {
+                            let opened =
+                                open_connection(state, input_senders, conn.clone(), None, None);
+                            if matches!(conn.kind, ConnectionKind::Ssh(_)) {
+                                restore_first_ssh_tabs
+                                    .insert(conn.id.clone(), opened.session_id.clone());
+                            }
+                            finish_restored_session(
+                                state,
+                                input_senders,
+                                ps,
+                                &conn_for_replay,
+                                opened.session_id,
                             );
                         }
-                    }
-                    // Establishment on restore, in priority order:
-                    // 1. Recorded interactive ops (jumpserver menu
-                    //    navigation) are replayed — they hold the user's
-                    //    *last* selection, overriding a pure-navigation
-                    //    login script (which is suppressed so the two never
-                    //    double-drive the menu). If the snapshot also has a
-                    //    cwd (integrated target shell), a follow-up `cd`
-                    //    lands the user back in their directory.
-                    // 2. Otherwise a configured login script owns the whole
-                    //    flow — always when it carries credentials
-                    //    (send_onekey), or when nothing was recorded. It
-                    //    re-runs on the fresh connection (driven from the
-                    //    session output loop), so no blind `cd` may type
-                    //    into the bastion menu on top of it.
-                    // 3. Plain integrated shells restore via `cd` alone.
-                    let has_login_script = conn_for_replay
-                        .login_script
-                        .as_deref()
-                        .is_some_and(|s| !s.trim().is_empty());
-                    if should_schedule_replay(
-                        conn_for_replay.login_script.as_deref(),
-                        &restore_replay_ops,
-                    ) {
-                        if has_login_script {
-                            suppress_login_script(&mut state.write(), &tab_id);
-                        }
-                        tracing::info!(
-                            "[REPLAY] restored session {} scheduling {} recorded op(s)",
-                            &tab_id[..tab_id.len().min(8)],
-                            restore_replay_ops.len()
-                        );
-                        schedule_replay_after_reconnect(
-                            state.clone(),
-                            input_senders.clone(),
-                            tab_id.clone(),
-                            restore_replay_ops,
-                            ps.cwd.clone(),
-                        );
-                    } else if has_login_script {
-                        tracing::info!(
-                            "[RESTORE] session {} has a login script — it owns establishment, skipping cd/replay",
-                            &tab_id[..tab_id.len().min(8)]
-                        );
-                    } else if let Some(cwd) = &ps.cwd {
-                        schedule_cd_after_restore(
-                            state.clone(),
-                            input_senders.clone(),
-                            tab_id,
-                            cwd.clone(),
-                        );
                     }
                 } else {
                     tracing::warn!(
@@ -15557,6 +15547,7 @@ fn restore_sessions(
                     );
                 }
             }
+            SessionType::Serial => {
             SessionType::Serial => {
                 // Serial sessions don't have a cwd to restore (no shell
                 // integration), and reconnecting to a serial port requires
@@ -16146,6 +16137,10 @@ fn open_connection(
     input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
     conn: ConnectionConfig,
     target: Option<PaneTarget>,
+    // When `Some` (SSH only), the new session clones its interactive
+    // channel from this already-authenticated transport instead of opening
+    // a fresh TCP+SSH+auth round-trip — see `start_ssh_connection`.
+    channel_clone_source: Option<rusterm_ssh::SshSession>,
 ) -> OpenConnectionResult {
     let tab_id = uuid::Uuid::new_v4().to_string();
     create_terminal(tab_id.clone(), &mut state);
@@ -16181,7 +16176,13 @@ fn open_connection(
                 last_command_status: CommandStatus::default(),
             });
             let assigned = assign_opened_session(&mut state.write(), target.as_ref(), &tab_id);
-            start_ssh_connection(state, input_senders, tab_id.clone(), ssh_config.clone());
+            start_ssh_connection(
+                state,
+                input_senders,
+                tab_id.clone(),
+                ssh_config.clone(),
+                channel_clone_source,
+            );
             assigned
         }
         ConnectionKind::Shell(shell_config) => {
@@ -17111,6 +17112,22 @@ fn schedule_replay_after_reconnect(
                     .map(|handle| handle.lock().terminal.extract_current_line())
                     .unwrap_or_default()
             };
+            // Regex-style state probe: when the cursor line already shows a
+            // shell prompt, the bastion landed this (cloned/reconnected)
+            // session straight on a target node — the recorded menu steps
+            // leading there are redundant, so skip this op instead of
+            // typing it into the shell. Context commands (`sudo -i`, …) are
+            // exempt and still replay (see `replay_op_already_satisfied`).
+            if crate::state::replay_op_already_satisfied(&current_line, &op) {
+                tracing::info!(
+                    "[REPLAY] session {} already at a shell prompt — skipping menu op {}/{}: {:?}",
+                    &tab_id[..tab_id.len().min(8)],
+                    idx + 1,
+                    total,
+                    op
+                );
+                continue;
+            }
             if credential_kind(&current_line).is_some() {
                 tracing::info!(
                     "[REPLAY] session {} hit a credential prompt before op {}/{} — waiting for resolution (OneKey / manual)",
@@ -17373,7 +17390,7 @@ fn reconnect_session(
     let wd_tab_id = tab_id.clone();
     match conn.kind {
         ConnectionKind::Ssh(ssh_config) => {
-            start_ssh_connection(state, input_senders, tab_id, ssh_config);
+            start_ssh_connection(state, input_senders, tab_id, ssh_config, None);
         }
         ConnectionKind::Shell(shell_config) => {
             start_shell_connection(state, input_senders, tab_id, shell_config);
@@ -19269,6 +19286,27 @@ pub fn App() -> Element {
                     // same context, not just on the bastion menu.
                     on_copy_session: move |sid: String| {
                         let conn = state.read().session_configs.get(&sid).cloned();
+                        // Fast path: when the source tab is a LIVE SSH session,
+                        // clone its interactive channel onto a new tab on the
+                        // same authenticated transport instead of opening a new
+                        // TCP connection. A bastion (JumpServer/koko) then drops
+                        // the copy straight at its main menu — no second login
+                        // and no second `2nd Password:` OTP prompt — and the
+                        // recorded establishment ops below replay the menu
+                        // navigation so the copy lands on the same target host.
+                        let channel_clone_source = if matches!(
+                            conn.as_ref().map(|c| &c.kind),
+                            Some(ConnectionKind::Ssh(_))
+                        ) {
+                            state
+                                .read()
+                                .ssh_sessions
+                                .get(&sid)
+                                .filter(|s| !s.is_disconnected())
+                                .cloned()
+                        } else {
+                            None
+                        };
                         if let Some(conn) = conn {
                             let mut new_conn = conn.clone();
                             new_conn.name = crate::i18n::tf(
@@ -19284,7 +19322,13 @@ pub fn App() -> Element {
                                 .iter()
                                 .find(|t| t.id == sid)
                                 .and_then(|t| t.cwd.clone());
-                            let opened = open_connection(state, input_senders, new_conn, None);
+                            let opened = open_connection(
+                                state,
+                                input_senders,
+                                new_conn,
+                                None,
+                                channel_clone_source,
+                            );
                             let new_sid = opened.session_id;
                             // Task 127: 副本支持就近复制 — open_connection
                             // appends the copy at the far right; move its tab
@@ -20032,6 +20076,9 @@ pub fn App() -> Element {
                     .unwrap_or_default(),
                 otp_webhook: state.read().config_manager.as_ref()
                     .and_then(|cm| cm.load_otp_webhook()),
+                otp_webhook_enabled: state.read().config_manager.as_ref()
+                    .map(|cm| cm.load_otp_webhook_enabled())
+                    .unwrap_or(true),
                 qwen_local_warning: {
                     #[cfg(feature = "qwen-local")]
                     {
@@ -20209,6 +20256,14 @@ pub fn App() -> Element {
                         cfg.as_ref().map(std::mem::discriminant)
                     );
                 },
+                on_save_otp_webhook_enabled: move |enabled: bool| {
+                    if let Some(cm) = state.read().config_manager.clone() {
+                        if let Err(e) = cm.save_otp_webhook_enabled(enabled) {
+                            tracing::error!("Failed to save OTP webhook enabled flag: {}", e);
+                        }
+                    }
+                    tracing::info!("[OTP] auto-fetch master switch set to {enabled}");
+                },
             }
         }
 
@@ -20303,7 +20358,7 @@ pub fn App() -> Element {
                 // Each `start_*_connection` fn owns its own I/O lifecycle.
                 match &kind {
                     ConnectionKind::Ssh(ssh_config) => {
-                        start_ssh_connection(state, input_senders, config.id, ssh_config.clone());
+                        start_ssh_connection(state, input_senders, config.id, ssh_config.clone(), None);
                     }
                     ConnectionKind::Telnet(telnet_config) => {
                         start_telnet_connection(state, input_senders, config.id, telnet_config.clone());

@@ -1604,6 +1604,13 @@ pub struct CustomApiTemplate {
     pub body: String,
 }
 
+/// Backward-compat default for the OTP auto-fetch master switch: legacy
+/// settings files predate the flag and must keep their configured provider
+/// active, so the default is ON.
+fn default_otp_webhook_enabled() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedConfig {
     pub version: u32,
@@ -1701,6 +1708,19 @@ pub struct PersistedConfig {
     /// to manual entry through the existing OneKey / credential prompt UI.
     #[serde(default)]
     pub otp_webhook: Option<OtpWebhookConfig>,
+
+    /// Master switch for the whole automatic-OTP pipeline. When `false`,
+    /// every automatic provider (Feishu browser round-trip, Feishu Open-API
+    /// bot read, generic HTTP webhook) stands down — no browser is launched
+    /// and no webhook is called — and OTP prompts fall back to manual entry
+    /// through the OneKey popup. The provider configuration in
+    /// `otp_webhook` is preserved untouched so the feature can be toggled
+    /// back on without re-entering anything.
+    ///
+    /// Default `true` so legacy settings files (which lack this field) keep
+    /// their previously-configured provider active.
+    #[serde(default = "default_otp_webhook_enabled")]
+    pub otp_webhook_enabled: bool,
 
     /// Floating agent chat box (issue #122): configurable agents, drag
     /// position, and last visibility. Legacy settings files omit this field
@@ -2914,6 +2934,7 @@ mod tests {
             qwen_local: QwenLocalSettings::default(),
             suggestion_popup_offset_y: -38.5,
             otp_webhook: None,
+            otp_webhook_enabled: true,
             chat: ChatSettings::default(),
             feishu_user_token: None,
         };
@@ -2952,6 +2973,24 @@ mod tests {
     }
 
     #[test]
+    #[test]
+    fn otp_webhook_enabled_defaults_on_for_legacy_settings() {
+        // A legacy settings.json that predates the master switch must
+        // deserialize with auto-fetch ENABLED (backward compatible).
+        let config: PersistedConfig =
+            serde_json::from_str(r#"{"version":1,"connections":[]}"#).unwrap();
+        assert!(config.otp_webhook_enabled);
+
+        // And an explicit false must round-trip.
+        let json = serde_json::to_string(&PersistedConfig {
+            otp_webhook_enabled: false,
+            ..config
+        })
+        .unwrap();
+        let parsed: PersistedConfig = serde_json::from_str(&json).unwrap();
+        assert!(!parsed.otp_webhook_enabled);
+    }
+
     fn api_custom_templates_default_empty_for_legacy_settings_and_roundtrip() {
         // A legacy settings.json that predates custom API templates must
         // deserialize with an empty list.
