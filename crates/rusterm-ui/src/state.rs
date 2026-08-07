@@ -313,6 +313,11 @@ pub struct AppState {
     /// while preserving the same session id and pane assignment.
     #[serde(skip)]
     pub session_connection_states: HashMap<String, SessionConnectionState>,
+    /// OTP 组级状态机的登记表（按 conn.id 分组）。JumpServer 共凭据的多个
+    /// tab 恢复时，组内只需一台 fresh connect + OTP，其余复用其 transport。
+    /// 见 [`OtpGroupRegistry`] 的说明。运行时状态，不持久化。
+    #[serde(skip)]
+    pub otp_groups: OtpGroupRegistry,
     /// Explicit target selection for the docked Send panel. `None` preserves
     /// the legacy initial behavior (focused pane / active tab); after the user
     /// changes the selection, `Some` keeps that choice stable across renders.
@@ -1200,6 +1205,7 @@ impl Default for AppState {
             onekey_skip_logged: HashSet::new(),
             session_configs: HashMap::new(),
             session_connection_states: HashMap::new(),
+            otp_groups: OtpGroupRegistry::default(),
             send_target_selection: None,
             ssh_sessions: HashMap::new(),
             sftp_clients: HashMap::new(),
@@ -8984,6 +8990,192 @@ pub fn replayable_ops(state: &AppState, session_id: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
+// ============================== OTP 组级状态机 ==============================
+
+/// JumpServer 共凭据组恢复时的 leader 心跳上限：leader watcher 每个 poll
+/// 周期都会盖章。超过该间隔未盖章即视为 leader 任务已死（panic / runtime
+/// 异常未走到错误处理），组内下一台可接棒。
+pub const OTP_GROUP_LEADER_DEAD_MS: i64 = 30_000;
+
+/// JumpServer 共凭据组（同一 `conn.id` 的多个 tab）的恢复协调登记表。
+///
+/// 状态机：
+/// 1. 组内任一成员 OTP 完成并落地（settle，提示符稳定）→ 其余成员（包括
+///    已 Failed / Disconnected 的）轮询发现后 clone 其 transport 复活；
+/// 2. 组内无 settle 成员时推举 leader：优先现任 leader（心跳有效）；否则
+///    按恢复顺序选第一个“还活着”（非 Failed / Disconnected）的成员接棒，
+///    由它 fresh connect / 输 OTP；
+/// 3. 全员失败或组级超时 → 保持 Failed，交给用户手动重连。
+///
+/// 登记表本身不做任何 IO；每次 watcher 的 poll 周期内由调用方收集好
+/// members / states / settled 快照后一次性传入，避免锁顺序问题。
+#[derive(Debug, Clone, Default)]
+pub struct OtpGroupRegistry {
+    groups: HashMap<String /* conn.id */, OtpGroupEntry>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct OtpGroupEntry {
+    /// 现任 leader 的 tab/session id；`None` = 待推举。
+    leader: Option<String>,
+    /// leader 上次心跳（毫秒）。leader 自己每 poll 周期更新。
+    beacon_ms: i64,
+    /// 锁存的可复用源：首个真正跨过 settle 门的成员。锁存后它已完成 OTP
+    /// 认证，后续无论其终端当前行是什么模样（用户继续操作后提示符会被
+    /// 冲掉），都稳定作为组的复用源——直到它掉线 / tab 被关。
+    latched_source: Option<String>,
+    /// 被摘帽子的成员：心跳超时但状态还停在 Connecting（watcher 任务已
+    /// 死，但连接尝试自身可能仍在跑）。此类死成员不能被反复重新推举，否
+    /// 则会造成死锁推举循环。当它的状态明确转为 Failed / Disconnected
+    /// 后（人工重连会先进 Connecting 再变状态），从该集合清除，允许未来
+    /// 重新被推举。
+    demoted: std::collections::HashSet<String>,
+}
+
+/// [`OtpGroupRegistry::poll`] 的判定结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OtpGroupRole {
+    /// 组内已有 settle 完成的成员（返回其 session id），我应该 clone 它的
+    /// transport 复活自己。
+    SettledPeer(String),
+    /// 我被推举为 leader，应该 fresh connect（输自己的 OTP）。
+    Lead,
+    /// 组里有活 leader（或我已是 leader），继续等待。
+    Wait,
+    /// 全员 Failed / Disconnected，组级恢复失败，退出等待。
+    Exhausted,
+}
+
+impl OtpGroupRegistry {
+    /// 组级状态机单次推进。只能在 `state.write()` 或独占持有 registry 的
+    /// 场景调用，以保证“摘帽子 → 推举”是原子的。
+    ///
+    /// * `group_key` — 组标识（`conn.id`）
+    /// * `order` — 恢复顺序的成员名单（首个即初始 leader）；运行中可能缺失
+    ///   已关闭的 tab，顺序依然有效
+    /// * `members` — 当前仍然打开的同组 tab id（含我本人）
+    /// * `state_of` — 取某成员当前连接状态
+    /// * `settled` — 该成员是否已过 settle 门（OTP 完成、提示符稳定）
+    /// * `my_tab` — 本次 poll 的发起者
+    /// * `now_ms` — 当前毫秒时间戳
+    pub fn poll(
+        &mut self,
+        group_key: &str,
+        order: &[String],
+        members: &[String],
+        state_of: &dyn Fn(&str) -> Option<SessionConnectionState>,
+        settled: &dyn Fn(&str) -> bool,
+        my_tab: &str,
+        now_ms: i64,
+    ) -> OtpGroupRole {
+        let entry = self.groups.entry(group_key.to_string()).or_default();
+
+        // 0a. 已锁存的复用源还能用 → 直接复用（优先级最高，能救活 Failed tab）
+        if let Some(src) = entry.latched_source.clone() {
+            // 锁存意味着它的 transport 已完成 OTP 认证，只要还 Connected
+            // 就可复用——不再要求其终端当前行长得提示符。
+            let usable = src != my_tab
+                && members.iter().any(|m| m == &src)
+                && matches!(state_of(&src), Some(SessionConnectionState::Connected));
+            if usable {
+                return OtpGroupRole::SettledPeer(src);
+            }
+            // 掉线 / 关闭 → 解锁，后续重新走扫描 / 推举。
+            entry.latched_source = None;
+        }
+
+        // 0b. 扫描新的 settle 成员，发现即锁存并作为复用源
+        if let Some(peer) = members.iter().find(|t| t.as_str() != my_tab && settled(t)) {
+            entry.latched_source = Some(peer.clone());
+            // leader 的使命已由 settle 成员完成，摘掉，避免其他 watcher 再
+            // 依赖旧 leader 判断。
+            if entry.leader.as_deref() == Some(peer.as_str()) {
+                entry.leader = None;
+            }
+            return OtpGroupRole::SettledPeer(peer.clone());
+        }
+
+        // 0c. 状态明确失败的成员清除 demoted 标记，允许人工重连后重新
+        // 被推举。
+        entry.demoted.retain(|t| {
+            !matches!(
+                state_of(t),
+                Some(SessionConnectionState::Failed) | Some(SessionConnectionState::Disconnected)
+            )
+        });
+
+        // 1. 现任 leader 还“算活”吗？
+        let leader_alive = match entry.leader.as_deref() {
+            None => false,
+            Some(l) if !members.iter().any(|m| m == l) => false,
+            Some(l) => match state_of(l) {
+                None
+                | Some(SessionConnectionState::Failed)
+                | Some(SessionConnectionState::Disconnected) => false,
+                Some(_) => now_ms - entry.beacon_ms <= OTP_GROUP_LEADER_DEAD_MS,
+            },
+        };
+        if !leader_alive {
+            // 心跳超时但状态还停在 Connecting：watcher 死了，连试图可能仍
+            // 在跑，不能让它被重新推举（会死锁），记入 demoted。
+            if let Some(l) = entry.leader.take() {
+                if members.iter().any(|m| m == &l)
+                    && matches!(
+                        state_of(&l),
+                        Some(SessionConnectionState::Connecting)
+                            | Some(SessionConnectionState::Connected)
+                            | Some(SessionConnectionState::Reconnecting)
+                    )
+                {
+                    entry.demoted.insert(l);
+                }
+            }
+        } else if entry.leader.as_deref() == Some(my_tab) {
+            entry.beacon_ms = now_ms;
+        }
+
+        // 2. 无 leader → 按恢复顺序推举第一个“还活着”的成员
+        if entry.leader.is_none() {
+            let alive = |t: &str| {
+                !matches!(
+                    state_of(t),
+                    Some(SessionConnectionState::Failed)
+                        | Some(SessionConnectionState::Disconnected)
+                )
+            };
+            let mut candidates: Vec<&String> = members
+                .iter()
+                .filter(|t| alive(t) && !entry.demoted.contains(t.as_str()))
+                .collect();
+            if candidates.is_empty() {
+                // 无人可推：若还有 demoted 的 beacon-死成员（连接尝试仍在跑），
+                // 等它那边可能 settle 后走锁存路径 → Wait；否则全员失败 → 超
+                // 出。
+                return if entry.demoted.is_empty() {
+                    OtpGroupRole::Exhausted
+                } else {
+                    OtpGroupRole::Wait
+                };
+            }
+            candidates.sort_by_key(|t| order.iter().position(|o| o == *t).unwrap_or(usize::MAX));
+            let next = candidates[0].clone();
+            entry.leader = Some(next.clone());
+            entry.beacon_ms = now_ms;
+            if next == my_tab {
+                return OtpGroupRole::Lead;
+            }
+        }
+
+        OtpGroupRole::Wait
+    }
+
+    /// 释放整个组（我退出 watcher 时无所谓，主要在组全部收拾完毕或用户
+    /// 关掉最后一台 tab 时清理，避免 registry 泄漏）。
+    pub fn drop_group(&mut self, group_key: &str) {
+        self.groups.remove(group_key);
+    }
+}
+
 #[cfg(test)]
 mod session_replay_tests {
     use super::*;
@@ -9045,8 +9237,14 @@ mod session_replay_tests {
         // Context commands are never skipped — a shell prompt says nothing
         // about the privilege/container context we must re-establish.
         assert!(!replay_op_already_satisfied("[ops@web-01 ~]$ ", "sudo -i"));
-        assert!(!replay_op_already_satisfied("root@db:~# ", "kubectl exec -it pod -- sh"));
-        assert!(!replay_op_already_satisfied("[ops@web-01 ~]$ ", "ssh internal-02"));
+        assert!(!replay_op_already_satisfied(
+            "root@db:~# ",
+            "kubectl exec -it pod -- sh"
+        ));
+        assert!(!replay_op_already_satisfied(
+            "[ops@web-01 ~]$ ",
+            "ssh internal-02"
+        ));
     }
 
     /// The core jumpserver flow: menu-navigation inputs are recorded in order
@@ -9451,5 +9649,267 @@ mod login_script_runtime_tests {
         state.login_scripts.get_mut("sess-1").unwrap().done = true;
         state.login_scripts.remove("sess-1");
         assert!(state.login_scripts.is_empty());
+    }
+}
+
+#[cfg(test)]
+mod otp_group_tests {
+    use super::*;
+
+    fn ids(v: &[&str]) -> Vec<String> {
+        v.iter().map(|s| s.to_string()).collect()
+    }
+
+    struct Fixture {
+        states: HashMap<String, SessionConnectionState>,
+        settled: HashSet<String>,
+    }
+
+    impl Fixture {
+        fn new() -> Self {
+            Self {
+                states: HashMap::new(),
+                settled: HashSet::new(),
+            }
+        }
+        fn state_of(&self) -> impl Fn(&str) -> Option<SessionConnectionState> + '_ {
+            |t: &str| self.states.get(t).copied()
+        }
+        fn settled_of(&self) -> impl Fn(&str) -> bool + '_ {
+            |t: &str| self.settled.contains(t)
+        }
+    }
+
+    /// 组内第二个 tab 已 settle → 第一个 tab 的 watcher 立刻拿到
+    /// SettledPeer，且该成员被锁存为复用源。
+    #[test]
+    fn settled_peer_wins_and_latches() {
+        let mut reg = OtpGroupRegistry::default();
+        let order = ids(&["a", "b"]);
+        let mut fx = Fixture::new();
+        fx.states
+            .insert("a".into(), SessionConnectionState::Connecting);
+        fx.states
+            .insert("b".into(), SessionConnectionState::Connected);
+        fx.settled.insert("b".into());
+
+        let role = reg.poll(
+            "conn",
+            &order,
+            &order,
+            &fx.state_of(),
+            &fx.settled_of(),
+            "a",
+            1_000,
+        );
+        assert_eq!(role, OtpGroupRole::SettledPeer("b".into()));
+
+        // 锁存后：即使 b 的提示符被用户操作冲掉（不再 settled），依旧复用。
+        fx.settled.clear();
+        let role = reg.poll(
+            "conn",
+            &order,
+            &order,
+            &fx.state_of(),
+            &fx.settled_of(),
+            "a",
+            2_000,
+        );
+        assert_eq!(role, OtpGroupRole::SettledPeer("b".into()));
+    }
+
+    /// leader 失败 → 下一个还有效的成员（按恢复顺序）被推举为 leader。
+    #[test]
+    fn failed_leader_handoff_follows_restore_order() {
+        let mut reg = OtpGroupRegistry::default();
+        let order = ids(&["a", "b", "c"]);
+        let mut fx = Fixture::new();
+        // a: 首台 leader，正在 Connecting；b/c: Connecting（克隆等待方）。
+        for t in ["a", "b", "c"] {
+            fx.states
+                .insert(t.into(), SessionConnectionState::Connecting);
+        }
+
+        // a 推举自己
+        let role = reg.poll(
+            "conn",
+            &order,
+            &order,
+            &fx.state_of(),
+            &fx.settled_of(),
+            "a",
+            1_000,
+        );
+        assert_eq!(role, OtpGroupRole::Lead);
+        // b poll：leader 是 a → Wait
+        let role = reg.poll(
+            "conn",
+            &order,
+            &order,
+            &fx.state_of(),
+            &fx.settled_of(),
+            "b",
+            1_100,
+        );
+        assert_eq!(role, OtpGroupRole::Wait);
+
+        // a Failed → b 接棒
+        fx.states.insert("a".into(), SessionConnectionState::Failed);
+        let role = reg.poll(
+            "conn",
+            &order,
+            &order,
+            &fx.state_of(),
+            &fx.settled_of(),
+            "b",
+            2_000,
+        );
+        assert_eq!(role, OtpGroupRole::Lead);
+
+        // b 也 Failed → c 接棒
+        fx.states.insert("b".into(), SessionConnectionState::Failed);
+        let role = reg.poll(
+            "conn",
+            &order,
+            &order,
+            &fx.state_of(),
+            &fx.settled_of(),
+            "c",
+            3_000,
+        );
+        assert_eq!(role, OtpGroupRole::Lead);
+    }
+
+    /// 全员 Failed → Exhausted。
+    #[test]
+    fn all_failed_is_exhausted() {
+        let mut reg = OtpGroupRegistry::default();
+        let order = ids(&["a", "b"]);
+        let mut fx = Fixture::new();
+        fx.states.insert("a".into(), SessionConnectionState::Failed);
+        fx.states.insert("b".into(), SessionConnectionState::Failed);
+        let role = reg.poll(
+            "conn",
+            &order,
+            &order,
+            &fx.state_of(),
+            &fx.settled_of(),
+            "a",
+            1_000,
+        );
+        assert_eq!(role, OtpGroupRole::Exhausted);
+    }
+
+    /// leader 任务 panic（状态收到 Connecting 但心跳停了 30s+）→ 其他成
+    /// 员能摘掉其帽子接棒。
+    #[test]
+    fn dead_leader_beacon_allows_handoff() {
+        let mut reg = OtpGroupRegistry::default();
+        let order = ids(&["a", "b"]);
+        let mut fx = Fixture::new();
+        fx.states
+            .insert("a".into(), SessionConnectionState::Connecting);
+        fx.states
+            .insert("b".into(), SessionConnectionState::Connecting);
+
+        // a 成为 leader，盖章 t=1_000
+        let role = reg.poll(
+            "conn",
+            &order,
+            &order,
+            &fx.state_of(),
+            &fx.settled_of(),
+            "a",
+            1_000,
+        );
+        assert_eq!(role, OtpGroupRole::Lead);
+
+        // t=1_000 + 29s：b 看到 a 心跳新鲜 → Wait
+        let role = reg.poll(
+            "conn",
+            &order,
+            &order,
+            &fx.state_of(),
+            &fx.settled_of(),
+            "b",
+            30_000,
+        );
+        assert_eq!(role, OtpGroupRole::Wait);
+
+        // t=1_000 + 31s：a 心跳超时 → b 接棒
+        let role = reg.poll(
+            "conn",
+            &order,
+            &order,
+            &fx.state_of(),
+            &fx.settled_of(),
+            "b",
+            32_000,
+        );
+        assert_eq!(role, OtpGroupRole::Lead);
+    }
+
+    /// 已 Failed 的 tab 在同伴 settle 后通过 SettledPeer 复活——这正是核
+    /// 心需求“第一台失败也能被第二台成功后拉起”。
+    #[test]
+    fn failed_tab_revives_via_settled_peer() {
+        let mut reg = OtpGroupRegistry::default();
+        let order = ids(&["a", "b"]);
+        let mut fx = Fixture::new();
+        // a：OTP 输错被踢 → Failed；b：顶上并成为 settle 成员。
+        fx.states.insert("a".into(), SessionConnectionState::Failed);
+        fx.states
+            .insert("b".into(), SessionConnectionState::Connected);
+        fx.settled.insert("b".into());
+
+        let role = reg.poll(
+            "conn",
+            &order,
+            &order,
+            &fx.state_of(),
+            &fx.settled_of(),
+            "a",
+            1_000,
+        );
+        assert_eq!(role, OtpGroupRole::SettledPeer("b".into()));
+    }
+
+    /// 锁存源掉线 → 解锁 → 回到推举流程（另一台可顶上）。
+    #[test]
+    fn latched_source_disconnect_unlatches() {
+        let mut reg = OtpGroupRegistry::default();
+        let order = ids(&["a", "b"]);
+        let mut fx = Fixture::new();
+        fx.states
+            .insert("a".into(), SessionConnectionState::Connecting);
+        fx.states
+            .insert("b".into(), SessionConnectionState::Connected);
+        fx.settled.insert("b".into());
+
+        // 第一次 poll 锁存 b
+        let _ = reg.poll(
+            "conn",
+            &order,
+            &order,
+            &fx.state_of(),
+            &fx.settled_of(),
+            "a",
+            1_000,
+        );
+
+        // b 掉线且不再 settle → 锁存解除 → a（Connecting）被推举为 leader
+        fx.states
+            .insert("b".into(), SessionConnectionState::Disconnected);
+        fx.settled.clear();
+        let role = reg.poll(
+            "conn",
+            &order,
+            &order,
+            &fx.state_of(),
+            &fx.settled_of(),
+            "a",
+            2_000,
+        );
+        assert_eq!(role, OtpGroupRole::Lead);
     }
 }

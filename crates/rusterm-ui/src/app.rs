@@ -62,23 +62,23 @@ use crate::layout::{PaneLayout, SplitAxis, SplitDirection};
 use crate::skin::css_variables;
 use crate::state::{
     AppState, CommandStatus, Modal, OneKeyBehaviorEvent, OneKeyBehaviorKind, OneKeyMatch,
-    OneKeyPopupState, OneKeyPreferenceAttempt, OneKeySubmissionFeedback, PendingCommandPayload,
-    PendingDangerousCommand, SessionConnectionState, SessionTab, TabDropOutcome, TerminalEntry,
-    UnlockState, activate_session, append_pane_to_active, available_send_targets,
-    begin_floating_pane_move, clear_terminal_command_lines, close_pane, close_session,
-    close_workspace, command_send_targets, distribute_sessions_across_panes, enqueue_pending_exit,
-    execute_tab_drop_on_pane, execute_tab_drop_on_pane_at, focus_pane_for_layout,
-    focused_pane_session, invert_send_targets, move_floating_pane_for_active,
-    move_session_to_leftmost, note_exit_code_evidence, note_shell_integration_evidence,
-    note_shell_prompt_evidence, place_copied_session_next_to_source, pop_context_command,
-    prepare_split_for_sidebar_drop, prepare_split_for_sidebar_drop_at, prompt_looks_like_shell,
-    prompt_return_completion_target, push_workspace_tab, record_context_command,
-    record_onekey_behavior, record_replay_op, reorder_tab, replayable_ops, resize_layout_split,
-    rollback_pending_exit, scroll_sync_targets, seed_onekey_habit_event, select_all_send_targets,
-    selected_send_target_ids, set_active_tab, set_pane_session_for_layout,
-    set_send_target_selected, source_pane_for_copy, suppress_comparison_diff_warning,
-    toggle_comparison_mode, toggle_pane_zoom, toggle_split_mode, track_terminal_input,
-    tracked_terminal_command,
+    OneKeyPopupState, OneKeyPreferenceAttempt, OneKeySubmissionFeedback, OtpGroupRole,
+    PendingCommandPayload, PendingDangerousCommand, SessionConnectionState, SessionTab,
+    TabDropOutcome, TerminalEntry, UnlockState, activate_session, append_pane_to_active,
+    available_send_targets, begin_floating_pane_move, clear_terminal_command_lines, close_pane,
+    close_session, close_workspace, command_send_targets, distribute_sessions_across_panes,
+    enqueue_pending_exit, execute_tab_drop_on_pane, execute_tab_drop_on_pane_at,
+    focus_pane_for_layout, focused_pane_session, invert_send_targets,
+    move_floating_pane_for_active, move_session_to_leftmost, note_exit_code_evidence,
+    note_shell_integration_evidence, note_shell_prompt_evidence,
+    place_copied_session_next_to_source, pop_context_command, prepare_split_for_sidebar_drop,
+    prepare_split_for_sidebar_drop_at, prompt_looks_like_shell, prompt_return_completion_target,
+    push_workspace_tab, record_context_command, record_onekey_behavior, record_replay_op,
+    reorder_tab, replayable_ops, resize_layout_split, rollback_pending_exit, scroll_sync_targets,
+    seed_onekey_habit_event, select_all_send_targets, selected_send_target_ids, set_active_tab,
+    set_pane_session_for_layout, set_send_target_selected, source_pane_for_copy,
+    suppress_comparison_diff_warning, toggle_comparison_mode, toggle_pane_zoom, toggle_split_mode,
+    track_terminal_input, tracked_terminal_command,
 };
 use crate::state::{
     FeishuOAuthEvent, FeishuOtpFetch, FeishuQrPopup, FeishuQrPopupStatus, FeishuTokenStatus,
@@ -12210,98 +12210,6 @@ send hi\n"
         assert!(!should_schedule_replay(None, &ops));
     }
 
-    /// Pins the 0.17 "恢复同一连接的多个 JumpServer 会话只输一次 OTP"
-    /// contract: only SSH restores group by resolved connection id, the
-    /// first one of a group opens fresh (its OTP covers the group), and
-    /// every later restore of the same connection defers to a channel clone
-    /// of that first session — sessions of *other* connections still open
-    /// independently, as do Telnet/TCP restores (no shared transport).
-    #[test]
-    fn restore_groups_ssh_sessions_by_resolved_connection_for_otp_reuse() {
-        let ssh_conn = |id: &str| ConnectionConfig {
-            id: id.to_string(),
-            name: format!("js-{id}"),
-            kind: ConnectionKind::Ssh(SshConfig {
-                host: "jump.example.com".to_string(),
-                port: 22,
-                username: "ops".to_string(),
-                auth: rusterm_core::config::SshAuth::Agent,
-                terminal_type: "xterm-256color".to_string(),
-                proxy: None,
-                proxy_jump: None,
-                keepalive_interval: None,
-                host_key_policy: "accept-new".to_string(),
-            }),
-            group: None,
-            tags: Vec::new(),
-            onekey: false,
-            login_script: None,
-        };
-        let telnet_conn = |id: &str| ConnectionConfig {
-            id: id.to_string(),
-            name: format!("tn-{id}"),
-            kind: ConnectionKind::Telnet(TelnetConfig {
-                host: "legacy.example.com".to_string(),
-                port: 23,
-            }),
-            group: None,
-            tags: Vec::new(),
-            onekey: false,
-            login_script: None,
-        };
-        let mut first_tabs: HashMap<String, String> = HashMap::new();
-
-        // First restore of conn-a: fresh open, registered as group head.
-        let a1 = ssh_conn("conn-a");
-        assert_eq!(
-            decide_restore_open(&first_tabs, &a1),
-            RestoreOpenDecision::Fresh
-        );
-        first_tabs.insert(a1.id.clone(), "tab-a1".to_string());
-
-        // Second and third restores of the SAME connection clone from the
-        // first — one OTP total for the whole group, each clone tied to the
-        // group's own head tab.
-        let a2 = ssh_conn("conn-a");
-        assert_eq!(
-            decide_restore_open(&first_tabs, &a2),
-            RestoreOpenDecision::CloneFrom {
-                first_tab_id: "tab-a1".to_string()
-            }
-        );
-        let a3 = ssh_conn("conn-a");
-        assert_eq!(
-            decide_restore_open(&first_tabs, &a3),
-            RestoreOpenDecision::CloneFrom {
-                first_tab_id: "tab-a1".to_string()
-            }
-        );
-
-        // A different connection starts its own group (parallel restores of
-        // several saved connections don't cross-contaminate).
-        let b1 = ssh_conn("conn-b");
-        assert_eq!(
-            decide_restore_open(&first_tabs, &b1),
-            RestoreOpenDecision::Fresh
-        );
-        first_tabs.insert(b1.id.clone(), "tab-b1".to_string());
-        let b2 = ssh_conn("conn-b");
-        assert_eq!(
-            decide_restore_open(&first_tabs, &b2),
-            RestoreOpenDecision::CloneFrom {
-                first_tab_id: "tab-b1".to_string()
-            }
-        );
-
-        // Telnet/TCP have no SSH transport to clone from: never grouped,
-        // even when an entry somehow shares the id.
-        let t1 = telnet_conn("conn-a");
-        assert_eq!(
-            decide_restore_open(&first_tabs, &t1),
-            RestoreOpenDecision::Fresh
-        );
-    }
-
     /// Pins the "会话副本也能正确恢复" contract: a copied session persists
     /// with the source's saved-connection id and a "副本" display name that
     /// matches no saved connection. Restore must resolve the transport
@@ -12368,6 +12276,61 @@ send hi\n"
                 .is_none()
         );
     }
+}
+
+/// Create the UI half of a restored SSH session — terminal, session tab,
+/// config and `Connecting` indicator — WITHOUT starting the connection.
+/// The OTP-group supervisor later attaches a real transport to this tab id
+/// (fresh connect when elected leader, or a channel clone from a settled
+/// peer), so every restored session of a shared-credential group exists as
+/// a tab from the start and can be revived no matter which member's OTP
+/// eventually succeeds.
+fn open_restored_ssh_session_deferred(
+    mut state: Signal<AppState>,
+    ps: &rusterm_core::PersistedSession,
+    conn: &ConnectionConfig,
+    ssh_config: &SshConfig,
+) -> String {
+    let tab_id = uuid::Uuid::new_v4().to_string();
+    let term_size = ps
+        .terminal_size
+        .as_ref()
+        .map(|s| TerminalSize {
+            cols: s.cols,
+            rows: s.rows,
+            pixel_width: s.pixel_width,
+            pixel_height: s.pixel_height,
+        })
+        .unwrap_or_default();
+    create_terminal_with_size(tab_id.clone(), term_size, &mut state);
+    state
+        .write()
+        .session_configs
+        .insert(tab_id.clone(), conn.clone());
+    state
+        .write()
+        .session_connection_states
+        .insert(tab_id.clone(), SessionConnectionState::Connecting);
+    state.write().sessions.push(SessionTab {
+        id: tab_id.clone(),
+        // Keep the persisted display name — a copied session ("X 副本")
+        // shares the source's connection id but must keep its own title.
+        name: ps.name.clone(),
+        kind: SessionType::Ssh,
+        render_output: Default::default(),
+        version: 0,
+        suggestion: None,
+        suggestions: Vec::new(),
+        suggestion_corrections: std::collections::HashSet::new(),
+        suggestion_selected: 0,
+        suggestion_visible: false,
+        command_history: ps.command_history_tail.clone(),
+        hostname: Some(ssh_config.host.clone()),
+        cwd: None,
+        last_command_status: CommandStatus::default(),
+    });
+    push_workspace_tab(&mut state.write(), &tab_id);
+    tab_id
 }
 
 fn start_ssh_connection(
@@ -15484,12 +15447,15 @@ fn restore_sessions(
 ) {
     let saved_active = to_restore.active_session.clone();
     let connections: Vec<ConnectionConfig> = state.read().connections.clone();
-    // 0.17 OTP-reuse grouping: resolved-connection id → tab id of the FIRST
-    // restored SSH session of that connection. Later restores of the same
-    // connection clone a channel from that session's authenticated transport
-    // instead of demanding a second JumpServer OTP. See
-    // `decide_restore_open` / `wait_for_restore_clone_source`.
-    let mut restore_first_ssh_tabs: HashMap<String, String> = HashMap::new();
+    // 0.17 OTP-group restore: resolved-connection id → ordered restored tab
+    // ids of that connection. Every SSH restored session gets a deferred tab
+    // up front; after the restore loop each group spawns one supervisor per
+    // tab (`otp_group_session_supervisor`) which drives the group state
+    // machine: elect a leader for the fresh connect + OTP, let everyone else
+    // clone the settled transport, hand leadership over sequentially on
+    // failure, and revive Failed tabs via clone once a sibling settles.
+    let mut otp_groups: Vec<(String, ConnectionConfig, Vec<String>)> = Vec::new();
+    let mut otp_group_index: HashMap<String, usize> = HashMap::new();
 
     for ps in &to_restore.sessions {
         match ps.kind {
@@ -15574,58 +15540,40 @@ fn restore_sessions(
                 let conn = find_restore_connection(&connections, ps);
                 if let Some(conn) = conn {
                     let conn_for_replay = conn.clone();
-                    // 0.17 OTP-reuse: several restored sessions against the
-                    // same saved SSH connection share ONE authentication. The
-                    // first opens fresh (its OTP covers the group); later
-                    // ones defer via a channel clone from its live transport.
-                    match decide_restore_open(&restore_first_ssh_tabs, &conn) {
-                        RestoreOpenDecision::CloneFrom { first_tab_id } => {
-                            let st = state;
-                            let senders = input_senders;
-                            let conn_clone = conn.clone();
-                            let conn_name = conn.name.clone();
-                            let ps_name = ps.name.clone();
-                            let ps_for_restore = ps.clone();
-                            tracing::info!(
-                                "[RESTORE-CLONE] session {:?} defers to the first {:?} session — waiting for its authentication before cloning a channel",
-                                ps_name,
-                                conn_name
-                            );
-                            spawn(async move {
-                                let clone_source =
-                                    wait_for_restore_clone_source(st, &first_tab_id, &conn_name)
-                                        .await;
-                                let opened = open_connection(
-                                    st,
-                                    senders,
-                                    conn_clone.clone(),
-                                    None,
-                                    clone_source,
-                                );
-                                finish_restored_session(
-                                    st,
-                                    senders,
-                                    &ps_for_restore,
-                                    &conn_for_replay,
-                                    opened.session_id,
-                                );
-                            });
-                        }
-                        RestoreOpenDecision::Fresh => {
-                            let opened =
-                                open_connection(state, input_senders, conn.clone(), None, None);
-                            if matches!(conn.kind, ConnectionKind::Ssh(_)) {
-                                restore_first_ssh_tabs
-                                    .insert(conn.id.clone(), opened.session_id.clone());
-                            }
-                            finish_restored_session(
-                                state,
-                                input_senders,
-                                ps,
-                                &conn_for_replay,
-                                opened.session_id,
-                            );
-                        }
+                    if let ConnectionKind::Ssh(ssh_config) = &conn.kind {
+                        // 0.17 OTP-group restore: give every restored SSH
+                        // session its deferred tab now; the group
+                        // supervisors spawned after this loop decide who
+                        // connects fresh (one OTP for the group) and who
+                        // clones the settled transport. Member order here
+                        // is the persisted restore order — it defines the
+                        // leader hand-off sequence.
+                        let tab_id =
+                            open_restored_ssh_session_deferred(state, ps, &conn, ssh_config);
+                        finish_restored_session(
+                            state,
+                            input_senders,
+                            ps,
+                            &conn_for_replay,
+                            tab_id.clone(),
+                        );
+                        let idx = *otp_group_index.entry(conn.id.clone()).or_insert_with(|| {
+                            otp_groups.push((conn.id.clone(), conn.clone(), Vec::new()));
+                            otp_groups.len() - 1
+                        });
+                        otp_groups[idx].2.push(tab_id);
+                    } else {
+                        // Telnet/TCP have no SSH transport to clone from:
+                        // always fresh.
+                        let opened =
+                            open_connection(state, input_senders, conn.clone(), None, None);
+                        finish_restored_session(
+                            state,
+                            input_senders,
+                            ps,
+                            &conn_for_replay,
+                            opened.session_id,
+                        );
                     }
                 } else {
                     tracing::warn!(
@@ -15645,6 +15593,40 @@ fn restore_sessions(
                     ps.name
                 );
             }
+        }
+    }
+
+    // Spawn one OTP-group supervisor per restored SSH tab. Each singleton
+    // group also goes through the watcher: its first poll elects itself as
+    // leader and performs the fresh connect, so the whole SSH restore is
+    // uniformly state-machine driven.
+    for (group_key, conn, member_tabs) in otp_groups {
+        let conn_name = conn.name.clone();
+        if member_tabs.len() > 1 {
+            tracing::info!(
+                "[OTP-GROUP] {:?} group of {} restored session(s) — state machine starting (leader order: {})",
+                conn_name,
+                member_tabs.len(),
+                member_tabs
+                    .iter()
+                    .map(|t| &t[..t.len().min(8)])
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+        for my_tab in member_tabs.iter().cloned() {
+            let st = state;
+            let senders = input_senders;
+            let group_key = group_key.clone();
+            let conn_name = conn_name.clone();
+            let conn = conn.clone();
+            let order = member_tabs.clone();
+            spawn(async move {
+                otp_group_session_supervisor(
+                    st, senders, group_key, conn_name, conn, order, my_tab,
+                )
+                .await;
+            });
         }
     }
 
@@ -15738,50 +15720,6 @@ fn restore_sessions(
     }
 }
 
-/// Decides how a restored session opens its transport.
-///
-/// OTP-reuse on restore: JumpServer (koko) guards every *new TCP+SSH auth*
-/// with a one-time code, but opening another interactive *channel* on an
-/// already-authenticated transport is OTP-free. So when a snapshot holds
-/// several SSH sessions against the same saved connection, only the FIRST
-/// restored one authenticates (the user enters — or Feishu fetches — a
-/// single OTP); later sessions of that connection wait for it, then clone
-/// their channel from its live transport via [`open_connection`]'s
-/// `channel_clone_source`.
-#[derive(Debug, PartialEq, Eq)]
-enum RestoreOpenDecision {
-    /// Open a brand-new TCP+SSH+auth connection (the user's OTP applies to
-    /// this one).
-    Fresh,
-    /// Wait until `first_tab_id` finishes auth, then clone its channel.
-    CloneFrom { first_tab_id: String },
-}
-
-/// Only SSH sessions can share a transport — Telnet/TCP restores always open
-/// fresh. The grouping key is the *resolved* connection id (post
-/// `find_restore_connection`, so legacy snapshots whose `connection_id` is a
-/// stale tab UUID still group correctly via the name fallback).
-fn decide_restore_open(
-    first_by_conn: &HashMap<String, String>,
-    conn: &ConnectionConfig,
-) -> RestoreOpenDecision {
-    if matches!(conn.kind, ConnectionKind::Ssh(_)) {
-        if let Some(first) = first_by_conn.get(&conn.id) {
-            return RestoreOpenDecision::CloneFrom {
-                first_tab_id: first.clone(),
-            };
-        }
-    }
-    RestoreOpenDecision::Fresh
-}
-
-/// How long a deferred restore-clone waits for the first same-connection
-/// session to finish auth AND adopt past its OTP + menu navigation before
-/// falling back to its own fresh connect. Generous on purpose: with the
-/// Feishu/webhook fetch the OTP round-trip takes seconds, but with manual
-/// entry the user may type slowly. Timing out is non-fatal — the clone simply
-/// reverts to the pre-0.17 behaviour (its own OTP prompt).
-const RESTORE_CLONE_WAIT_SECS: u64 = 180;
 /// Number of consecutive settled-prompt polls (× [`REPLAY_POLL_MS`], so
 /// ~800ms of a stable usable prompt) before the first restored session counts
 /// as "adopted" — i.e. past the JumpServer tty OTP and its replayed menu
@@ -15812,73 +15750,288 @@ fn restored_first_session_ready_for_clone(state: &AppState, tab_id: &str) -> boo
     crate::state::prompt_looks_like_shell(&current_line) || !current_line.trim().is_empty()
 }
 
-/// Poll until the first restored session of a saved connection reaches
-/// `Connected` AND has settled past its OTP + adopted navigation, then return
-/// its live transport for channel cloning. Returns `None` when the first
-/// session failed, its transport is already gone, or the wait timed out — the
-/// caller then opens a fresh connection (extra OTP, but never a hung restore).
-async fn wait_for_restore_clone_source(
-    state: Signal<AppState>,
-    first_tab_id: &str,
-    conn_name: &str,
-) -> Option<rusterm_ssh::SshSession> {
+/// Total budget for the OTP-group state machine per restored group: covers
+/// the worst case of (N-1) failed leaders each burning a manual-OTP entry
+/// attempt, plus the final successful OTP + settle. Generous since manual OTP
+/// entry dominates; automatic webhook flows finish in seconds.
+const OTP_GROUP_BUDGET_SECS: u64 = 300;
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
+/// Clean up one tab's dead/stale connection state and mark it
+/// `Reconnecting`, preparing it for a fresh SSH connect or a channel clone
+/// from a group peer. Mirrors the first half of [`reconnect_session`] but
+/// is driven by the OTP-group watcher rather than the user pressing Enter;
+/// unlike `begin_reconnect`, the tab may currently be in *any* state
+/// (Connecting clone-wait, Failed, Disconnected), so the state is forced
+/// to `Reconnecting` directly. Returns the preserved terminal size.
+fn otp_group_recycle_tab(
+    mut state: Signal<AppState>,
+    mut input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    tab_id: &str,
+) -> TerminalSize {
+    let previous_size = state
+        .read()
+        .terminals
+        .get(tab_id)
+        .map(|handle| handle.lock().terminal.size())
+        .unwrap_or_default();
+    {
+        let mut s = state.write();
+        s.session_connection_states
+            .insert(tab_id.to_string(), SessionConnectionState::Reconnecting);
+        s.close_senders.retain(|(sid, _)| sid != tab_id);
+        s.resize_senders.remove(tab_id);
+        s.terminals.remove(tab_id);
+        s.onekey_popups.remove(tab_id);
+        s.onekey_submission_feedback.remove(tab_id);
+        s.onekey_submission_cooldown.remove(tab_id);
+        s.onekey_output_since_submission.remove(tab_id);
+        s.onekey_preference_attempts.remove(tab_id);
+        s.pending_exit_check.remove(tab_id);
+        feishu_otp_session_closed(&mut s, tab_id);
+        s.login_scripts.remove(tab_id);
+    }
+    input_senders.write().remove(tab_id);
+    create_terminal_with_size(tab_id.to_string(), previous_size, &mut state);
+    previous_size
+}
+
+/// The per-tab half of the OTP-group state machine. One watcher is spawned
+/// per restored tab of a JumpServer-esque shared-credential connection
+/// group; every poll it:
+///
+/// 1. Exits when its own tab is settled past OTP (its OTP covered the
+///    group, or its clone landed) — the connection/replay pipeline owns the
+///    tab from there.
+/// 2. Adopts a settled peer's transport (channel clone) into its own tab —
+///    this is what revives a Failed tab once a sibling completes OTP.
+/// 3. When the registry says no live leader remains and this tab is next in
+///    restore order, takes over and performs its own fresh connect (its own
+///    OTP) — sequential fallback instead of all waiters racing fresh.
+/// 4. Gives up when every member is Failed/Disconnected or the shared
+///    budget is exhausted.
+///
+/// `order` is the persisted restore sequence of all group members (surviving
+/// members only; closed tabs are filtered live via `session_configs`).
+#[allow(clippy::too_many_arguments)]
+async fn otp_group_session_supervisor(
+    mut state: Signal<AppState>,
+    input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    group_key: String,
+    conn_name: String,
+    conn: ConnectionConfig,
+    order: Vec<String>,
+    my_tab: String,
+) {
     let deadline =
-        std::time::Instant::now() + std::time::Duration::from_secs(RESTORE_CLONE_WAIT_SECS);
-    let mut settled = 0u32;
+        std::time::Instant::now() + std::time::Duration::from_secs(OTP_GROUP_BUDGET_SECS);
+    // Per-member consecutive ready-prompt counters; readiness must persist a
+    // few polls so a freshly-echoed menu op is not mistaken for a settled
+    // prompt mid-replay.
+    let mut ready_streaks: HashMap<String, u32> = HashMap::new();
+    // Once I've been handed a clone source or promoted to leader, the
+    // corresponding reconnect/clone is in flight — don't fire it twice.
+    let mut attempt_in_flight = false;
+
+    // Called on every watcher exit: once no tab of the group remains open,
+    // drop the registry entry so `otp_groups` doesn't grow stale groups.
+    let maybe_drop_group = |state: &mut Signal<AppState>| {
+        let remaining = state
+            .read()
+            .session_configs
+            .values()
+            .filter(|c| c.id == group_key)
+            .count();
+        // Note: `my_tab` still counts if I'm exiting for a reason other than
+        // closing (e.g. settled) — drop only when truly nobody is left.
+        let my_config_gone = state.read().session_configs.get(&my_tab).is_none();
+        if remaining == 0 || (remaining <= 1 && my_config_gone) {
+            state.write().otp_groups.drop_group(&group_key);
+        }
+    };
+
     loop {
-        {
+        // ---- Phase A (read): collect a snapshot of the group ----
+        let (members, state_map, ready_map, my_settled, i_am_gone) = {
             let s = state.read();
-            match s.session_connection_states.get(first_tab_id) {
-                Some(SessionConnectionState::Connected) => {
-                    // Gate cloning on adoption, not bare auth. Only accumulate
-                    // the settled streak once the first session shows a usable
-                    // prompt that is not a credential prompt; any blip (OTP
-                    // appears, a replay op echoes, a logout drops the line)
-                    // resets it, so we clone only after the first session has
-                    // genuinely landed.
-                    if restored_first_session_ready_for_clone(&s, first_tab_id) {
-                        settled += 1;
-                    } else {
-                        settled = 0;
-                    }
-                    if settled >= RESTORE_CLONE_SETTLED_POLLS {
-                        let src = s
-                            .ssh_sessions
-                            .get(first_tab_id)
-                            .filter(|sess| !sess.is_disconnected())
-                            .cloned();
-                        if src.is_some() {
-                            tracing::info!(
-                                "[RESTORE-CLONE] first session of {:?} settled past OTP — cloning its channel (OTP re-used)",
-                                conn_name
-                            );
-                        } else {
-                            tracing::warn!(
-                                "[RESTORE-CLONE] first session of {:?} connected but its transport is already gone — falling back to a fresh connect",
-                                conn_name
-                            );
-                        }
-                        return src;
-                    }
-                }
-                Some(SessionConnectionState::Failed)
-                | Some(SessionConnectionState::Disconnected) => {
-                    tracing::warn!(
-                        "[RESTORE-CLONE] first session of {:?} failed to authenticate — restored clone opens its own connection (one more OTP)",
-                        conn_name
-                    );
-                    return None;
-                }
-                _ => {}
+            let members: Vec<String> = s
+                .session_configs
+                .iter()
+                .filter(|(_, c)| c.id == group_key)
+                .map(|(tab_id, _)| tab_id.clone())
+                .collect();
+            let state_map: HashMap<String, SessionConnectionState> = members
+                .iter()
+                .filter_map(|t| {
+                    s.session_connection_states
+                        .get(t)
+                        .map(|st| (t.clone(), *st))
+                })
+                .collect();
+            let ready_map: HashMap<String, bool> = members
+                .iter()
+                .map(|t| (t.clone(), restored_first_session_ready_for_clone(&s, t)))
+                .collect();
+            let i_am_gone = !members.iter().any(|t| t == &my_tab);
+            let my_settled = members.iter().any(|t| t == &my_tab)
+                && matches!(
+                    state_map.get(&my_tab),
+                    Some(SessionConnectionState::Connected)
+                )
+                && *ready_map.get(&my_tab).unwrap_or(&false);
+            (members, state_map, ready_map, my_settled, i_am_gone)
+        };
+
+        if i_am_gone {
+            tracing::debug!(
+                "[OTP-GROUP] {:?} tab {} closed — watcher exits",
+                conn_name,
+                &my_tab[..my_tab.len().min(8)]
+            );
+            maybe_drop_group(&mut state);
+            return;
+        }
+
+        // Maintain settle streaks across polls.
+        for t in &members {
+            let settled_now = matches!(state_map.get(t), Some(SessionConnectionState::Connected))
+                && *ready_map.get(t).unwrap_or(&false);
+            let streak = ready_streaks.entry(t.clone()).or_insert(0);
+            if settled_now {
+                *streak += 1;
+            } else {
+                *streak = 0;
             }
         }
+        let settled_of =
+            |t: &str| ready_streaks.get(t).copied().unwrap_or(0) >= RESTORE_CLONE_SETTLED_POLLS;
+
+        // (1) My own OTP/clone landed — quit. My tab is the settled member
+        // others will now latch onto.
+        if my_settled && settled_of(&my_tab) {
+            tracing::info!(
+                "[OTP-GROUP] {:?} tab {} settled past OTP — group source ready",
+                conn_name,
+                &my_tab[..my_tab.len().min(8)]
+            );
+            maybe_drop_group(&mut state);
+            return;
+        }
+
+        // ---- Phase B (write): advance the registry state machine ----
+        let state_map_for_poll = state_map.clone();
+        let role = {
+            let mut s = state.write();
+            let state_of = |t: &str| state_map_for_poll.get(t).copied();
+            s.otp_groups.poll(
+                &group_key,
+                &order,
+                &members,
+                &state_of,
+                &settled_of,
+                &my_tab,
+                now_ms(),
+            )
+        };
+
+        match role {
+            OtpGroupRole::SettledPeer(src) => {
+                if !attempt_in_flight {
+                    // Grab the live transport and hand MY tab a cloned
+                    // channel — revives this tab even after it had Failed.
+                    let handle = state
+                        .read()
+                        .ssh_sessions
+                        .get(&src)
+                        .filter(|sess| !sess.is_disconnected())
+                        .cloned();
+                    match (&conn.kind, handle) {
+                        (ConnectionKind::Ssh(ssh_config), Some(source)) => {
+                            tracing::info!(
+                                "[OTP-GROUP] {:?} tab {} cloning channel from settled peer {} (OTP re-used)",
+                                conn_name,
+                                &my_tab[..my_tab.len().min(8)],
+                                &src[..src.len().min(8)]
+                            );
+                            otp_group_recycle_tab(state, input_senders, &my_tab);
+                            start_ssh_connection(
+                                state,
+                                input_senders,
+                                my_tab.clone(),
+                                ssh_config.clone(),
+                                Some(source),
+                            );
+                            attempt_in_flight = true;
+                        }
+                        _ => {
+                            // Transport raced away between polls — keep
+                            // waiting; the registry's latch will be dropped
+                            // or another leader elected next round.
+                        }
+                    }
+                }
+            }
+            OtpGroupRole::Lead => {
+                if !attempt_in_flight {
+                    if let ConnectionKind::Ssh(ssh_config) = &conn.kind {
+                        tracing::info!(
+                            "[OTP-GROUP] {:?} tab {} taking over as group leader — fresh connect (its own OTP)",
+                            conn_name,
+                            &my_tab[..my_tab.len().min(8)]
+                        );
+                        otp_group_recycle_tab(state, input_senders, &my_tab);
+                        start_ssh_connection(
+                            state,
+                            input_senders,
+                            my_tab.clone(),
+                            ssh_config.clone(),
+                            None,
+                        );
+                        attempt_in_flight = true;
+                    }
+                }
+            }
+            OtpGroupRole::Wait => {
+                // If a previous attempt died (state fell back to
+                // Failed/Disconnected), clear the guard so the NEXT
+                // SettledPeer/Lead verdict can fire again.
+                if attempt_in_flight
+                    && matches!(
+                        state_map.get(&my_tab),
+                        Some(SessionConnectionState::Failed)
+                            | Some(SessionConnectionState::Disconnected)
+                    )
+                {
+                    attempt_in_flight = false;
+                }
+            }
+            OtpGroupRole::Exhausted => {
+                tracing::warn!(
+                    "[OTP-GROUP] {:?} group exhausted — no restorable member left; tab {} stays {:?}",
+                    conn_name,
+                    &my_tab[..my_tab.len().min(8)],
+                    state_map.get(&my_tab)
+                );
+                maybe_drop_group(&mut state);
+                return;
+            }
+        }
+
         if std::time::Instant::now() >= deadline {
             tracing::warn!(
-                "[RESTORE-CLONE] timed out after {}s waiting for the first session of {:?} to settle — opening a fresh connection",
-                RESTORE_CLONE_WAIT_SECS,
-                conn_name
+                "[OTP-GROUP] {:?} group timed out after {}s — tab {} gives up (manual reconnect still available)",
+                conn_name,
+                OTP_GROUP_BUDGET_SECS,
+                &my_tab[..my_tab.len().min(8)]
             );
-            return None;
+            maybe_drop_group(&mut state);
+            return;
         }
         tokio::time::sleep(std::time::Duration::from_millis(REPLAY_POLL_MS)).await;
     }

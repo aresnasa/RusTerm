@@ -631,6 +631,7 @@ mod tests {
             onekey_skip_logged: Default::default(),
             session_configs: HashMap::new(),
             session_connection_states: HashMap::new(),
+            otp_groups: crate::state::OtpGroupRegistry::default(),
             send_target_selection: None,
             ssh_sessions: HashMap::new(),
             sftp_clients: HashMap::new(),
