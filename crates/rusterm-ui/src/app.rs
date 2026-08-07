@@ -12210,6 +12210,98 @@ send hi\n"
         assert!(!should_schedule_replay(None, &ops));
     }
 
+    /// Pins the 0.17 "恢复同一连接的多个 JumpServer 会话只输一次 OTP"
+    /// contract: only SSH restores group by resolved connection id, the
+    /// first one of a group opens fresh (its OTP covers the group), and
+    /// every later restore of the same connection defers to a channel clone
+    /// of that first session — sessions of *other* connections still open
+    /// independently, as do Telnet/TCP restores (no shared transport).
+    #[test]
+    fn restore_groups_ssh_sessions_by_resolved_connection_for_otp_reuse() {
+        let ssh_conn = |id: &str| ConnectionConfig {
+            id: id.to_string(),
+            name: format!("js-{id}"),
+            kind: ConnectionKind::Ssh(SshConfig {
+                host: "jump.example.com".to_string(),
+                port: 22,
+                username: "ops".to_string(),
+                auth: rusterm_core::config::SshAuth::Agent,
+                terminal_type: "xterm-256color".to_string(),
+                proxy: None,
+                proxy_jump: None,
+                keepalive_interval: None,
+                host_key_policy: "accept-new".to_string(),
+            }),
+            group: None,
+            tags: Vec::new(),
+            onekey: false,
+            login_script: None,
+        };
+        let telnet_conn = |id: &str| ConnectionConfig {
+            id: id.to_string(),
+            name: format!("tn-{id}"),
+            kind: ConnectionKind::Telnet(TelnetConfig {
+                host: "legacy.example.com".to_string(),
+                port: 23,
+            }),
+            group: None,
+            tags: Vec::new(),
+            onekey: false,
+            login_script: None,
+        };
+        let mut first_tabs: HashMap<String, String> = HashMap::new();
+
+        // First restore of conn-a: fresh open, registered as group head.
+        let a1 = ssh_conn("conn-a");
+        assert_eq!(
+            decide_restore_open(&first_tabs, &a1),
+            RestoreOpenDecision::Fresh
+        );
+        first_tabs.insert(a1.id.clone(), "tab-a1".to_string());
+
+        // Second and third restores of the SAME connection clone from the
+        // first — one OTP total for the whole group, each clone tied to the
+        // group's own head tab.
+        let a2 = ssh_conn("conn-a");
+        assert_eq!(
+            decide_restore_open(&first_tabs, &a2),
+            RestoreOpenDecision::CloneFrom {
+                first_tab_id: "tab-a1".to_string()
+            }
+        );
+        let a3 = ssh_conn("conn-a");
+        assert_eq!(
+            decide_restore_open(&first_tabs, &a3),
+            RestoreOpenDecision::CloneFrom {
+                first_tab_id: "tab-a1".to_string()
+            }
+        );
+
+        // A different connection starts its own group (parallel restores of
+        // several saved connections don't cross-contaminate).
+        let b1 = ssh_conn("conn-b");
+        assert_eq!(
+            decide_restore_open(&first_tabs, &b1),
+            RestoreOpenDecision::Fresh
+        );
+        first_tabs.insert(b1.id.clone(), "tab-b1".to_string());
+        let b2 = ssh_conn("conn-b");
+        assert_eq!(
+            decide_restore_open(&first_tabs, &b2),
+            RestoreOpenDecision::CloneFrom {
+                first_tab_id: "tab-b1".to_string()
+            }
+        );
+
+        // Telnet/TCP have no SSH transport to clone from: never grouped,
+        // even when an entry somehow shares the id.
+        let t1 = telnet_conn("conn-a");
+        assert_eq!(
+            decide_restore_open(&first_tabs, &t1),
+            RestoreOpenDecision::Fresh
+        );
+    }
+
     /// Pins the "会话副本也能正确恢复" contract: a copied session persists
     /// with the source's saved-connection id and a "副本" display name that
     /// matches no saved connection. Restore must resolve the transport
@@ -15488,7 +15580,7 @@ fn restore_sessions(
                     // ones defer via a channel clone from its live transport.
                     match decide_restore_open(&restore_first_ssh_tabs, &conn) {
                         RestoreOpenDecision::CloneFrom { first_tab_id } => {
-                            let mut st = state;
+                            let st = state;
                             let senders = input_senders;
                             let conn_clone = conn.clone();
                             let conn_name = conn.name.clone();
@@ -15646,6 +15738,253 @@ fn restore_sessions(
                 state.write().dedup_pane_session_tabs();
             }
         }
+    }
+}
+
+/// Decides how a restored session opens its transport.
+///
+/// OTP-reuse on restore: JumpServer (koko) guards every *new TCP+SSH auth*
+/// with a one-time code, but opening another interactive *channel* on an
+/// already-authenticated transport is OTP-free. So when a snapshot holds
+/// several SSH sessions against the same saved connection, only the FIRST
+/// restored one authenticates (the user enters — or Feishu fetches — a
+/// single OTP); later sessions of that connection wait for it, then clone
+/// their channel from its live transport via [`open_connection`]'s
+/// `channel_clone_source`.
+#[derive(Debug, PartialEq, Eq)]
+enum RestoreOpenDecision {
+    /// Open a brand-new TCP+SSH+auth connection (the user's OTP applies to
+    /// this one).
+    Fresh,
+    /// Wait until `first_tab_id` finishes auth, then clone its channel.
+    CloneFrom { first_tab_id: String },
+}
+
+/// Only SSH sessions can share a transport — Telnet/TCP restores always open
+/// fresh. The grouping key is the *resolved* connection id (post
+/// `find_restore_connection`, so legacy snapshots whose `connection_id` is a
+/// stale tab UUID still group correctly via the name fallback).
+fn decide_restore_open(
+    first_by_conn: &HashMap<String, String>,
+    conn: &ConnectionConfig,
+) -> RestoreOpenDecision {
+    if matches!(conn.kind, ConnectionKind::Ssh(_)) {
+        if let Some(first) = first_by_conn.get(&conn.id) {
+            return RestoreOpenDecision::CloneFrom {
+                first_tab_id: first.clone(),
+            };
+        }
+    }
+    RestoreOpenDecision::Fresh
+}
+
+/// How long a deferred restore-clone waits for the first same-connection
+/// session to finish auth (password + OTP) before falling back to its own
+/// fresh connect. Generous on purpose: with the Feishu/webhook fetch the OTP
+/// round-trip takes seconds, but with manual entry the user may type slowly.
+/// Timing out is non-fatal — the clone simply reverts to the pre-0.17
+/// behaviour (its own OTP prompt).
+const RESTORE_CLONE_WAIT_SECS: u64 = 180;
+
+/// Poll until the first restored session of a saved connection reaches
+/// `Connected` (the `ssh_sessions` entry is written in the same state write,
+/// see `start_ssh_connection`) and return its live transport for channel
+/// cloning. Returns `None` when the first session failed, its transport is
+/// already gone, or the wait timed out — the caller then opens a fresh
+/// connection (extra OTP, but never a hung restore).
+async fn wait_for_restore_clone_source(
+    state: Signal<AppState>,
+    first_tab_id: &str,
+    conn_name: &str,
+) -> Option<rusterm_ssh::SshSession> {
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_secs(RESTORE_CLONE_WAIT_SECS);
+    loop {
+        {
+            let s = state.read();
+            match s.session_connection_states.get(first_tab_id) {
+                Some(SessionConnectionState::Connected) => {
+                    let src = s
+                        .ssh_sessions
+                        .get(first_tab_id)
+                        .filter(|sess| !sess.is_disconnected())
+                        .cloned();
+                    if src.is_some() {
+                        tracing::info!(
+                            "[RESTORE-CLONE] first session of {:?} authenticated — cloning its channel (OTP re-used)",
+                            conn_name
+                        );
+                    } else {
+                        tracing::warn!(
+                            "[RESTORE-CLONE] first session of {:?} connected but its transport is already gone — falling back to a fresh connect",
+                            conn_name
+                        );
+                    }
+                    return src;
+                }
+                Some(SessionConnectionState::Failed)
+                | Some(SessionConnectionState::Disconnected) => {
+                    tracing::warn!(
+                        "[RESTORE-CLONE] first session of {:?} failed to authenticate — restored clone opens its own connection (one more OTP)",
+                        conn_name
+                    );
+                    return None;
+                }
+                _ => {}
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            tracing::warn!(
+                "[RESTORE-CLONE] timed out after {}s waiting for the first session of {:?} to authenticate — opening a fresh connection",
+                RESTORE_CLONE_WAIT_SECS,
+                conn_name
+            );
+            return None;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(REPLAY_POLL_MS)).await;
+    }
+}
+
+/// Post-open restore work shared by the fresh and clone paths: apply the
+/// persisted terminal size, fold the per-session DuckDB replay stream,
+/// migrate it onto the new tab id, re-seed the replay recorder, then schedule
+/// menu-op replay / login-script / `cd` in priority order.
+fn finish_restored_session(
+    mut state: Signal<AppState>,
+    input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    ps: &rusterm_core::PersistedSession,
+    conn_for_replay: &ConnectionConfig,
+    tab_id: String,
+) {
+    if !tab_id.is_empty() {
+        // Apply the persisted terminal size so the SSH session
+        // opens with the correct PTY winsize from the start.
+        if let Some(ts) = ps.terminal_size.as_ref() {
+            let terminals = state.read().terminals.clone();
+            if let Some(handle) = terminals.get(&tab_id) {
+                let mut entry = handle.lock();
+                entry.terminal.resize(
+                    ts.cols,
+                    ts.rows,
+                    ts.pixel_width,
+                    ts.pixel_height,
+                );
+            }
+        }
+    }
+    // Establishment ops to replay: the session's OWN DuckDB
+    // replay-event stream (keyed by the persisted tab id)
+    // wins over the bincode snapshot when it has data — each
+    // event row is written as the input happens, so the fold
+    // can't lose the final ops to the snapshot's save
+    // debounce (and it survives crashes for the same
+    // reason). Streams are strictly per-session: several
+    // jumpserver windows restored from the same saved
+    // connection each fold only their own navigation, so
+    // concurrent restores can't cross-contaminate. Without
+    // the `analytics` feature the fold is always empty and
+    // the snapshot ops are used as before.
+    let restore_replay_ops = {
+        let analytics = state.read().analytics.clone();
+        match analytics.latest_replay_ops(&ps.id) {
+            Ok(ops) if !ops.is_empty() => {
+                tracing::info!(
+                    "[REPLAY] restored session {} using {} op(s) from its per-session replay stream (was {})",
+                    &tab_id[..tab_id.len().min(8)],
+                    ops.len(),
+                    &ps.id[..ps.id.len().min(8)],
+                );
+                ops
+            }
+            Ok(_) => ps.replay_ops.clone(),
+            Err(e) => {
+                tracing::warn!(
+                    "[REPLAY] failed to read replay-event log — falling back to snapshot ops: {e}"
+                );
+                ps.replay_ops.clone()
+            }
+        }
+    };
+    // Re-home the stream onto the freshly minted tab id so
+    // the next snapshot/restart finds it, and drop the old
+    // stream (its id is now unreferenced).
+    if !restore_replay_ops.is_empty() && !tab_id.is_empty() {
+        migrate_replay_stream(
+            state.read().analytics.clone(),
+            ps.id.clone(),
+            tab_id.clone(),
+            restore_replay_ops.clone(),
+        );
+    }
+    if !tab_id.is_empty() {
+        // Pre-seed command history tail so suggestions work.
+        let mut s = state.write();
+        if let Some(tab) = s.sessions.iter_mut().find(|t| t.id == tab_id) {
+            tab.command_history = ps.command_history_tail.clone();
+        }
+        // Re-seed the interactive-replay recorder so future
+        // reconnects of the restored session replay the same
+        // establishment ops.
+        if !restore_replay_ops.is_empty() {
+            s.session_replays.insert(
+                tab_id.clone(),
+                crate::state::SessionReplayRecorder {
+                    ops: restore_replay_ops.clone(),
+                    shell_integrated: false,
+                },
+            );
+        }
+    }
+    // Establishment on restore, in priority order:
+    // 1. Recorded interactive ops (jumpserver menu
+    //    navigation) are replayed — they hold the user's
+    //    *last* selection, overriding a pure-navigation
+    //    login script (which is suppressed so the two never
+    //    double-drive the menu). If the snapshot also has a
+    //    cwd (integrated target shell), a follow-up `cd`
+    //    lands the user back in their directory.
+    // 2. Otherwise a configured login script owns the whole
+    //    flow — always when it carries credentials
+    //    (send_onekey), or when nothing was recorded. It
+    //    re-runs on the fresh connection (driven from the
+    //    session output loop), so no blind `cd` may type
+    //    into the bastion menu on top of it.
+    // 3. Plain integrated shells restore via `cd` alone.
+    let has_login_script = conn_for_replay
+        .login_script
+        .as_deref()
+        .is_some_and(|s| !s.trim().is_empty());
+    if should_schedule_replay(
+        conn_for_replay.login_script.as_deref(),
+        &restore_replay_ops,
+    ) {
+        if has_login_script {
+            suppress_login_script(&mut state.write(), &tab_id);
+        }
+        tracing::info!(
+            "[REPLAY] restored session {} scheduling {} recorded op(s)",
+            &tab_id[..tab_id.len().min(8)],
+            restore_replay_ops.len()
+        );
+        schedule_replay_after_reconnect(
+            state.clone(),
+            input_senders.clone(),
+            tab_id.clone(),
+            restore_replay_ops,
+            ps.cwd.clone(),
+        );
+    } else if has_login_script {
+        tracing::info!(
+            "[RESTORE] session {} has a login script — it owns establishment, skipping cd/replay",
+            &tab_id[..tab_id.len().min(8)]
+        );
+    } else if let Some(cwd) = &ps.cwd {
+        schedule_cd_after_restore(
+            state.clone(),
+            input_senders.clone(),
+            tab_id,
+            cwd.clone(),
+        );
     }
 }
 
