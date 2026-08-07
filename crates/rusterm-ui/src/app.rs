@@ -15776,17 +15776,17 @@ fn decide_restore_open(
 }
 
 /// How long a deferred restore-clone waits for the first same-connection
-/// session to finish auth (password + OTP) before falling back to its own
-/// fresh connect. Generous on purpose: with the Feishu/webhook fetch the OTP
-/// round-trip takes seconds, but with manual entry the user may type slowly.
-/// Timing out is non-fatal — the clone simply reverts to the pre-0.17
-/// behaviour (its own OTP prompt).
+/// session to finish auth AND adopt past its OTP + menu navigation before
+/// falling back to its own fresh connect. Generous on purpose: with the
+/// Feishu/webhook fetch the OTP round-trip takes seconds, but with manual
+/// entry the user may type slowly. Timing out is non-fatal — the clone simply
+/// reverts to the pre-0.17 behaviour (its own OTP prompt).
 const RESTORE_CLONE_WAIT_SECS: u64 = 180;
-/// Number of consecutive unchanged-output polls (× [`REPLAY_POLL_MS`]) of a
-/// stable, non-credential prompt before the first restored session counts as
-/// "adopted" — i.e. past the JumpServer tty OTP and its replayed menu steps,
-/// safe to clone a channel from. Kept in sync with the replay pacing.
-const RESTORE_CLONE_SETTLED_POLLS: u32 = crate::state::REPLAY_QUIESCENT_POLLS;
+/// Number of consecutive settled-prompt polls (× [`REPLAY_POLL_MS`], so
+/// ~800ms of a stable usable prompt) before the first restored session counts
+/// as "adopted" — i.e. past the JumpServer tty OTP and its replayed menu
+/// steps, safe to clone a channel from. Matches the replay quiescence budget.
+const RESTORE_CLONE_SETTLED_POLLS: u32 = 4;
 
 /// Has the FIRST restored session of a connection advanced past the point
 /// where cloning one of its channels is safe? Transport `Connected` alone is
