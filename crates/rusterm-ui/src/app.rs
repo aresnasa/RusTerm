@@ -15592,12 +15592,9 @@ fn restore_sessions(
                                 conn_name
                             );
                             spawn(async move {
-                                let clone_source = wait_for_restore_clone_source(
-                                    st,
-                                    &first_tab_id,
-                                    &conn_name,
-                                )
-                                .await;
+                                let clone_source =
+                                    wait_for_restore_clone_source(st, &first_tab_id, &conn_name)
+                                        .await;
                                 let opened = open_connection(
                                     st,
                                     senders,
@@ -15785,13 +15782,41 @@ fn decide_restore_open(
 /// Timing out is non-fatal — the clone simply reverts to the pre-0.17
 /// behaviour (its own OTP prompt).
 const RESTORE_CLONE_WAIT_SECS: u64 = 180;
+/// Number of consecutive unchanged-output polls (× [`REPLAY_POLL_MS`]) of a
+/// stable, non-credential prompt before the first restored session counts as
+/// "adopted" — i.e. past the JumpServer tty OTP and its replayed menu steps,
+/// safe to clone a channel from. Kept in sync with the replay pacing.
+const RESTORE_CLONE_SETTLED_POLLS: u32 = crate::state::REPLAY_QUIESCENT_POLLS;
+
+/// Has the FIRST restored session of a connection advanced past the point
+/// where cloning one of its channels is safe? Transport `Connected` alone is
+/// NOT enough: JumpServer demands its tty `2nd Password:` OTP after auth, and
+/// the koko menu navigation (replayed ops) runs on top of that. A channel
+/// opened while the first channel is mid-OTP / mid-menu is dropped by the
+/// bastion (the clone's tab shows red \"断开\").
+///
+/// Ready means the cursor line is a usable prompt — a real shell, or a
+/// non-credential line (the koko `Opt>` menu) — and it is NOT any OTP /
+/// password / username prompt. The caller additionally requires a few quiet
+/// polls so a freshly-landed prompt is not mistaken for settled while the
+/// next replay op is still in flight.
+fn restored_first_session_ready_for_clone(state: &AppState, tab_id: &str) -> bool {
+    let current_line = state
+        .terminals
+        .get(tab_id)
+        .map(|handle| handle.lock().terminal.extract_current_line())
+        .unwrap_or_default();
+    if credential_kind(&current_line).is_some() {
+        return false;
+    }
+    crate::state::prompt_looks_like_shell(&current_line) || !current_line.trim().is_empty()
+}
 
 /// Poll until the first restored session of a saved connection reaches
-/// `Connected` (the `ssh_sessions` entry is written in the same state write,
-/// see `start_ssh_connection`) and return its live transport for channel
-/// cloning. Returns `None` when the first session failed, its transport is
-/// already gone, or the wait timed out — the caller then opens a fresh
-/// connection (extra OTP, but never a hung restore).
+/// `Connected` AND has settled past its OTP + adopted navigation, then return
+/// its live transport for channel cloning. Returns `None` when the first
+/// session failed, its transport is already gone, or the wait timed out — the
+/// caller then opens a fresh connection (extra OTP, but never a hung restore).
 async fn wait_for_restore_clone_source(
     state: Signal<AppState>,
     first_tab_id: &str,
@@ -15799,28 +15824,42 @@ async fn wait_for_restore_clone_source(
 ) -> Option<rusterm_ssh::SshSession> {
     let deadline =
         std::time::Instant::now() + std::time::Duration::from_secs(RESTORE_CLONE_WAIT_SECS);
+    let mut settled = 0u32;
     loop {
         {
             let s = state.read();
             match s.session_connection_states.get(first_tab_id) {
                 Some(SessionConnectionState::Connected) => {
-                    let src = s
-                        .ssh_sessions
-                        .get(first_tab_id)
-                        .filter(|sess| !sess.is_disconnected())
-                        .cloned();
-                    if src.is_some() {
-                        tracing::info!(
-                            "[RESTORE-CLONE] first session of {:?} authenticated — cloning its channel (OTP re-used)",
-                            conn_name
-                        );
+                    // Gate cloning on adoption, not bare auth. Only accumulate
+                    // the settled streak once the first session shows a usable
+                    // prompt that is not a credential prompt; any blip (OTP
+                    // appears, a replay op echoes, a logout drops the line)
+                    // resets it, so we clone only after the first session has
+                    // genuinely landed.
+                    if restored_first_session_ready_for_clone(&s, first_tab_id) {
+                        settled += 1;
                     } else {
-                        tracing::warn!(
-                            "[RESTORE-CLONE] first session of {:?} connected but its transport is already gone — falling back to a fresh connect",
-                            conn_name
-                        );
+                        settled = 0;
                     }
-                    return src;
+                    if settled >= RESTORE_CLONE_SETTLED_POLLS {
+                        let src = s
+                            .ssh_sessions
+                            .get(first_tab_id)
+                            .filter(|sess| !sess.is_disconnected())
+                            .cloned();
+                        if src.is_some() {
+                            tracing::info!(
+                                "[RESTORE-CLONE] first session of {:?} settled past OTP — cloning its channel (OTP re-used)",
+                                conn_name
+                            );
+                        } else {
+                            tracing::warn!(
+                                "[RESTORE-CLONE] first session of {:?} connected but its transport is already gone — falling back to a fresh connect",
+                                conn_name
+                            );
+                        }
+                        return src;
+                    }
                 }
                 Some(SessionConnectionState::Failed)
                 | Some(SessionConnectionState::Disconnected) => {
@@ -15835,7 +15874,7 @@ async fn wait_for_restore_clone_source(
         }
         if std::time::Instant::now() >= deadline {
             tracing::warn!(
-                "[RESTORE-CLONE] timed out after {}s waiting for the first session of {:?} to authenticate — opening a fresh connection",
+                "[RESTORE-CLONE] timed out after {}s waiting for the first session of {:?} to settle — opening a fresh connection",
                 RESTORE_CLONE_WAIT_SECS,
                 conn_name
             );
@@ -15863,12 +15902,9 @@ fn finish_restored_session(
             let terminals = state.read().terminals.clone();
             if let Some(handle) = terminals.get(&tab_id) {
                 let mut entry = handle.lock();
-                entry.terminal.resize(
-                    ts.cols,
-                    ts.rows,
-                    ts.pixel_width,
-                    ts.pixel_height,
-                );
+                entry
+                    .terminal
+                    .resize(ts.cols, ts.rows, ts.pixel_width, ts.pixel_height);
             }
         }
     }
@@ -15954,10 +15990,7 @@ fn finish_restored_session(
         .login_script
         .as_deref()
         .is_some_and(|s| !s.trim().is_empty());
-    if should_schedule_replay(
-        conn_for_replay.login_script.as_deref(),
-        &restore_replay_ops,
-    ) {
+    if should_schedule_replay(conn_for_replay.login_script.as_deref(), &restore_replay_ops) {
         if has_login_script {
             suppress_login_script(&mut state.write(), &tab_id);
         }
@@ -15979,12 +16012,7 @@ fn finish_restored_session(
             &tab_id[..tab_id.len().min(8)]
         );
     } else if let Some(cwd) = &ps.cwd {
-        schedule_cd_after_restore(
-            state.clone(),
-            input_senders.clone(),
-            tab_id,
-            cwd.clone(),
-        );
+        schedule_cd_after_restore(state.clone(), input_senders.clone(), tab_id, cwd.clone());
     }
 }
 
