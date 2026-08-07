@@ -8187,6 +8187,7 @@ dependencies = [
  "tokio",
  "tokio-util",
  "tracing",
+ "tungstenite",
  "uuid",
  "vte",
  "zeroize",

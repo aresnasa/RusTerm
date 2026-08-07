@@ -124,10 +124,41 @@ User directive: the Feishu window must pop up BEFORE the JumpServer terminal log
 `cargo check --workspace` ✅, `cargo test -p rusterm-ui` 815 pass ✅. Unpushed commits on main:
 e38e99c + ff363a7 (ff363a7 also swept in previously-staged .claude/Claude.md + this memory file).
 
+## Session 8: local Chrome/Edge replaces Wry/Obscura (uncommitted)
+User explicitly rejected Obscura and embedded Wry. `feishu_browser.rs` was replaced with an external Chromium launcher/controller:
+- Browser priority: Google Chrome, then Microsoft Edge; actionable failure when neither exists. Optional `RUSTERM_CHROME_PATH` / `RUSTERM_EDGE_PATH` overrides.
+- Dedicated persistent profiles under the platform data directory: `rusterm/feishu-browser/chrome` and `.../edge`; never uses the user's default browser profile.
+- Launch flags include `--remote-debugging-port=0`, `--remote-allow-origins=*`, no-first-run/default-browser checks, and `--new-window`.
+- Reads `DevToolsActivePort`, polls loopback CDP `/json/list`, and marks the web session logged in only for an official tenant `/next/messenger` URL. Official HTTPS host validation prevents arbitrary URLs.
+- Closing the RusTerm popup stops monitoring but deliberately does not kill Chrome/Edge, preserving the session.
+- Removed the tao custom event handler, Wry implementation, debug smoke hook, and generic macOS `open` fallback (which could choose Safari). Popup copy/actions now explicitly say Chrome/Edge.
+- Existing `2nd Password:` OneKey/login-script ownership guards and OAuth prompt timing were preserved.
+Validation: Chrome and Edge executables both detected on this Mac; 7 browser unit tests passed; full `cargo test -p rusterm-ui` passed (825 + 2 doctests); `cargo check --workspace`, fmt check, diff check, and diagnostics passed. Live QR scan/CDP session reuse still needs user interaction and was not run. No commit/push.
+
 ## Still unverified end-to-end (needs live JumpServer + Feishu)
 QR scan → exchange → 动态口令 → bot reply parse → tty fill. Next user retest should capture
 `RUST_LOG=info` logs (~/Library/Application Support/rusterm/logs/) and grep `[OTP-FEISHU]`,
 `[REPLAY]`, `[LOGIN-SCRIPT]`, `[ONEKEY-SKIP]` (new reason: `feishu_otp_prompt`).
+
+## Session 9: v0.11 requirement already satisfied by staged tree (verified)
+User restated the v0.11 goal: keep Chrome/Edge background-resident after QR sign-in; every
+new/cloned session reuses the Feishu web login and just sends 2fa/动态口令 to 智小安 via CDP.
+Audit found ALL of it already implemented in the staged tree (Sessions 7+8):
+- Browser never killed: `close_feishu_login_window`/`hide_feishu_login_window` only stop monitoring
+  + flip ACTIVE; `close` does NOT kill the process.
+- Duplicate/clone (`open_connection` → `clone_session_into_pane`) routes through the same
+  `start_ssh_connection` → `maybe_preauth_feishu_at_connect`; browser-flow `start` gate is
+  `!is_feishu_browser_active() && !is_feishu_web_session_logged_in()` ⇒ no reopen once logged in.
+- `maybe_trigger_feishu_otp` (browser flow, LOGGED_IN=true) → `StartFetch` → `trigger_feishu_otp_fetch`
+  → `feishu_browser::request_feishu_otp` (智小安, `default_feishu_otp_request_text` = "动态口令",
+  user-editable in settings 取码消息文本 — "2fa" also bot-supported) → CDP automate → `OtpReply` → parse
+  (`parse_otp_reply`, pattern `\b\d{4,8}\b`) → `queue_feishu_otp_if_prompt_visible` → tty send.
+- Resilience: `working_devtools_port` re-scans `DevToolsActivePort`; `OtpFailed` with
+  `cdp_unavailable` clears LOGGED_IN → next prompt re-opens browser.
+Only edit made: i18n label `settings.otp_feishu_request_text` now reads "(e.g. 动态口令 or 2fa)"
+so users know either keyword works. Validation: `cargo check --workspace` clean;
+`cargo test -p rusterm-ui` 835 passed, 0 failed. Staged (uncommitted) state is the deliverable;
+live QR→OTP E2E still needs user retest with real Feishu/JumpServer.
 
 ## Session 7: real SSH entry bypass + OTP ownership invariant (uncommitted)
 User retest showed no Feishu window and OneKey `sudo 密码` at `2nd Password:`.

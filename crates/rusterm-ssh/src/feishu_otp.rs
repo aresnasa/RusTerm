@@ -336,6 +336,19 @@ pub fn parse_validity_secs(text: &str) -> Option<u64> {
     re.captures(text)?.get(1)?.as_str().parse().ok()
 }
 
+/// Parse an OTP from a browser-rendered bot reply using the same extraction
+/// rules as the OpenAPI message path. Invalid configured regexes fall back to
+/// the conservative 4–8 digit pattern used by [`FeishuOtpClient`].
+pub fn parse_otp_reply(text: &str, code_pattern: &str) -> Option<FetchedOtp> {
+    let code_re = Regex::new(code_pattern)
+        .unwrap_or_else(|_| Regex::new(r"\b\d{4,8}\b").expect("default OTP regex is valid"));
+    let code = extract_first_match(text, &code_re)?;
+    Some(FetchedOtp {
+        code,
+        valid_secs: parse_validity_secs(text),
+    })
+}
+
 /// Client that relays a one-time code request to the designated ops bot via
 /// the signed-in user's Feishu identity. The destination bot is fixed at
 /// construction and cannot be changed on the send path.
@@ -664,6 +677,15 @@ mod tests {
             extract_first_match("code 123456 ok", &re).as_deref(),
             Some("123456")
         );
+    }
+
+    #[test]
+    fn parses_browser_reply_with_configured_code_pattern() {
+        let parsed = parse_otp_reply("otp：313786，有效期剩余：36秒", r"otp[：:]\s*(\d{6})")
+            .expect("reply should contain an OTP");
+        assert_eq!(parsed.code, "313786");
+        assert_eq!(parsed.valid_secs, Some(36));
+        assert!(parse_otp_reply("动态口令", r"(\d{6})").is_none());
     }
 
     #[test]

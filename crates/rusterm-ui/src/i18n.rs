@@ -170,7 +170,10 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         "settings.otp_feishu_bot_open_id" => {
             ("Ops bot open id (智小安)", "运维机器人 open id（智小安）")
         }
-        "settings.otp_feishu_request_text" => ("OTP request message", "取码消息文本"),
+        "settings.otp_feishu_request_text" => (
+            "OTP request message (e.g. 动态口令 or 2fa)",
+            "取码消息文本（如 动态口令 或 2fa）",
+        ),
         "settings.otp_feishu_token_connected" => (
             "Feishu signed in, expires {ts}",
             "飞书已登录，token 至 {ts}",
@@ -205,21 +208,18 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         "settings.otp_timeout_secs" => ("Timeout (seconds)", "超时（秒）"),
         "feishu.qr_title" => ("Feishu sign-in", "飞书扫码登录"),
         "feishu.qr_subtitle_session" => (
-            "Sign in via the Feishu window to auto-fill the JumpServer OTP",
-            "在飞书登录窗口中完成授权，自动填入 JumpServer 二次验证码",
+            "Sign in via Chrome or Edge to auto-fill the JumpServer OTP",
+            "在 Chrome 或 Edge 中完成授权，自动填入 JumpServer 二次验证码",
         ),
         "feishu.qr_subtitle_settings" => (
-            "Sign in via the Feishu window to connect RusTerm",
-            "在飞书登录窗口中完成授权",
+            "Sign in via Chrome or Edge to connect RusTerm",
+            "在 Chrome 或 Edge 中完成授权",
         ),
-        "feishu.qr_embedded_hint" => (
-            "A Feishu sign-in window is open.\nScan the QR inside it with the Feishu app\n(an existing session signs in automatically).",
-            "已打开飞书登录窗口\n请用手机飞书扫描该窗口内的二维码\n（已登录过会自动完成授权）",
+        "feishu.qr_browser_hint" => (
+            "A dedicated Chrome or Edge window is open.\nScan the Feishu QR shown there\n(an existing session signs in automatically).",
+            "已打开 RusTerm 专用 Chrome 或 Edge 窗口\n请用手机飞书扫描其中的二维码\n（已登录过会自动完成授权）",
         ),
-        "feishu.qr_open_embedded" => ("Reopen Feishu sign-in window", "重新打开飞书登录窗口"),
-        "feishu.browser_title" => ("Feishu sign-in", "飞书扫码登录"),
-        "feishu.browser_loading" => ("Loading Feishu sign-in page…", "正在加载飞书登录页…"),
-        "feishu.qr_open" => ("Open in browser", "在浏览器打开"),
+        "feishu.qr_open_browser" => ("Reopen in Chrome or Edge", "重新在 Chrome 或 Edge 中打开"),
         "feishu.qr_rescan" => ("Restart authorization", "重新授权"),
         "feishu.qr_expired" => (
             "Sign-in expired — restart to retry",

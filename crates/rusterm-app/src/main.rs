@@ -146,14 +146,7 @@ html,body{margin:0;padding:0;width:100%;height:100%;overflow:hidden;background:#
         // has previously unchecked "下次关闭时不再询问" + picked "确认", the
         // wry handler flips the behaviour to `WindowCloses` directly so the
         // app exits without showing the dialog.
-        .with_close_behaviour(dioxus::desktop::WindowCloseBehaviour::WindowHides)
-        // Feishu uses a plain Wry child window because Dioxus' own WebView
-        // wrapper intentionally sends all external http(s) navigation to the
-        // system browser. The event hook keeps native window creation on tao's
-        // main thread while rusterm-ui queues open/close requests.
-        .with_custom_event_handler(|event, target| {
-            rusterm_ui::feishu_browser::handle_feishu_browser_event(event, target);
-        });
+        .with_close_behaviour(dioxus::desktop::WindowCloseBehaviour::WindowHides);
 
     // Window icon. The PNG embedded below is rasterized at build time
     // from `assets/gemini-svg.svg` by `build.rs` (using resvg/usvg/tiny-skia).

@@ -257,6 +257,11 @@ Linux gpu-muxi-001.x86.test.brainpp.dev 5.15.0-119-generic #1，将API 脚本放
   0.4 [@Image](zed:///agent/pasted-image?name=Image) 还是没有弹出飞书扫码页，不符合预期。，需要使用obscura访问open.feishu.cn 创建相关会话并获取飞书聊天的权限，再进行后续步骤
   0.5 不符合预期，这里登录 jumpserver 的终端前，需要先弹出一个串口飞书扫码成功后获取了相关信息再将转换好的 OTP 密码填入 jumpserver 的 OTP，继续改造逻辑。
   0.6 [@Image](zed:///agent/pasted-image?name=Image) 弹出窗口了，需要继续调试联动浏览器和生成飞书二维码
+  0.7 这里不能使用obscura了，需要调用本地的 chrome 浏览器或者 edge 浏览器，适配一下这两个浏览器提供扫码能力，改造一下
+  0.8 用户手动输入 OTP 作为最终的兜底方案，如果都失败了，报错即可
+  0.9 ![](image_14.png)修复开启多个 chrome 的页面，同时修复扫码成功后，没有发送消息到“智小安”，需要修复
+  0.10 ![](image_15.png)需要调用 chrome 登录飞书，检查并修复相关问题
+  0.11 登录成功后的这个 chrome 或者 edge 可以在后台挂着，每次新复制会话直接调用智小安消息中的 OTP 内容即可，可以发送 2fa 或者动态口令给智小安，复用飞书登录态的信息。
 
 
   1. 首先尝试触发飞书扫码，获取登录态的 session

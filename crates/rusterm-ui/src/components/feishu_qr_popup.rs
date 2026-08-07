@@ -1,8 +1,8 @@
 //! Floating status popup for the Feishu OAuth sign-in (issues #129/#130).
 //!
-//! The actual QR code is rendered by Feishu itself inside the embedded
-//! browser window (`crate::feishu_browser`) — the phone scan must authorize
-//! the desktop webview so the OAuth redirect can reach the loopback
+//! The actual QR code is rendered by Feishu itself inside a local Chrome or
+//! Edge window (`crate::feishu_browser`) — the phone scan authorizes the
+//! dedicated browser profile so the OAuth redirect can reach the loopback
 //! listener. This popup only tracks flow status (scanning / delivered /
 //! failed) and offers recovery actions. Once the backend obtains tokens,
 //! the app event loop closes this popup automatically; a settings-initiated
@@ -14,16 +14,13 @@ use dioxus::prelude::*;
 use crate::state::{FeishuQrPopup, FeishuQrPopupStatus};
 
 /// Render the Feishu sign-in status popup. Never displays the authorize URL
-/// itself in the UI — the embedded window / system browser carries it — but
-/// the "open in browser" button offers a launcher-based fallback.
+/// itself in the UI — the dedicated Chrome/Edge window carries it.
 #[component]
 pub fn FeishuQrPopupView(
     popup: FeishuQrPopup,
     /// Fires when the user cancels / dismisses the popup.
     on_close: EventHandler<()>,
-    /// Fires when the user asks to reopen the embedded sign-in window.
-    on_embedded: EventHandler<()>,
-    /// Fires when the user asks to reopen the authorize URL in a browser.
+    /// Fires when the user asks to reopen the dedicated Chrome/Edge window.
     on_browser: EventHandler<()>,
     /// Fires when the user re-scans after expiration/failure.
     on_rescan: EventHandler<()>,
@@ -102,8 +99,8 @@ pub fn FeishuQrPopupView(
                     { crate::i18n::t(if is_settings_session { "feishu.qr_subtitle_settings" } else { "feishu.qr_subtitle_session" }) }
                 }
 
-                // Instruction panel — the QR itself lives in the embedded
-                // Feishu window; this block just points the user there.
+                // The QR itself lives in the dedicated Chrome/Edge window;
+                // this block just points the user there.
                 div {
                     style: "
                         background: #16161e;
@@ -119,7 +116,7 @@ pub fn FeishuQrPopupView(
                     }
                     div {
                         style: "font-size: 12px; color: #a9b1d6; line-height: 1.7; white-space: pre-line;",
-                        { crate::i18n::t("feishu.qr_embedded_hint") }
+                        { crate::i18n::t("feishu.qr_browser_hint") }
                     }
                 }
 
@@ -140,21 +137,9 @@ pub fn FeishuQrPopupView(
                         ",
                         onclick: move |e| {
                             e.stop_propagation();
-                            on_embedded.call(());
-                        },
-                        { crate::i18n::t("feishu.qr_open_embedded") }
-                    }
-                    button {
-                        r#type: "button",
-                        style: "
-                            background: transparent; color: #a9b1d6; border: 1px solid #2a2b3d;
-                            border-radius: 6px; padding: 8px; font-size: 12px; cursor: pointer;
-                        ",
-                        onclick: move |e| {
-                            e.stop_propagation();
                             on_browser.call(());
                         },
-                        { crate::i18n::t("feishu.qr_open") }
+                        { crate::i18n::t("feishu.qr_open_browser") }
                     }
                     button {
                         r#type: "button",
