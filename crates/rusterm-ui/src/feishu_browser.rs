@@ -1108,6 +1108,132 @@ fn wait_for_point(
     }
 }
 
+fn json_string(text: &str) -> String {
+    Value::String(text.to_string()).to_string()
+}
+
+/// Locates the search editor. Prefers the known Lark DOM id, falls back to any
+/// contenteditable inside a modal dialog, then to the currently focused
+/// editable element (clicking the navbar search entry focuses the editor).
+fn search_editor_finder() -> String {
+    "(document.querySelector('#search_bar_editor [contenteditable=true]') \
+        || document.querySelector('[role=dialog] [contenteditable=true]') \
+        || document.querySelector('.dialog [contenteditable=true]') \
+        || ((document.activeElement && document.activeElement.isContentEditable \
+            && document.activeElement.getBoundingClientRect().width > 0) ? document.activeElement : null))"
+        .to_string()
+}
+
+/// Locates the chat composer. Prefers the known Lark editor class, falls back
+/// to the first visible contenteditable that is not inside the search dialog.
+fn composer_finder() -> String {
+    "(document.querySelector('[contenteditable=true].innerdocbody') \
+        || Array.from(document.querySelectorAll('[contenteditable=true]')) \
+            .find((el) => { \
+                const rect = el.getBoundingClientRect(); \
+                return rect.width > 0 && rect.height > 0 \
+                    && !el.closest('[role=dialog], .dialog, #search_bar_editor, .appNavbar'); \
+            }) || null)"
+        .to_string()
+}
+
+fn element_focus_script(finders_expr: &str) -> String {
+    "(() => { const el = __FINDERS__; if (!el) return false; el.focus(); return true; })()"
+        .replace("__FINDERS__", finders_expr)
+}
+
+fn element_text_script(finders_expr: &str) -> String {
+    "(() => { const el = __FINDERS__; if (!el) return null; \
+        return (el.innerText || el.textContent || '').replace(/\\u200B/g, '').trim(); })()"
+        .replace("__FINDERS__", finders_expr)
+}
+
+/// Script that focuses the located editor, selects its contents, and inserts
+/// `text` via `document.execCommand('insertText')`. Unlike the raw CDP
+/// `Input.insertText`, this runs the browser's real editing pipeline, which
+/// fires the beforeinput/input events Feishu's custom editor listens to — the
+/// raw CDP call was observed to silently drop text in the live app. Handles
+/// plain INPUT/TEXTAREA controls via the native value setter. Returns
+/// 'ok' | 'mismatch' | 'missing' after a read-back verification.
+fn text_insert_script(finders_expr: &str, text: &str) -> String {
+    "(() => {\
+        const el = __FINDERS__;\
+        if (!el) return 'missing';\
+        const tag = (el.tagName || '').toUpperCase();\
+        el.focus();\
+        if (tag === 'INPUT' || tag === 'TEXTAREA') {\
+            const proto = tag === 'INPUT' ? HTMLInputElement.prototype : HTMLTextAreaElement.prototype;\
+            const descriptor = Object.getOwnPropertyDescriptor(proto, 'value');\
+            if (descriptor && descriptor.set) descriptor.set.call(el, __TEXT__);\
+            else el.value = __TEXT__;\
+            el.dispatchEvent(new Event('input', { bubbles: true }));\
+            el.dispatchEvent(new Event('change', { bubbles: true }));\
+            return el.value === __TEXT__ ? 'ok' : 'mismatch';\
+        }\
+        if (el.isContentEditable) {\
+            const selection = window.getSelection();\
+            const range = document.createRange();\
+            range.selectNodeContents(el);\
+            selection.removeAllRanges();\
+            selection.addRange(range);\
+        }\
+        document.execCommand('insertText', false, __TEXT__);\
+        const current = (el.innerText || el.textContent || '').replace(/\\u200B/g, '').trim();\
+        return current === __EXPECTED__ ? 'ok' : 'mismatch';\
+    })()"
+    .replace("__FINDERS__", finders_expr)
+    .replace("__TEXT__", &json_string(text))
+    .replace("__EXPECTED__", &json_string(text.trim()))
+}
+
+/// Verified, retrying text entry. Live runs showed the bare CDP
+/// `Input.insertText` intermittently landing nowhere (empty search box / wrong
+/// composer content) depending on which element held focus at that instant, so
+/// every write is now followed by a DOM read-back and retried, alternating
+/// between the in-page execCommand pipeline and the CDP input pipeline (each
+/// attempt re-clears the editor first, so retries cannot duplicate text).
+fn type_into_editor(
+    client: &mut CdpClient,
+    finders_expr: &str,
+    text: &str,
+    failure_reason: &str,
+) -> Result<(), AutomationFailure> {
+    let exec_script = text_insert_script(finders_expr, text);
+    let focus_script = element_focus_script(finders_expr);
+    let text_script = element_text_script(finders_expr);
+    let mut last_state = "missing".to_string();
+    for attempt in 0..6 {
+        if attempt > 0 {
+            thread::sleep(AUTOMATION_POLL_INTERVAL);
+        }
+        if attempt % 3 == 2 {
+            // Fallback: focus via DOM, then drive the native CDP input pipeline.
+            let focused: bool = client.evaluate(&focus_script)?;
+            if focused {
+                client.clear_focused_editor()?;
+                client.insert_text(text)?;
+                thread::sleep(AUTOMATION_POLL_INTERVAL);
+                let current: Option<String> = client.evaluate(&text_script)?;
+                if current.as_deref() == Some(text.trim()) {
+                    return Ok(());
+                }
+                last_state = "cdp-mismatch".to_string();
+                continue;
+            }
+        }
+        let state: String = client.evaluate(&exec_script)?;
+        last_state = state.clone();
+        if state == "ok" {
+            return Ok(());
+        }
+    }
+    tracing::warn!(
+        "[OTP-FEISHU] editor text entry failed after retries (state={last_state}, text len={})",
+        text.chars().count()
+    );
+    Err(AutomationFailure::dom(failure_reason))
+}
+
 fn unique_exact_bot_candidate(
     candidates: &[BotCandidate],
     bot_name: &str,
@@ -1191,24 +1317,84 @@ fn automate_feishu_otp(
         "未找到飞书搜索输入框。",
     )?;
     client.click(search_editor)?;
-    client.clear_focused_editor()?;
-    client.insert_text(bot_name)?;
+    type_into_editor(
+        &mut client,
+        &search_editor_finder(),
+        bot_name,
+        "未能在飞书搜索框中输入机器人名称。",
+    )?;
+    tracing::info!(
+        "[OTP-FEISHU] search editor filled (bot name len={})",
+        bot_name.chars().count()
+    );
 
-    let candidates_expression = r#"(() => Array.from(document.querySelectorAll('.bot-chatter-info-name')).map(nameElement => {
-        const card = nameElement.closest('.bot-result-card');
-        const rect = card?.getBoundingClientRect();
-        return {
-            name: (nameElement.textContent || '').trim(),
-            has_robot_label: !!card && Array.from(card.querySelectorAll('*'))
-                .some(element => (element.textContent || '').trim() === '机器人'),
-            center: card && rect && rect.width > 0 && rect.height > 0
-                ? { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
-                : null
+    // Primary strategy uses the known Lark result-card classes. The fallback
+    // locates a bare "机器人" badge, walks up to its small surrounding result
+    // box, and matches an exact-name element inside it — entries under a
+    // "历史记录"/history container are excluded so stale history chips cannot
+    // masquerade as live results. Both still require name == bot_name and the
+    // robot label, and uniqueness is enforced later.
+    let candidates_expression = r#"(() => {
+        const out = [];
+        const seen = new Set();
+        const record = (name, hasLabel, rect) => {
+            if (!rect || rect.width <= 0 || rect.height <= 0) return;
+            const key = Math.round(rect.x / 4) + '/' + Math.round(rect.y / 4);
+            if (seen.has(key)) return;
+            seen.add(key);
+            out.push({
+                name,
+                has_robot_label: !!hasLabel,
+                center: { x: rect.left + rect.width / 2, y: rect.top + rect.height / 2 }
+            });
         };
-    }))()"#;
+        document.querySelectorAll('.bot-chatter-info-name').forEach((nameElement) => {
+            const card = nameElement.closest('.bot-result-card');
+            const rect = card ? card.getBoundingClientRect() : null;
+            const hasLabel = !!card && Array.from(card.querySelectorAll('*'))
+                .some((element) => (element.textContent || '').trim() === '机器人');
+            record((nameElement.textContent || '').trim(), hasLabel, rect);
+        });
+        if (!out.some((candidate) => candidate.has_robot_label)) {
+            const botName = __BOT__;
+            const inHistory = (el) => {
+                let node = el;
+                for (let i = 0; i < 8 && node; i += 1) {
+                    const cls = String(node.className || '').toLowerCase();
+                    if (cls.indexOf('history') !== -1 || cls.indexOf('recent') !== -1) return true;
+                    for (const child of node.children) {
+                        const text = (child.textContent || '').trim();
+                        if (text === '历史记录' || text === '搜索历史' || text === '历史搜索') return true;
+                    }
+                    node = node.parentElement;
+                }
+                return false;
+            };
+            const labels = Array.from(document.querySelectorAll('span, div, p, li'))
+                .filter((el) => el.childElementCount === 0 && (el.textContent || '').trim() === '机器人');
+            for (const label of labels) {
+                if (inHistory(label)) continue;
+                let box = label.parentElement;
+                for (let i = 0; i < 5 && box; i += 1) {
+                    const boxText = (box.textContent || '').trim();
+                    if (boxText.length > 3 && boxText.length <= 80) {
+                        const nameElement = Array.from(box.querySelectorAll('*'))
+                            .find((el) => el.childElementCount === 0 && (el.textContent || '').trim() === botName);
+                        if (nameElement) {
+                            record(botName, true, nameElement.getBoundingClientRect());
+                            break;
+                        }
+                    }
+                    box = box.parentElement;
+                }
+            }
+        }
+        return out;
+    })()"#
+    .replace("__BOT__", &json_string(bot_name));
     let candidates_deadline = Instant::now() + DOM_WAIT_TIMEOUT;
     loop {
-        let candidates: Vec<BotCandidate> = client.evaluate(candidates_expression)?;
+        let candidates: Vec<BotCandidate> = client.evaluate(&candidates_expression)?;
         if candidates
             .iter()
             .any(|candidate| candidate.name == bot_name && candidate.has_robot_label)
@@ -1223,10 +1409,11 @@ fn automate_feishu_otp(
         thread::sleep(AUTOMATION_POLL_INTERVAL);
     }
     thread::sleep(Duration::from_millis(300));
-    let candidates: Vec<BotCandidate> = client.evaluate(candidates_expression)?;
+    let candidates: Vec<BotCandidate> = client.evaluate(&candidates_expression)?;
     let bot_point =
         unique_exact_bot_candidate(&candidates, bot_name).map_err(AutomationFailure::dom)?;
     client.click(bot_point)?;
+    tracing::info!("[OTP-FEISHU] bot result card clicked");
 
     let expected_placeholder = format!("发送给 {bot_name}");
     let composer_deadline = Instant::now() + DOM_WAIT_TIMEOUT;
@@ -1270,14 +1457,12 @@ fn automate_feishu_otp(
         .map(|message| message.id)
         .collect::<HashSet<_>>();
     client.click(composer.center.expect("composer center checked"))?;
-    client.clear_focused_editor()?;
-    client.insert_text(request_text)?;
-    let editor_text: String = client.evaluate(
-        r#"(() => (document.querySelector('[contenteditable=true].innerdocbody')?.innerText || '').trim())()"#,
+    type_into_editor(
+        &mut client,
+        &composer_finder(),
+        request_text,
+        "发送框内容校验失败，未发送请求。",
     )?;
-    if editor_text != request_text {
-        return Err(AutomationFailure::dom("发送框内容校验失败，未发送请求。"));
-    }
     let chat_name: String = client.evaluate(
         r#"(() => (document.querySelector('.chatWindow_chatName')?.textContent || '').trim())()"#,
     )?;
