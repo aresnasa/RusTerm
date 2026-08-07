@@ -226,6 +226,10 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
             "授权已过期 — 请重新授权",
         ),
         "feishu.qr_fetching" => ("Fetching OTP from 智小安…", "正在向智小安获取临时密码…"),
+        "feishu.qr_otp_timeout" => (
+            "OTP fetch timed out — please retry",
+            "获取临时密码超时，请重试",
+        ),
         "feishu.qr_delivered" => ("OTP auto-filled", "已自动填入验证码"),
         "feishu.qr_failed" => ("Sign-in failed: {reason}", "授权失败：{reason}"),
         "feishu.qr_status_cfg_missing_fields" => (

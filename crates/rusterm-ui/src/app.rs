@@ -242,6 +242,33 @@ async fn handle_feishu_oauth_event(state: &mut Signal<AppState>, event: FeishuOA
 /// failed attempt falls back to the OneKey popup (attempts are capped).
 const FEISHU_WEB_OTP_BOT_NAME: &str = "智小安";
 
+/// Grace window for the tty OTP prompt to (re)appear after the browser
+/// automation says it is ready to send: the backend only waits 3 s, so the UI
+/// retries the strict current-line check for ~2.4 s before denying.
+const FEISHU_OTP_SEND_APPROVAL_GRACE: std::time::Duration = std::time::Duration::from_millis(2400);
+
+/// Watchdog for an OTP cycle whose browser automation thread never reported
+/// back (panic, vanished event). Browser-side worst case is CDP connect (20 s)
+/// + DOM waits (2×8 s) + reply poll (25 s) plus slack; well under this. After
+/// it elapses the cycle fails visibly instead of leaving the popup stuck on
+/// "正在向智小安获取临时密码…" forever.
+const FEISHU_OTP_CYCLE_WATCHDOG: std::time::Duration = std::time::Duration::from_secs(180);
+
+/// Mark the QR popup failed when it belongs to `session`, so the banner stops
+/// showing "正在向智小安获取临时密码…" after the fetch already failed.
+fn feishu_mark_popup_failed_for(state: &mut AppState, session: &str, reason: &str) {
+    if let Some(popup) = state.feishu_qr_popup.as_mut() {
+        if popup.session.as_deref() == Some(session)
+            && !matches!(popup.status, FeishuQrPopupStatus::Failed { .. })
+        {
+            popup.status = FeishuQrPopupStatus::Failed {
+                reason: reason.to_string(),
+                failed_at: std::time::Instant::now(),
+            };
+        }
+    }
+}
+
 fn feishu_web_otp_settings(state: &AppState) -> (String, String) {
     let cfg = feishu_user_cfg(state);
     let request_text = cfg
@@ -17625,14 +17652,53 @@ pub fn App() -> Element {
                             request_id,
                             cycle_started,
                         } => {
-                            let approved = {
+                            let approved_now = {
                                 let snapshot = state.read();
                                 feishu_cycle_is_current(&snapshot, &session, cycle_started)
                                     && current_jumpserver_second_password_prompt(
                                         &snapshot, &session,
                                     )
                             };
-                            crate::feishu_browser::approve_feishu_otp_send(request_id, approved);
+                            if approved_now {
+                                crate::feishu_browser::approve_feishu_otp_send(request_id, true);
+                            } else {
+                                // The backend only waits 3 s for an answer. The
+                                // prompt may be a few ticks away (SSH splits the
+                                // prompt across chunks, or this event beat the
+                                // next render), so retry briefly before denying
+                                // instead of silently never messaging 智小安.
+                                let state = state;
+                                spawn(async move {
+                                    let deadline =
+                                        std::time::Instant::now() + FEISHU_OTP_SEND_APPROVAL_GRACE;
+                                    loop {
+                                        tokio::time::sleep(std::time::Duration::from_millis(150))
+                                            .await;
+                                        let ready = {
+                                            let snapshot = state.read();
+                                            feishu_cycle_is_current(
+                                                &snapshot,
+                                                &session,
+                                                cycle_started,
+                                            ) && current_jumpserver_second_password_prompt(
+                                                &snapshot, &session,
+                                            )
+                                        };
+                                        if ready {
+                                            crate::feishu_browser::approve_feishu_otp_send(
+                                                request_id, true,
+                                            );
+                                            return;
+                                        }
+                                        if std::time::Instant::now() >= deadline {
+                                            crate::feishu_browser::approve_feishu_otp_send(
+                                                request_id, false,
+                                            );
+                                            return;
+                                        }
+                                    }
+                                });
+                            }
                         }
                         crate::feishu_browser::FeishuBrowserEvent::OtpReply {
                             session,
@@ -17655,7 +17721,20 @@ pub fn App() -> Element {
                                 }
                                 Some(otp) => {
                                     let mut snapshot = state.write();
-                                    queue_feishu_otp_if_prompt_visible(&mut snapshot, &session, otp)
+                                    let queued = queue_feishu_otp_if_prompt_visible(
+                                        &mut snapshot,
+                                        &session,
+                                        otp,
+                                    );
+                                    if queued.is_ok()
+                                        && let Some(popup) = snapshot.feishu_qr_popup.as_mut()
+                                        && popup.session.as_deref() == Some(session.as_str())
+                                    {
+                                        popup.status = FeishuQrPopupStatus::Delivered {
+                                            delivered_at: std::time::Instant::now(),
+                                        };
+                                    }
+                                    queued
                                 }
                                 None => Err("bot reply did not contain a matching OTP"),
                             };
@@ -17668,6 +17747,7 @@ pub fn App() -> Element {
                                         false,
                                         Some(reason.into()),
                                     );
+                                    feishu_mark_popup_failed_for(&mut snapshot, &session, reason);
                                 }
                                 tracing::warn!(
                                     "[OTP-FEISHU] browser OTP request for {} failed: {}",
@@ -17694,6 +17774,7 @@ pub fn App() -> Element {
                                     false,
                                     Some(reason.clone()),
                                 );
+                                feishu_mark_popup_failed_for(&mut snapshot, &session, &reason);
                             }
                             tracing::warn!(
                                 "[OTP-FEISHU] browser automation failed for {}: {}",
@@ -17716,6 +17797,34 @@ pub fn App() -> Element {
                         | crate::feishu_browser::FeishuBrowserEvent::OtpRequestStarted { .. }
                         | crate::feishu_browser::FeishuBrowserEvent::Closed => {}
                     }
+                }
+                // Watchdog: a cycle that outlived every browser-side timeout
+                // without a reply/failure event must FAIL visibly — otherwise
+                // the popup stays on "正在向智小安获取临时密码…" forever.
+                let stale_sessions = {
+                    let snapshot = state.read();
+                    snapshot
+                        .feishu_otp_status
+                        .iter()
+                        .filter_map(|(session, status)| match status {
+                            FeishuOtpFetch::InFlight { started }
+                                if started.elapsed() > FEISHU_OTP_CYCLE_WATCHDOG =>
+                            {
+                                Some(session.clone())
+                            }
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                };
+                for session in stale_sessions {
+                    let reason = crate::i18n::t("feishu.qr_otp_timeout");
+                    let mut snapshot = state.write();
+                    feishu_tty_fill_end(&mut snapshot, &session, false, Some(reason.clone()));
+                    feishu_mark_popup_failed_for(&mut snapshot, &session, &reason);
+                    tracing::warn!(
+                        "[OTP-FEISHU] OTP cycle watchdog expired for {} — marking failed",
+                        &session[..session.len().min(8)]
+                    );
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(150)).await;
                 let deliveries = {
