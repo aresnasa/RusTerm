@@ -128,3 +128,12 @@ e38e99c + ff363a7 (ff363a7 also swept in previously-staged .claude/Claude.md + t
 QR scan → exchange → 动态口令 → bot reply parse → tty fill. Next user retest should capture
 `RUST_LOG=info` logs (~/Library/Application Support/rusterm/logs/) and grep `[OTP-FEISHU]`,
 `[REPLAY]`, `[LOGIN-SCRIPT]`, `[ONEKEY-SKIP]` (new reason: `feishu_otp_prompt`).
+
+## Session 7: real SSH entry bypass + OTP ownership invariant (uncommitted)
+User retest showed no Feishu window and OneKey `sudo 密码` at `2nd Password:`.
+- Confirmed `cargo run` resolves to the only workspace binary, `rusterm-app` → `rusterm`; stale/wrong binary was not the cause.
+- Found a third SSH start path in `ConnectionDialog::on_create` calling `start_ssh_connection` directly, bypassing the proactive Feishu hook. Moved `maybe_preauth_feishu_at_connect` into the top of the single `start_ssh_connection` function, before its async SSH spawn, and removed duplicated caller hooks. Saved/open, reconnect/restore, and newly-created SSH sessions now all share the same preauth entry.
+- Replaced provider-dependent `feishu_owns_prompt` with `otp_prompt_blocks_password_automation`: recognized OTP prompts always block OneKey/login scripts, even if Feishu config is unavailable or retries are exhausted. Direct terminal typing remains the manual fallback. Missing provider at an OTP prompt now invokes `start_feishu_auth_session`, which either opens auth after a re-check or shows the explicit missing-config popup; no sudo popup.
+- Fixed proactive OAuth ordering: OAuth success only fetches/sends OTP when the session has an InFlight OTP cycle AND the current rendered terminal line still matches an OTP prompt. A fast QR scan before `2nd Password:` now persists the token and waits for the later prompt instead of typing OTP into an earlier login/menu stage.
+- Added regressions: `jumpserver_otp_prompt_never_creates_a_password_popup`, `oauth_success_fetches_only_for_an_already_visible_otp_prompt`, and strengthened prompt gate tests.
+Validation: `cargo test -p rusterm-ui` 817 tests + 2 doctests passed; `cargo check --workspace` passed; rust-analyzer diagnostics clean. Live Feishu/JumpServer E2E still requires user credentials and was not run. No commit/push made.

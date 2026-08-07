@@ -256,6 +256,7 @@ Linux gpu-muxi-001.x86.test.brainpp.dev 5.15.0-119-generic #1，将API 脚本放
   0.3 ![](image_13.png)没有先使用obscura访问飞书的接口生成二维码获取 session，检查继承逻辑
   0.4 [@Image](zed:///agent/pasted-image?name=Image) 还是没有弹出飞书扫码页，不符合预期。，需要使用obscura访问open.feishu.cn 创建相关会话并获取飞书聊天的权限，再进行后续步骤
   0.5 不符合预期，这里登录 jumpserver 的终端前，需要先弹出一个串口飞书扫码成功后获取了相关信息再将转换好的 OTP 密码填入 jumpserver 的 OTP，继续改造逻辑。
+  0.6 [@Image](zed:///agent/pasted-image?name=Image) 弹出窗口了，需要继续调试联动浏览器和生成飞书二维码
 
 
   1. 首先尝试触发飞书扫码，获取登录态的 session

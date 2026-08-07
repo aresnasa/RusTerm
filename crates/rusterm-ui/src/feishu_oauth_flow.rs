@@ -69,16 +69,15 @@ pub fn looks_like_feishu_otp_prompt(line: &str) -> bool {
     rusterm_ssh::client::looks_like_otp_prompt(line)
 }
 
-/// `true` when the Feishu OTP auto-fill pipeline OWNS this prompt: the line
-/// is a tty OTP prompt, the FeishuUser provider is active, and the session
-/// still has auto-fill attempts left. While owned, OneKey auto-submit and
-/// login-script sends must stand down — a broad `password` expect would
-/// otherwise auto-type a stored login password (or a bastion menu selection)
-/// into `2nd Password:`, submitting garbage and burning the OTP prompt
-/// (issue #130). Once the attempt cap is exhausted the prompt is released so
-/// the manual OneKey popup can serve as the fallback.
-pub fn feishu_owns_prompt(provider_active: bool, line: &str, attempts: u8) -> bool {
-    provider_active && looks_like_feishu_otp_prompt(line) && attempts < FEISHU_OTP_MAX_ATTEMPTS
+/// `true` when password automation must stand down for this prompt.
+///
+/// JumpServer's `2nd Password:` is an OTP field, never an ordinary login/sudo
+/// password field. OneKey and login scripts therefore must not claim it even
+/// when the Feishu provider is temporarily unavailable or its retry budget is
+/// exhausted. In those cases the user can still type directly in the terminal,
+/// while the OTP pipeline surfaces the configuration/auth failure separately.
+pub fn otp_prompt_blocks_password_automation(line: &str) -> bool {
+    looks_like_feishu_otp_prompt(line)
 }
 
 /// The FeishuUser OTP configuration, if that provider is active. Everything
@@ -107,7 +106,7 @@ pub fn feishu_user_cfg(state: &AppState) -> Option<FeishuUserCfgView> {
 
 /// Snapshot of the FeishuUser provider config (owned strings so callers can
 /// drop the state read guard before doing I/O).
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FeishuUserCfgView {
     pub app_id: String,
     pub app_secret: String,
@@ -127,6 +126,42 @@ pub fn feishu_cfg_incomplete(cfg: &FeishuUserCfgView) -> bool {
 }
 
 // ── Auth start ─────────────────────────────────────────────────────────────
+
+/// Stable Feishu Web entry point. It redirects an authenticated browser to
+/// the tenant messenger and otherwise renders Feishu's official QR login.
+pub const FEISHU_WEB_LOGIN_URL: &str = "https://www.feishu.cn/messenger/";
+
+/// Browser mode selected before any UI/window side effect occurs.
+///
+/// OpenAPI OAuth remains available when all application credentials are
+/// configured. Missing or partial OpenAPI configuration is not an error for
+/// the browser-session flow: RusTerm opens Feishu Web and reuses its persisted
+/// cookies instead.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FeishuBrowserStartPlan {
+    OpenWebLogin { url: String },
+    OpenOAuth { cfg: FeishuUserCfgView },
+}
+
+impl FeishuBrowserStartPlan {
+    pub fn url(&self) -> &str {
+        match self {
+            Self::OpenWebLogin { url } => url,
+            Self::OpenOAuth { .. } => "",
+        }
+    }
+}
+
+pub fn feishu_browser_start_plan(cfg: Option<&FeishuUserCfgView>) -> FeishuBrowserStartPlan {
+    match cfg {
+        Some(cfg) if !feishu_cfg_incomplete(cfg) => {
+            FeishuBrowserStartPlan::OpenOAuth { cfg: cfg.clone() }
+        }
+        _ => FeishuBrowserStartPlan::OpenWebLogin {
+            url: FEISHU_WEB_LOGIN_URL.to_string(),
+        },
+    }
+}
 
 /// What the caller must do to kick off a fresh QR sign-in.
 pub struct AuthStart {
@@ -490,6 +525,22 @@ pub fn feishu_tty_fill_begin(state: &mut AppState, session: &str) -> bool {
     true
 }
 
+/// After a proactive OAuth exchange, fetch an OTP only when this session has
+/// already reached and is still displaying its OTP prompt. A successful scan
+/// that finishes before JumpServer asks for `2nd Password:` must only persist
+/// the token; the later prompt will start the fetch at the correct time.
+pub fn feishu_should_fetch_after_auth(
+    state: &AppState,
+    session: &str,
+    otp_prompt_visible: bool,
+) -> bool {
+    otp_prompt_visible
+        && matches!(
+            state.feishu_otp_status.get(session),
+            Some(FeishuOtpFetch::InFlight { .. })
+        )
+}
+
 /// Record the OTP fetch outcome for the popup / status badge. A delivered
 /// OTP resets the session's attempt counter so the NEXT login prompt gets a
 /// fresh allowance.
@@ -695,21 +746,48 @@ mod tests {
     fn feishu_prompt_ownership_gates() {
         // Owned: provider active, OTP prompt, attempts left — OneKey and
         // login scripts must stand down so the auto-fill (or QR popup) runs.
-        assert!(feishu_owns_prompt(true, "2nd Password: ", 0));
+        assert!(otp_prompt_blocks_password_automation("2nd Password: "));
         // koko echoes `*` per typed char — the masked tail must not break
         // the ownership match.
-        assert!(feishu_owns_prompt(true, "2nd Password: ******", 2));
-        // Provider inactive → normal OneKey handling.
-        assert!(!feishu_owns_prompt(false, "2nd Password: ", 0));
-        // Not an OTP prompt → OneKey may auto-submit the login password.
-        assert!(!feishu_owns_prompt(true, "Password: ", 0));
-        // Attempt cap exhausted → release the prompt so the manual OneKey
-        // popup can serve as the fallback.
-        assert!(!feishu_owns_prompt(
-            true,
-            "2nd Password: ",
-            FEISHU_OTP_MAX_ATTEMPTS
+        assert!(otp_prompt_blocks_password_automation(
+            "2nd Password: ******"
         ));
+        // A temporarily unavailable/missing provider must not let OneKey
+        // reinterpret JumpServer's OTP as an ordinary sudo/login password.
+        assert!(otp_prompt_blocks_password_automation("2nd Password: "));
+        // Not an OTP prompt → OneKey may auto-submit the login password.
+        assert!(!otp_prompt_blocks_password_automation("Password: "));
+        // Exhausting Feishu retries still must not release an OTP prompt to
+        // password automation. The user can type directly in the terminal.
+        assert!(otp_prompt_blocks_password_automation("2nd Password: "));
+    }
+
+    #[test]
+    fn oauth_success_fetches_only_for_an_already_visible_otp_prompt() {
+        let mut state = state_without_cm();
+        state.feishu_otp_status.insert(
+            "sess-1".into(),
+            FeishuOtpFetch::InFlight {
+                started: Instant::now(),
+            },
+        );
+
+        assert!(feishu_should_fetch_after_auth(&state, "sess-1", true));
+        assert!(!feishu_should_fetch_after_auth(&state, "sess-1", false));
+        assert!(!feishu_should_fetch_after_auth(&state, "other", true));
+    }
+
+    #[test]
+    fn missing_openapi_config_starts_web_session_login() {
+        let plan = feishu_browser_start_plan(None);
+        assert_eq!(
+            plan,
+            FeishuBrowserStartPlan::OpenWebLogin {
+                url: FEISHU_WEB_LOGIN_URL.to_string(),
+            }
+        );
+        assert!(plan.url().starts_with("https://"));
+        assert!(!plan.url().trim().is_empty());
     }
 
     // ── start & cancel ─────────────────────────────────────────────────
