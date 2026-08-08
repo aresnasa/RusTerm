@@ -287,6 +287,10 @@ Linux gpu-muxi-001.x86.test.brainpp.dev 5.15.0-119-generic #1，将API 脚本放
     2. 副本命名链条逻辑复查：v0.22 的 `strip_copy_suffix` + `next_copy_number` 路径已终结 "副本副本副本" 链条；本轮仅需纯样式调宽，无逻辑变更。
     3. 测试：纯 CSS 常量调宽，无新断言；rusterm-ui lib 866 全绿，cargo fmt 已跑。
 
+  ── v0.25（任务 0.25）已完成（2026-08-08）──
+  1. Tab 纵向重排：主机名（jumpserver 节点 FQDN）从「会话名 · 节点」同行并列改为放在会话名下方的独立行。`components/tab_bar.rs`：v0.24 的两个并排两行 clamp span 替换为竖向列容器（`display: flex; flex-direction: column; justify-content: center; gap: 1px; max-width: 220px`），上行为会话名（单行 nowrap 省略）、下行为节点（11px 弱化色、单行省略、去掉 " · " 前缀，仅在 OSC-7 节点与连接主机不同才显示，逻辑不变）。
+  2. 效果：Tab 更高更窄——TabBar `min-height: 36px` 不变，带节点行时自动加高；序号/圆点/徽标/关闭按钮仍为行内兄弟元素，靠 align-items: center 垂直居中。外层 tab div 的 `data-rusterm-tab-id` 未动，Task 22 手动拖拽命中测试不受影响。
+  3. 测试：纯布局变更，无新断言；rusterm-ui lib 866 全绿，cargo fmt 已跑。
 
 
   1. 首先尝试触发飞书扫码，获取登录态的 session

@@ -393,62 +393,51 @@ pub fn TabBar(
                                 style: "width: 6px; height: 6px; border-radius: 50%; background: {dot_color}; flex-shrink: 0;",
                             }
 
-                            // v0.22: both the session name and the node
-                            // suffix wrap onto at most two lines instead of
-                            // truncating to a 120px single line (too long /
-                            // unreadable for jumpserver-copied sessions like
-                            // "ops@jump 副本 2 · lg-prod-k8s-master-0001…").
-                            // `white-space: normal` overrides the tab div's
-                            // inherited `nowrap`; `-webkit-line-clamp: 2`
-                            // caps the wrap and still ellipsizes beyond that.
-                            // v0.24: name width raised 220px → 320px — with a
-                            // numbered copy ("jumpserver 副本 2") plus the node
-                            // suffix, 220px still wrapped the NAME onto two
-                            // lines; the user asked for a wider session tab
-                            // ("会话的宽度扩大") so the common case sits on one.
-                            span {
+                            // v0.25: the session name and the node hostname
+                            // no longer sit side-by-side — the hostname is
+                            // stacked UNDER the name (its own second row),
+                            // so the tab is taller but much narrower than the
+                            // v0.22/v0.24 side-by-side wrapping layout. Each
+                            // row ellipsizes on a single line; the column
+                            // caps at 220px total (220+400px side-by-side
+                            // needed ~740px for the same content).
+                            div {
                                 style: "
-                                    overflow: hidden;
-                                    text-overflow: ellipsis;
-                                    max-width: 320px;
-                                    white-space: normal;
-                                    overflow-wrap: anywhere;
-                                    display: -webkit-box;
-                                    -webkit-box-orient: vertical;
-                                    -webkit-line-clamp: 2;
-                                    line-height: 1.2;
+                                    display: flex;
+                                    flex-direction: column;
+                                    justify-content: center;
+                                    gap: 1px;
+                                    max-width: 220px;
+                                    min-width: 0;
                                 ",
-                                "{session_name}"
-                            }
-                            // v0.21: jumpserver-internal node suffix (e.g.
-                            // "· web-01"), shown only when the node differs from
-                            // the connection host. Lets the user tell which
-                            // internal machine each jumpserver copy landed on.
-                            // v0.22: no longer `flex-shrink: 0` (an unshrinkable
-                            // 40+ char node hostname blew the tab out of the
-                            // bar); it wraps/shrinks together with the name.
-                            // v0.24: suffix width raised 240px → 400px — a full
-                            // k8s node FQDN like "lg-cmc-q-prod-k8s-master-0001.
-                            // host.lg.shzhisuan.com" (~47 chars ≈ 285px at 11px)
-                            // was still being wrapped; 400px shows it whole.
-                            if let Some(node) = &node_label {
                                 span {
                                     style: "
-                                        color: var(--skin-text-muted);
-                                        font-size: 11px;
-                                        max-width: 400px;
-                                        flex-shrink: 1;
-                                        min-width: 32px;
                                         overflow: hidden;
                                         text-overflow: ellipsis;
-                                        white-space: normal;
-                                        overflow-wrap: anywhere;
-                                        display: -webkit-box;
-                                        -webkit-box-orient: vertical;
-                                        -webkit-line-clamp: 2;
+                                        white-space: nowrap;
                                         line-height: 1.2;
                                     ",
-                                    " · {node}"
+                                    "{session_name}"
+                                }
+                                // v0.21: jumpserver-internal node suffix (e.g.
+                                // "web-01"), shown only when the node differs
+                                // from the connection host. Lets the user tell
+                                // which internal machine each jumpserver copy
+                                // landed on.
+                                // v0.25: rendered on its own row beneath the
+                                // name; single-line ellipsis, narrower tab.
+                                if let Some(node) = &node_label {
+                                    span {
+                                        style: "
+                                            color: var(--skin-text-muted);
+                                            font-size: 11px;
+                                            overflow: hidden;
+                                            text-overflow: ellipsis;
+                                            white-space: nowrap;
+                                            line-height: 1.2;
+                                        ",
+                                        "{node}"
+                                    }
                                 }
                             }
 
