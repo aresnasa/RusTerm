@@ -401,11 +401,16 @@ pub fn TabBar(
                             // `white-space: normal` overrides the tab div's
                             // inherited `nowrap`; `-webkit-line-clamp: 2`
                             // caps the wrap and still ellipsizes beyond that.
+                            // v0.24: name width raised 220px → 320px — with a
+                            // numbered copy ("jumpserver 副本 2") plus the node
+                            // suffix, 220px still wrapped the NAME onto two
+                            // lines; the user asked for a wider session tab
+                            // ("会话的宽度扩大") so the common case sits on one.
                             span {
                                 style: "
                                     overflow: hidden;
                                     text-overflow: ellipsis;
-                                    max-width: 220px;
+                                    max-width: 320px;
                                     white-space: normal;
                                     overflow-wrap: anywhere;
                                     display: -webkit-box;
@@ -422,12 +427,16 @@ pub fn TabBar(
                             // v0.22: no longer `flex-shrink: 0` (an unshrinkable
                             // 40+ char node hostname blew the tab out of the
                             // bar); it wraps/shrinks together with the name.
+                            // v0.24: suffix width raised 240px → 400px — a full
+                            // k8s node FQDN like "lg-cmc-q-prod-k8s-master-0001.
+                            // host.lg.shzhisuan.com" (~47 chars ≈ 285px at 11px)
+                            // was still being wrapped; 400px shows it whole.
                             if let Some(node) = &node_label {
                                 span {
                                     style: "
                                         color: var(--skin-text-muted);
                                         font-size: 11px;
-                                        max-width: 240px;
+                                        max-width: 400px;
                                         flex-shrink: 1;
                                         min-width: 32px;
                                         overflow: hidden;
