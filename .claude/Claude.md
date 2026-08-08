@@ -281,6 +281,11 @@ Linux gpu-muxi-001.x86.test.brainpp.dev 5.15.0-119-generic #1，将API 脚本放
   2. 副本命名链条修复：复制会话时源会话的已存配置名可能已带 "副本 N" 后缀，直接追加会链出 "… 副本 1 副本 2 副本 …"。新增 `state.rs::strip_copy_suffix`（循环剥离尾部 "副本 N"/"copy N",case-insensitive；不动 "web-01"、"web-副本" 这类合法名字）,`app.rs::on_copy_session` 改用剥离后的 base name + `next_copy_number` 编号，名字恒为 "… 副本 1, 2, …, N"。
   3. 测试：state.rs +4（zh/en/链条折叠/非副本名保持）,app.rs +1（复制副本 → 副本 2；遗留链条名 → 折叠取 max+1)。rusterm-ui lib 866 全绿（v0.21 861 + 5)。
 
+    ── v0.24（任务 0.24）已完成（2026-08-08）──
+    1. 会话页顶部 TabBar 加宽：image_16.png 指出 v0.22 后名字/节点后缀仍双行拥挤（"会话的宽度扩大"）。`components/tab_bar.rs`：会话名 span max-width 220px → 320px,node 后缀 span max-width 240px → 400px —— 完整 k8s 节点 FQDN（如 "lg-cmc-q-prod-k8s-master-0001.host.lg.shzhisuan.com" ~47 字符 ≈ 285px@11px）不再折行；name+"副本 N"后缀常见情况控制在单行。仍保留两行 clamp 与 flex-shrink 收缩作为超长兜底。
+    2. 副本命名链条逻辑复查：v0.22 的 `strip_copy_suffix` + `next_copy_number` 路径已终结 "副本副本副本" 链条；本轮仅需纯样式调宽，无逻辑变更。
+    3. 测试：纯 CSS 常量调宽，无新断言；rusterm-ui lib 866 全绿，cargo fmt 已跑。
+
 
 
   1. 首先尝试触发飞书扫码，获取登录态的 session

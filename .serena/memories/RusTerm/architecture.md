@@ -595,3 +595,7 @@ All 4 connection types (SSH, shell, serial, telnet) use the same `drain_output_b
 **Tests**: state.rs +4 strip tests (zh/en/chained/non-copy untouched), app.rs +1 (`copying_a_copy_renames_to_the_next_number_without_chaining` — pins copy-of-copy → "副本 2" and legacy-chain → collapsed max+1). rusterm-ui lib 866 green (was 861).
 
 **Pitfall for future**: the pre-existing `cargo clippy -p rusterm-ui --lib` "invisible character detected" error in `feishu_browser.rs:1315` is at HEAD (not v0.22); it blocks full-crate clippy but not build/tests.
+
+## v0.24 — tab-bar widening (0.24) (2026-08-08)
+
+Pure CSS-constant widening of the v0.22 wrapped tab (user annotated image_16.png "会话的宽度扩大" — name + node suffix still double-wrapped at 220/240px). `components/tab_bar.rs`: session-name span `max-width: 220px → 320px`, node-suffix span `max-width: 240px → 400px`. Rationale: a real k8s node FQDN (`lg-cmc-q-prod-k8s-master-0001.host.lg.shzhisuan.com`, ~47 chars ≈ 285px at 11px) now fits on one line. The 2-line `-webkit-line-clamp` + `flex-shrink: 1; min-width: 32px` stay as the fallback for longer titles. Copy-naming (v0.22 `strip_copy_suffix` + `next_copy_number`) re-verified green, no logic change. No new tests (style constants); rusterm-ui lib 866 green, `cargo fmt` clean. External auto-commit sweep landed the hunks as `f0e4157 fix 会话宽度` + `15c7d59 Update tab_bar.rs`.
