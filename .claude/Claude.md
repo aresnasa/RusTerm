@@ -301,3 +301,8 @@ Linux gpu-muxi-001.x86.test.brainpp.dev 5.15.0-119-generic #1，将API 脚本放
   4. 自动填入 otp 到 jumpserver
   5. 继续其他逻辑。
   6. 如果已经登录了飞书可以复用相关 session
+
+  ── v0.26（任务 0.26）已完成（2026-08-08）──
+  1. Tab 宽度动态匹配主机名：v0.25 竖排行列保留 `max-width: 220px` + 单行省略，长 FQDN（如 "lg-cmc-q-prod-k8s-master-0001.host.lg.shzhisuan.com"）仍被截断为 "…"。用户要求「会话的宽度要动态的和主机名匹配，动态的显示」。`components/tab_bar.rs`：列容器去掉 `max-width: 220px`/`min-width: 0`，改 `flex-shrink: 0`（防止兄弟 Tab 拥挤时被压回省略样式）；会话名/节点两行 span 删除 `overflow: hidden` + `text-overflow: ellipsis`，仅留 `white-space: nowrap` —— Tab 宽度 = 两行中较长者的固有宽度，节点行永远完整显示。
+  2. 效果：宽由内容驱动，不再有固定上限；序号/圆点/徽标/关闭按钮仍为行内兄弟。外层 `data-rusterm-tab-id` 与 Task 22 拖拽命中测试不受影响。+v0.25 的竖排结构、节点行显示条件均未变。
+  3. 测试：纯样式变更，无新断言；rusterm-ui lib 866 全绿，cargo fmt 已跑。

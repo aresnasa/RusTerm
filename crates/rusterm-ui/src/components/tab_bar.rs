@@ -397,23 +397,22 @@ pub fn TabBar(
                             // no longer sit side-by-side — the hostname is
                             // stacked UNDER the name (its own second row),
                             // so the tab is taller but much narrower than the
-                            // v0.22/v0.24 side-by-side wrapping layout. Each
-                            // row ellipsizes on a single line; the column
-                            // caps at 220px total (220+400px side-by-side
-                            // needed ~740px for the same content).
+                            // v0.22/v0.24 side-by-side wrapping layout.
+                            // v0.26: tab width is now INTRINSIC — no max-width
+                            // cap and no ellipsis. The column sizes to the
+                            // longer of the two rows (usually the full node
+                            // hostname), and `flex-shrink: 0` keeps sibling
+                            // tabs from crushing it when the bar gets crowded.
                             div {
                                 style: "
                                     display: flex;
                                     flex-direction: column;
                                     justify-content: center;
                                     gap: 1px;
-                                    max-width: 220px;
-                                    min-width: 0;
+                                    flex-shrink: 0;
                                 ",
                                 span {
                                     style: "
-                                        overflow: hidden;
-                                        text-overflow: ellipsis;
                                         white-space: nowrap;
                                         line-height: 1.2;
                                     ",
@@ -425,14 +424,14 @@ pub fn TabBar(
                                 // which internal machine each jumpserver copy
                                 // landed on.
                                 // v0.25: rendered on its own row beneath the
-                                // name; single-line ellipsis, narrower tab.
+                                // name, stacked vertically under it.
+                                // v0.26: no ellipsis — the full hostname is
+                                // always visible and drives the tab width.
                                 if let Some(node) = &node_label {
                                     span {
                                         style: "
                                             color: var(--skin-text-muted);
                                             font-size: 11px;
-                                            overflow: hidden;
-                                            text-overflow: ellipsis;
                                             white-space: nowrap;
                                             line-height: 1.2;
                                         ",
