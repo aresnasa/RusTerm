@@ -76,7 +76,7 @@ use crate::state::{
     push_workspace_tab, record_context_command, record_onekey_behavior, record_replay_op,
     reorder_tab, replayable_ops, resize_layout_split, rollback_pending_exit, scroll_sync_targets,
     seed_onekey_habit_event, select_all_send_targets, selected_send_target_ids, set_active_tab,
-    set_pane_session_for_layout, set_send_target_selected, source_pane_for_copy,
+    set_pane_session_for_layout, set_send_target_selected, source_pane_for_copy, strip_copy_suffix,
     suppress_comparison_diff_warning, toggle_comparison_mode, toggle_pane_zoom, toggle_split_mode,
     track_terminal_input, tracked_terminal_command,
 };
@@ -12227,6 +12227,82 @@ send hi\n"
         assert_eq!(next_copy_number(&state, saved_conn_id), 4);
     }
 
+    /// v0.22: copying a COPY must not chain the "副本" marker. The source
+    /// session's stored config name already carries the "副本 N" suffix; the
+    /// handler strips it back to the base name and appends the next number, so
+    /// names read "… 副本 1, 2, …, N" — never "… 副本 1 副本 2 …".
+    #[test]
+    fn copying_a_copy_renames_to_the_next_number_without_chaining() {
+        use crate::state::{next_copy_number, strip_copy_suffix};
+        use rusterm_core::config::{ConnectionKind, ShellConfig};
+        use rusterm_core::session::SessionType;
+
+        let mut state = AppState::default();
+        let saved_conn_id = "jump-conn-1";
+        let mk = |state: &mut AppState, sid: &str, name: &str| {
+            state.sessions.push(SessionTab {
+                id: sid.to_string(),
+                name: name.to_string(),
+                kind: SessionType::Ssh,
+                render_output: Default::default(),
+                version: 1,
+                suggestion: None,
+                suggestions: Vec::new(),
+                suggestion_corrections: std::collections::HashSet::new(),
+                suggestion_selected: 0,
+                suggestion_visible: false,
+                command_history: Vec::new(),
+                hostname: Some("jump.example.com".to_string()),
+                cwd: None,
+                last_command_status: CommandStatus::default(),
+            });
+            state.session_configs.insert(
+                sid.to_string(),
+                ConnectionConfig {
+                    id: saved_conn_id.to_string(),
+                    name: name.to_string(),
+                    kind: ConnectionKind::Shell(ShellConfig {
+                        command: None,
+                        args: Vec::new(),
+                        env: Vec::new(),
+                        working_dir: None,
+                    }),
+                    group: None,
+                    tags: Vec::new(),
+                    onekey: false,
+                    login_script: None,
+                },
+            );
+        };
+
+        // Source + 副本 1. Copying 副本 1 — exactly what its stored config
+        // carries ("ops@jump 副本 1") — must yield "ops@jump 副本 2", not
+        // "ops@jump 副本 1 副本 2".
+        mk(&mut state, "src", "ops@jump");
+        mk(&mut state, "c1", "ops@jump 副本 1");
+        let conn = state.session_configs.get("c1").unwrap().clone();
+        let base_name = strip_copy_suffix(&conn.name);
+        let copy_n = next_copy_number(&state, &conn.id);
+        let new_name = crate::i18n::tf(
+            "connection.copy_name_numbered",
+            &[("name", &base_name), ("n", &copy_n.to_string())],
+        );
+        assert_eq!(new_name, "ops@jump 副本 2");
+
+        // A legacy chained name ("ops@jump 副本 1 副本 2", produced before the
+        // v0.22 fix) must also collapse: the next copy off it is the max+1 of
+        // the whole chain, named off the stripped base.
+        mk(&mut state, "c2", "ops@jump 副本 1 副本 2");
+        let conn = state.session_configs.get("c2").unwrap().clone();
+        let base_name = strip_copy_suffix(&conn.name);
+        let copy_n = next_copy_number(&state, &conn.id);
+        let new_name = crate::i18n::tf(
+            "connection.copy_name_numbered",
+            &[("name", &base_name), ("n", &copy_n.to_string())],
+        );
+        assert_eq!(new_name, "ops@jump 副本 3");
+    }
+
     /// v0.21: a restored OTP-group member's per-session menu replay must keep
     /// waiting through the whole group's leader-failover + channel-clone
     /// window (up to `OTP_GROUP_BUDGET_SECS`), otherwise a non-leader tab whose
@@ -20016,11 +20092,17 @@ pub fn App() -> Element {
                             // `find_restore_connection` resolves them all to the
                             // same saved-connection id. The source itself has no
                             // "副本 N" suffix, so the first copy is 1.
+                            // v0.22: the source's stored config name may
+                            // ALREADY carry a "副本 N" suffix when copying a
+                            // copy — strip it (and any earlier chained
+                            // suffixes) so names read "… 副本 1, 2, …, N"
+                            // instead of chaining ("… 副本 1 副本 2").
+                            let base_name = strip_copy_suffix(&conn.name);
                             let copy_n = next_copy_number(&state.read(), &conn.id);
                             new_conn.name = crate::i18n::tf(
                                 "connection.copy_name_numbered",
                                 &[
-                                    ("name", &conn.name),
+                                    ("name", &base_name),
                                     ("n", &copy_n.to_string()),
                                 ],
                             );

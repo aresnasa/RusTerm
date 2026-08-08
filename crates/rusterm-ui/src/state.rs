@@ -2489,6 +2489,70 @@ pub fn next_copy_number(state: &AppState, source_saved_connection_id: &str) -> u
     max_n + 1
 }
 
+/// Strip a trailing "副本 N" / "copy N" copy suffix from a session/connection
+/// display name, returning the BASE name the suffix was appended to. Applied
+/// repeatedly, so a chained "web 副本 1 副本 2" (the pre-v0.22 bug) collapses
+/// back to "web". Names without a suffix are returned as-is — notably a base
+/// name that merely ends in digits ("web-01") or in the bare marker word
+/// ("web-副本", no number) is NOT touched.
+///
+/// Used by the copy-session handler: the source session's stored config name
+/// may already carry a "副本 N" suffix (a copy of a copy); naming the new copy
+/// from that name verbatim would chain the markers ("… 副本 1 副本 2"), which
+/// is exactly the bug v0.22 fixed — copies must read "… 副本 1, 2, …, N".
+pub fn strip_copy_suffix(name: &str) -> String {
+    let mut current = name.trim_end().to_string();
+    while let Some(base) = strip_one_copy_suffix(&current) {
+        current = base;
+    }
+    current
+}
+
+/// Single-pass suffix strip backing [`strip_copy_suffix`]. Mirrors the
+/// boundary logic of [`parse_copy_number`]: a run of trailing digits, then
+/// whitespace, then the `副本`/`copy` marker with a non-empty base before it.
+/// Returns `None` when any piece is missing (in which case the name is not a
+/// numbered copy).
+fn strip_one_copy_suffix(name: &str) -> Option<String> {
+    let trimmed = name.trim_end();
+    let bytes = trimmed.as_bytes();
+    let mut i = bytes.len();
+    while i > 0 && bytes[i - 1].is_ascii_digit() {
+        i -= 1;
+    }
+    if i == bytes.len() || i == 0 {
+        return None;
+    }
+    // A positive integer, same as `parse_copy_number` (0 is not a copy).
+    let n: usize = std::str::from_utf8(&bytes[i..]).ok()?.parse().ok()?;
+    if n == 0 {
+        return None;
+    }
+    while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    if i == 0 {
+        return None;
+    }
+    let marker = trimmed[..i].trim_end();
+    if let Some(base) = marker.strip_suffix("副本") {
+        let base = base.trim_end();
+        if !base.is_empty() {
+            return Some(base.to_string());
+        }
+    } else {
+        let lowered = marker.to_ascii_lowercase();
+        if lowered.ends_with(" copy") {
+            // " copy" is pure ASCII, so the byte length matches `marker`.
+            let base = marker[..marker.len() - " copy".len()].trim_end();
+            if !base.is_empty() {
+                return Some(base.to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Apply a layout preset to the active tab. Builds a fresh `PaneLayout`
 /// from the preset using the active tab's anchor session as the first pane,
 /// then fills the remaining pane slots with other open sessions (in tab
@@ -4859,6 +4923,47 @@ mod tests {
         assert_eq!(parse_copy_number("web-01"), None);
         // With the marker it parses fine.
         assert_eq!(parse_copy_number("web-01 副本 2"), Some(2));
+    }
+
+    #[test]
+    fn strip_copy_suffix_strips_a_zh_suffix() {
+        assert_eq!(strip_copy_suffix("ops@jump 副本 1"), "ops@jump");
+        assert_eq!(strip_copy_suffix("ops@jump 副本 12"), "ops@jump");
+    }
+
+    #[test]
+    fn strip_copy_suffix_strips_an_en_suffix_case_insensitively() {
+        assert_eq!(strip_copy_suffix("ops@jump copy 3"), "ops@jump");
+        assert_eq!(strip_copy_suffix("ops@jump Copy 2"), "ops@jump");
+    }
+
+    #[test]
+    fn strip_copy_suffix_collapses_chained_suffixes_from_the_naming_bug() {
+        // The v0.22 bug: copying a copy used the already-suffixed name as the
+        // base, chaining markers ("… 副本 1 副本 2"). Stripping must collapse
+        // every trailing suffix back to the true base.
+        assert_eq!(strip_copy_suffix("ops@jump 副本 1 副本 2"), "ops@jump");
+        assert_eq!(
+            strip_copy_suffix("ops@jump 副本 1 副本 2 副本 3"),
+            "ops@jump"
+        );
+        // Mixed-language chains from locale switching are also collapse.
+        assert_eq!(strip_copy_suffix("ops@jump 副本 1 copy 2"), "ops@jump");
+    }
+
+    #[test]
+    fn strip_copy_suffix_leaves_non_copy_names_untouched() {
+        // No suffix at all.
+        assert_eq!(strip_copy_suffix("ops@jumpserver"), "ops@jumpserver");
+        // A base name that merely ends in digits.
+        assert_eq!(strip_copy_suffix("web-01"), "web-01");
+        // The bare marker word without a trailing number is not a copy.
+        assert_eq!(strip_copy_suffix("web-副本"), "web-副本");
+        assert_eq!(strip_copy_suffix("ops@jump 副本"), "ops@jump 副本");
+        // Zero is not a valid copy number.
+        assert_eq!(strip_copy_suffix("ops@jump 副本 0"), "ops@jump 副本 0");
+        // "copy of something" has no trailing number.
+        assert_eq!(strip_copy_suffix("copy of something"), "copy of something");
     }
 
     #[test]

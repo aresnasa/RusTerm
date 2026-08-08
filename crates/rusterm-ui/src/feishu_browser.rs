@@ -1246,7 +1246,10 @@ fn type_into_editor(
         }
         if !cleared {
             last_state = "clear-failed".to_string();
-            tracing::warn!("[OTP-FEISHU] text entry attempt {} -> could not clear editor", attempt);
+            tracing::warn!(
+                "[OTP-FEISHU] text entry attempt {} -> could not clear editor",
+                attempt
+            );
             continue;
         }
         let active_ok: bool = client.evaluate(&active_ok_script).unwrap_or(false);
@@ -1581,7 +1584,9 @@ fn automate_feishu_otp(
     let _bot_point = bot_point
         .ok_or_else(|| AutomationFailure::dom("未找到名称完全匹配且标记为机器人的飞书联系人。"))?;
     client.press_enter()?;
-    tracing::info!("[OTP-FEISHU] exact bot candidate confirmed; Enter pressed to open conversation");
+    tracing::info!(
+        "[OTP-FEISHU] exact bot candidate confirmed; Enter pressed to open conversation"
+    );
 
     let expected_placeholder = format!("发送给 {bot_name}");
     let composer_deadline = Instant::now() + DOM_WAIT_TIMEOUT;

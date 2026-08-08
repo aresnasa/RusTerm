@@ -797,8 +797,7 @@ impl SshSession {
     /// peer, a write failure, or an explicit disconnect). A disconnected
     /// session cannot serve as the source of a channel clone.
     pub fn is_disconnected(&self) -> bool {
-        self.disconnected
-            .load(std::sync::atomic::Ordering::Acquire)
+        self.disconnected.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Duplicate this session onto a fresh interactive channel of the SAME
@@ -1426,11 +1425,8 @@ l3IjZ0yTc0Xx9bC6dF8gAAAAG2FyZXNuYXNhQEZyYW5rcy1NNU1heC5sb2NhbAEC
         clone_session.close().unwrap();
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         loop {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                clone_event_rx.recv(),
-            )
-            .await
+            match tokio::time::timeout(std::time::Duration::from_millis(100), clone_event_rx.recv())
+                .await
             {
                 Ok(Some(SessionEvent::Disconnected(id, _))) => {
                     assert_eq!(id, "clone-tab");

@@ -274,6 +274,12 @@ Linux gpu-muxi-001.x86.test.brainpp.dev 5.15.0-119-generic #1，将API 脚本放
   0.21 需要优化多个终端恢复的逻辑，这里由于会等待一个终端连接成功获取 ssh 的相关信息，这里可以改造成，多个终端同时等待，等待一个终端连接成功后将相关的终端进行副本复制（但是这里需要切换不同的需要被回放的终端，这里需要改进这块恢复逻辑，每个会话登录了哪些jumpserver 内的机器需要正确的记录，这里除了保留 jumpserver 外，还需要增加具体登录到了什么节点（直接在会话后台读取 hostname，然后完善一下副本副本的逻辑，这里可以用副本 1,2,3...N 这种来匹配，改造一下会话头部））
   0.22 [@Image](zed:///agent/pasted-image?name=Image) 太长了，这里可以换行，同时加宽会话顶部。
   0.23 [@Image](zed:///agent/pasted-image?name=Image)  太长了，这里可以换行，同时加宽会话顶部,还要检查副本的命名逻辑，这里使用副本 1,2,...,N 不要复制多个副本副本副本...
+  0.24 ![](image_16.png)继续完善会话页
+
+  ── v0.22（任务 0.22 + 0.23）已完成（2026-08-08）──
+  1. 顶部会话栏（TabBar）长文本换行 + 栏体加高：`components/tab_bar.rs` 的会话名 span 从固定 120px 单行截断改为最多两行换行（`-webkit-line-clamp: 2`,`overflow-wrap: anywhere`,max-width 220px）,node 后缀（" · lg-prod-k8s-master-0001.host…"）去掉 `flex-shrink: 0`、同样两行换行收缩（max-width 240px）;TabBar 容器由固定 `height: 36px` 改为 `min-height: 36px`，有换行时自动加高。
+  2. 副本命名链条修复：复制会话时源会话的已存配置名可能已带 "副本 N" 后缀，直接追加会链出 "… 副本 1 副本 2 副本 …"。新增 `state.rs::strip_copy_suffix`（循环剥离尾部 "副本 N"/"copy N",case-insensitive；不动 "web-01"、"web-副本" 这类合法名字）,`app.rs::on_copy_session` 改用剥离后的 base name + `next_copy_number` 编号，名字恒为 "… 副本 1, 2, …, N"。
+  3. 测试：state.rs +4（zh/en/链条折叠/非副本名保持）,app.rs +1（复制副本 → 副本 2；遗留链条名 → 折叠取 max+1)。rusterm-ui lib 866 全绿（v0.21 861 + 5)。
 
 
 

@@ -585,3 +585,13 @@ All 4 connection types (SSH, shell, serial, telnet) use the same `drain_output_b
 **bincode safety**: node + copy-number are runtime-only (session_nodes serde-skip; copy-number derived from the name string) — NO new fields on `PersistedSession`/`SessionState`, so existing `session_state.enc` snapshots stay compatible.
 
 **Test totals**: rusterm-core 236 (was 220 +5 osc7_host + existing), rusterm-ui 861 (was 851 v0.20 +8 copy-number +1 copy-numbering +1 replay-deadline), rusterm-ssh 145. Workspace all green. v0.20 uncommitted hunks untouched.
+
+## v0.22 — tab-bar wrap/widen + 副本-chain naming fix (2026-08-08)
+
+**Bug 1 (naming)**: v0.21's `on_copy_session` named the new copy off `conn.name` — the SOURCE session's stored config name — which already carries "副本 N" when copying a copy. Result: chained "jumpserver 副本 1 副本 2 … 副本 N" titles. Fix: `state.rs::strip_copy_suffix(name) -> String` loops `strip_one_copy_suffix` (mirrors `parse_copy_number`'s boundary walk: trailing digits → whitespace → `副本`/`copy` marker, non-empty base required, `0` rejected) so chained suffixes collapse to the true base; `on_copy_session` then re-numbers via `next_copy_number` → always "… 副本 1, 2, …, N". Untouched names: "web-01" (digits only), "web-副本" (bare marker, no number), "copy of something" (no trailing number). Legacy chained titles ("… 副本 1 副本 2") parse as the LAST number for `next_copy_number` (max+1 still a clean sequence) and strip fully when copied.
+
+**Bug 2 (tab overflow)**: `components/tab_bar.rs` — the v0.21 node suffix span was `flex-shrink: 0`, so a 40+ char internal hostname (`lg-prod-k8s-master-0001.host…`) blew out the tab; the name span was hard-clipped at `max-width: 120px` single-line. Now: bar container `height: 36px` → `min-height: 36px` (grows when a title wraps); name + node spans wrap to ≤2 lines (`white-space: normal` overriding the tab div's `nowrap`, `overflow-wrap: anywhere`, `display: -webkit-box` + `-webkit-line-clamp: 2` + `line-height: 1.2`), name `max-width: 220px`, node `max-width: 240px` + `flex-shrink: 1; min-width: 32px`. Tab number/dot/badge/close stay `flex-shrink: 0` on the first line.
+
+**Tests**: state.rs +4 strip tests (zh/en/chained/non-copy untouched), app.rs +1 (`copying_a_copy_renames_to_the_next_number_without_chaining` — pins copy-of-copy → "副本 2" and legacy-chain → collapsed max+1). rusterm-ui lib 866 green (was 861).
+
+**Pitfall for future**: the pre-existing `cargo clippy -p rusterm-ui --lib` "invisible character detected" error in `feishu_browser.rs:1315` is at HEAD (not v0.22); it blocks full-crate clippy but not build/tests.
