@@ -69,8 +69,8 @@ use crate::state::{
     close_session, close_workspace, command_send_targets, distribute_sessions_across_panes,
     enqueue_pending_exit, execute_tab_drop_on_pane, execute_tab_drop_on_pane_at,
     focus_pane_for_layout, focused_pane_session, invert_send_targets,
-    move_floating_pane_for_active, move_session_to_leftmost, note_exit_code_evidence,
-    note_shell_integration_evidence, note_shell_prompt_evidence,
+    move_floating_pane_for_active, move_session_to_leftmost, next_copy_number,
+    note_exit_code_evidence, note_shell_integration_evidence, note_shell_prompt_evidence,
     place_copied_session_next_to_source, pop_context_command, prepare_split_for_sidebar_drop,
     prepare_split_for_sidebar_drop_at, prompt_looks_like_shell, prompt_return_completion_target,
     push_workspace_tab, record_context_command, record_onekey_behavior, record_replay_op,
@@ -2345,6 +2345,87 @@ fn suggestion_acceptance_input(
     Vec::new()
 }
 
+/// Accept a selected suggestion popup entry and dispatch it to the PTY.
+///
+/// Shared by the Tab handler (`force_replace = false`, suffix-completion) and
+/// the ArrowRight handler (`force_replace = true`, whole-command fill). When
+/// `force_replace` is true the entire selected command replaces the edited
+/// line (no Enter) — the "directly fill in the command" affordance — which
+/// also covers contains-style matches whose prefix differs from the typed
+/// text. In Alt+R history-completion mode the line is always replaced, so both
+/// keys behave the same there. Corrections always replace regardless.
+///
+/// Extracted as a free function (not a closure) so both `EventHandler`s can
+/// call it without closure-`Clone`/`Fn`-vs-`FnMut` friction: `Signal` handles
+/// are `Copy`, so the function takes them by value and each handler invokes
+/// it directly.
+#[allow(clippy::too_many_arguments)]
+fn apply_suggestion_acceptance(
+    mut state: Signal<AppState>,
+    input_senders: Signal<HashMap<String, mpsc::UnboundedSender<Vec<u8>>>>,
+    session_id: &str,
+    cmd: String,
+    force_replace: bool,
+    isolated: bool,
+) {
+    let is_correction = state
+        .read()
+        .sessions
+        .iter()
+        .find(|tab| tab.id == session_id)
+        .is_some_and(|tab| tab.suggestion_corrections.contains(&cmd));
+    let current = tracked_terminal_command(&state.read(), session_id).unwrap_or_else(|| {
+        let terminals = state.read().terminals.clone();
+        terminals
+            .get(session_id)
+            .map(|handle| {
+                let line = handle.lock().terminal.extract_current_line();
+                strip_prompt(line.trim()).to_string()
+            })
+            .unwrap_or_default()
+    });
+    let replace_line = force_replace
+        || state
+            .read()
+            .history_completion_sessions
+            .contains(session_id);
+    let input = suggestion_acceptance_input(&current, &cmd, is_correction, replace_line);
+    if !input.is_empty() {
+        let input_targets = if isolated {
+            vec![session_id.to_string()]
+        } else {
+            let targets = crate::state::broadcast_targets(&state.read());
+            if targets.len() > 1 {
+                targets
+            } else {
+                vec![session_id.to_string()]
+            }
+        };
+        dispatch_terminal_input_bytes(
+            state,
+            input_senders,
+            session_id,
+            &input_targets,
+            input,
+            true,
+        );
+    }
+    // Dismiss dropdown and clear suggestion state for this session.
+    state.write().history_completion_sessions.remove(session_id);
+    state
+        .write()
+        .sessions
+        .iter_mut()
+        .find(|t| t.id == session_id)
+        .map(|tab| {
+            tab.suggestion_visible = false;
+            tab.suggestion = None;
+            tab.suggestions = Vec::new();
+            tab.suggestion_corrections.clear();
+            tab.suggestion_selected = 0;
+        });
+}
+
 fn history_completion_candidates(
     query: &str,
     commands: impl IntoIterator<Item = String>,
@@ -3100,6 +3181,10 @@ fn render_terminal_pane(
             let keybindings = state.read().keybindings.clone();
             let history_completion_visible =
                 state.read().history_completion_sessions.contains(&tab.id);
+            // Each suggestion-acceptance EventHandler owns its own clone of
+            // the session id (Tab suffix-complete vs ArrowRight whole-fill),
+            // since `String` is not `Copy` and `move` closures consume it.
+            let sid_for_sug_fill = sid_for_sug_accept.clone();
             rsx! {
                 div {
                     style: "position: relative; width: 100%; height: 100%;",
@@ -4018,74 +4103,24 @@ fn render_terminal_pane(
                         });
                     },
                     on_suggestion_accept: move |cmd: String| {
-                        let is_correction = state_for_cmd
-                            .read()
-                            .sessions
-                            .iter()
-                            .find(|tab| tab.id == sid_for_sug_accept)
-                            .is_some_and(|tab| tab.suggestion_corrections.contains(&cmd));
-                        // History suggestions append their suffix. Corrections
-                        // replace the current input using DEL bytes and insert
-                        // the corrected line without Enter, so the user still
-                        // reviews and explicitly executes it.
-                        let current = tracked_terminal_command(
-                            &state_for_cmd.read(),
+                        apply_suggestion_acceptance(
+                            state_for_cmd,
+                            senders,
                             &sid_for_sug_accept,
-                        )
-                        .unwrap_or_else(|| {
-                            let terminals = state_for_cmd.read().terminals.clone();
-                            terminals
-                                .get(&sid_for_sug_accept)
-                                .map(|handle| {
-                                    let line = handle.lock().terminal.extract_current_line();
-                                    strip_prompt(line.trim()).to_string()
-                                })
-                                .unwrap_or_default()
-                        });
-                        let replace_line = state_for_cmd
-                            .read()
-                            .history_completion_sessions
-                            .contains(&sid_for_sug_accept);
-                        let input = suggestion_acceptance_input(
-                            &current,
-                            &cmd,
-                            is_correction,
-                            replace_line,
+                            cmd,
+                            false,
+                            isolated,
                         );
-                        if !input.is_empty() {
-                            let input_targets = if isolated {
-                                vec![sid_for_sug_accept.clone()]
-                            } else {
-                                let targets = crate::state::broadcast_targets(&state_for_cmd.read());
-                                if targets.len() > 1 {
-                                    targets
-                                } else {
-                                    vec![sid_for_sug_accept.clone()]
-                                }
-                            };
-                            dispatch_terminal_input_bytes(
-                                state_for_cmd,
-                                senders,
-                                &sid_for_sug_accept,
-                                &input_targets,
-                                input,
-                                true,
-                            );
-                        }
-                        // Dismiss dropdown and clear suggestion
-                        state_for_cmd
-                            .write()
-                            .history_completion_sessions
-                            .remove(&sid_for_sug_accept);
-                        state_for_cmd.write().sessions.iter_mut()
-                            .find(|t| t.id == sid_for_sug_accept)
-                            .map(|tab| {
-                                tab.suggestion_visible = false;
-                                tab.suggestion = None;
-                                tab.suggestions = Vec::new();
-                                tab.suggestion_corrections.clear();
-                                tab.suggestion_selected = 0;
-                            });
+                    },
+                    on_suggestion_fill: move |cmd: String| {
+                        apply_suggestion_acceptance(
+                            state_for_cmd,
+                            senders,
+                            &sid_for_sug_fill,
+                            cmd,
+                            true,
+                            isolated,
+                        );
                     },
                     on_suggestion_dismiss: move |keep_inline_ghost: bool| {
                         state_for_cmd
@@ -12127,6 +12162,89 @@ send hi\n"
         }
     }
 
+    /// v0.21: copying a session numbers it "副本 1, 2, 3 … N" off the highest
+    /// existing copy of the same saved connection, so each copy stays
+    /// distinguishable after a restart (when copies share one saved-connection
+    /// id and `find_restore_connection` resolves them all to it).
+    #[test]
+    fn copy_session_numbers_copies_sequentially_off_existing_ones() {
+        use crate::state::next_copy_number;
+        use rusterm_core::config::{ConnectionKind, ShellConfig};
+        use rusterm_core::session::SessionType;
+
+        let mut state = AppState::default();
+        let saved_conn_id = "jump-conn-1";
+        let mk = |state: &mut AppState, sid: &str, name: &str| {
+            state.sessions.push(SessionTab {
+                id: sid.to_string(),
+                name: name.to_string(),
+                kind: SessionType::Ssh,
+                render_output: Default::default(),
+                version: 1,
+                suggestion: None,
+                suggestions: Vec::new(),
+                suggestion_corrections: std::collections::HashSet::new(),
+                suggestion_selected: 0,
+                suggestion_visible: false,
+                command_history: Vec::new(),
+                hostname: Some("jump.example.com".to_string()),
+                cwd: None,
+                last_command_status: CommandStatus::default(),
+            });
+            state.session_configs.insert(
+                sid.to_string(),
+                ConnectionConfig {
+                    id: saved_conn_id.to_string(),
+                    name: name.to_string(),
+                    kind: ConnectionKind::Shell(ShellConfig {
+                        command: None,
+                        args: Vec::new(),
+                        env: Vec::new(),
+                        working_dir: None,
+                    }),
+                    group: None,
+                    tags: Vec::new(),
+                    onekey: false,
+                    login_script: None,
+                },
+            );
+        };
+
+        // Source + an existing 副本 1. The NEXT copy must be 副本 2.
+        mk(&mut state, "src", "ops@jump");
+        mk(&mut state, "c1", "ops@jump 副本 1");
+        let n = next_copy_number(&state, saved_conn_id);
+        assert_eq!(n, 2);
+        let name = crate::i18n::tf(
+            "connection.copy_name_numbered",
+            &[("name", &"ops@jump"), ("n", &n.to_string())],
+        );
+        assert_eq!(name, "ops@jump 副本 2");
+
+        // A gap (副本 1, 副本 3) → next is 4, never colliding with the still-
+        // persisted 副本 3 on a future restore.
+        mk(&mut state, "c3", "ops@jump 副本 3");
+        assert_eq!(next_copy_number(&state, saved_conn_id), 4);
+    }
+
+    /// v0.21: a restored OTP-group member's per-session menu replay must keep
+    /// waiting through the whole group's leader-failover + channel-clone
+    /// window (up to `OTP_GROUP_BUDGET_SECS`), otherwise a non-leader tab whose
+    /// clone lands late would silently lose its recorded navigation. The
+    /// restore path hands `schedule_replay_after_reconnect` a deadline of
+    /// `OTP_GROUP_BUDGET_SECS + REPLAY_CONNECT_WAIT_SECS`; pin that it strictly
+    /// exceeds the group budget so the replay never times out before the
+    /// supervisor gives up on the group.
+    #[test]
+    fn restored_session_replay_deadline_outlasts_otp_group_budget() {
+        assert!(
+            OTP_GROUP_BUDGET_SECS + REPLAY_CONNECT_WAIT_SECS > OTP_GROUP_BUDGET_SECS,
+            "restore replay deadline must exceed the OTP-group budget"
+        );
+        // The normal reconnect/copy path keeps the short watchdog deadline.
+        assert_eq!(REPLAY_CONNECT_WAIT_SECS, 60);
+    }
+
     #[test]
     fn copy_session_seeds_replay_recorder_and_schedules_login_replay() {
         // Pins the "复制会话要重新执行登录逻辑" contract: the duplicated
@@ -12162,6 +12280,7 @@ send hi\n"
                     "sudo -i".to_string(),
                 ],
                 shell_integrated: true,
+                follow_up_cwd: None,
             },
         );
 
@@ -12984,12 +13103,13 @@ fn start_ssh_connection(
                             }
                             let terminals = state.read().terminals.clone();
                             if let Some(handle) = terminals.get(&id) {
-                                let (render_result, exit_code, new_cwd) = {
+                                let (render_result, exit_code, new_cwd, new_node) = {
                                     let mut entry = handle.lock();
                                     (
                                         entry.process_and_render(&data),
                                         entry.terminal.take_exit_code(),
                                         entry.terminal.cwd().map(|p| p.to_path_buf()),
+                                        entry.terminal.osc7_host().map(|s| s.to_string()),
                                     )
                                 };
                                 if let Some(exit_code) = exit_code {
@@ -13224,6 +13344,17 @@ fn start_ssh_connection(
                                         if let Some(cwd) = &new_cwd {
                                             tab.cwd = Some(cwd.to_string_lossy().into_owned());
                                         }
+                                    }
+                                    // Mirror the OSC 7 `<host>` authority into the
+                                    // per-session node map. For a JumpServer session
+                                    // this is the internal target node's hostname
+                                    // (the target shell emits it after the bastion
+                                    // menu lands on it) — distinct from the bastion
+                                    // host stored on `SessionTab.hostname`. Read "in
+                                    // the background" from the shell's own prompt
+                                    // hook; `None` leaves any previous value intact.
+                                    if let Some(node) = &new_node {
+                                        s.session_nodes.insert(id.clone(), node.clone());
                                     }
                                 }
                                 // Capture before the move below — the badge update reads this after
@@ -14060,12 +14191,13 @@ fn start_shell_connection(
                             }
                             let terminals = state.read().terminals.clone();
                             if let Some(handle) = terminals.get(&id) {
-                                let (render_result, exit_code, new_cwd) = {
+                                let (render_result, exit_code, new_cwd, new_node) = {
                                     let mut entry = handle.lock();
                                     (
                                         entry.process_and_render(&data),
                                         entry.terminal.take_exit_code(),
                                         entry.terminal.cwd().map(|p| p.to_path_buf()),
+                                        entry.terminal.osc7_host().map(|s| s.to_string()),
                                     )
                                 };
                                 if let Some(exit_code) = exit_code {
@@ -14260,6 +14392,17 @@ fn start_shell_connection(
                                         if let Some(cwd) = &new_cwd {
                                             tab.cwd = Some(cwd.to_string_lossy().into_owned());
                                         }
+                                    }
+                                    // Mirror the OSC 7 `<host>` authority into the
+                                    // per-session node map. For a JumpServer session
+                                    // this is the internal target node's hostname
+                                    // (the target shell emits it after the bastion
+                                    // menu lands on it) — distinct from the bastion
+                                    // host stored on `SessionTab.hostname`. Read "in
+                                    // the background" from the shell's own prompt
+                                    // hook; `None` leaves any previous value intact.
+                                    if let Some(node) = &new_node {
+                                        s.session_nodes.insert(id.clone(), node.clone());
                                     }
                                 }
                                 // Capture before the move below — the badge update reads this after
@@ -14577,12 +14720,13 @@ fn start_serial_connection(
                             }
                             let terminals = state.read().terminals.clone();
                             if let Some(handle) = terminals.get(&id) {
-                                let (render_result, exit_code, new_cwd) = {
+                                let (render_result, exit_code, new_cwd, new_node) = {
                                     let mut entry = handle.lock();
                                     (
                                         entry.process_and_render(&data),
                                         entry.terminal.take_exit_code(),
                                         entry.terminal.cwd().map(|p| p.to_path_buf()),
+                                        entry.terminal.osc7_host().map(|s| s.to_string()),
                                     )
                                 };
                                 if let Some(exit_code) = exit_code {
@@ -14625,6 +14769,9 @@ fn start_serial_connection(
                                         if let Some(cwd) = &new_cwd {
                                             tab.cwd = Some(cwd.to_string_lossy().into_owned());
                                         }
+                                    }
+                                    if let Some(node) = &new_node {
+                                        s.session_nodes.insert(id.clone(), node.clone());
                                     }
                                 }
                             }
@@ -14825,12 +14972,13 @@ fn start_telnet_connection(
                             }
                             let terminals = state.read().terminals.clone();
                             if let Some(handle) = terminals.get(&id) {
-                                let (render_result, exit_code, new_cwd) = {
+                                let (render_result, exit_code, new_cwd, new_node) = {
                                     let mut entry = handle.lock();
                                     (
                                         entry.process_and_render(&data),
                                         entry.terminal.take_exit_code(),
                                         entry.terminal.cwd().map(|p| p.to_path_buf()),
+                                        entry.terminal.osc7_host().map(|s| s.to_string()),
                                     )
                                 };
                                 if let Some(exit_code) = exit_code {
@@ -14869,6 +15017,9 @@ fn start_telnet_connection(
                                         if let Some(cwd) = &new_cwd {
                                             tab.cwd = Some(cwd.to_string_lossy().into_owned());
                                         }
+                                    }
+                                    if let Some(node) = &new_node {
+                                        s.session_nodes.insert(id.clone(), node.clone());
                                     }
                                 }
                             }
@@ -15796,6 +15947,11 @@ fn otp_group_recycle_tab(
         s.pending_exit_check.remove(tab_id);
         feishu_otp_session_closed(&mut s, tab_id);
         s.login_scripts.remove(tab_id);
+        // v0.21: drop the stale jumpserver-internal node label so the tab
+        // title doesn't keep showing the PREVIOUS target while the clone
+        // re-navigates the bastion menu. The new target's shell will repopulate
+        // it via OSC 7 once the recorded establishment ops land on it.
+        s.session_nodes.remove(tab_id);
     }
     input_senders.write().remove(tab_id);
     create_terminal_with_size(tab_id.to_string(), previous_size, &mut state);
@@ -16113,13 +16269,18 @@ fn finish_restored_session(
         }
         // Re-seed the interactive-replay recorder so future
         // reconnects of the restored session replay the same
-        // establishment ops.
+        // establishment ops. Carry the persisted follow-up cwd so the
+        // OTP-group supervisor can re-schedule a clone tab's replay (the
+        // original 60s-deadline task may expire while the tab waits for the
+        // group leader's OTP to settle) without losing the `cd` back to the
+        // user's last directory.
         if !restore_replay_ops.is_empty() {
             s.session_replays.insert(
                 tab_id.clone(),
                 crate::state::SessionReplayRecorder {
                     ops: restore_replay_ops.clone(),
                     shell_integrated: false,
+                    follow_up_cwd: ps.cwd.clone(),
                 },
             );
         }
@@ -16158,6 +16319,12 @@ fn finish_restored_session(
             tab_id.clone(),
             restore_replay_ops,
             ps.cwd.clone(),
+            // Restore path covers OTP-group members: a non-leader tab may
+            // wait through the whole group's leader-failover + clone window
+            // (up to OTP_GROUP_BUDGET_SECS) before its channel clone lands.
+            // A `Failed`/`Disconnected` flip still aborts early, so the longer
+            // budget only extends the wait for tabs genuinely still trying.
+            OTP_GROUP_BUDGET_SECS + REPLAY_CONNECT_WAIT_SECS,
         );
     } else if has_login_script {
         tracing::info!(
@@ -17057,11 +17224,18 @@ fn seed_copied_session_replay(state: &mut AppState, source_id: &str, new_id: &st
     if ops.is_empty() {
         return Vec::new();
     }
+    // Inherit the source's follow-up cwd so a copy's replay lands in the same
+    // directory after its establishment ops, mirroring the source's restore.
+    let follow_up_cwd = state
+        .session_replays
+        .get(source_id)
+        .and_then(|r| r.follow_up_cwd.clone());
     state.session_replays.insert(
         new_id.to_string(),
         crate::state::SessionReplayRecorder {
             ops: ops.clone(),
             shell_integrated: false,
+            follow_up_cwd,
         },
     );
     ops
@@ -17447,6 +17621,7 @@ fn schedule_replay_after_reconnect(
     tab_id: String,
     ops: Vec<String>,
     follow_up_cwd: Option<String>,
+    connect_wait_secs: u64,
 ) {
     if ops.is_empty() {
         return;
@@ -17455,8 +17630,13 @@ fn schedule_replay_after_reconnect(
         // 1. Wait for the reconnect to actually land. `None` means the
         // connection task has not registered a state yet (startup restore
         // path) — keep waiting; a failed attempt shows up as `Failed`.
+        // The wait budget is caller-supplied: a normal reconnect/copy waits
+        // ~60s, but a restored OTP-group member may have to outlast the whole
+        // group's leader-failover + clone window (up to OTP_GROUP_BUDGET_SECS)
+        // before its channel clone lands — a fixed 60s would give up early and
+        // silently drop that tab's per-session menu replay.
         let deadline =
-            std::time::Instant::now() + std::time::Duration::from_secs(REPLAY_CONNECT_WAIT_SECS);
+            std::time::Instant::now() + std::time::Duration::from_secs(connect_wait_secs);
         loop {
             match state.read().session_connection_states.get(&tab_id).copied() {
                 Some(SessionConnectionState::Connected) => break,
@@ -17902,6 +18082,7 @@ fn reconnect_session(
             tab_id.clone(),
             replay_ops,
             follow_up_cwd,
+            REPLAY_CONNECT_WAIT_SECS,
         );
     }
     // Keep the id for the reconnect watchdog after the selected connector
@@ -19748,6 +19929,7 @@ pub fn App() -> Element {
                         .or_else(|| state.read().active_session.clone()),
                     focused_appearance: state.read().focused_tab_appearance.clone(),
                     connection_states: state.read().session_connection_states.clone(),
+                    session_nodes: state.read().session_nodes.clone(),
                     on_select: move |id: String| {
                         // Switching the top TabBar entry: update active_tab
                         // and derive active_session from the new tab's anchor.
@@ -19828,9 +20010,19 @@ pub fn App() -> Element {
                         };
                         if let Some(conn) = conn {
                             let mut new_conn = conn.clone();
+                            // v0.21: number copies of the same saved
+                            // connection as "副本 1, 2, 3 … N" so each stays
+                            // distinguishable after a restart, when
+                            // `find_restore_connection` resolves them all to the
+                            // same saved-connection id. The source itself has no
+                            // "副本 N" suffix, so the first copy is 1.
+                            let copy_n = next_copy_number(&state.read(), &conn.id);
                             new_conn.name = crate::i18n::tf(
-                                "connection.copy_name",
-                                &[("name", &conn.name)],
+                                "connection.copy_name_numbered",
+                                &[
+                                    ("name", &conn.name),
+                                    ("n", &copy_n.to_string()),
+                                ],
                             );
                             // Source tab's last known cwd — restored after
                             // the replayed establishment ops, exactly like a
@@ -19904,6 +20096,7 @@ pub fn App() -> Element {
                                     new_sid,
                                     replay_ops,
                                     follow_up_cwd,
+                                    REPLAY_CONNECT_WAIT_SECS,
                                 );
                             }
                         } else {
@@ -22156,6 +22349,26 @@ mod suggestion_acceptance_tests {
     #[test]
     fn unrelated_suggestion_produces_no_terminal_input() {
         assert!(suggestion_acceptance_input("git", "cargo test", false, false).is_empty());
+    }
+
+    #[test]
+    fn arrow_right_fill_replaces_whole_line_where_tab_suffix_would_be_a_noop() {
+        // Tab (suffix-completion, replace_line=false): the suggestion's prefix
+        // ("systemctl") differs from the typed text ("status"), so there is no
+        // suffix to append — Tab is a no-op and the user keeps typing "status".
+        assert!(
+            suggestion_acceptance_input("status", "systemctl status nginx", false, false)
+                .is_empty()
+        );
+        // ArrowRight fill (force_replace=true): the whole selected command
+        // replaces the edited line via DEL-bytes + the full command, no Enter —
+        // the user lands on "systemctl status nginx" ready to review/run. This
+        // is the contains-match case (Alt+R history mode surfaces it) where
+        // Right genuinely differs from Tab.
+        let input = suggestion_acceptance_input("status", "systemctl status nginx", false, true);
+        assert_eq!(&input[..6], &[0x7f; 6]);
+        assert_eq!(&input[6..], b"systemctl status nginx");
+        assert!(!input.contains(&b'\r'));
     }
 }
 

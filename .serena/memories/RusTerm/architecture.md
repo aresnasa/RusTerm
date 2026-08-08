@@ -26,7 +26,7 @@
   - `app.rs` (~2900 lines): `App()` function, `start_ssh_connection`, `start_shell_connection`, `open_local_terminal`, `reconnect_session`.
   - `analytics.rs` (NEW): `AnalyticsHandle` with feature-gated real/stub impls.
   - `components/suggestion_popup.rs`: `SuggestionPopup` component (props: suggestions, selected_index, on_select, on_dismiss, on_delete [NEW]).
-  - `components/terminal_view.rs`: `TerminalView` component. Suggestion keyboard handler handles ArrowUp/Down/Tab/Escape/Shift+Delete [NEW]/Enter.
+  - `components/terminal_view.rs`: `TerminalView` component. Suggestion keyboard handler handles ArrowUp/Down/Tab/Escape/Shift+Delete [NEW]/Enter. **v0.20**: unmodified ArrowRight FILLS the selected suggestion (whole-command replace via `on_suggestion_fill` → `apply_suggestion_acceptance(force_replace=true)`), distinct from Tab's suffix-completion (`on_suggestion_accept`, `force_replace=false`). Pure guard `suggestion_fill_accepts_key` (ArrowRight-only, no modifiers) precedes the `ArrowLeft|ArrowRight` dismiss arm. Modified Right / ArrowLeft still dismiss+forward to PTY.
 - `rusterm-app` — binary crate.
 - `rusterm-ssh`, `rusterm-crypto`, `rusterm-ai`, `rusterm-plugins`, `rusterm-proto` — supporting.
 
@@ -550,3 +550,38 @@ All 4 connection types (SSH, shell, serial, telnet) use the same `drain_output_b
 **Workspace changes**: `Cargo.toml` workspace members + deps gained `rusterm-ohmyzsh`; `rusterm-ui/Cargo.toml` gained `rusterm-ohmyzsh.workspace = true`.
 
 **Test totals**: rusterm-ohmyzsh 20, rusterm-ui 619 (was 618 — +1 reconnect watchdog test), workspace all green.
+
+## v0.19 — OTP-group concurrent restore + failover state machine (2026-08-08)
+
+**Goal**: when multiple restored SSH tabs share one JumpServer saved-connection (same OTP credential), only ONE tab does the fresh connect + OTP; the rest clone its authenticated transport. If the leader's OTP fails, leadership hands off to the next tab in restore order; once any tab settles past OTP, it's latched as the group's reuse source and revives even Failed siblings via channel clone. All-fail → group-level timeout exit.
+
+**State machine** (`crates/rusterm-ui/src/state.rs`):
+- `OtpGroupRegistry` (serde-skip) — `groups: HashMap<conn.id, OtpGroupEntry>`. `OtpGroupEntry { leader, beacon_ms, latched_source, demoted }`.
+- `OtpGroupRole::{SettledPeer(src), Lead, Wait, Exhausted}` — `poll(group_key, order, members, state_of, settled, my_tab, now_ms)` returns the verdict for one member per cycle. Latched source (first member to cross the settle gate) is reused at highest priority; leader election is by restore order among alive non-demoted members; demoted members (beacon-dead but still Connecting) can't be re-elected until they clearly fail.
+- `OTP_GROUP_LEADER_DEAD_MS` beacon timeout; `drop_group` cleanup.
+
+**Per-tab supervisor** (`crates/rusterm-ui/src/app.rs` `otp_group_session_supervisor`): spawned concurrently for EVERY restored SSH tab of a group (`restore_sessions` spawns one per member). Each polls every `REPLAY_POLL_MS`: collects members/states/ready-streaks snapshot, advances the shared registry, then acts — `SettledPeer` → `otp_group_recycle_tab` + `start_ssh_connection(.., Some(source))` (channel clone); `Lead` → recycle + fresh connect (own OTP); `Wait` → sleep; `Exhausted`/budget → exit. `OTP_GROUP_BUDGET_SECS=300` group timeout. `RESTORE_CLONE_SETTLED_POLLS=4` quiet-prompt streak before a tab counts as settled past OTP.
+
+**Concurrent wait**: all members spawn simultaneously; non-leaders `Wait` while one connects; first settle latches and the rest clone. Per-tab replay (each tab's OWN DuckDB stream + `finish_restored_session` scheduling) routes independently — a clone replays ITS menu navigation to land on its own target node.
+
+## v0.21 — jumpserver node tracking + 副本 N naming + restore-replay deadline (2026-08-08)
+
+**Goal**: record which jumpserver-internal machine each session landed on (read hostname in the background), number session copies "副本 1, 2, 3 … N" so they stay distinguishable on restore, surface the node in the session header, and stop non-leader clone tabs from silently losing their per-session menu replay.
+
+**Sub-task 1 — restore-replay deadline** (`app.rs`): `schedule_replay_after_reconnect` gained a `connect_wait_secs: u64` param. The restore path passes `OTP_GROUP_BUDGET_SECS + REPLAY_CONNECT_WAIT_SECS` so a non-leader clone tab's replay task keeps waiting through the whole leader-failover + clone window (up to 300s) instead of giving up at the 60s watchdog. `Failed`/`Disconnected` still aborts early, so only genuinely-still-trying tabs wait longer. Reconnect/copy keep the 60s `REPLAY_CONNECT_WAIT_SECS`.
+
+**Sub-task 2 — node tracking** (`rusterm-core/src/terminal.rs` + `state.rs` + `app.rs`):
+- `Terminal.osc7_host: Option<String>` + `osc7_host()` accessor. `parse_osc7_parts(payload) -> Option<(Option<String> host, PathBuf path)>` now extracts the `file://<host>/<path>` authority (was discarded). `scan_cwd` stores both cwd and host. For a JumpServer session this host is the INTERNAL target node's hostname (target shell emits it after the bastion menu lands on it).
+- `AppState.session_nodes: HashMap<String, String>` (serde-skip) — per-session internal node, mirrored from `terminal.osc7_host()` in all 4 output handlers (SSH/shell/serial/telnet) alongside the existing `tab.cwd` mirror. Cleared on `close_session`/`close_workspace`/`otp_group_recycle_tab` (so the title doesn't show a stale node while a clone re-navigates).
+
+**Sub-task 3 — 副本 N naming** (`state.rs` + `app.rs` + `i18n.rs`):
+- `parse_copy_number(name) -> Option<usize>` — recognises trailing "副本 N" / "copy N" (case-insensitive en) suffix; ignores a base name that merely ends in digits ("web-01" is NOT copy 1).
+- `next_copy_number(state, source_saved_connection_id) -> usize` — max existing copy number of sessions sharing that saved-connection id, +1 (min 1). Gaps are respected (副本 1 + 副本 3 → next is 4) so numbers never collide with a still-persisted closed copy on restore.
+- `on_copy_session` now names copies via i18n `connection.copy_name_numbered` ("{name} copy {n}" / "{name} 副本 {n}"). The number lives in `PersistedSession.name`, so `find_restore_connection` (matches by shared connection_id, keeps `ps.name`) preserves "副本 N" across restarts — that IS the matching.
+- `SessionReplayRecorder` gained `follow_up_cwd: Option<String>` (stored at restore from `ps.cwd`, inherited by copies via `seed_copied_session_replay`) so a re-scheduled/late clone replay still `cd`s back to the user's directory.
+
+**Sub-task 4 — session header** (`components/tab_bar.rs`): `TabBar` gained a `session_nodes` prop. The tab title shows a muted " · {node}" suffix when the session's node differs from its own connection host (`SessionTab.hostname`) — substring/substring/eq-ignore-case match suppresses the suffix for plain SSH (node == host) and local shells, so only jumpserver-internal nodes surface (e.g. "ops@jump 副本 1 · web-01").
+
+**bincode safety**: node + copy-number are runtime-only (session_nodes serde-skip; copy-number derived from the name string) — NO new fields on `PersistedSession`/`SessionState`, so existing `session_state.enc` snapshots stay compatible.
+
+**Test totals**: rusterm-core 236 (was 220 +5 osc7_host + existing), rusterm-ui 861 (was 851 v0.20 +8 copy-number +1 copy-numbering +1 replay-deadline), rusterm-ssh 145. Workspace all green. v0.20 uncommitted hunks untouched.

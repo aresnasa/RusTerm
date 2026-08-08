@@ -313,6 +313,15 @@ pub struct AppState {
     /// while preserving the same session id and pane assignment.
     #[serde(skip)]
     pub session_connection_states: HashMap<String, SessionConnectionState>,
+    /// Per-session hostname of the jumpserver-internal node the session has
+    /// landed on, captured "in the background" from the target shell's OSC 7
+    /// report (`file://<node-host>/<path>`). `None` for plain SSH (where the
+    /// node IS the connection host, already stored on `SessionTab.hostname`)
+    /// and for shells that never report OSC 7. Used to label which internal
+    /// machine each (possibly duplicated) jumpserver session is on, so the
+    /// session header can show `ops@jump → web-01` instead of just the bastion.
+    #[serde(skip)]
+    pub session_nodes: HashMap<String, String>,
     /// OTP 组级状态机的登记表（按 conn.id 分组）。JumpServer 共凭据的多个
     /// tab 恢复时，组内只需一台 fresh connect + OTP，其余复用其 transport。
     /// 见 [`OtpGroupRegistry`] 的说明。运行时状态，不持久化。
@@ -1205,6 +1214,7 @@ impl Default for AppState {
             onekey_skip_logged: HashSet::new(),
             session_configs: HashMap::new(),
             session_connection_states: HashMap::new(),
+            session_nodes: HashMap::new(),
             otp_groups: OtpGroupRegistry::default(),
             send_target_selection: None,
             ssh_sessions: HashMap::new(),
@@ -2410,6 +2420,75 @@ pub fn place_copied_session_next_to_source(
     true
 }
 
+/// Parse the trailing "副本 N" / "copy N" suffix off a session display name
+/// and return `N`. Recognises both the zh (`副本`) and en (`copy`) markers,
+/// case-insensitively, followed by whitespace and a positive integer at the
+/// very end of the string. Returns `None` when the name has no such suffix
+/// (the source session itself, or a name that was never numbered).
+///
+/// Used by [`AppState::next_copy_number`] to sequence copies of the same
+/// jumpserver connection as "副本 1, 2, 3 … N" so each copy is distinguishable
+/// on restore (where copies share one saved-connection id and are matched by
+/// this title).
+pub fn parse_copy_number(name: &str) -> Option<usize> {
+    let trimmed = name.trim_end();
+    // Walk back from the end: a run of digits, then whitespace, then the
+    // marker word. Find the last space before the digit run.
+    let bytes = trimmed.as_bytes();
+    let mut i = bytes.len();
+    while i > 0 && bytes[i - 1].is_ascii_digit() {
+        i -= 1;
+    }
+    if i == bytes.len() || i == 0 {
+        // No trailing digits, or the whole string is digits.
+        return None;
+    }
+    let n: usize = std::str::from_utf8(&bytes[i..]).ok()?.parse().ok()?;
+    if n == 0 {
+        return None;
+    }
+    // Skip whitespace between marker and number.
+    while i > 0 && bytes[i - 1].is_ascii_whitespace() {
+        i -= 1;
+    }
+    if i == 0 {
+        return None;
+    }
+    let marker = &trimmed[..i];
+    let marker = marker.trim_end();
+    if marker.ends_with("副本") || marker.to_ascii_lowercase().ends_with(" copy") {
+        Some(n)
+    } else {
+        None
+    }
+}
+
+/// Next "副本 N" sequence number for a new copy of the connection identified
+/// by `source_saved_connection_id` (the saved-connection id shared by the
+/// source and all its existing copies). Counts open sessions whose stored
+/// config shares that id and parses the highest existing copy number, then
+/// returns `max + 1` (minimum `1` when no copies exist yet).
+///
+/// This is the matching key v0.21 asked for: copies of the same jumpserver
+/// connection are numbered "副本 1, 2, 3 … N" so they stay distinguishable
+/// after a restart, when `find_restore_connection` resolves them all to the
+/// same saved-connection id.
+pub fn next_copy_number(state: &AppState, source_saved_connection_id: &str) -> usize {
+    let mut max_n = 0usize;
+    for tab in &state.sessions {
+        let conn = state.session_configs.get(&tab.id);
+        if conn.map(|c| c.id.as_str()) != Some(source_saved_connection_id) {
+            continue;
+        }
+        if let Some(n) = parse_copy_number(&tab.name) {
+            if n > max_n {
+                max_n = n;
+            }
+        }
+    }
+    max_n + 1
+}
+
 /// Apply a layout preset to the active tab. Builds a fresh `PaneLayout`
 /// from the preset using the active tab's anchor session as the first pane,
 /// then fills the remaining pane slots with other open sessions (in tab
@@ -3446,6 +3525,7 @@ pub fn close_session(
         .onekey_skip_logged
         .retain(|(session_id, _)| session_id != id);
     state.session_connection_states.remove(id);
+    state.session_nodes.remove(id);
     if let Some(selection) = state.send_target_selection.as_mut() {
         selection.remove(id);
     }
@@ -3638,6 +3718,7 @@ pub fn close_workspace(
             .onekey_skip_logged
             .retain(|(session_id, _)| session_id != sid);
         state.session_connection_states.remove(sid);
+        state.session_nodes.remove(sid);
         state.session_configs.remove(sid);
         state.pending_exit_check.remove(sid);
         state.exit_code_sessions.remove(sid);
@@ -4699,6 +4780,125 @@ mod tests {
         let placed = place_copied_session_next_to_source(&mut state, "alpha", "nonexistent");
         assert!(!placed);
         assert_eq!(tab_anchors(&state), vec!["alpha", "beta"]);
+    }
+
+    // ── v0.21 copy numbering (副本 1, 2, 3 … N) ──────────────────────────
+
+    /// Build one session tab + workspace tab + a `session_configs` entry whose
+    /// `ConnectionConfig.id` is `saved_conn_id` (the saved-connection id shared
+    /// by a source and all its copies). Mirrors what `open_connection` / the
+    /// copy-session handler leave behind, minus the transport.
+    fn numbered_session(state: &mut AppState, sid: &str, name: &str, saved_conn_id: &str) {
+        state.sessions.push(SessionTab {
+            id: sid.to_string(),
+            name: name.to_string(),
+            kind: SessionType::Ssh,
+            render_output: Default::default(),
+            version: 1,
+            suggestion: None,
+            suggestions: Vec::new(),
+            suggestion_corrections: std::collections::HashSet::new(),
+            suggestion_selected: 0,
+            suggestion_visible: false,
+            command_history: Vec::new(),
+            hostname: Some("jump.example.com".to_string()),
+            cwd: None,
+            last_command_status: CommandStatus::default(),
+        });
+        state.tabs.push(WorkspaceTab {
+            id: sid.to_string(),
+            anchor_session_id: Some(sid.to_string()),
+        });
+        state.session_configs.insert(
+            sid.to_string(),
+            ConnectionConfig {
+                id: saved_conn_id.to_string(),
+                name: name.to_string(),
+                kind: ConnectionKind::Shell(ShellConfig {
+                    command: None,
+                    args: Vec::new(),
+                    env: Vec::new(),
+                    working_dir: None,
+                }),
+                group: None,
+                tags: Vec::new(),
+                onekey: false,
+                login_script: None,
+            },
+        );
+    }
+
+    #[test]
+    fn parse_copy_number_recognises_zh_suffix() {
+        assert_eq!(parse_copy_number("ops@jump 副本 1"), Some(1));
+        assert_eq!(parse_copy_number("ops@jump 副本 12"), Some(12));
+    }
+
+    #[test]
+    fn parse_copy_number_recognises_en_suffix() {
+        assert_eq!(parse_copy_number("ops@jump copy 3"), Some(3));
+        // Case-insensitive marker.
+        assert_eq!(parse_copy_number("ops@jump Copy 2"), Some(2));
+    }
+
+    #[test]
+    fn parse_copy_number_none_for_unnumbered_names() {
+        // The source session itself, or a name that was never numbered.
+        assert_eq!(parse_copy_number("ops@jumpserver"), None);
+        assert_eq!(parse_copy_number("ops@jump 副本"), None);
+        // A base name that happens to contain "copy" but no trailing number.
+        assert_eq!(parse_copy_number("copy of something"), None);
+        // Zero is not a valid copy number.
+        assert_eq!(parse_copy_number("ops@jump 副本 0"), None);
+    }
+
+    #[test]
+    fn parse_copy_number_ignores_a_base_name_ending_in_digits() {
+        // "web-01" is the base name; without a 副本/copy marker it must NOT be
+        // mistaken for copy number 1.
+        assert_eq!(parse_copy_number("web-01"), None);
+        // With the marker it parses fine.
+        assert_eq!(parse_copy_number("web-01 副本 2"), Some(2));
+    }
+
+    #[test]
+    fn next_copy_number_starts_at_one_with_no_existing_copies() {
+        let mut state = AppState::default();
+        // Source session alone — no copies yet.
+        numbered_session(&mut state, "src", "ops@jump", "conn-1");
+        assert_eq!(next_copy_number(&state, "conn-1"), 1);
+    }
+
+    #[test]
+    fn next_copy_number_picks_max_plus_one_across_existing_copies() {
+        let mut state = AppState::default();
+        // Source + two existing copies (副本 1, 副本 3 — a gap, as if 副本 2 was
+        // closed). The next copy must be 4, not 2, so numbers never collide
+        // with a still-persisted closed copy on restore.
+        numbered_session(&mut state, "src", "ops@jump", "conn-1");
+        numbered_session(&mut state, "c1", "ops@jump 副本 1", "conn-1");
+        numbered_session(&mut state, "c3", "ops@jump 副本 3", "conn-1");
+        assert_eq!(next_copy_number(&state, "conn-1"), 4);
+    }
+
+    #[test]
+    fn next_copy_number_ignores_sessions_of_other_connections() {
+        let mut state = AppState::default();
+        numbered_session(&mut state, "src", "ops@jump", "conn-1");
+        // A copy of a DIFFERENT connection that happens to use 副本 5 — must
+        // not influence conn-1's sequence.
+        numbered_session(&mut state, "other", "ops@other 副本 5", "conn-2");
+        assert_eq!(next_copy_number(&state, "conn-1"), 1);
+    }
+
+    #[test]
+    fn next_copy_number_ignores_unnumbered_sibling_of_same_connection() {
+        let mut state = AppState::default();
+        // Two sessions of the same connection, neither numbered (e.g. two
+        // freshly-opened jumpserver windows before any copy was made).
+        numbered_session(&mut state, "src", "ops@jump", "conn-1");
+        numbered_session(&mut state, "src2", "ops@jump", "conn-1");
+        assert_eq!(next_copy_number(&state, "conn-1"), 1);
     }
 
     /// Verifies the timing-window guard for failed-command suggestions.
@@ -8705,6 +8905,13 @@ pub struct SessionReplayRecorder {
     /// then on `ops` is frozen (kept as the establishment prefix) and
     /// recording is disabled for this session.
     pub shell_integrated: bool,
+    /// The cwd to `cd` back to AFTER the establishment ops replay (captured
+    /// from the persisted snapshot at restore time). Carried on the recorder so
+    /// the OTP-group supervisor can re-schedule a clone tab's replay once its
+    /// channel clone lands — the original `schedule_replay_after_reconnect`
+    /// task (60s deadline) may have expired while the tab waited for the
+    /// group leader's OTP to settle.
+    pub follow_up_cwd: Option<String>,
 }
 
 /// Records one submitted menu-navigation input line into the session's

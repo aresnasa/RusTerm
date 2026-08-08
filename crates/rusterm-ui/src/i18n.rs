@@ -325,12 +325,12 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         // ── suggestion.* — suggestion popup ─────────────────────────────
         "suggestion.correction_prefix" => ("Fix ·", "纠正 ·"),
         "suggestion.correction_hint" => (
-            "↑↓ select · Fixes: Tab replaces only (no run) · History: × removes",
-            "↑↓ 选择 · 纠正项：Tab 仅替换，不执行 · 历史项：× 删除",
+            "↑↓ select · → fills whole command · Fixes: Tab replaces only (no run) · History: × removes",
+            "↑↓ 选择 · → 填入整条命令 · 纠正项：Tab 仅替换，不执行 · 历史项：× 删除",
         ),
         "suggestion.history_hint" => (
-            "↑↓ select · Shift+Del or click × to remove",
-            "↑↓ 选择 · Shift+Del 或点击 × 删除",
+            "↑↓ select · → fills whole command · Tab completes · Shift+Del or × removes",
+            "↑↓ 选择 · → 填入整条命令 · Tab 补全 · Shift+Del 或 × 删除",
         ),
         "suggestion.snooze" => ("Mute this session", "本次不再提示"),
         "suggestion.snooze_tooltip" => (
@@ -344,8 +344,8 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         ),
         "suggestion.history_completion_title" => ("Complete from history", "补全历史"),
         "suggestion.history_completion_hint" => (
-            "↑↓ or Ctrl+N/P selects · Enter inserts · Esc closes",
-            "↑↓ 或 Ctrl+N/P 选择 · Enter 插入 · Esc 关闭",
+            "↑↓ or Ctrl+N/P selects · Enter/→ inserts whole command · Esc closes",
+            "↑↓ 或 Ctrl+N/P 选择 · Enter/→ 填入整条命令 · Esc 关闭",
         ),
         "popup.drag_grip_tooltip" => (
             "Drag to move the popup (position is remembered) · double-click to restore automatic placement",
@@ -984,6 +984,10 @@ fn translate<'a>(key: &str, lang: Language) -> Option<&'a str> {
         "common.active" => ("Active", "活动"),
         "common.focused" => ("Focused", "已聚焦"),
         "connection.copy_name" => ("{name} copy", "{name} 副本"),
+        // v0.21: numbered copy name for session copies of the same saved
+        // connection (副本 1, 2, 3 … N) so each stays distinguishable after a
+        // restart, when copies share one saved-connection id.
+        "connection.copy_name_numbered" => ("{name} copy {n}", "{name} 副本 {n}"),
         "connection.delete_body" => (
             "Delete connection \"{name}\"? This cannot be undone.",
             "是否删除连接“{name}”？此操作无法撤销。",

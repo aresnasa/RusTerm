@@ -122,6 +122,12 @@ pub fn TabBar(
     /// Per-session connection state, used to enable/disable the Disconnect
     /// and Reconnect context-menu items.
     connection_states: HashMap<String, SessionConnectionState>,
+    /// Per-session hostname of the jumpserver-internal node the session has
+    /// landed on (captured from the target shell's OSC 7 report). Shown as a
+    /// muted suffix on the tab title when it differs from the session's own
+    /// connection host — so a jumpserver copy reads "ops@jump 副本 1 · web-01"
+    /// instead of just the bastion name.
+    session_nodes: HashMap<String, String>,
     on_select: EventHandler<String>,
     on_close: EventHandler<String>,
     /// Manual mouse-based tab drag (Task 22). Fired on `mousedown` with
@@ -213,6 +219,37 @@ pub fn TabBar(
                     let is_active = active.as_ref() == Some(&tab.id);
                     let is_pane_focused = focused_session.as_ref() == Some(&session_id);
                     let is_hover = hover_tab() == Some(tab.id.clone());
+                    // v0.21 session header: when this session has landed on a
+                    // jumpserver-internal node (OSC 7 host) that's distinct from
+                    // its own connection host, surface the node as a muted suffix
+                    // so a jumpserver copy reads "ops@jump 副本 1 · web-01". We
+                    // suppress the suffix when the node matches (or is a
+                    // substring of) the connection host, so plain SSH / local
+                    // shells don't show a redundant label.
+                    let node_label: Option<String> = {
+                        let node = session_nodes.get(&session_id);
+                        let host = sessions
+                            .iter()
+                            .find(|s| s.id == session_id)
+                            .and_then(|s| s.hostname.as_deref());
+                        node.and_then(|n| {
+                            let n = n.trim();
+                            if n.is_empty() {
+                                return None;
+                            }
+                            let same_as_host = match host {
+                                Some(h) => {
+                                    let h = h.trim();
+                                    h == n
+                                        || h.contains(n)
+                                        || n.contains(h)
+                                        || n.eq_ignore_ascii_case(h)
+                                }
+                                None => false,
+                            };
+                            if same_as_host { None } else { Some(n.to_string()) }
+                        })
+                    };
                     let color = session_type_color(&kind);
                     let _label = session_type_label(&kind);
                     // The indicator dot reflects the session's *connection*
@@ -354,6 +391,16 @@ pub fn TabBar(
                             span {
                                 style: "overflow: hidden; text-overflow: ellipsis; max-width: 120px;",
                                 "{session_name}"
+                            }
+                            // v0.21: jumpserver-internal node suffix (e.g.
+                            // "· web-01"), shown only when the node differs from
+                            // the connection host. Lets the user tell which
+                            // internal machine each jumpserver copy landed on.
+                            if let Some(node) = &node_label {
+                                span {
+                                    style: "color: var(--skin-text-muted); font-size: 11px; flex-shrink: 0;",
+                                    " · {node}"
+                                }
                             }
 
                             // Task #65: status belongs to the session's real top

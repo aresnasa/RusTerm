@@ -16,16 +16,25 @@ use dioxus::prelude::*;
 ///   - Click on an item        : accept it (same as Tab)
 ///   - Click on the × button   : delete that item from history (dirty-data
 ///                                cleanup — typos / broken commands)
-///   - Tab                     : accept selected (parent)
+///   - Tab                     : accept selected — completes the matching
+///                                suffix only (parent)
+///   - ArrowRight (→)          : fill selected — replaces the whole line
+///                                with the selected command (parent, no run)
 ///   - Escape                  : dismiss (parent)
 ///   - Shift+Delete            : delete selected from history (parent)
 ///   - ArrowUp / ArrowDown     : move the selection within the list
 ///                                (consumed by the parent — never reach the
 ///                                PTY, so the shell cannot swap away the
 ///                                line being completed)
-///   - ArrowLeft / ArrowRight  : dismiss panel + forward to PTY (parent)
-///                                — left/right always move the cursor
-///                                within the edited line.
+///   - ArrowLeft               : dismiss panel + forward to PTY (parent) —
+///                                always moves the cursor left within the line.
+///   - ArrowRight              : fill the selected suggestion directly into
+///                                the line (whole-command replace, no run) and
+///                                close the panel (parent). Distinct from Tab,
+///                                which only completes the matching suffix —
+///                                Right fills the entire selected command even
+///                                when the typed prefix differs (contains
+///                                matches from Alt+R history mode, etc.).
 ///
 /// The × button is the discoverable affordance for deletion — it's always
 /// visible on the selected item and on hover for the others. The

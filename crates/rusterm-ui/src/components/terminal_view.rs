@@ -417,6 +417,19 @@ fn accepts_history_completion(key: &Key, ctrl: bool, alt: bool, meta: bool, shif
     !ctrl && !alt && !meta && !shift && matches!(key, Key::Enter | Key::End | Key::Tab)
 }
 
+/// Whether an unmodified ArrowRight should "directly fill" the selected
+/// suggestion into the command line. Unlike Tab (which only completes the
+/// matching suffix), Right replaces the whole edited line with the selected
+/// command — useful for contains-style matches where the typed prefix is not
+/// the suggestion's start. The fill is a no-run replace: the command lands in
+/// the line and the user reviews it before pressing Enter.
+///
+/// Only the unmodified key qualifies: Ctrl+Right / Shift+Right still reach the
+/// PTY so word-jump / selection bindings keep working while the panel is open.
+fn suggestion_fill_accepts_key(key: &Key, ctrl: bool, alt: bool, meta: bool, shift: bool) -> bool {
+    !ctrl && !alt && !meta && !shift && matches!(key, Key::ArrowRight)
+}
+
 fn suggestion_navigation_index(
     key: &Key,
     ctrl: bool,
@@ -1606,6 +1619,14 @@ pub fn TerminalView(
     on_copy_session_log: EventHandler<()>,
     on_suggestion_navigate: EventHandler<Option<usize>>,
     on_suggestion_accept: EventHandler<String>,
+    /// Fill the selected suggestion directly into the command line, replacing
+    /// the whole edited line (no run). Triggered by unmodified ArrowRight
+    /// while the suggestion panel is open. Unlike `on_suggestion_accept`
+    /// (Tab, suffix-completion), this always replaces the full line so it
+    /// works for contains-style matches whose prefix differs from the typed
+    /// text. The handler in `app.rs` reuses the acceptance path with
+    /// `replace_line = true`.
+    on_suggestion_fill: EventHandler<String>,
     on_history_completion: EventHandler<()>,
     /// Dismiss the suggestion panel. Payload `keep_inline_ghost`:
     ///   - `true`  — user simply closed the popup (Escape / popup close):
@@ -2122,10 +2143,16 @@ pub fn TerminalView(
         // ArrowUp/ArrowDown navigate the suggestion list while the panel is
         // visible (consumed above by `suggestion_navigation_index` — the key
         // never reaches the PTY, so the shell cannot swap away the line being
-        // completed). ArrowLeft/ArrowRight stay with the terminal: they
-        // dismiss the panel and fall through to the PTY so the user keeps
-        // in-line cursor movement. The panel can also be driven via
-        // Ctrl+N/Ctrl+P (navigate), Tab (accept), Escape (dismiss), and
+        // completed). ArrowRight, when unmodified and a suggestion is selected,
+        // FILLS the whole selected command into the line (replace, no run) —
+        // distinct from Tab's suffix-completion, this is the "directly fill in
+        // the config/command" affordance and works for contains-style matches
+        // whose prefix differs from the typed text. ArrowLeft stays with the
+        // terminal: it dismisses the panel and falls through to the PTY so the
+        // user keeps in-line leftward cursor movement. Modified Right
+        // (Ctrl/Shift/Alt/Meta+Right) also dismisses + forwards so word-jump /
+        // selection bindings keep working. The panel can also be driven via
+        // Ctrl+N/Ctrl+P (navigate), Tab (accept suffix), Escape (dismiss), and
         // Shift+Delete (purge entry).
         if current_suggestion_visible && !closure_suggestions.is_empty() {
             if let Some(next) = suggestion_navigation_index(
@@ -2149,9 +2176,23 @@ pub fn TerminalView(
                     }
                     return;
                 }
-                // Left/Right dismiss the panel and fall through to the PTY
-                // so the shell can move the cursor within the line. Up/Down
-                // are handled above by `suggestion_navigation_index`.
+                // ArrowRight fills the selected suggestion directly into the
+                // line (whole-command replace, no run) and closes the panel.
+                // Must precede the ArrowLeft/ArrowRight dismiss arm so the
+                // unmodified Right is consumed here; modified Right (Ctrl etc.)
+                // falls through to the dismiss arm below and reaches the PTY.
+                _ if suggestion_fill_accepts_key(&key, ctrl, alt, meta, shift) => {
+                    if let Some(cmd) = closure_suggestions.get(current_suggestion_selected) {
+                        on_suggestion_fill.call(cmd.clone());
+                        return;
+                    }
+                    // No selectable command — dismiss + forward as a fallback.
+                    on_suggestion_dismiss.call(false);
+                }
+                // Left dismisses the panel and falls through to the PTY so the
+                // shell can move the cursor left within the line. Modified
+                // Right (Ctrl/Shift/Alt/Meta+Right) lands here too. Up/Down are
+                // handled above by `suggestion_navigation_index`.
                 Key::ArrowLeft | Key::ArrowRight => {
                     on_suggestion_dismiss.call(false);
                     // Don't return — let the key continue to the PTY.
@@ -3534,8 +3575,9 @@ mod tests {
         is_history_completion_shortcut, onekey_popup_key_action, online_search_url,
         parse_popup_drag_poll_response, popup_anchor_col, popup_anchor_row, popup_fallback_left_px,
         popup_fallback_top_px, popup_layout, scroll_thumb_geometry, search_query_from_selection,
-        selection_in_viewport, suggestion_navigation_index, terminal_key_bytes,
-        terminal_overlay_key_action, terminal_selection_text, viewport_base, word_range_in_row,
+        selection_in_viewport, suggestion_fill_accepts_key, suggestion_navigation_index,
+        terminal_key_bytes, terminal_overlay_key_action, terminal_selection_text, viewport_base,
+        word_range_in_row,
     };
     use dioxus::prelude::{Code, Key};
     use rusterm_core::terminal::{CellColor, RenderCell, RenderRow};
@@ -4456,6 +4498,78 @@ mod tests {
         assert!(!accepts_history_completion(
             &Key::Enter,
             true,
+            false,
+            false,
+            false,
+        ));
+    }
+
+    #[test]
+    fn only_unmodified_arrow_right_fills_the_selected_suggestion() {
+        // Unmodified ArrowRight fills the selected command into the line.
+        assert!(suggestion_fill_accepts_key(
+            &Key::ArrowRight,
+            false,
+            false,
+            false,
+            false,
+        ));
+        // Any modifier disqualifies the key — Ctrl/Shift/Alt/Meta+Right must
+        // reach the PTY (word-jump / selection bindings stay available).
+        assert!(!suggestion_fill_accepts_key(
+            &Key::ArrowRight,
+            true,
+            false,
+            false,
+            false,
+        ));
+        assert!(!suggestion_fill_accepts_key(
+            &Key::ArrowRight,
+            false,
+            false,
+            false,
+            true,
+        ));
+        assert!(!suggestion_fill_accepts_key(
+            &Key::ArrowRight,
+            false,
+            true,
+            false,
+            false,
+        ));
+        assert!(!suggestion_fill_accepts_key(
+            &Key::ArrowRight,
+            false,
+            false,
+            true,
+            false,
+        ));
+        // ArrowLeft never fills — it always dismisses + forwards to the PTY.
+        assert!(!suggestion_fill_accepts_key(
+            &Key::ArrowLeft,
+            false,
+            false,
+            false,
+            false,
+        ));
+        // Tab/End/Enter are NOT fill keys (they accept/execute via other arms).
+        assert!(!suggestion_fill_accepts_key(
+            &Key::Tab,
+            false,
+            false,
+            false,
+            false,
+        ));
+        assert!(!suggestion_fill_accepts_key(
+            &Key::End,
+            false,
+            false,
+            false,
+            false,
+        ));
+        assert!(!suggestion_fill_accepts_key(
+            &Key::Enter,
+            false,
             false,
             false,
             false,

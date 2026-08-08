@@ -459,8 +459,15 @@ pub struct Terminal {
     // Working directory reported by the shell via OSC 7
     // (`ESC ] 7 ; file://<host><path> ST`), used by the session-state restore
     // feature to know which directory to `cd` back to on next launch. None
-    // until the shell reports one (raw telnet/serial shells never will).
+    // until the shell reports one (raw telnet/serial sessions never will).
     cwd: Option<std::path::PathBuf>,
+    // The `<host>` authority from the most recent OSC 7 report. For an SSH
+    // session through a JumpServer/koko bastion this is the *internal* target
+    // node's hostname (emitted by the target shell's integration after the
+    // user navigates the bastion menu to it) — distinct from the bastion host
+    // itself. `None` until the shell reports one. Captured "in the background"
+    // from the shell's own prompt hook, no extra exec round-trip needed.
+    osc7_host: Option<String>,
 }
 
 impl Terminal {
@@ -511,6 +518,7 @@ impl Terminal {
             last_exit_code: None,
             exit_code_dirty: false,
             cwd: None,
+            osc7_host: None,
         }
     }
 
@@ -534,6 +542,16 @@ impl Terminal {
     /// feature to `cd` back to this directory on next launch.
     pub fn cwd(&self) -> Option<&std::path::Path> {
         self.cwd.as_deref()
+    }
+
+    /// Returns the `<host>` authority from the most recent OSC 7 report
+    /// (`file://<host><path>`). For a JumpServer session this is the internal
+    /// target node's hostname (the target shell emits it once the user has
+    /// navigated the bastion menu onto it). `None` until the shell reports
+    /// one. Used to label which jumpserver-internal machine a session landed
+    /// on, without an extra `hostname` exec round-trip.
+    pub fn osc7_host(&self) -> Option<&str> {
+        self.osc7_host.as_deref()
     }
 
     /// If a new exit code arrived since the last call (via OSC 133;D), return
@@ -600,17 +618,21 @@ impl Terminal {
     }
 
     /// Scan raw output for OSC 7 working-directory reports
-    /// `ESC ] 7 ; file://<host><path> (BEL|ST)` and record the path.
+    /// `ESC ] 7 ; file://<host><path> (BEL|ST)` and record both the path and
+    /// the host.
     ///
     /// Same single-pass-over-ESC-byte approach as `scan_exit_codes`. The path
     /// is everything after the optional `//<host>` authority up to the next BEL
-    /// (0x07) or ST (ESC `\`). Hostname is ignored — we only care about the
-    /// path. `file://localhost/path` and `file:///path` (empty host) both
+    /// (0x07) or ST (ESC `\`). The host is the authority between `//` and the
+    /// next `/` — for a JumpServer session this is the internal target node's
+    /// hostname (the target shell emits it once the bastion menu has landed on
+    /// it). `file://localhost/path` and `file:///path` (empty host) both
     /// resolve to `/path`.
     ///
     /// Used by the session-state restore feature: on next launch we send
     /// `cd '<path>'` to the shell after it's ready, so the user lands in the
-    /// directory they were last working in.
+    /// directory they were last working in. The host is surfaced to the UI to
+    /// label which jumpserver-internal machine a session is on.
     fn scan_cwd(&mut self, data: &[u8]) {
         // `ESC ] 7 ;`
         const PREFIX: &[u8] = b"]7;";
@@ -643,8 +665,11 @@ impl Terminal {
                     }
                     let payload = &data[payload_start..j];
 
-                    if let Some(path) = parse_osc7_payload(payload) {
+                    if let Some((host, path)) = parse_osc7_parts(payload) {
                         self.cwd = Some(path);
+                        if let Some(host) = host {
+                            self.osc7_host = Some(host);
+                        }
                     }
 
                     // Skip past the consumed marker.
@@ -1920,38 +1945,53 @@ impl Default for TerminalSize {
 use serde::{Deserialize, Serialize};
 
 /// Parse the payload of an OSC 7 sequence (everything between `ESC ] 7 ;` and
-/// the terminator) into a `PathBuf`.
+/// the terminator) into a `(host, path)` pair.
 ///
 /// Accepts `file://<host>/<path>`, `file:///path` (empty host), or a bare
 /// `/path` (lenient fallback for shells that don't emit the `file://` prefix
-/// consistently). The hostname is intentionally ignored — we only need the
-/// path for `cd` on restore, and the path is local to the shell that emitted
-/// it (for SSH sessions, that's the remote host's filesystem).
+/// consistently). The host is the authority between `//` and the next `/`
+/// (for a JumpServer session this is the internal target node's hostname);
+/// `None` when the payload has no `file://` authority (bare path) or an empty
+/// host (`file:///path`).
 ///
 /// Returns `None` if the payload doesn't look like a path we can `cd` to
 /// (e.g. empty, or not starting with `/`).
-fn parse_osc7_payload(payload: &[u8]) -> Option<std::path::PathBuf> {
+fn parse_osc7_parts(payload: &[u8]) -> Option<(Option<String>, std::path::PathBuf)> {
     let s = std::str::from_utf8(payload).ok()?;
-    let path_str = if let Some(rest) = s.strip_prefix("file://") {
-        // `file://<host>/<path>` — skip past the host (everything up to the
-        // next `/`). `file://localhost/home` → `/home`.
-        // `file:///home` (empty host) → `/home`.
+    let (host, path_str) = if let Some(rest) = s.strip_prefix("file://") {
+        // `file://<host>/<path>` — split at the first `/`. `file://localhost/home`
+        // → (Some("localhost"), "/home"). `file:///home` (empty host) →
+        // (None, "/home").
         if let Some(slash) = rest.find('/') {
-            &rest[slash..]
+            let host = if slash == 0 {
+                None
+            } else {
+                Some(rest[..slash].to_string())
+            };
+            (host, &rest[slash..])
         } else {
             // `file://host` with no path — not useful.
             return None;
         }
     } else {
         // Bare path (lenient fallback). Only accept if it starts with `/`.
-        s
+        // No host authority to extract.
+        (None, s)
     };
 
     if !path_str.starts_with('/') || path_str.is_empty() {
         return None;
     }
 
-    Some(std::path::PathBuf::from(path_str))
+    Some((host, std::path::PathBuf::from(path_str)))
+}
+
+/// Parse the payload of an OSC 7 sequence into a `PathBuf`, discarding the
+/// host. Thin wrapper over [`parse_osc7_parts`] kept for the existing cwd-only
+/// tests.
+#[cfg(test)]
+fn parse_osc7_payload(payload: &[u8]) -> Option<std::path::PathBuf> {
+    parse_osc7_parts(payload).map(|(_, path)| path)
 }
 
 #[cfg(test)]
@@ -2633,6 +2673,67 @@ mod tests {
     fn parse_osc7_payload_rejects_host_only() {
         // `file://localhost` with no path after the host — not useful.
         assert!(parse_osc7_payload(b"file://localhost").is_none());
+    }
+
+    // ── OSC 7 host tracking (v0.21 jumpserver-internal node) ──────────
+
+    #[test]
+    fn parse_osc7_parts_extracts_host_authority() {
+        // `file://<host>/<path>` → (Some(host), path). For a JumpServer
+        // session this host is the internal target node's hostname.
+        let (host, path) = parse_osc7_parts(b"file://web-01/home/user").unwrap();
+        assert_eq!(host.as_deref(), Some("web-01"));
+        assert_eq!(path, std::path::PathBuf::from("/home/user"));
+    }
+
+    #[test]
+    fn parse_osc7_parts_empty_host_when_authority_blank() {
+        // `file:///path` (empty host) → (None, path).
+        let (host, path) = parse_osc7_parts(b"file:///var/log").unwrap();
+        assert_eq!(host, None);
+        assert_eq!(path, std::path::PathBuf::from("/var/log"));
+    }
+
+    #[test]
+    fn parse_osc7_parts_bare_path_has_no_host() {
+        // Bare path (lenient fallback) carries no host authority.
+        let (host, path) = parse_osc7_parts(b"/tmp/work").unwrap();
+        assert_eq!(host, None);
+        assert_eq!(path, std::path::PathBuf::from("/tmp/work"));
+    }
+
+    #[test]
+    fn osc7_host_captured_from_processed_output() {
+        // After navigating a JumpServer menu onto an internal node, the
+        // target shell's integration emits OSC 7 with the node's hostname —
+        // captured "in the background" without any extra exec round-trip.
+        let mut term = Terminal::new(TerminalSize::default());
+        let mut parser = vte::ansi::Processor::new();
+        term.process(b"\x1b]7;file://db-node-3/var/lib/mysql\x07", &mut parser);
+        assert_eq!(term.osc7_host(), Some("db-node-3"));
+        assert_eq!(term.cwd(), Some(std::path::Path::new("/var/lib/mysql")));
+    }
+
+    #[test]
+    fn osc7_host_updates_to_latest_report() {
+        // Bastion shell reports its own hostname first, then the user
+        // navigates the menu onto a target node whose shell reports a
+        // different hostname — the latest wins.
+        let mut term = Terminal::new(TerminalSize::default());
+        let mut parser = vte::ansi::Processor::new();
+        term.process(
+            b"\x1b]7;file://jump.zs.shaipower.online/home/ops\x07",
+            &mut parser,
+        );
+        assert_eq!(term.osc7_host(), Some("jump.zs.shaipower.online"));
+        term.process(b"\x1b]7;file://web-01/home/ops\x07", &mut parser);
+        assert_eq!(term.osc7_host(), Some("web-01"));
+    }
+
+    #[test]
+    fn osc7_host_none_until_first_report() {
+        let term = Terminal::new(TerminalSize::default());
+        assert_eq!(term.osc7_host(), None);
     }
 
     /// Helper: feed bytes into a fresh terminal and return it.
