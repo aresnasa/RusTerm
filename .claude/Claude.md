@@ -276,6 +276,7 @@ Linux gpu-muxi-001.x86.test.brainpp.dev 5.15.0-119-generic #1，将API 脚本放
   0.23 [@Image](zed:///agent/pasted-image?name=Image)  太长了，这里可以换行，同时加高会话顶部,还要检查副本的命名逻辑，这里使用副本 1,2,...,N 不要复制多个副本副本副本...
   0.24 ![](image_16.png)继续完善会话页，
   0.25 登录的会话主机名放单 jumpserver 的下方，然后增加会话的高度减小长度，让会话更高
+  0.26 [@Image](zed:///agent/pasted-image?name=Image) 会话的宽度要动态的和主机名匹配。
 
   ── v0.22（任务 0.22 + 0.23）已完成（2026-08-08）──
   1. 顶部会话栏（TabBar）长文本换行 + 栏体加高：`components/tab_bar.rs` 的会话名 span 从固定 120px 单行截断改为最多两行换行（`-webkit-line-clamp: 2`,`overflow-wrap: anywhere`,max-width 220px）,node 后缀（" · lg-prod-k8s-master-0001.host…"）去掉 `flex-shrink: 0`、同样两行换行收缩（max-width 240px）;TabBar 容器由固定 `height: 36px` 改为 `min-height: 36px`，有换行时自动加高。
