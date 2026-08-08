@@ -427,10 +427,14 @@ pub fn TabBar(
                                 // name, stacked vertically under it.
                                 // v0.26: no ellipsis — the full hostname is
                                 // always visible and drives the tab width.
+                                // v0.27: hostname row highlighted — accent
+                                // color + bold instead of muted, so the user
+                                // can confirm the logged-in machine at a glance.
                                 if let Some(node) = &node_label {
                                     span {
                                         style: "
-                                            color: var(--skin-text-muted);
+                                            color: var(--skin-accent);
+                                            font-weight: 600;
                                             font-size: 11px;
                                             white-space: nowrap;
                                             line-height: 1.2;
